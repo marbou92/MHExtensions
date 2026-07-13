@@ -228,7 +228,14 @@ class Comix : HttpSource() {
         ),
     )
 
-    private class CheckboxFilter(name: String, val value: String, default: Boolean = false) : Filter.CheckBox(name, default)
+    private class CheckboxFilter(
+        name: String,
+        val value: String,
+        default: Boolean = false,
+    ) : Filter.CheckBox(
+        name,
+        default,
+    )
 
     // ========================================================================
     // Sign + Decrypt (reverse-engineered API protection)
