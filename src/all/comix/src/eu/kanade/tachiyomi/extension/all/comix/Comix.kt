@@ -228,21 +228,14 @@ class Comix : HttpSource() {
         ),
     )
 
-    private class CheckboxFilter(
-        name: String,
-        val value: String,
-        default: Boolean = false,
-    ) : Filter.CheckBox(
-        name,
-        default,
-    )
+    private class CheckboxFilter(name: String, val value: String, default: Boolean = false) : Filter.CheckBox(name, default)
 
     // ========================================================================
     // Sign + Decrypt (reverse-engineered API protection)
     // ========================================================================
 
     /**
-     * Intercepts outgoing GET requests to `/api/v1/manga*` and `/api/v1/chapters/*`
+     * Intercepts outgoing GET requests to the manga and chapters API endpoints
      * and appends the `_` signature query parameter that the server validates.
      *
      * The signature is a 3-stage chained S-box substitution (base64url encoded) over
