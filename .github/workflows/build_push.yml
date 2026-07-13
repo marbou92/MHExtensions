@@ -68,20 +68,9 @@ jobs:
       - name: Make gradlew executable
         run: chmod +x gradlew
 
-      # Optional signing — only runs if you've set the SIGNING_KEY secret.
-      # Debug builds (the default here) don't need it, so this is a no-op until
-      # you switch the build type to Release and configure the secrets.
-      - name: Prepare signing key
-        if: ${{ secrets.SIGNING_KEY != '' }}
-        run: |
-          echo ${{ secrets.SIGNING_KEY }} | base64 -d > signingkey.jks
-
       - name: Build extensions (${{ matrix.chunk.number }})
         env:
           MODULES: ${{ join(matrix.chunk.modules, ' ') }}
-          ALIAS: ${{ secrets.ALIAS }}
-          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
-          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
         run: |
           ./gradlew $MODULES
 
@@ -97,25 +86,42 @@ jobs:
           retention-days: 30
           if-no-files-found: error
 
-      - name: Clean up CI files
-        if: ${{ secrets.SIGNING_KEY != '' }}
-        run: rm -f signingkey.jks
-
   # -----------------------------------------------------------------------
-  # Publish job (OPTIONAL)
+  # Publish job (OPTIONAL — disabled by default)
   # -----------------------------------------------------------------------
   # This publishes the built APKs to a `repo` branch of the SAME repository
-  # (so Mihon can read index.min.json from
-  #  https://raw.githubusercontent.com/<you>/<repo>/repo/index.min.json).
+  # so Mihon can read index.min.json from:
+  #   https://raw.githubusercontent.com/<you>/<repo>/repo/index.min.json
   #
-  # It is DISABLED by default. To enable it:
-  #   1. Set up signing secrets (SIGNING_KEY, ALIAS, KEY_STORE_PASSWORD,
-  #      KEY_PASSWORD) so release APKs can be signed.
-  #   2. Change the build type above from "Debug" back to "Release".
-  #   3. Change `if: false` below to `if: true`.
-  #   4. Edit .github/scripts/publish-repo.py to point APK_BASE_URL /
-  #      JAR_BASE_URL / ICON_BASE_URL at your repo and set your signingKey
-  #      fingerprint + name.
+  # To enable it:
+  #   1. Generate a signing keystore and add these repository secrets:
+  #        SIGNING_KEY         — base64 of your .jks file  (run: base64 -w0 signingkey.jks)
+  #        ALIAS               — your key alias
+  #        KEY_STORE_PASSWORD  — keystore password
+  #        KEY_PASSWORD        — key password
+  #   2. Change the build type in the prepare step above from "Debug" to "Release".
+  #   3. Add the signing-key steps back into the build job (see comments below).
+  #   4. Change `if: false` to `if: true` in the publish job below.
+  #   5. Edit .github/scripts/publish-repo.py to set your APK_BASE_URL /
+  #      JAR_BASE_URL / ICON_BASE_URL / signingKey / name.
+  #
+  # When you re-enable release signing, add these steps to the build job
+  # (BEFORE the "Build extensions" step):
+  #
+  #   - name: Prepare signing key
+  #     run: echo "${{ secrets.SIGNING_KEY }}" | base64 -d > signingkey.jks
+  #
+  #   - name: Build extensions
+  #     env:
+  #       MODULES: ${{ join(matrix.chunk.modules, ' ') }}
+  #       ALIAS: ${{ secrets.ALIAS }}
+  #       KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+  #       KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+  #     run: ./gradlew $MODULES
+  #
+  #   - name: Clean up signing key
+  #     if: always()
+  #     run: rm -f signingkey.jks
   # -----------------------------------------------------------------------
   publish:
     name: Publish extension repo (disabled)
