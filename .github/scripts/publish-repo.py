@@ -151,9 +151,9 @@ index = index_pb2.Index(
     #                MUST match the signingKeyFingerprint in repo.json exactly.
     #                WARNING: Do NOT use the value below — it's keiyoushi's key!
     # ==========================================================================
-    name="MyRepo",
-    badgeLabel="MINE",
-    signingKey="REPLACE_WITH_YOUR_SHA256_FINGERPRINT",
+    name="MarBou",
+    badgeLabel="marbou92",
+    signingKey="b6e621b40ac65e148b4b1213523e30a4ebba336f62e7243cd2851e700a911285",
     contact=index_pb2.Contact(
         website="https://github.com/marbou92/MHExtensions"
     ),
