@@ -228,11 +228,7 @@ class Comix : HttpSource() {
         ),
     )
 
-    private class CheckboxFilter(
-        name: String,
-        val value: String,
-        default: Boolean = false,
-    ) : Filter.CheckBox(name, default)
+    private class CheckboxFilter(name: String, val value: String, default: Boolean = false) : Filter.CheckBox(name, default)
 
     // ========================================================================
     // Sign + Decrypt (reverse-engineered API protection)
@@ -319,7 +315,7 @@ class Comix : HttpSource() {
         }
     }
 
-    // --- S-box constants (extracted from the site's JS) ---
+    // --- S-box constants (extracted from the site JS) ---
 
     private val sbox1 = Base64.decode(SBOX1_B64, Base64.DEFAULT)
     private val key1 = Base64.decode(KEY1_B64, Base64.DEFAULT)
