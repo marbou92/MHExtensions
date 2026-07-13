@@ -51,7 +51,9 @@ class Comix : HttpSource() {
 
     // =============================== Latest ==============================
 
-    override fun latestUpdatesRequest(page: Int): Request = mangaListRequest(page, sortBy = "chapter_updated_at", query = null)
+    override fun latestUpdatesRequest(page: Int): Request {
+        return mangaListRequest(page, sortBy = "chapter_updated_at", query = null)
+    }
 
     override fun latestUpdatesParse(response: Response): MangasPage = mangaListParse(response)
 
@@ -90,7 +92,9 @@ class Comix : HttpSource() {
         return GET("$apiBaseUrl/manga/$hid", headers)
     }
 
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/title/${manga.url}"
+    override fun getMangaUrl(manga: SManga): String {
+        return "$baseUrl/title/${manga.url}"
+    }
 
     override fun mangaDetailsParse(response: Response): SManga {
         val detail = response.parseAs<ComixMangaDetailDto>()
@@ -189,44 +193,40 @@ class Comix : HttpSource() {
         7 to "follows_total",
     )
 
-    private class SortFilter :
-        Filter.Sort(
-            "Sort by",
-            arrayOf("Relevance", "Latest update", "Recently added", "Title", "Year", "Highest rated", "Most viewed", "Most followed"),
-            Selection(0, false),
-        )
+    private class SortFilter : Filter.Sort(
+        "Sort by",
+        arrayOf("Relevance", "Latest update", "Recently added", "Title", "Year", "Highest rated", "Most viewed", "Most followed"),
+        Selection(0, false),
+    )
 
-    private class TypeFilter :
-        Filter.Group<CheckboxFilter>(
-            "Type",
-            listOf(
-                CheckboxFilter("Manga", "manga"),
-                CheckboxFilter("Manhwa", "manhwa"),
-                CheckboxFilter("Manhua", "manhua"),
-            ),
-        )
+    private class TypeFilter : Filter.Group<CheckboxFilter>(
+        "Type",
+        listOf(
+            CheckboxFilter("Manga", "manga"),
+            CheckboxFilter("Manhwa", "manhwa"),
+            CheckboxFilter("Manhua", "manhua"),
+        ),
+    )
 
-    private class StatusFilter :
-        Filter.Group<CheckboxFilter>(
-            "Status",
-            listOf(
-                CheckboxFilter("Releasing", "releasing"),
-                CheckboxFilter("Finished", "finished"),
-                CheckboxFilter("Cancelled", "cancelled"),
-                CheckboxFilter("Hiatus", "hiatus"),
-            ),
-        )
+    private class StatusFilter : Filter.Group<CheckboxFilter>(
+        "Status",
+        listOf(
+            CheckboxFilter("Releasing", "releasing"),
+            CheckboxFilter("Finished", "finished"),
+            CheckboxFilter("Cancelled", "cancelled"),
+            CheckboxFilter("Hiatus", "hiatus"),
+        ),
+    )
 
-    private class ContentRatingFilter :
-        Filter.Group<CheckboxFilter>(
-            "Content rating",
-            listOf(
-                CheckboxFilter("Safe", "safe", true),
-                CheckboxFilter("Suggestive", "suggestive", true),
-                CheckboxFilter("Erotica", "erotica"),
-                CheckboxFilter("Pornographic", "pornographic"),
-            ),
-        )
+    private class ContentRatingFilter : Filter.Group<CheckboxFilter>(
+        "Content rating",
+        listOf(
+            CheckboxFilter("Safe", "safe", true),
+            CheckboxFilter("Suggestive", "suggestive", true),
+            CheckboxFilter("Erotica", "erotica"),
+            CheckboxFilter("Pornographic", "pornographic"),
+        ),
+    )
 
     private class CheckboxFilter(name: String, val value: String, default: Boolean = false) : Filter.CheckBox(name, default)
 
@@ -452,8 +452,7 @@ class Comix : HttpSource() {
         return now - millis
     }
 
-    private inline fun <reified T : Filter<*>> FilterList.firstInstance(): T? =
-        filterIsInstance<T>().firstOrNull()
+    private inline fun <reified T : Filter<*>> FilterList.firstInstance(): T? = filterIsInstance<T>().firstOrNull()
 
     companion object {
         private const val SBOX1_B64 = "gbicCvAMzfcXEtGAyjvvhmb2yCWzWhjqcxXZ7ZhpzANOzoQLo3nuPZ2vK9dkb9hJExC0Vni/hdQBceI+mw611gkhQFjBuf4bJg1TxYqM+SL4YDqtwjxiGSdeH7so7Fn1HiRo37Z+RNvl44twXWVhomtMjw+8bemfmv9XEXr7mS82MxaCOJZRR0oHd9PLI5O+gyBGT6hcLoduNa7yCObVVCk3bFWsoD+xcqTrBcP6dNJN/NB1Br2QGhSN2snHAqeRNKVFQiyeAFLPSKGwY8aq9EPgsi17qd4ywPMxiH8w6N1qX1tLKtzhOeemHWeJQfFQ5H23q7qSlJUcjgTEl3x2/Q=="
