@@ -22,7 +22,9 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 
 @Source
-abstract class Comix : HttpSource(), ConfigurableSource {
+abstract class Comix :
+    HttpSource(),
+    ConfigurableSource {
 
     override val supportsLatest = true
 
@@ -624,7 +626,7 @@ abstract class Comix : HttpSource(), ConfigurableSource {
             thumbnail_url = poster?.large ?: poster?.medium
             // Score in title prefix
             if (scorePosition == "title" && ratedAvg != null && ratedCount != null && ratedCount > 0) {
-                title = "[${ratedAvg}] ${this@toSManga.title}"
+                title = "[$ratedAvg] ${this@toSManga.title}"
             }
             initialized = true
         }
@@ -798,40 +800,25 @@ abstract class Comix : HttpSource(), ConfigurableSource {
         }.let(screen::addPreference)
     }
 
-    private fun androidx.preference.SharedPreferences.getDefaultTypes(): List<String> =
-        getStringSet(PREF_DEFAULT_TYPES, emptySet())?.toList() ?: emptyList()
+    private fun androidx.preference.SharedPreferences.getDefaultTypes(): List<String> = getStringSet(PREF_DEFAULT_TYPES, emptySet())?.toList() ?: emptyList()
 
-    private fun androidx.preference.SharedPreferences.getDefaultDemographics(): List<String> =
-        getStringSet(PREF_DEFAULT_DEMOGRAPHICS, emptySet())?.toList() ?: emptyList()
+    private fun androidx.preference.SharedPreferences.getDefaultDemographics(): List<String> = getStringSet(PREF_DEFAULT_DEMOGRAPHICS, emptySet())?.toList() ?: emptyList()
 
-    private fun androidx.preference.SharedPreferences.getContentRatings(): List<String> =
-        getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive"))?.toList()
-            ?: listOf("safe", "suggestive")
+    private fun androidx.preference.SharedPreferences.getContentRatings(): List<String> = getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive"))?.toList() ?: listOf("safe", "suggestive")
 
-    private fun androidx.preference.SharedPreferences.getBlockedGenres(): List<String> =
-        getString(PREF_BLOCKED_GENRES, "")
-            ?.split(",")
-            ?.map { it.trim().lowercase() }
-            ?.filter { it.isNotBlank() }
-            ?: emptyList()
+    private fun androidx.preference.SharedPreferences.getBlockedGenres(): List<String> = getString(PREF_BLOCKED_GENRES, "")?.split(",")?.map { it.trim().lowercase() }?.filter { it.isNotBlank() } ?: emptyList()
 
-    private fun androidx.preference.SharedPreferences.deduplicateChapters(): Boolean =
-        getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
+    private fun androidx.preference.SharedPreferences.deduplicateChapters(): Boolean = getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
 
-    private fun androidx.preference.SharedPreferences.getScanlatorFilter(): String =
-        getString(PREF_SCANLATOR_FILTER, "") ?: ""
+    private fun androidx.preference.SharedPreferences.getScanlatorFilter(): String = getString(PREF_SCANLATOR_FILTER, "") ?: ""
 
-    private fun androidx.preference.SharedPreferences.showAltNames(): Boolean =
-        getBoolean(PREF_SHOW_ALT_NAMES, true)
+    private fun androidx.preference.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
-    private fun androidx.preference.SharedPreferences.showExtraInfo(): Boolean =
-        getBoolean(PREF_SHOW_EXTRA_INFO, true)
+    private fun androidx.preference.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
 
-    private fun androidx.preference.SharedPreferences.showTagsInGenre(): Boolean =
-        getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
+    private fun androidx.preference.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun androidx.preference.SharedPreferences.getScorePosition(): String =
-        getString(PREF_SCORE_POSITION, "description") ?: "description"
+    private fun androidx.preference.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "description") ?: "description"
 
     companion object {
         private const val PREF_CONTENT_RATING = "pref_content_rating"
