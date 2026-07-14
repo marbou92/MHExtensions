@@ -800,25 +800,25 @@ abstract class Comix :
         }.let(screen::addPreference)
     }
 
-    private fun androidx.preference.SharedPreferences.getDefaultTypes(): List<String> = getStringSet(PREF_DEFAULT_TYPES, emptySet())?.toList() ?: emptyList()
+    private fun android.content.SharedPreferences.getDefaultTypes(): List<String> = getStringSet(PREF_DEFAULT_TYPES, emptySet())?.toList() ?: emptyList()
 
-    private fun androidx.preference.SharedPreferences.getDefaultDemographics(): List<String> = getStringSet(PREF_DEFAULT_DEMOGRAPHICS, emptySet())?.toList() ?: emptyList()
+    private fun android.content.SharedPreferences.getDefaultDemographics(): List<String> = getStringSet(PREF_DEFAULT_DEMOGRAPHICS, emptySet())?.toList() ?: emptyList()
 
-    private fun androidx.preference.SharedPreferences.getContentRatings(): List<String> = getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive"))?.toList() ?: listOf("safe", "suggestive")
+    private fun android.content.SharedPreferences.getContentRatings(): List<String> = getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive"))?.toList() ?: listOf("safe", "suggestive")
 
-    private fun androidx.preference.SharedPreferences.getBlockedGenres(): List<String> = getString(PREF_BLOCKED_GENRES, "")?.split(",")?.map { it.trim().lowercase() }?.filter { it.isNotBlank() } ?: emptyList()
+    private fun android.content.SharedPreferences.getBlockedGenres(): List<String> = getString(PREF_BLOCKED_GENRES, "")?.split(",")?.map { it.trim().lowercase() }?.filter { it.isNotBlank() } ?: emptyList()
 
-    private fun androidx.preference.SharedPreferences.deduplicateChapters(): Boolean = getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
+    private fun android.content.SharedPreferences.deduplicateChapters(): Boolean = getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
 
-    private fun androidx.preference.SharedPreferences.getScanlatorFilter(): String = getString(PREF_SCANLATOR_FILTER, "") ?: ""
+    private fun android.content.SharedPreferences.getScanlatorFilter(): String = getString(PREF_SCANLATOR_FILTER, "") ?: ""
 
-    private fun androidx.preference.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
+    private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
-    private fun androidx.preference.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
+    private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
 
-    private fun androidx.preference.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
+    private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun androidx.preference.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "description") ?: "description"
+    private fun android.content.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "description") ?: "description"
 
     companion object {
         private const val PREF_CONTENT_RATING = "pref_content_rating"
