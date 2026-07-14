@@ -143,9 +143,7 @@ abstract class Comix : HttpSource() {
     // The image CDNs (static.comix.to for posters, *.wowpic1.store for pages) require a
     // Referer header — without it they return HTML/redirects instead of image data,
     // causing "failed to initialize decoder".
-    override fun imageRequest(page: Page): Request {
-        return GET(page.imageUrl!!, headers)
-    }
+    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
