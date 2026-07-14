@@ -290,29 +290,40 @@ abstract class Comix : HttpSource() {
     }
 
     /**
-     * Intercepts responses with the `x-enc: 1` header and decrypts the body.
-     * The body is a JSON object `{"e": "base64url-encrypted-payload"}`.
-     * Decryption reverses the 3-stage S-box substitution.
+     * Intercepts responses: decrypts `x-enc: 1` bodies, then unwraps the
+     * `{"status":"ok","result":...}` envelope so parseAs gets the inner data.
      */
     private fun decryptResponseInterceptor(chain: Interceptor.Chain): Response {
         val response = chain.proceed(chain.request())
-        if (response.headers["x-enc"] != "1") return response
-
         val body = response.body ?: return response
         val contentType = body.contentType()
-        val content = body.string()
-        return try {
-            val encrypted = content.parseAs<ComixEncryptedDto>()
-            val decrypted = decrypt(encrypted.e)
-            response.newBuilder()
-                .body(decrypted.toResponseBody("application/json".toMediaType()))
-                .build()
-        } catch (e: Exception) {
-            // If decryption fails, return original body so the caller can see the error
-            response.newBuilder()
-                .body(content.toResponseBody(contentType))
-                .build()
+        var content = body.string()
+
+        // Step 1: Decrypt if x-enc: 1
+        if (response.headers["x-enc"] == "1") {
+            content = try {
+                val encrypted = content.parseAs<ComixEncryptedDto>()
+                decrypt(encrypted.e)
+            } catch (_: Exception) {
+                content
+            }
         }
+
+        // Step 2: Unwrap {"status":"ok","result":...} envelope
+        content = try {
+            val json = org.json.JSONObject(content)
+            if (json.optString("status") == "ok" && json.has("result")) {
+                json.get("result").toString()
+            } else {
+                content
+            }
+        } catch (_: Exception) {
+            content
+        }
+
+        return response.newBuilder()
+            .body(content.toResponseBody("application/json".toMediaType()))
+            .build()
     }
 
     // --- S-box constants (extracted from the site JS) ---
