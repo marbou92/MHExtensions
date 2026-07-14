@@ -29,10 +29,17 @@ abstract class Comix : HttpSource() {
         .addInterceptor(::decryptResponseInterceptor)
         .build()
 
+    // Default headers: only Referer (safe for both API and image requests)
     override fun headersBuilder() = super.headersBuilder()
-        .set("Accept", "application/json")
-        .set("X-Requested-With", "XMLHttpRequest")
         .add("Referer", "$baseUrl/")
+
+    // API-specific headers (JSON + XHR) — used only for /api/v1/ calls
+    private val apiHeaders by lazy {
+        headersBuilder()
+            .set("Accept", "application/json")
+            .set("X-Requested-With", "XMLHttpRequest")
+            .build()
+    }
 
     // ========================================================================
     // API
@@ -87,7 +94,7 @@ abstract class Comix : HttpSource() {
 
     override fun mangaDetailsRequest(manga: SManga): Request {
         val hid = manga.url
-        return GET("$apiBaseUrl/manga/$hid", headers)
+        return GET("$apiBaseUrl/manga/$hid", apiHeaders)
     }
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl/title/${manga.url}"
@@ -101,7 +108,7 @@ abstract class Comix : HttpSource() {
 
     override fun chapterListRequest(manga: SManga): Request {
         val hid = manga.url
-        return GET("$apiBaseUrl/manga/$hid/chapters", headers)
+        return GET("$apiBaseUrl/manga/$hid/chapters", apiHeaders)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -113,7 +120,7 @@ abstract class Comix : HttpSource() {
 
     override fun pageListRequest(chapter: SChapter): Request {
         val chapterId = chapter.url
-        return GET("$apiBaseUrl/chapters/$chapterId", headers)
+        return GET("$apiBaseUrl/chapters/$chapterId", apiHeaders)
     }
 
     override fun getChapterUrl(chapter: SChapter): String {
@@ -124,9 +131,11 @@ abstract class Comix : HttpSource() {
 
     override fun pageListParse(response: Response): List<Page> {
         val data = response.parseAs<ComixChapterPagesDto>()
-        val pages = data.pages?.items ?: emptyList()
+        val container = data.pages
+        val base = container?.baseUrl.orEmpty()
+        val pages = container?.items ?: emptyList()
         return pages.mapIndexed { index, pageDto ->
-            Page(index, imageUrl = pageDto.url)
+            Page(index, imageUrl = base + pageDto.url)
         }
     }
 
@@ -157,7 +166,7 @@ abstract class Comix : HttpSource() {
             }
             .build()
 
-        return GET(url, headers)
+        return GET(url, apiHeaders)
     }
 
     private fun mangaListParse(response: Response): MangasPage {
