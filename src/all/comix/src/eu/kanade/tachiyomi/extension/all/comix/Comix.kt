@@ -69,13 +69,17 @@ abstract class Comix : HttpSource() {
         val sortIndex = sortFilter?.state?.index ?: 0
         val sortAscending = sortFilter?.state?.ascending ?: false
         val sortBy = sortOptions[sortIndex] ?: "relevance"
-        // "title" is naturally ascending; everything else descending by default
         val sortDir = if (sortAscending) "asc" else "desc"
 
         val types = filters.firstInstance<TypeFilter>()?.state?.filter { it.state }?.map { it.value } ?: emptyList()
         val statuses = filters.firstInstance<StatusFilter>()?.state?.filter { it.state }?.map { it.value } ?: emptyList()
+        val demographics = filters.firstInstance<DemographicFilter>()?.state?.filter { it.state }?.map { it.value } ?: emptyList()
+        val genresIncl = filters.firstInstance<GenreFilter>()?.state?.filter { it.state }?.map { it.value } ?: emptyList()
         val contentRatings = filters.firstInstance<ContentRatingFilter>()?.state?.filter { it.state }?.map { it.value }
             ?: listOf("safe", "suggestive")
+        val minChapters = filters.firstInstance<MinChaptersFilter>()?.state?.toIntOrNull() ?: ""
+        val yearFrom = filters.firstInstance<YearFromFilter>()?.state?.toIntOrNull() ?: ""
+        val yearTo = filters.firstInstance<YearToFilter>()?.state?.toIntOrNull() ?: ""
 
         return mangaListRequest(
             page = page,
@@ -85,6 +89,11 @@ abstract class Comix : HttpSource() {
             types = types,
             statuses = statuses,
             contentRatings = contentRatings,
+            demographics = demographics,
+            genresIncl = genresIncl,
+            minChapters = minChapters,
+            yearFrom = yearFrom,
+            yearTo = yearTo,
         )
     }
 
@@ -118,7 +127,7 @@ abstract class Comix : HttpSource() {
             .substringAfter("/manga/")
             .substringBefore("/chapters")
         var page = 1
-        while (data.meta?.hasNext == true && page < 50) {
+        while (data.meta?.hasNext == true) {
             page++
             val nextReq = GET("$apiBaseUrl/manga/$hid/chapters?page=$page&limit=100", apiHeaders)
             val nextResp = client.newCall(nextReq).execute()
@@ -172,6 +181,11 @@ abstract class Comix : HttpSource() {
         types: List<String> = emptyList(),
         statuses: List<String> = emptyList(),
         contentRatings: List<String> = listOf("safe", "suggestive"),
+        demographics: List<String> = emptyList(),
+        genresIncl: List<String> = emptyList(),
+        minChapters: String = "",
+        yearFrom: String = "",
+        yearTo: String = "",
     ): Request {
         val url = "$apiBaseUrl/manga".toHttpUrl().newBuilder()
             .addQueryParameter("page", page.toString())
@@ -182,6 +196,11 @@ abstract class Comix : HttpSource() {
                 types.forEach { addQueryParameter("types[]", it) }
                 statuses.forEach { addQueryParameter("statuses[]", it) }
                 contentRatings.forEach { addQueryParameter("content_rating[]", it) }
+                demographics.forEach { addQueryParameter("demographics[]", it) }
+                genresIncl.forEach { addQueryParameter("genres_in[]", it) }
+                if (minChapters.isNotBlank()) addQueryParameter("min_chap", minChapters)
+                if (yearFrom.isNotBlank()) addQueryParameter("year_from", yearFrom)
+                if (yearTo.isNotBlank()) addQueryParameter("year_to", yearTo)
             }
             .build()
 
@@ -203,7 +222,12 @@ abstract class Comix : HttpSource() {
         SortFilter(),
         TypeFilter(),
         StatusFilter(),
+        DemographicFilter(),
+        GenreFilter(),
         ContentRatingFilter(),
+        MinChaptersFilter(),
+        YearFromFilter(),
+        YearToFilter(),
     )
 
     private val sortOptions = mapOf(
@@ -213,14 +237,29 @@ abstract class Comix : HttpSource() {
         3 to "title",
         4 to "year",
         5 to "score",
-        6 to "views_total",
-        7 to "follows_total",
+        6 to "views_7d",
+        7 to "views_30d",
+        8 to "views_90d",
+        9 to "views_total",
+        10 to "follows_total",
     )
 
     private class SortFilter :
         Filter.Sort(
             "Sort by",
-            arrayOf("Relevance", "Latest update", "Recently added", "Title", "Year", "Highest rated", "Most viewed", "Most followed"),
+            arrayOf(
+                "Relevance",
+                "Latest update",
+                "Recently added",
+                "Title",
+                "Year",
+                "Highest rated",
+                "Most viewed (7 days)",
+                "Most viewed (30 days)",
+                "Most viewed (90 days)",
+                "Most viewed (all time)",
+                "Most followed",
+            ),
             Selection(0, false),
         )
 
@@ -231,6 +270,7 @@ abstract class Comix : HttpSource() {
                 CheckboxFilter("Manga", "manga"),
                 CheckboxFilter("Manhwa", "manhwa"),
                 CheckboxFilter("Manhua", "manhua"),
+                CheckboxFilter("Other", "other"),
             ),
         )
 
@@ -240,8 +280,57 @@ abstract class Comix : HttpSource() {
             listOf(
                 CheckboxFilter("Releasing", "releasing"),
                 CheckboxFilter("Finished", "finished"),
-                CheckboxFilter("Cancelled", "cancelled"),
-                CheckboxFilter("Hiatus", "hiatus"),
+                CheckboxFilter("On hiatus", "on_hiatus"),
+                CheckboxFilter("Discontinued", "discontinued"),
+            ),
+        )
+
+    private class DemographicFilter :
+        Filter.Group<CheckboxFilter>(
+            "Demographic",
+            listOf(
+                CheckboxFilter("Shounen", "shounen"),
+                CheckboxFilter("Seinen", "seinen"),
+                CheckboxFilter("Shoujo", "shoujo"),
+                CheckboxFilter("Josei", "josei"),
+            ),
+        )
+
+    private class GenreFilter :
+        Filter.Group<CheckboxFilter>(
+            "Genres (include)",
+            listOf(
+                CheckboxFilter("Action", "action"),
+                CheckboxFilter("Adventure", "adventure"),
+                CheckboxFilter("Boys Love", "boys-love"),
+                CheckboxFilter("Comedy", "comedy"),
+                CheckboxFilter("Crime", "crime"),
+                CheckboxFilter("Drama", "drama"),
+                CheckboxFilter("Ecchi", "ecchi"),
+                CheckboxFilter("Fantasy", "fantasy"),
+                CheckboxFilter("Girls Love", "girls-love"),
+                CheckboxFilter("Harem", "harem"),
+                CheckboxFilter("Hentai", "hentai"),
+                CheckboxFilter("Historical", "historical"),
+                CheckboxFilter("Horror", "horror"),
+                CheckboxFilter("Isekai", "isekai"),
+                CheckboxFilter("Magical Girls", "magical-girls"),
+                CheckboxFilter("Mature", "mature"),
+                CheckboxFilter("Mecha", "mecha"),
+                CheckboxFilter("Medical", "medical"),
+                CheckboxFilter("Mystery", "mystery"),
+                CheckboxFilter("Philosophical", "philosophical"),
+                CheckboxFilter("Psychological", "psychological"),
+                CheckboxFilter("Romance", "romance"),
+                CheckboxFilter("Sci-Fi", "sci-fi"),
+                CheckboxFilter("Slice of Life", "slice-of-life"),
+                CheckboxFilter("Sports", "sports"),
+                CheckboxFilter("Superhero", "superhero"),
+                CheckboxFilter("Smut", "smut"),
+                CheckboxFilter("Tragedy", "tragedy"),
+                CheckboxFilter("Thriller", "thriller"),
+                CheckboxFilter("Wuxia", "wuxia"),
+                CheckboxFilter("Adult", "adult"),
             ),
         )
 
@@ -255,6 +344,12 @@ abstract class Comix : HttpSource() {
                 CheckboxFilter("Pornographic", "pornographic"),
             ),
         )
+
+    private class MinChaptersFilter : Filter.Text("Min chapters", "")
+
+    private class YearFromFilter : Filter.Text("Year from", "")
+
+    private class YearToFilter : Filter.Text("Year to", "")
 
     private class CheckboxFilter(name: String, val value: String, default: Boolean = false) : Filter.CheckBox(name, default)
 
