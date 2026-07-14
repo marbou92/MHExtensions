@@ -108,7 +108,7 @@ abstract class Comix : HttpSource() {
 
     override fun chapterListRequest(manga: SManga): Request {
         val hid = manga.url
-        return GET("$apiBaseUrl/manga/$hid/chapters", apiHeaders)
+        return GET("$apiBaseUrl/manga/$hid/chapters?limit=500", apiHeaders)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -309,8 +309,12 @@ abstract class Comix : HttpSource() {
      */
     private fun decryptResponseInterceptor(chain: Interceptor.Chain): Response {
         val response = chain.proceed(chain.request())
+
+        // Only process API responses — never touch image downloads
+        val path = response.request.url.encodedPath
+        if (!path.startsWith("/api/v1/")) return response
+
         val body = response.body ?: return response
-        val contentType = body.contentType()
         var content = body.string()
 
         // Step 1: Decrypt if x-enc: 1
