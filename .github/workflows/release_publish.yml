@@ -1,0 +1,226 @@
+name: Release & Publish
+
+# Manual trigger only — builds signed release APKs and publishes to the repo branch.
+# Use this when you've tested the debug build and want to publish an update.
+#
+# Prerequisites:
+#   - Signing secrets configured: SIGNING_KEY, ALIAS, KEY_STORE_PASSWORD, KEY_PASSWORD
+#   - A `repo` branch exists (created via setup-signing.sh or manually)
+#   - publish-repo.py has your signingKey fingerprint set
+
+on:
+  workflow_dispatch:
+    inputs:
+      force_publish:
+        description: "Force publish even if no code changes detected"
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-publish
+  cancel-in-progress: false
+
+env:
+  CI_CHUNK_SIZE: 80
+  IS_PR_CHECK: false
+
+jobs:
+  prepare:
+    name: Prepare release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      matrix: ${{ steps.generate-matrices.outputs.matrix }}
+      delete: ${{ steps.generate-matrices.outputs.delete }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get last successful CI commit
+        uses: nrwl/nx-set-shas@v5
+        with:
+          fallback-sha: 4b825dc642cb6eb9a060e54bf8d69288fbee4904
+
+      - name: Verify signing secrets exist
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          if [ -z "$SIGNING_KEY" ] || [ -z "$ALIAS" ] || [ -z "$KEY_STORE_PASSWORD" ] || [ -z "$KEY_PASSWORD" ]; then
+            echo "::error::Missing signing secrets! Set SIGNING_KEY, ALIAS, KEY_STORE_PASSWORD, KEY_PASSWORD as repository secrets."
+            echo "See: https://github.com/marbou92/MHExtensions/settings/secrets/actions"
+            exit 1
+          fi
+          echo "✓ All signing secrets present."
+
+      - id: generate-matrices
+        name: Create build matrices (force all modules)
+        run: |
+          # Always build ALL extensions for release (not just changed ones)
+          # This ensures the repo always has the latest signed APKs
+          python ./.github/scripts/generate-build-matrices.py "$NX_BASE" Release
+
+  build:
+    name: Build release APKs
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    if: ${{ toJson(fromJson(needs.prepare.outputs.matrix).chunk) != '[]' }}
+    strategy:
+      matrix: ${{ fromJSON(needs.prepare.outputs.matrix) }}
+    steps:
+      - name: Checkout main branch
+        uses: actions/checkout@v4
+
+      - name: Set up Java
+        uses: actions/setup-java@v4
+        with:
+          java-version: 17
+          distribution: temurin
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          cache-read-only: ${{ matrix.chunk.number > 1 }}
+
+      - name: Make gradlew executable
+        run: chmod +x gradlew
+
+      - name: Prepare signing key
+        env:
+          SIGNING_KEY: ${{ secrets.SIGNING_KEY }}
+        run: |
+          echo "$SIGNING_KEY" | base64 -d > signingkey.jks
+          echo "✓ Signing key prepared."
+
+      - name: Build release extensions
+        env:
+          MODULES: ${{ join(matrix.chunk.modules, ' ') }}
+          ALIAS: ${{ secrets.ALIAS }}
+          KEY_STORE_PASSWORD: ${{ secrets.KEY_STORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+        run: |
+          ./gradlew $MODULES
+
+      - name: Verify release APKs exist
+        run: |
+          echo "=== Built APKs ==="
+          find . -path "*/build/outputs/apk/release/*.apk" -exec ls -lh {} \;
+          if [ -z "$(find . -path '*/build/outputs/apk/release/*.apk' -print -quit)" ]; then
+            echo "::error::No release APKs found! Check that signing secrets are correct."
+            exit 1
+          fi
+          echo "✓ Release APKs verified."
+
+      - name: Upload APKs artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: "release-apks-${{ matrix.chunk.number }}"
+          path: |
+            **/build/outputs/apk/release/*.apk
+            **/build/outputs/jar/release/*.jar
+            **/build/keiyoushi-source-info.json
+          retention-days: 7
+          if-no-files-found: error
+
+      - name: Clean up signing key
+        if: always()
+        run: rm -f signingkey.jks
+
+  publish:
+    name: Publish to repo branch
+    needs: [prepare, build]
+    if: always() && needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Download APK artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: ~/apk-artifacts
+
+      - name: Checkout main branch (for scripts)
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref_name }}
+          path: main
+
+      - name: Checkout repo branch
+        uses: actions/checkout@v4
+        with:
+          ref: repo
+          path: repo
+          persist-credentials: true
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install protobuf
+        run: pip install protobuf
+
+      - name: Publish and deploy to repo branch
+        env:
+          DELETE: ${{ needs.prepare.outputs.delete }}
+        run: |
+          cd repo
+          echo "=== Current repo branch contents ==="
+          ls -la
+          echo ""
+          echo "=== Running publish-repo.py ==="
+          python ../main/.github/scripts/publish-repo.py "$DELETE"
+          echo ""
+          echo "=== Repo branch after publish ==="
+          ls -la
+          echo ""
+          echo "=== Git status ==="
+          git status
+
+      - name: Commit and push to repo branch
+        run: |
+          cd repo
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global user.name "github-actions[bot]"
+          if [ -n "$(git status --porcelain)" ]; then
+            git add .
+            git commit -m "Release: update extension repo
+
+          Built from commit ${{ github.sha }}
+          Triggered by: ${{ github.actor }}
+          Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
+            git push
+            echo "✓ Pushed to repo branch!"
+            echo ""
+            echo "=== Mihon repo URL ==="
+            echo "https://raw.githubusercontent.com/marbou92/MHExtensions/repo/index.min.json"
+          else
+            echo "ℹ No changes to commit — repo is already up to date."
+          fi
+
+      - name: Summary
+        run: |
+          echo "## Release & Publish Complete! 🎉" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### What happened:" >> $GITHUB_STEP_SUMMARY
+          echo "1. ✅ Built signed release APKs" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Published to \`repo\` branch" >> $GITHUB_STEP_SUMMARY
+          echo "3. ✅ Updated \`index.min.json\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### Mihon repo URL:" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "https://raw.githubusercontent.com/marbou92/MHExtensions/repo/index.min.json" >> $GITHUB_STEP_SUMMARY
+          echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "### To update in Mihon:" >> $GITHUB_STEP_SUMMARY
+          echo "1. Open Mihon → Settings → Browse → Extension repos" >> $GITHUB_STEP_SUMMARY
+          echo "2. Your repo should auto-update (or pull to refresh)" >> $GITHUB_STEP_SUMMARY
+          echo "3. Update the Comix extension from the Extensions tab" >> $GITHUB_STEP_SUMMARY
