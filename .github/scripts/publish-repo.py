@@ -49,9 +49,9 @@ REPO_ICON_DIR.mkdir(parents=True, exist_ok=True)
 # faster than raw.githubusercontent.com for large files, but raw works fine
 # for personal repos. Use whichever you prefer.
 # ==========================================================================
-APK_BASE_URL = "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk"
-JAR_BASE_URL = "https://raw.githubusercontent.com/marbou92/MHRepo/main/jar"
-ICON_BASE_URL = "https://raw.githubusercontent.com/marbou92/MHRepo/main/icon"
+APK_BASE_URL = "https://cdn.jsdelivr.net/gh/marbou92/MHRepo@main/apk"
+JAR_BASE_URL = "https://cdn.jsdelivr.net/gh/marbou92/MHRepo@main/jar"
+ICON_BASE_URL = "https://cdn.jsdelivr.net/gh/marbou92/MHRepo@main/icon"
 
 to_delete: list[str] = json.loads(sys.argv[1])
 
