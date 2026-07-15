@@ -36,7 +36,7 @@ rootProject.name = "Keiyoushi"
 // Only load the Comix extension (all other extensions have been removed from this fork).
 // To add more extensions later, either use loadIndividualExtension("lang", "name") for each,
 // or switch back to loadAllIndividualExtensions() to auto-discover everything under src/.
-loadIndividualExtension("all", "comix")
+loadIndividualExtension("all", "comixto")
 // loadAllIndividualExtensions()
 
 /**
