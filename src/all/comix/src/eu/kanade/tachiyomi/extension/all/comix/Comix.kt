@@ -152,9 +152,19 @@ abstract class Comix :
 
         var chapters = items.map { it.toSChapter() }
 
-        // Deduplicate chapters by number (keep first of each)
+        // Deduplicate chapters by number — keep the best version of each
         if (preferences.deduplicateChapters()) {
-            chapters = chapters.distinctBy { it.chapter_number }
+            // Build a map of chapter_number -> best DTO, then preserve original order
+            val bestByKey = mutableMapOf<Float, ComixChapterDto>()
+            for (dto in items) {
+                val key = dto.number ?: -1f
+                val existing = bestByKey[key]
+                if (existing == null || isBetterChapter(dto, existing)) {
+                    bestByKey[key] = dto
+                }
+            }
+            val bestIds = bestByKey.values.map { it.id }.toSet()
+            chapters = items.filter { it.id in bestIds }.map { it.toSChapter() }
         }
 
         // Filter by scanlator preference
@@ -168,6 +178,22 @@ abstract class Comix :
         }
 
         return chapters
+    }
+
+    /**
+     * Returns true if [a] is a better chapter than [b] for deduplication.
+     * Priority: official > more votes > more recent.
+     */
+    private fun isBetterChapter(a: ComixChapterDto, b: ComixChapterDto): Boolean {
+        // Official chapters always win
+        if (a.isOfficial == true && b.isOfficial != true) return true
+        if (b.isOfficial == true && a.isOfficial != true) return false
+        // Then higher votes
+        val aVotes = a.votes ?: 0
+        val bVotes = b.votes ?: 0
+        if (aVotes != bVotes) return aVotes > bVotes
+        // Then more recent (by relative date — can't parse exact, so keep original order)
+        return false
     }
 
     // =============================== Pages ===============================
@@ -573,8 +599,18 @@ abstract class Comix :
             .filterNot { it.lowercase() in blockedGenres }
             .joinToString(", ")
 
+        // Build score line (white star ☆)
+        val hasScore = ratedAvg != null && ratedCount != null && ratedCount > 0
+        val scoreLine = if (hasScore) "☆ $ratedAvg/10 — $ratedCount votes" else null
+
         // Build description
         val desc = buildString {
+            // Score at top
+            if (scorePosition == "top" && scoreLine != null) {
+                append(scoreLine)
+                append("\n\n")
+            }
+
             synopsis?.let { append(it) }
 
             if (showAltNames && altTitles.isNotEmpty()) {
@@ -593,18 +629,15 @@ abstract class Comix :
                 if (followsTotal != null && followsTotal > 0) {
                     append("Follows: $followsTotal\n")
                 }
-                if (ratedAvg != null && ratedCount != null && ratedCount > 0) {
-                    append("Rating: $ratedAvg ($ratedCount votes)\n")
-                }
                 if (latestChapter != null && latestChapter > 0) {
                     append("Latest chapter: ${latestChapter.toString().removeSuffix(".0")}\n")
                 }
             }
 
-            // Score display
-            if (scorePosition == "description" && ratedAvg != null && ratedCount != null && ratedCount > 0) {
-                if (isNotEmpty()) append("\n")
-                append("\n⭐ Score: $ratedAvg/10 ($ratedCount votes)")
+            // Score at end
+            if (scorePosition == "end" && scoreLine != null) {
+                if (isNotEmpty()) append("\n\n")
+                append(scoreLine)
             }
         }.trim()
 
@@ -624,10 +657,6 @@ abstract class Comix :
                 else -> SManga.UNKNOWN
             }
             thumbnail_url = poster?.large ?: poster?.medium
-            // Score in title prefix
-            if (scorePosition == "title" && ratedAvg != null && ratedCount != null && ratedCount > 0) {
-                title = "[$ratedAvg] ${this@toSManga.title}"
-            }
             initialized = true
         }
     }
@@ -794,9 +823,9 @@ abstract class Comix :
             key = PREF_SCORE_POSITION
             title = "Score display position"
             summary = "Where to display the manga score"
-            entries = arrayOf("Don't show", "In title (prefix)", "In description (bottom)")
-            entryValues = arrayOf("none", "title", "description")
-            setDefaultValue("description")
+            entries = arrayOf("Don't show", "Top of description", "End of description")
+            entryValues = arrayOf("none", "top", "end")
+            setDefaultValue("end")
         }.let(screen::addPreference)
     }
 
@@ -818,7 +847,7 @@ abstract class Comix :
 
     private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun android.content.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "description") ?: "description"
+    private fun android.content.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
 
     companion object {
         private const val PREF_CONTENT_RATING = "pref_content_rating"

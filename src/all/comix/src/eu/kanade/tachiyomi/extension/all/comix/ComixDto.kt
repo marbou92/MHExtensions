@@ -92,6 +92,7 @@ data class ComixChapterDto(
     val name: String? = null,
     val language: String? = null,
     val isOfficial: Boolean? = null,
+    val votes: Int? = null,
     val groupId: Long? = null,
     val group: ComixGroupDto? = null,
     val createdAtFormatted: String? = null,
