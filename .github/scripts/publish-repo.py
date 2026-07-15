@@ -130,8 +130,13 @@ for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
     )
 
 # Merge with the already-published index, dropping the deleted/rebuilt modules.
-with REPO_DIR.joinpath("index.json").open() as f:
-    remote_proto = json_format.Parse(f.read(), index_pb2.Index())
+# On the first run, index.json doesn't exist yet — start from an empty index.
+index_json_path = REPO_DIR.joinpath("index.json")
+if index_json_path.exists():
+    with index_json_path.open() as f:
+        remote_proto = json_format.Parse(f.read(), index_pb2.Index())
+else:
+    remote_proto = index_pb2.Index()
 
 all_extensions = [
     ext
