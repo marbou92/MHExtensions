@@ -95,7 +95,19 @@ for info_file in ARTIFACTS_DIR.glob("**/keiyoushi-source-info.json"):
     badging = subprocess.check_output(
         [aapt(), "dump", "--include-meta-data", "badging", apk]
     ).decode()
-    application_icon = APPLICATION_ICON_320_REGEX.search(badging).group(1)
+
+    # Try to get the highest-density icon available (640=xxxhdpi, 480=xxhdpi, 320=xhdpi)
+    # Falling back to 320 if the higher densities don't exist
+    application_icon = None
+    for density in (640, 480, 320, 240, 160):
+        match = re.search(
+            rf"^application-icon-{density}:'([^']+)'", badging, re.MULTILINE
+        )
+        if match:
+            application_icon = match.group(1)
+            break
+    if application_icon is None:
+        raise RuntimeError(f"{package_name}: no application icon found in APK badging")
     with (
         ZipFile(apk) as z,
         z.open(application_icon) as i,
