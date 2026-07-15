@@ -136,7 +136,7 @@ jobs:
         run: rm -f signingkey.jks
 
   publish:
-    name: Publish to repo branch
+    name: Publish to MHRepo
     needs: [prepare, build]
     if: always() && needs.build.result == 'success'
     runs-on: ubuntu-latest
@@ -153,11 +153,13 @@ jobs:
           ref: ${{ github.ref_name }}
           path: main
 
-      - name: Checkout repo branch
+      - name: Checkout MHRepo repository
         uses: actions/checkout@v4
         with:
-          ref: repo
+          repository: marbou92/MHRepo
+          ref: main
           path: repo
+          token: ${{ secrets.REPO_PAT }}
           persist-credentials: true
 
       - name: Set up Python
@@ -168,24 +170,24 @@ jobs:
       - name: Install protobuf
         run: pip install protobuf
 
-      - name: Publish and deploy to repo branch
+      - name: Publish and deploy to MHRepo
         env:
           DELETE: ${{ needs.prepare.outputs.delete }}
         run: |
           cd repo
-          echo "=== Current repo branch contents ==="
+          echo "=== Current MHRepo contents ==="
           ls -la
           echo ""
           echo "=== Running publish-repo.py ==="
           python ../main/.github/scripts/publish-repo.py "$DELETE"
           echo ""
-          echo "=== Repo branch after publish ==="
+          echo "=== MHRepo after publish ==="
           ls -la
           echo ""
           echo "=== Git status ==="
           git status
 
-      - name: Commit and push to repo branch
+      - name: Commit and push to MHRepo
         run: |
           cd repo
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
@@ -198,12 +200,12 @@ jobs:
           Triggered by: ${{ github.actor }}
           Date: $(date -u '+%Y-%m-%d %H:%M:%S UTC')"
             git push
-            echo "✓ Pushed to repo branch!"
+            echo "✓ Pushed to MHRepo!"
             echo ""
             echo "=== Mihon repo URL ==="
-            echo "https://raw.githubusercontent.com/marbou92/MHExtensions/repo/index.min.json"
+            echo "https://raw.githubusercontent.com/marbou92/MHRepo/main/index.min.json"
           else
-            echo "ℹ No changes to commit — repo is already up to date."
+            echo "ℹ No changes to commit — MHRepo is already up to date."
           fi
 
       - name: Summary
@@ -212,12 +214,12 @@ jobs:
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### What happened:" >> $GITHUB_STEP_SUMMARY
           echo "1. ✅ Built signed release APKs" >> $GITHUB_STEP_SUMMARY
-          echo "2. ✅ Published to \`repo\` branch" >> $GITHUB_STEP_SUMMARY
+          echo "2. ✅ Published to MHRepo repository" >> $GITHUB_STEP_SUMMARY
           echo "3. ✅ Updated \`index.min.json\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### Mihon repo URL:" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
-          echo "https://raw.githubusercontent.com/marbou92/MHExtensions/repo/index.min.json" >> $GITHUB_STEP_SUMMARY
+          echo "https://raw.githubusercontent.com/marbou92/MHRepo/main/index.min.json" >> $GITHUB_STEP_SUMMARY
           echo "\`\`\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "### To update in Mihon:" >> $GITHUB_STEP_SUMMARY
