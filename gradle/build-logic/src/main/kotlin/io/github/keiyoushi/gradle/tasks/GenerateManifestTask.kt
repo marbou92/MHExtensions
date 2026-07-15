@@ -59,7 +59,21 @@ abstract class GenerateManifestTask : DefaultTask() {
         }
 
         val activitySection = if (filterList.isEmpty()) {
-            ""
+            // Even without deeplinks, add a launcher activity so Android
+            // treats this as a "real app" and shows the icon in Settings
+            buildString {
+                appendLine()
+                appendLine("        <activity")
+                appendLine("            android:name=\"keiyoushi.source.UrlActivity\"")
+                appendLine("            android:excludeFromRecents=\"true\"")
+                appendLine("            android:exported=\"true\"")
+                appendLine("            android:theme=\"@android:style/Theme.NoDisplay\">")
+                appendLine("            <intent-filter>")
+                appendLine("                <action android:name=\"android.intent.action.MAIN\" />")
+                appendLine("                <category android:name=\"android.intent.category.LAUNCHER\" />")
+                appendLine("            </intent-filter>")
+                append("        </activity>")
+            }
         } else {
             buildString {
                 appendLine()
@@ -68,6 +82,10 @@ abstract class GenerateManifestTask : DefaultTask() {
                 appendLine("            android:excludeFromRecents=\"true\"")
                 appendLine("            android:exported=\"true\"")
                 appendLine("            android:theme=\"@android:style/Theme.NoDisplay\">")
+                appendLine("            <intent-filter>")
+                appendLine("                <action android:name=\"android.intent.action.MAIN\" />")
+                appendLine("                <category android:name=\"android.intent.category.LAUNCHER\" />")
+                appendLine("            </intent-filter>")
                 appendLine(intentFilters)
                 append("        </activity>")
             }
