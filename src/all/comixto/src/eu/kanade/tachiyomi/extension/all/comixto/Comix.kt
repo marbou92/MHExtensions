@@ -218,73 +218,12 @@ abstract class Comix :
         val container = data.pages
         val base = container?.baseUrl.orEmpty()
         val pages = container?.items ?: emptyList()
-        val resultList = mutableListOf<Page>()
-        for ((index, pageDto) in pages.withIndex()) {
+        return pages.mapIndexed { index, pageDto ->
             val cleanUrl = (base + pageDto.url).substringBefore("?")
-            if (pageDto.s == 1) {
-                // Scrambled page — download, descramble, return as data URI
-                val imageUrl = descrambleToDataUri(cleanUrl)
-                resultList.add(Page(index, imageUrl = imageUrl))
-            } else {
-                resultList.add(Page(index, imageUrl = cleanUrl))
-            }
-        }
-        return resultList
-    }
-
-    /**
-     * Downloads a scrambled image, descrambles it, and returns a base64 data URI.
-     * This is needed because Mihon's image loader uses its own client, bypassing
-     * the extension's interceptors.
-     */
-    private fun descrambleToDataUri(url: String): String {
-        return try {
-            val imgResponse = client.newCall(GET(url, headers)).execute()
-            val scrambleGrid = imgResponse.header("X-Scramble-Grid") ?: "5x5"
-            val scrambleSeed = imgResponse.header("X-Scramble-Seed")?.toLongOrNull() ?: 0L
-            val scrambleHash = imgResponse.header("X-Scramble-Hash") ?: ""
-            val algo = if (imgResponse.header("X-Scramble-Algo") == "3") 2 else 1
-
-            val grid = scrambleGrid.split("x")
-            val cols = grid.getOrNull(0)?.toIntOrNull() ?: 5
-            val rows = grid.getOrNull(1)?.toIntOrNull() ?: 5
-
-            val hashSeed = SCRAMBLE_HASH_TABLE[scrambleHash.trim()] ?: 0
-            val permSeed = (scrambleSeed xor hashSeed.toLong()) and 0xFFFFFFFFL
-
-            val imageBytes = imgResponse.body?.bytes() ?: return url
-            imgResponse.close()
-
-            val bitmap = BitmapFactory.decodeStream(imageBytes.inputStream()) ?: return url
-            val tileW = bitmap.width / cols
-            val tileH = bitmap.height / rows
-            if (tileW < 1 || tileH < 1) return url
-
-            val order = buildOrder(permSeed, cols * rows, algo)
-            val output = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
-            val canvas = Canvas(output)
-
-            for (i in 0 until cols * rows) {
-                val dst = order[i]
-                val dstCol = dst % cols
-                val dstRow = dst / cols
-                val srcCol = i % cols
-                val srcRow = i / cols
-                val srcRect = Rect(srcCol * tileW, srcRow * tileH, (srcCol + 1) * tileW, (srcRow + 1) * tileH)
-                val dstRect = Rect(dstCol * tileW, dstRow * tileH, (dstCol + 1) * tileW, (dstRow + 1) * tileH)
-                canvas.drawBitmap(bitmap, srcRect, dstRect, null)
-            }
-
-            val outBytes = java.io.ByteArrayOutputStream().apply {
-                output.compress(Bitmap.CompressFormat.WEBP, 90, this)
-            }.toByteArray()
-            bitmap.recycle()
-            output.recycle()
-
-            val b64 = Base64.encodeToString(outBytes, Base64.DEFAULT)
-            "data:image/webp;base64,$b64"
-        } catch (e: Exception) {
-            url
+            // For scrambled pages (s=1), pass the URL through imageUrlParse
+            // which downloads and descrambles the image
+            val finalUrl = if (pageDto.s == 1) "$cleanUrl?__descramble=1" else cleanUrl
+            Page(index, imageUrl = finalUrl)
         }
     }
 
@@ -293,7 +232,57 @@ abstract class Comix :
     // challenge page (HTML) instead of image data, causing decoder errors.
     override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers.newBuilder().add("Accept", "image/*,*/*;q=0.8").build())
 
-    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+    override fun imageUrlParse(response: Response): String {
+        // Check if this is a descramble request (page URL had ?__descramble=1)
+        val url = response.request.url.toString()
+        if (!url.contains("__descramble")) {
+            return throw UnsupportedOperationException()
+        }
+        
+        // Read scramble params from response headers
+        val scrambleGrid = response.header("X-Scramble-Grid") ?: return throw UnsupportedOperationException()
+        val scrambleSeed = response.header("X-Scramble-Seed")?.toLongOrNull() ?: 0L
+        val scrambleHash = response.header("X-Scramble-Hash") ?: ""
+        val algo = if (response.header("X-Scramble-Algo") == "3") 2 else 1
+
+        val grid = scrambleGrid.split("x")
+        val cols = grid.getOrNull(0)?.toIntOrNull() ?: 5
+        val rows = grid.getOrNull(1)?.toIntOrNull() ?: 5
+
+        val hashSeed = SCRAMBLE_HASH_TABLE[scrambleHash.trim()] ?: 0
+        val permSeed = (scrambleSeed xor hashSeed.toLong()) and 0xFFFFFFFFL
+
+        val imageBytes = response.body?.bytes() ?: return throw UnsupportedOperationException()
+        val bitmap = BitmapFactory.decodeStream(imageBytes.inputStream()) ?: return throw UnsupportedOperationException()
+
+        val tileW = bitmap.width / cols
+        val tileH = bitmap.height / rows
+        if (tileW < 1 || tileH < 1) return throw UnsupportedOperationException()
+
+        val order = buildOrder(permSeed, cols * rows, algo)
+        val output = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(output)
+
+        for (i in 0 until cols * rows) {
+            val dst = order[i]
+            val dstCol = dst % cols
+            val dstRow = dst / cols
+            val srcCol = i % cols
+            val srcRow = i / cols
+            val srcRect = Rect(srcCol * tileW, srcRow * tileH, (srcCol + 1) * tileW, (srcRow + 1) * tileH)
+            val dstRect = Rect(dstCol * tileW, dstRow * tileH, (dstCol + 1) * tileW, (dstRow + 1) * tileH)
+            canvas.drawBitmap(bitmap, srcRect, dstRect, null)
+        }
+
+        val outBytes = java.io.ByteArrayOutputStream().apply {
+            output.compress(Bitmap.CompressFormat.WEBP, 90, this)
+        }.toByteArray()
+        bitmap.recycle()
+        output.recycle()
+
+        val b64 = Base64.encodeToString(outBytes, Base64.DEFAULT)
+        return "data:image/webp;base64,$b64"
+    }
 
     // ========================================================================
     // List request builder
