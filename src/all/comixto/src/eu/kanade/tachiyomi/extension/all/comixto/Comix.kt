@@ -290,6 +290,8 @@ abstract class Comix :
         }
     }
 
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
     private fun mangaListRequest(
         page: Int,
         sortBy: String,
