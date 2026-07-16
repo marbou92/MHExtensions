@@ -37,6 +37,7 @@ abstract class Comix :
     override val client: OkHttpClient = network.client.newBuilder()
         .addInterceptor(::signRequestInterceptor)
         .addInterceptor(::decryptResponseInterceptor)
+        .addNetworkInterceptor(::descrambleImageInterceptor)
         .build()
 
     // Default headers: only Referer (safe for both API and image requests)
@@ -220,41 +221,51 @@ abstract class Comix :
         val pages = container?.items ?: emptyList()
         return pages.mapIndexed { index, pageDto ->
             val cleanUrl = (base + pageDto.url).substringBefore("?")
-            // For scrambled pages (s=1), set imageUrl=null so Mihon calls imageUrlParse
-            if (pageDto.s == 1) {
-                Page(index, url = cleanUrl, imageUrl = null)
-            } else {
-                Page(index, imageUrl = cleanUrl)
-            }
+            val finalUrl = if (pageDto.s == 1) "$cleanUrl?__descramble=1" else cleanUrl
+            Page(index, imageUrl = finalUrl)
         }
     }
 
     // Mihon downloads images using a SEPARATE client. The image CDNs require
     // a proper User-Agent and Referer, otherwise they may return a Cloudflare
     // challenge page (HTML) instead of image data, causing decoder errors.
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers.newBuilder().add("Accept", "image/*,*/*;q=0.8").build())
+    override fun imageRequest(page: Page): Request {
+        val url = page.imageUrl!!
+        // Strip __descramble param for the actual CDN request
+        val cleanUrl = url.substringBefore("?__descramble")
+        return GET(cleanUrl, headers.newBuilder().add("Accept", "image/*,*/*;q=0.8").build())
+    }
 
-    override fun imageUrlParse(response: Response): String {
-        // This is called by Mihon when imageUrl is null (scrambled pages)
-        // Read scramble params from response headers
-        val scrambleGrid = response.header("X-Scramble-Grid") ?: throw UnsupportedOperationException()
-        val scrambleSeed = response.header("X-Scramble-Seed")?.toLongOrNull() ?: 0L
-        val scrambleHash = response.header("X-Scramble-Hash") ?: ""
-        val algo = if (response.header("X-Scramble-Algo") == "3") 2 else 1
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
+
+    /**
+     * Descrambles scrambled images (every 10th page with s=1).
+     * Uses the same xorshift PRNG + Fisher-Yates as the comix.to WASM.
+     */
+    private fun descrambleImageInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+
+        // Check if this image is scrambled (via response headers)
+        val scrambleGrid = response.header("X-Scramble-Grid") ?: return response
+        val body = response.body ?: return response
 
         val grid = scrambleGrid.split("x")
         val cols = grid.getOrNull(0)?.toIntOrNull() ?: 5
         val rows = grid.getOrNull(1)?.toIntOrNull() ?: 5
+        val scrambleSeed = response.header("X-Scramble-Seed")?.toLongOrNull() ?: 0L
+        val scrambleHash = response.header("X-Scramble-Hash") ?: ""
+        val algo = if (response.header("X-Scramble-Algo") == "3") 2 else 1
 
         val hashSeed = SCRAMBLE_HASH_TABLE[scrambleHash.trim()] ?: 0
         val permSeed = (scrambleSeed xor hashSeed.toLong()) and 0xFFFFFFFFL
 
-        val imageBytes = response.body?.bytes() ?: throw UnsupportedOperationException()
-        val bitmap = BitmapFactory.decodeStream(imageBytes.inputStream()) ?: throw UnsupportedOperationException()
+        val imageBytes = body.bytes()
+        val bitmap = BitmapFactory.decodeStream(imageBytes.inputStream()) ?: return response
 
         val tileW = bitmap.width / cols
         val tileH = bitmap.height / rows
-        if (tileW < 1 || tileH < 1) throw UnsupportedOperationException()
+        if (tileW < 1 || tileH < 1) return response
 
         val order = buildOrder(permSeed, cols * rows, algo)
         val output = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
@@ -277,13 +288,10 @@ abstract class Comix :
         bitmap.recycle()
         output.recycle()
 
-        val b64 = Base64.encodeToString(outBytes, Base64.DEFAULT)
-        return "data:image/webp;base64,$b64"
+        return response.newBuilder()
+            .body(outBytes.toResponseBody("image/webp".toMediaType()))
+            .build()
     }
-
-    // ========================================================================
-    // List request builder
-    // ========================================================================
 
     private fun mangaListRequest(
         page: Int,
@@ -723,35 +731,37 @@ abstract class Comix :
             null
         }
 
-        // Build info line
-        val infoLine = buildString {
-            if (year != null) append("Year: $year")
-            if (latestChapter != null && latestChapter > 0) {
-                if (isNotEmpty()) append(" · ")
-                append("Chapters: ${latestChapter.toString().removeSuffix(".0")}")
-            }
-            if (followsTotal != null && followsTotal > 0) {
-                if (isNotEmpty()) append(" · ")
-                append("Tracked: $followsTotal")
-            }
-            if (contentRating != null) {
-                if (isNotEmpty()) append(" · ")
-                append("Content Rating: ${formatContentRating(contentRating)}")
-            }
-            if (hasScore) {
-                if (isNotEmpty()) append(" · ")
-                append("$ratedCount ratings")
-            }
-        }.ifBlank { null }
+        // Build info line (bold labels)
+        val infoLine = if (showExtraInfo) {
+            buildString {
+                if (year != null) append("**Year:** $year")
+                if (latestChapter != null && latestChapter > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Chapters:** ${latestChapter.toString().removeSuffix(".0")}")
+                }
+                if (followsTotal != null && followsTotal > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Tracked:** $followsTotal")
+                }
+                if (contentRating != null) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Content Rating:** ${formatContentRating(contentRating)}")
+                }
+                if (hasScore) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**$ratedCount ratings**")
+                }
+            }.ifBlank { null }
+        } else {
+            null
+        }
 
         // Build description
         val desc = buildString {
-            // Score + info at top
-            if (scorePosition == "top" || scorePosition == "end") {
-                if (stars != null) {
-                    append(stars)
-                    append("\n")
-                }
+            // Score at top
+            if (scorePosition == "top" && stars != null) {
+                append(stars)
+                append("\n")
                 if (infoLine != null) {
                     append(infoLine)
                     append("\n\n")
@@ -764,6 +774,22 @@ abstract class Comix :
                 if (isNotEmpty()) append("\n\n")
                 append("Alternative names:\n")
                 append(altTitles.joinToString("\n") { "• $it" })
+            }
+
+            // Score at end
+            if (scorePosition == "end" && stars != null) {
+                if (isNotEmpty()) append("\n\n")
+                append(stars)
+                if (infoLine != null) {
+                    append("\n")
+                    append(infoLine)
+                }
+            }
+
+            // No score
+            if (scorePosition == "none" && infoLine != null) {
+                if (isNotEmpty()) append("\n\n")
+                append(infoLine)
             }
         }.trim()
 
