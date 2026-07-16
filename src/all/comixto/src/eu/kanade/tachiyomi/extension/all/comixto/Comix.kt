@@ -525,41 +525,52 @@ abstract class Comix :
      * Descrambles images that have the #scrambled fragment in the URL.
      * Every 10th page (page 9, 19, 29...) has s=1 in the API response,
      * meaning the image is tile-scrambled with a 5x5 grid.
-     * This reverses the scrambling by swapping tiles back to their original positions.
+     * Uses the same xorshift PRNG + Fisher-Yates as the comix.to WASM.
      */
     private fun descrambleImageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val fragment = request.url.fragment
 
-        // Only descramble if the URL has #scrambled fragment
         if (fragment != "scrambled") return chain.proceed(request)
 
-        // Build the request WITHOUT the fragment (CDN doesn't know about it)
         val cleanRequest = request.newBuilder()
             .url(request.url.newBuilder().fragment(null).build())
             .build()
         val response = chain.proceed(cleanRequest)
         val body = response.body ?: return response
 
+        // Read scramble params from response headers
+        val grid = (response.header("X-Scramble-Grid") ?: "5x5").split("x")
+        val cols = grid.getOrNull(0)?.toIntOrNull() ?: 5
+        val rows = grid.getOrNull(1)?.toIntOrNull() ?: 5
+        val scrambleSeed = response.header("X-Scramble-Seed")?.toLongOrNull() ?: 0L
+        val scrambleHash = response.header("X-Scramble-Hash") ?: ""
+        val algo = if (response.header("X-Scramble-Algo") == "3") 2 else 1
+
+        val hashSeed = SCRAMBLE_HASH_TABLE[scrambleHash.trim()] ?: 0
+        val permSeed = (scrambleSeed xor hashSeed.toLong()) and 0xFFFFFFFFL
+
         val imageBytes = body.bytes()
         val bitmap = BitmapFactory.decodeStream(imageBytes.inputStream())
             ?: return response
 
-        val cols = 5
-        val rows = 5
         val tileW = bitmap.width / cols
         val tileH = bitmap.height / rows
         if (tileW < 1 || tileH < 1) return response
 
+        // Generate the permutation using the same algorithm as the WASM
+        val order = buildOrder(permSeed, cols * rows, algo)
+
         val output = Bitmap.createBitmap(bitmap.width, bitmap.height, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(output)
 
-        // Descramble: rotate 180 degrees (reverse both rows and columns)
+        // Apply permutation: tile i goes to position order[i]
         for (i in 0 until cols * rows) {
-            val dstCol = i % cols
-            val dstRow = i / cols
-            val srcCol = cols - 1 - dstCol
-            val srcRow = rows - 1 - dstRow
+            val dst = order[i]
+            val dstCol = dst % cols
+            val dstRow = dst / cols
+            val srcCol = i % cols
+            val srcRow = i / cols
             val srcRect = Rect(srcCol * tileW, srcRow * tileH, (srcCol + 1) * tileW, (srcRow + 1) * tileH)
             val dstRect = Rect(dstCol * tileW, dstRow * tileH, (dstCol + 1) * tileW, (dstRow + 1) * tileH)
             canvas.drawBitmap(bitmap, srcRect, dstRect, null)
@@ -574,6 +585,48 @@ abstract class Comix :
         return response.newBuilder()
             .body(outBytes.toResponseBody("image/webp".toMediaType()))
             .build()
+    }
+
+    /**
+     * Generates a permutation of [count] elements using a seeded PRNG.
+     * Implements the same algorithm as the comix.to WASM (buildOrderV1/V2).
+     * Uses xorshift PRNG + Fisher-Yates shuffle.
+     */
+    private fun buildOrder(seed: Long, count: Int, algo: Int): IntArray {
+        val arr = IntArray(count) { it }
+        if (count < 2) return arr
+
+        // PRNG state
+        var state = (seed.toInt() or 1)
+
+        if (algo == 2) {
+            // buildOrderV2: xorshift with shifts 13, 17, 13
+            var n = count
+            while (n >= 2) {
+                state = state xor (state shl 13)
+                state = state xor (state ushr 17)
+                state = state xor (state shl 13)
+
+                val j = (state and 0x7FFFFFFF) % n
+                val tmp = arr[n - 1]
+                arr[n - 1] = arr[j]
+                arr[j] = tmp
+                n--
+            }
+        } else {
+            // buildOrderV1: simpler PRNG
+            var n = count
+            while (n >= 2) {
+                state = state * 22695477 + 1
+                val j = ((state ushr 16) and 0x7FFFFFFF) % n
+                val tmp = arr[n - 1]
+                arr[n - 1] = arr[j]
+                arr[j] = tmp
+                n--
+            }
+        }
+
+        return arr
     }
 
     // --- S-box constants (extracted from the site JS) ---
@@ -916,6 +969,11 @@ abstract class Comix :
     private fun android.content.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
 
     companion object {
+        private val SCRAMBLE_HASH_TABLE = mapOf(
+            "03632" to 58414,
+            "02900" to 117532,
+        )
+
         private const val PREF_CONTENT_RATING = "pref_content_rating"
         private const val PREF_DEFAULT_TYPES = "pref_default_types"
         private const val PREF_DEFAULT_DEMOGRAPHICS = "pref_default_demographics"
