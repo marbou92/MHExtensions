@@ -589,32 +589,47 @@ abstract class Comix :
 
     /**
      * Generates a permutation of [count] elements using a seeded PRNG.
-     * Implements the same algorithm as the comix.to WASM (buildOrderV1/V2).
-     * Uses xorshift PRNG + Fisher-Yates shuffle.
+     * Implements the exact algorithm from the comix.to WASM (decompiled via wasm2wat).
+     * V2 uses xorshift(21,1,5) + accumulator mixing + Fisher-Yates shuffle.
      */
     private fun buildOrder(seed: Long, count: Int, algo: Int): IntArray {
         val arr = IntArray(count) { it }
         if (count < 2) return arr
 
-        // PRNG state
         var state = (seed.toInt() or 1)
 
         if (algo == 2) {
-            // buildOrderV2: xorshift with shifts 13, 17, 13
+            // buildOrderV2: shifts 21, 1, 5 with accumulator
+            val shl1 = 21
+            val shr = 1
+            val shl2 = 5
+            var acc = 0
+
+            // Initialize array and accumulator
+            for (i in 0 until count) {
+                arr[i] = i
+                acc = (acc xor i) + i * shl1
+            }
+
+            // Fisher-Yates shuffle
             var n = count
             while (n >= 2) {
-                state = state xor (state shl 13)
-                state = state xor (state ushr 17)
-                state = state xor (state shl 13)
+                state = state xor (state shl shl1)
+                acc += state * n
+                state = state xor (state ushr shr)
+                acc = (acc shl 9 or (acc ushr 23)) xor state
+                state = state xor (state shl shl2)
 
-                val j = (state and 0x7FFFFFFF) % n
-                val tmp = arr[n - 1]
-                arr[n - 1] = arr[j]
-                arr[j] = tmp
+                val j = state % n
+                val oldN1 = arr[n - 1]
+                val oldJ = arr[j]
+                arr[n - 1] = oldJ
+                arr[j] = oldN1
+                acc = (acc shl 5) xor (oldN1 + oldJ)
                 n--
             }
         } else {
-            // buildOrderV1: simpler PRNG
+            // buildOrderV1: LCG-based Fisher-Yates
             var n = count
             while (n >= 2) {
                 state = state * 22695477 + 1
