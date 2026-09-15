@@ -20,7 +20,6 @@ import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonObject
-import kotlinx.serialization.json.putJsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -118,8 +117,7 @@ abstract class MKissa :
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request =
-        mangaListRequest(page, "Trending", "")
+    override fun latestUpdatesRequest(page: Int): Request = mangaListRequest(page, "Trending", "")
 
     override fun latestUpdatesParse(response: Response): MangasPage = mangaListParse(response)
 
@@ -137,25 +135,24 @@ abstract class MKissa :
 
     override fun searchMangaParse(response: Response): MangasPage = mangaListParse(response)
 
-    private fun mangaListRequest(page: Int, sortBy: String, query: String): Request =
-        graphqlRequest(
-            variables = buildJsonObject {
-                putJsonObject("search") {
-                    put("sortBy", sortBy)
-                    put("isManga", true)
-                    if (query.isNotBlank()) put("query", query)
-                    put("listProfile", "browse")
-                    put("allowAdult", allowAdult)
-                    put("allowUnknown", false)
-                    put("denyEcchi", false)
-                    put("lite", false)
-                }
-                put("limit", PAGE_SIZE)
-                put("page", page)
-                put("translationType", "sub")
-            },
-            hash = hashQueryManga,
-        )
+    private fun mangaListRequest(page: Int, sortBy: String, query: String): Request = graphqlRequest(
+        variables = buildJsonObject {
+            putJsonObject("search") {
+                put("sortBy", sortBy)
+                put("isManga", true)
+                if (query.isNotBlank()) put("query", query)
+                put("listProfile", "browse")
+                put("allowAdult", allowAdult)
+                put("allowUnknown", false)
+                put("denyEcchi", false)
+                put("lite", false)
+            }
+            put("limit", PAGE_SIZE)
+            put("page", page)
+            put("translationType", "sub")
+        },
+        hash = hashQueryManga,
+    )
 
     private fun mangaListParse(response: Response): MangasPage {
         val mangas = response.parseAs<MangaListResponse>()
@@ -298,28 +295,22 @@ abstract class MKissa :
         }.let(screen::addPreference)
     }
 
-    private fun android.content.SharedPreferences.blockedGenres(): Set<String> =
-        getString(PREF_BLOCKED_GENRES, "")
-            ?.split(",")
-            ?.map { it.trim().lowercase() }
-            ?.filter { it.isNotBlank() }
-            ?.toSet()
-            ?: emptySet()
+    private fun android.content.SharedPreferences.blockedGenres(): Set<String> = getString(PREF_BLOCKED_GENRES, "")
+        ?.split(",")
+        ?.map { it.trim().lowercase() }
+        ?.filter { it.isNotBlank() }
+        ?.toSet()
+        ?: emptySet()
 
-    private fun android.content.SharedPreferences.showAltNames(): Boolean =
-        getBoolean(PREF_SHOW_ALT_NAMES, true)
+    private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
-    private fun android.content.SharedPreferences.showExtraInfo(): Boolean =
-        getBoolean(PREF_SHOW_EXTRA_INFO, true)
+    private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
 
-    private fun android.content.SharedPreferences.showTagsInGenre(): Boolean =
-        getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
+    private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun android.content.SharedPreferences.scorePosition(): String =
-        getString(PREF_SCORE_POSITION, "end") ?: "end"
+    private fun android.content.SharedPreferences.scorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
 
-    private fun android.content.SharedPreferences.defaultContentRatings(): Set<String> =
-        getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive")) ?: setOf("safe", "suggestive")
+    private fun android.content.SharedPreferences.defaultContentRatings(): Set<String> = getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive")) ?: setOf("safe", "suggestive")
 
     companion object {
         private const val PREF_CONTENT_RATING = "pref_content_rating"

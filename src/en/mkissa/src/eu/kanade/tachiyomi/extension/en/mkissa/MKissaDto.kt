@@ -215,10 +215,12 @@ fun MangaDetail.toSManga(
     val genreChips = buildList {
         addAll(genres)
         if (showTagsInGenre) {
-            addAll(tags.map { tag ->
-                // tags are prefixed like "theme:monsters" / "format:full_color"
-                tag.substringAfter(':').replace('_', ' ').replaceFirstChar { it.uppercase() }
-            })
+            addAll(
+                tags.map { tag ->
+                    // tags are prefixed like "theme:monsters" / "format:full_color"
+                    tag.substringAfter(':').replace('_', ' ').replaceFirstChar { it.uppercase() }
+                },
+            )
         }
     }.distinct()
         .filterNot { it.lowercase() in blockedGenres }

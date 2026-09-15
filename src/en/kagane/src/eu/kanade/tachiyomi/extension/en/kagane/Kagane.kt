@@ -71,15 +71,13 @@ abstract class Kagane :
 
     // ============================== Popular ==============================
 
-    override fun popularMangaRequest(page: Int): Request =
-        searchRequest(page, "", SortFilter(Filter.Sort.Selection(1, false)), defaultContentRatings())
+    override fun popularMangaRequest(page: Int): Request = searchRequest(page, "", SortFilter(Filter.Sort.Selection(1, false)), defaultContentRatings())
 
     override fun popularMangaParse(response: Response): MangasPage = searchParse(response)
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request =
-        searchRequest(page, "", SortFilter(Filter.Sort.Selection(6, false)), defaultContentRatings())
+    override fun latestUpdatesRequest(page: Int): Request = searchRequest(page, "", SortFilter(Filter.Sort.Selection(6, false)), defaultContentRatings())
 
     override fun latestUpdatesParse(response: Response): MangasPage = searchParse(response)
 
@@ -157,27 +155,24 @@ abstract class Kagane :
 
     // ============================== Details ==============================
 
-    override fun mangaDetailsRequest(manga: SManga): Request =
-        GET("$apiUrl/series/${manga.url}", apiHeaders)
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/series/${manga.url}", apiHeaders)
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl/series/${manga.url}"
 
-    override fun mangaDetailsParse(response: Response): SManga =
-        response.parseAs<DetailsDto>().toSManga(
-            apiUrl = apiUrl,
-            seriesId = response.request.url.encodedPath
-                .substringAfter("/series/")
-                .substringBefore("/"),
-            showAltNames = preferences.showAltNames(),
-            showExtraInfo = preferences.showExtraInfo(),
-            showTagsInGenre = preferences.showTagsInGenre(),
-            blockedGenres = preferences.blockedGenres(),
-        )
+    override fun mangaDetailsParse(response: Response): SManga = response.parseAs<DetailsDto>().toSManga(
+        apiUrl = apiUrl,
+        seriesId = response.request.url.encodedPath
+            .substringAfter("/series/")
+            .substringBefore("/"),
+        showAltNames = preferences.showAltNames(),
+        showExtraInfo = preferences.showExtraInfo(),
+        showTagsInGenre = preferences.showTagsInGenre(),
+        blockedGenres = preferences.blockedGenres(),
+    )
 
     // ============================= Chapters ==============================
 
-    override fun chapterListRequest(manga: SManga): Request =
-        GET("$apiUrl/series/${manga.url}", apiHeaders)
+    override fun chapterListRequest(manga: SManga): Request = GET("$apiUrl/series/${manga.url}", apiHeaders)
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val seriesId = response.request.url.encodedPath
@@ -282,8 +277,11 @@ abstract class Kagane :
 
         integrityToken = res.token
         // `exp` is unix seconds; refresh a minute early to be safe.
-        integrityExp = if (res.exp > 0) (res.exp - 60) * 1000 else
+        integrityExp = if (res.exp > 0) {
+            (res.exp - 60) * 1000
+        } else {
             System.currentTimeMillis() + 4 * 60 * 1000
+        }
 
         return integrityToken
     }
@@ -467,29 +465,23 @@ abstract class Kagane :
         }.let(screen::addPreference)
     }
 
-    private fun android.content.SharedPreferences.blockedGenres(): Set<String> =
-        getString(PREF_BLOCKED_GENRES, "")
-            ?.split(",")
-            ?.map { it.trim().lowercase() }
-            ?.filter { it.isNotBlank() }
-            ?.toSet()
-            ?: emptySet()
+    private fun android.content.SharedPreferences.blockedGenres(): Set<String> = getString(PREF_BLOCKED_GENRES, "")
+        ?.split(",")
+        ?.map { it.trim().lowercase() }
+        ?.filter { it.isNotBlank() }
+        ?.toSet()
+        ?: emptySet()
 
-    private fun android.content.SharedPreferences.deduplicateChapters(): Boolean =
-        getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
+    private fun android.content.SharedPreferences.deduplicateChapters(): Boolean = getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
 
-    private fun android.content.SharedPreferences.showAltNames(): Boolean =
-        getBoolean(PREF_SHOW_ALT_NAMES, true)
+    private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
-    private fun android.content.SharedPreferences.showExtraInfo(): Boolean =
-        getBoolean(PREF_SHOW_EXTRA_INFO, true)
+    private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
 
-    private fun android.content.SharedPreferences.showTagsInGenre(): Boolean =
-        getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
+    private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun defaultContentRatings(): List<String> =
-        preferences.getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive"))?.toList()
-            ?: listOf("safe", "suggestive")
+    private fun defaultContentRatings(): List<String> = preferences.getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive"))?.toList()
+        ?: listOf("safe", "suggestive")
 
     companion object {
         private const val PAGE_SIZE = 35

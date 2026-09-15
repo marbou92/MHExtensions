@@ -185,10 +185,9 @@ class PageDto(
     val height: Int? = null,
 )
 
-fun List<PageDto>.toPageList(cdnBase: String): List<eu.kanade.tachiyomi.source.model.Page> =
-    mapIndexed { index, dto ->
-        eu.kanade.tachiyomi.source.model.Page(index, imageUrl = cdnBase + dto.image)
-    }
+fun List<PageDto>.toPageList(cdnBase: String): List<eu.kanade.tachiyomi.source.model.Page> = mapIndexed { index, dto ->
+    eu.kanade.tachiyomi.source.model.Page(index, imageUrl = cdnBase + dto.image)
+}
 
 // ------------------------------------------------------------------
 // Shared: Comix-style description builder pieces

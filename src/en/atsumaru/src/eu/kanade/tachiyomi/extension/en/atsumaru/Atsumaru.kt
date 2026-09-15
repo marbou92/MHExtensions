@@ -165,8 +165,7 @@ abstract class Atsumaru :
 
     // ============================== Details ==============================
 
-    override fun mangaDetailsRequest(manga: SManga): Request =
-        GET("$apiUrl/manga/page?id=${manga.url}", apiHeaders)
+    override fun mangaDetailsRequest(manga: SManga): Request = GET("$apiUrl/manga/page?id=${manga.url}", apiHeaders)
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl/manga/${manga.url}"
 
@@ -259,8 +258,7 @@ abstract class Atsumaru :
 
     // ============================= Chapters ==============================
 
-    override fun chapterListRequest(manga: SManga): Request =
-        GET("$apiUrl/manga/allChapters?mangaId=${manga.url}", apiHeaders)
+    override fun chapterListRequest(manga: SManga): Request = GET("$apiUrl/manga/allChapters?mangaId=${manga.url}", apiHeaders)
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val mangaId = response.request.url.queryParameter("mangaId").orEmpty()
@@ -308,8 +306,7 @@ abstract class Atsumaru :
         return parts[0] to parts[1]
     }
 
-    private inline fun <reified T : Filter<*>> FilterList.firstInstanceOrNull(): T? =
-        filterIsInstance<T>().firstOrNull()
+    private inline fun <reified T : Filter<*>> FilterList.firstInstanceOrNull(): T? = filterIsInstance<T>().firstOrNull()
 
     // ========================================================================
     // Filters
@@ -342,8 +339,7 @@ abstract class Atsumaru :
         }
     }
 
-    private class TypeCheckBox(name: String, val value: String, state: Boolean = false) :
-        Filter.CheckBox(name, state)
+    private class TypeCheckBox(name: String, val value: String, state: Boolean = false) : Filter.CheckBox(name, state)
 
     private class TypeFilter :
         Filter.Group<TypeCheckBox>(
@@ -377,8 +373,7 @@ abstract class Atsumaru :
             ),
         )
 
-    private class GenreCheckBox(name: String, val id: String, state: Boolean = false) :
-        Filter.CheckBox(name, state)
+    private class GenreCheckBox(name: String, val id: String, state: Boolean = false) : Filter.CheckBox(name, state)
 
     private class GenreFilter :
         Filter.Group<GenreCheckBox>(
@@ -476,36 +471,28 @@ abstract class Atsumaru :
         }.let(screen::addPreference)
     }
 
-    private fun android.content.SharedPreferences.blockedGenres(): Set<String> =
-        getString(PREF_BLOCKED_GENRES, "")
-            ?.split(",")
-            ?.map { it.trim().lowercase() }
-            ?.filter { it.isNotBlank() }
-            ?.toSet()
-            ?: emptySet()
+    private fun android.content.SharedPreferences.blockedGenres(): Set<String> = getString(PREF_BLOCKED_GENRES, "")
+        ?.split(",")
+        ?.map { it.trim().lowercase() }
+        ?.filter { it.isNotBlank() }
+        ?.toSet()
+        ?: emptySet()
 
-    private fun android.content.SharedPreferences.deduplicateChapters(): Boolean =
-        getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
+    private fun android.content.SharedPreferences.deduplicateChapters(): Boolean = getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)
 
-    private fun android.content.SharedPreferences.showAltNames(): Boolean =
-        getBoolean(PREF_SHOW_ALT_NAMES, true)
+    private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
-    private fun android.content.SharedPreferences.showExtraInfo(): Boolean =
-        getBoolean(PREF_SHOW_EXTRA_INFO, true)
+    private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
 
-    private fun android.content.SharedPreferences.showTagsInGenre(): Boolean =
-        getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
+    private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun android.content.SharedPreferences.scorePosition(): String =
-        getString(PREF_SCORE_POSITION, "end") ?: "end"
+    private fun android.content.SharedPreferences.scorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
 
-    private fun defaultContentRatings(): List<String> =
-        preferences.getStringSet(PREF_CONTENT_RATING, setOf("Safe", "Suggestive"))?.toList()
-            ?: listOf("Safe", "Suggestive")
+    private fun defaultContentRatings(): List<String> = preferences.getStringSet(PREF_CONTENT_RATING, setOf("Safe", "Suggestive"))?.toList()
+        ?: listOf("Safe", "Suggestive")
 
-    private fun defaultTypes(): List<String> =
-        preferences.getStringSet(PREF_DEFAULT_TYPES, emptySet())?.toList()
-            ?: listOf("Manga", "Manwha", "Manhua", "OEL", "Other")
+    private fun defaultTypes(): List<String> = preferences.getStringSet(PREF_DEFAULT_TYPES, emptySet())?.toList()
+        ?: listOf("Manga", "Manwha", "Manhua", "OEL", "Other")
 
     companion object {
         private const val PREF_CONTENT_RATING = "pref_content_rating"
