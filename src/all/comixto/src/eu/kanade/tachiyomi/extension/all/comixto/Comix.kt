@@ -36,6 +36,11 @@ abstract class Comix :
         .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .apply {
+            // Modern Cloudflare bypass: browser fingerprint headers, WebView cookie
+            // sync and smart retry on CF blocks (rate limits / transient challenges).
+            CloudflareBypass(setOf("comix.to")).install(this)
+        }
         .addInterceptor(::signRequestInterceptor)
         .addInterceptor(::decryptResponseInterceptor)
         .addNetworkInterceptor(::descrambleImageInterceptor)

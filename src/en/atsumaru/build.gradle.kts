@@ -5,18 +5,18 @@ plugins {
 }
 
 keiyoushi {
-    name = "Comix"
-    versionCode = 22
+    name = "Atsumaru"
+    versionCode = 1
     contentWarning = ContentWarning.MIXED
     libVersion = "1.4"
 
     source {
-        lang = "all"
-        baseUrl = "https://comix.to"
+        lang = "en"
+        baseUrl = "https://atsu.moe"
     }
 
     deeplink {
-        host("comix.to")
-        path("/title/..*")
+        host("atsu.moe")
+        path("/manga/..*")
     }
 }

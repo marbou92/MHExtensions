@@ -5,18 +5,18 @@ plugins {
 }
 
 keiyoushi {
-    name = "Comix"
-    versionCode = 22
+    name = "MKissa"
+    versionCode = 1
     contentWarning = ContentWarning.MIXED
     libVersion = "1.4"
 
     source {
-        lang = "all"
-        baseUrl = "https://comix.to"
+        lang = "en"
+        baseUrl = "https://mkissa.to"
     }
 
     deeplink {
-        host("comix.to")
-        path("/title/..*")
+        host("mkissa.to")
+        path("/manga/..*")
     }
 }
