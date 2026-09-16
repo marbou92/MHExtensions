@@ -68,6 +68,12 @@ fun CardDto.coverUrl(): String? = when {
     else -> null
 }
 
+fun MangaDetail.coverUrl(): String? = when {
+    tbObj?.u != null -> "https://aln.youtube-anime.com/${tbObj.u}"
+    thumbnail?.startsWith("http") == true -> thumbnail
+    else -> null
+}
+
 fun CardDto.lastChapterMillis(): Long = lastChapterDate?.sub?.toMillis() ?: 0L
 
 fun ChapterDateParts.toMillis(): Long {
@@ -203,13 +209,16 @@ fun MangaDetail.toSManga(
     showTagsInGenre: Boolean,
     blockedGenres: Set<String>,
     scorePosition: String,
-): SManga = SManga.create().apply {
-    url = _id
-    title = title()
+): SManga {
+    val dtoId = _id
+    val dtoTitle = title()
+    val dtoDescription = description
+    val dtoStatus = status
+    val cover = coverUrl()
 
     val altNames = buildList {
-        nativeName?.takeIf { it.isNotBlank() && it != title() }?.let { add(it) }
-        name?.takeIf { it.isNotBlank() && it != englishName && it != title() }?.let { add(it) }
+        nativeName?.takeIf { it.isNotBlank() && it != dtoTitle }?.let { add(it) }
+        name?.takeIf { it.isNotBlank() && it != englishName && it != dtoTitle }?.let { add(it) }
     }
 
     val genreChips = buildList {
@@ -238,9 +247,9 @@ fun MangaDetail.toSManga(
                 if (isNotEmpty()) append(" · ")
                 append("**Type:** $type")
             }
-            if (!status.isNullOrBlank()) {
+            if (!dtoStatus.isNullOrBlank()) {
                 if (isNotEmpty()) append(" · ")
-                append("**Status:** $status")
+                append("**Status:** $dtoStatus")
             }
             if (stars != null) {
                 if (isNotEmpty()) append(" · ")
@@ -251,7 +260,7 @@ fun MangaDetail.toSManga(
         null
     }
 
-    description = buildString {
+    val builtDescription = buildString {
         if (scorePosition != "none" && stars != null && scorePosition != "end") {
             // "top"
             append(stars)
@@ -265,7 +274,7 @@ fun MangaDetail.toSManga(
             append("\n\n")
         }
 
-        this@MangaDetail.description?.let { append(it.trim()) }
+        dtoDescription?.trim()?.let { append(it) }
 
         if (showAltNames && altNames.isNotEmpty()) {
             if (isNotEmpty()) append("\n\n")
@@ -277,19 +286,23 @@ fun MangaDetail.toSManga(
             if (isNotEmpty()) append("\n\n")
             append(stars)
         }
-    }.trim().ifBlank { description }
+    }.trim()
 
-    status = when (status?.lowercase()) {
-        "releasing", "ongoing" -> SManga.ONGOING
-        "completed" -> SManga.COMPLETED
-        "hiatus" -> SManga.ON_HIATUS
-        "cancelled", "discontinued" -> SManga.CANCELLED
-        else -> SManga.UNKNOWN
+    return SManga.create().apply {
+        url = dtoId
+        title = dtoTitle
+        description = builtDescription.ifBlank { dtoDescription }
+        status = when (dtoStatus?.lowercase()) {
+            "releasing", "ongoing" -> SManga.ONGOING
+            "completed" -> SManga.COMPLETED
+            "hiatus" -> SManga.ON_HIATUS
+            "cancelled", "discontinued" -> SManga.CANCELLED
+            else -> SManga.UNKNOWN
+        }
+        genre = genreChips.ifBlank { null }
+        thumbnail_url = cover
+        initialized = true
     }
-
-    genre = genreChips.ifBlank { null }
-    thumbnail_url = coverUrl()
-    initialized = true
 }
 
 fun MangaDetail.toChapterList(): List<SChapter> {

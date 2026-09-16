@@ -217,7 +217,7 @@ abstract class Atsumaru :
             null
         }
 
-        val description = buildString {
+        val details = buildString {
             if (scorePosition == "top" && stars != null) {
                 append(stars)
                 append("\n")
@@ -249,7 +249,7 @@ abstract class Atsumaru :
             title = mangaPage.title
             author = mangaPage.authors.joinToString(", ") { it.name }.ifBlank { null }
             genre = genreChips.ifBlank { null }
-            description = description.ifBlank { mangaPage.synopsis }
+            description = details.ifBlank { mangaPage.synopsis }
             status = formatAtsuStatus(mangaPage.status)
             thumbnail_url = mangaPage.poster?.image?.let { "$cdnBase/$it" }
             initialized = true

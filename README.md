@@ -7,7 +7,7 @@ Tachiyomi/Mihon extension repository for personal use, based on the [Keiyoushi](
 | Extension | Language | Site | Status |
 |-----------|----------|------|--------|
 | **Comix** | All | [comix.to](https://comix.to) | Working (with modern Cloudflare bypass) |
-| **ManhuaRMTL** | English | [manhuarmtl.com](https://manhuarmtl.com) | Working (with OCR text overlay) |
+| **ManhuaRMTL** | All | [manhuarmtl.com](https://manhuarmtl.com) | Working (OCR text overlay in 12 languages) |
 | **Kagane** | English | [kagane.to](https://kagane.to) | Working (integrity-token flow + CF bypass) |
 | **Atsumaru** | English | [atsu.moe](https://atsu.moe) | Working (custom JSON API) |
 | **MKissa** | English | [mkissa.to](https://mkissa.to) | Browse/search/details only (see below) |
@@ -34,10 +34,13 @@ https://raw.githubusercontent.com/marbou92/MHRepo/main/repo.json
 - 10 extension settings (content rating, deduplication, score display, etc.)
 - Comix-style description format with stars and bold info line
 
-### ManhuaRMTL (`src/en/manhuarmtl/`)
+### ManhuaRMTL (`src/all/manhuarmtl/`)
 - Madara-based theme with custom MRM selectors
-- **OCR text overlay** — burns English MTL text onto raw images (the site serves raw images; English is a JS overlay fetched from `fetch-ocr.php`)
-- Toggle between English (MTL overlay) and Raw images in settings
+- **Fixed Popular/Latest duplication** — the site ignores `sort` on its search URL; browse now uses the `/manga/` archive which honours `?sort=` (Popular = most viewed, Latest = recently updated) with proper `/page/N/` pagination
+- **Fixed OCR text overlay** — the image host check had a typo (`cdn.manhuarmmtl.com`) so overlay data never matched any image; now uses `clean_box` placement data as well
+- **Multi-language text overlay** — burn machine-translated text onto raw images in Arabic + 10 more languages (Spanish, French, German, Portuguese, Italian, Russian, Turkish, Indonesian, Filipino, Vietnamese), with background pre-translation and caching so images don't stall
+- Toggle between English (site MTL), any overlay language, and Raw images in settings
+- Faster page encoding (`WEBP_LOSSY` on Android 11+)
 - NSFW content filter (hide/show adult content)
 - Comix-style description format with stars and bold info line
 - Custom filters: genres (include/exclude), status, sort, author, artist, release year
@@ -120,7 +123,7 @@ MHExtensions/
 ├── lib-multisrc/                # Multisrc themes (madara, etc.)
 ├── src/
 │   ├── all/comixto/             # Comix extension
-│   ├── en/manhuarmtl/           # ManhuaRMTL extension
+│   ├── all/manhuarmtl/          # ManhuaRMTL extension
 │   ├── en/kagane/               # Kagane extension
 │   ├── en/atsumaru/             # Atsumaru extension
 │   └── en/mkissa/               # MKissa extension
