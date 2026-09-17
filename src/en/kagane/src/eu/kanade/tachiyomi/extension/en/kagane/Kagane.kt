@@ -22,6 +22,7 @@ import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -72,13 +73,31 @@ abstract class Kagane :
 
     // ============================== Popular ==============================
 
-    override fun popularMangaRequest(page: Int): Request = searchRequest(page, "", SortFilter(Filter.Sort.Selection(1, false)), defaultContentRatings())
+    override fun popularMangaRequest(page: Int): Request = searchRequest(
+        page,
+        "",
+        SortFilter(Filter.Sort.Selection(1, false)),
+        defaultContentRatings(),
+        emptyList(),
+        emptyList(),
+        emptyList(),
+        emptyList(),
+    )
 
     override fun popularMangaParse(response: Response): MangasPage = searchParse(response)
 
     // =============================== Latest ===============================
 
-    override fun latestUpdatesRequest(page: Int): Request = searchRequest(page, "", SortFilter(Filter.Sort.Selection(6, false)), defaultContentRatings())
+    override fun latestUpdatesRequest(page: Int): Request = searchRequest(
+        page,
+        "",
+        SortFilter(Filter.Sort.Selection(6, false)),
+        defaultContentRatings(),
+        emptyList(),
+        emptyList(),
+        emptyList(),
+        emptyList(),
+    )
 
     override fun latestUpdatesParse(response: Response): MangasPage = searchParse(response)
 
@@ -87,6 +106,10 @@ abstract class Kagane :
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         var sortFilter = SortFilter()
         val contentRatings = mutableListOf<String>()
+        val statuses = mutableListOf<String>()
+        val formats = mutableListOf<String>()
+        val genresIncluded = mutableListOf<String>()
+        val genresExcluded = mutableListOf<String>()
 
         filters.forEach { filter ->
             when (filter) {
@@ -94,6 +117,16 @@ abstract class Kagane :
                 is ContentRatingFilter -> contentRatings.addAll(
                     filter.state.filter { it.state }.map { it.value },
                 )
+                is StatusFilter -> statuses.addAll(
+                    filter.state.filter { it.state }.map { it.value },
+                )
+                is FormatFilter -> formats.addAll(
+                    filter.state.filter { it.state }.map { it.value },
+                )
+                is GenreFilter -> {
+                    genresIncluded.addAll(filter.included())
+                    genresExcluded.addAll(filter.excluded())
+                }
                 else -> {}
             }
         }
@@ -103,6 +136,10 @@ abstract class Kagane :
             query,
             sortFilter,
             contentRatings.ifEmpty { defaultContentRatings() },
+            statuses,
+            formats,
+            genresIncluded,
+            genresExcluded,
         )
     }
 
@@ -113,6 +150,10 @@ abstract class Kagane :
         query: String,
         sortFilter: SortFilter,
         contentRatings: List<String>,
+        statuses: List<String>,
+        formats: List<String>,
+        genresIncluded: List<String>,
+        genresExcluded: List<String>,
     ): Request {
         val sortParam = sortFilter.toUriPart()
 
@@ -124,10 +165,28 @@ abstract class Kagane :
                 add("Mixed")
             }
             putJsonArray("content_rating") {
-                contentRatings.forEach { add(it) }
+                // The API requires the capitalized enum values ("Safe",
+                // "Suggestive", ...). Lowercase values make it answer HTTP 400
+                // even with a valid Cloudflare clearance.
+                contentRatings.forEach { add(normalizeRating(it)) }
             }
             putJsonArray("content_lang") {
                 add("en")
+            }
+            if (statuses.isNotEmpty()) {
+                putJsonArray("upload_status") { statuses.forEach { add(it) } }
+            }
+            if (formats.isNotEmpty()) {
+                putJsonArray("format") { formats.forEach { add(it) } }
+            }
+            if (genresIncluded.isNotEmpty() || genresExcluded.isNotEmpty()) {
+                putJsonObject("genres") {
+                    putJsonArray("values") { genresIncluded.forEach { add(it) } }
+                    put("match_all", true)
+                    if (genresExcluded.isNotEmpty()) {
+                        putJsonArray("exclude") { genresExcluded.forEach { add(it) } }
+                    }
+                }
             }
         }
 
@@ -350,6 +409,9 @@ abstract class Kagane :
 
     override fun getFilterList(): FilterList = FilterList(
         SortFilter(),
+        GenreFilter(),
+        FormatFilter(),
+        StatusFilter(),
         ContentRatingFilter(),
     )
 
@@ -392,20 +454,79 @@ abstract class Kagane :
         }
     }
 
+    internal class GenreTriState(name: String, val value: String) : Filter.TriState(name)
+
+    /**
+     * Genre filter with include/exclude states. Values are the site's own
+     * genre names (verified against the website's browse filters).
+     */
+    internal class GenreFilter :
+        Filter.Group<GenreTriState>(
+            "Genres",
+            GENRES.map { GenreTriState(it, it) },
+        ) {
+        fun included(): List<String> = state.filter { it.state == Filter.TriState.STATE_INCLUDE }.map { it.value }
+
+        fun excluded(): List<String> = state.filter { it.state == Filter.TriState.STATE_EXCLUDE }.map { it.value }
+
+        private companion object {
+            val GENRES = listOf(
+                "4-koma", "AI", "Action", "Adventure", "Award Winning", "Comedy",
+                "Coming of Age", "Cooking", "Crime", "Demons", "Doujinshi", "Drama",
+                "Ecchi", "Fan Colored", "Fantasy", "Full Color", "Gender Bender",
+                "Gore", "Harem", "Hentai", "Historical", "Horror", "Isekai", "Josei",
+                "LGBTQIA+", "Magic", "Magical Girls", "Martial Arts", "Mecha",
+                "Medical", "Military", "Monsters", "Music", "Mystery",
+                "Office Workers", "Official Colored", "Omegaverse", "Oneshot",
+                "Philosophical", "Police", "Post-Apocalyptic", "Psychological",
+                "Reincarnation", "Reverse Harem", "Romance", "School Life", "Sci-Fi",
+                "Seinen", "Shoujo", "Shoujo Ai", "Shounen", "Shounen Ai",
+                "Slice of Life", "Smut", "Sports", "Supernatural", "Survival",
+                "Thriller", "Time Travel", "Tragedy", "Vampires", "Video Games",
+                "Villainess", "Wuxia", "Yaoi", "Yuri",
+            )
+        }
+    }
+
     private class RatingCheckBox(
         name: String,
         val value: String,
         state: Boolean = false,
     ) : Filter.CheckBox(name, state)
 
+    private class FormatFilter :
+        Filter.Group<RatingCheckBox>(
+            "Format",
+            listOf(
+                RatingCheckBox("Manga", "Manga"),
+                RatingCheckBox("Manhwa", "Manhwa"),
+                RatingCheckBox("Manhua", "Manhua"),
+                RatingCheckBox("Comic", "Comic"),
+                RatingCheckBox("Other", "Other"),
+            ),
+        )
+
+    private class StatusFilter :
+        Filter.Group<RatingCheckBox>(
+            "Status",
+            listOf(
+                RatingCheckBox("Ongoing", "Ongoing"),
+                RatingCheckBox("Completed", "Completed"),
+                RatingCheckBox("Hiatus", "Hiatus"),
+                RatingCheckBox("Cancelled", "Cancelled"),
+            ),
+        )
+
     private class ContentRatingFilter :
         Filter.Group<RatingCheckBox>(
             "Content rating",
             listOf(
-                RatingCheckBox("Safe", "safe", true),
-                RatingCheckBox("Suggestive", "suggestive", true),
-                RatingCheckBox("Erotica", "erotica"),
-                RatingCheckBox("Pornographic", "pornographic"),
+                // Capitalized values are required by the API (lowercase ones
+                // cause HTTP 400 responses even after a WebView clearance).
+                RatingCheckBox("Safe", "Safe", true),
+                RatingCheckBox("Suggestive", "Suggestive", true),
+                RatingCheckBox("Erotica", "Erotica"),
+                RatingCheckBox("Pornographic", "Pornographic"),
             ),
         )
 
@@ -419,8 +540,8 @@ abstract class Kagane :
             title = "Default content rating"
             summary = "Content ratings to show by default in browse/search"
             entries = arrayOf("Safe", "Suggestive", "Erotica", "Pornographic")
-            entryValues = arrayOf("safe", "suggestive", "erotica", "pornographic")
-            setDefaultValue(setOf("safe", "suggestive"))
+            entryValues = arrayOf("Safe", "Suggestive", "Erotica", "Pornographic")
+            setDefaultValue(setOf("Safe", "Suggestive"))
         }.let(screen::addPreference)
 
         EditTextPreference(screen.context).apply {
@@ -481,8 +602,16 @@ abstract class Kagane :
 
     private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun defaultContentRatings(): List<String> = preferences.getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive"))?.toList()
-        ?: listOf("safe", "suggestive")
+    /**
+     * The API only accepts the capitalized enum values. Older builds saved
+     * lowercase values in the preferences, so normalize whatever comes out.
+     */
+    private fun normalizeRating(value: String): String = value.lowercase().replaceFirstChar { it.uppercase() }
+
+    private fun defaultContentRatings(): List<String> = preferences.getStringSet(PREF_CONTENT_RATING, setOf("Safe", "Suggestive"))
+        ?.map(::normalizeRating)
+        ?.takeIf { it.isNotEmpty() }
+        ?: listOf("Safe", "Suggestive")
 
     companion object {
         private const val PAGE_SIZE = 35

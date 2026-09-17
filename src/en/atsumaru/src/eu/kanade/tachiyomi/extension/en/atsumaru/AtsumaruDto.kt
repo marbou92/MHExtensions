@@ -102,6 +102,8 @@ class MangaPage(
     class Author(
         val id: String,
         val name: String,
+        // "Author", "Artist", "Story", "Art", ... depending on the credit.
+        val type: String? = null,
     )
 
     @Serializable
@@ -140,6 +142,22 @@ class ChapterDto(
     val pageCount: Int? = null,
 )
 
+/**
+ * Titles like "Chapter 195", "Chapiter 195" or a bare "195" only restate the
+ * chapter number — the old name builder produced "Ch. 195 · Chapiter 195".
+ * A real title ("Chapter 5: The Beginning") keeps its text after the number
+ * prefix is stripped.
+ */
+private val CHAPTER_NUMBER_TITLE = Regex(
+    "^(?:ch(?:apter|apiter)?|chapiter|episode|ep|épisode)?\\s*(?:no\\.?|#)?\\s*\\d+(?:\\.\\d+)?$",
+    RegexOption.IGNORE_CASE,
+)
+
+private val CHAPTER_TITLE_PREFIX = Regex(
+    "^(?:ch(?:apter|apiter)?|episode|ep|épisode)\\s*\\d+(?:\\.\\d+)?\\s*[:\\-–—]\\s*",
+    RegexOption.IGNORE_CASE,
+)
+
 fun ChapterDto.toSChapter(): SChapter = SChapter.create().apply {
     // chapter.url is the chapter id; the manga id is joined in the source.
     url = id
@@ -151,12 +169,16 @@ fun ChapterDto.toSChapter(): SChapter = SChapter.create().apply {
             append("Ch. ")
             append(num.toString().removeSuffix(".0"))
         }
-        val t = this@toSChapter.title.trim()
-        if (t.isNotEmpty() && t != "null") {
+
+        var t = this@toSChapter.title.trim()
+        if (t.isNotEmpty() && t.equals("null", true)) t = ""
+        t = t.replaceFirst(CHAPTER_TITLE_PREFIX, "").trim()
+        if (t.isNotEmpty() && num != null && CHAPTER_NUMBER_TITLE.matches(t)) t = ""
+        if (t.isNotEmpty()) {
             if (isNotEmpty()) append(" · ")
             append(t)
         }
-        if (isEmpty()) append("Chapter ${num ?: id}")
+        if (isEmpty()) append("Chapter ${num?.toString()?.removeSuffix(".0") ?: id}")
     }
 }
 
@@ -185,8 +207,20 @@ class PageDto(
     val height: Int? = null,
 )
 
+/**
+ * Page image paths live under `/static/` on the CDN. Paths that already
+ * contain `static/` are kept as-is so previously working URLs stay stable.
+ */
 fun List<PageDto>.toPageList(cdnBase: String): List<eu.kanade.tachiyomi.source.model.Page> = mapIndexed { index, dto ->
-    eu.kanade.tachiyomi.source.model.Page(index, imageUrl = cdnBase + dto.image)
+    val path = dto.image.trim()
+    val imageUrl = when {
+        path.startsWith("http") -> path
+        path.startsWith("//") -> "https:$path"
+        path.startsWith("/static/") -> cdnBase + path
+        path.startsWith("static/") -> "$cdnBase/$path"
+        else -> "$cdnBase/static/${path.removePrefix("/")}"
+    }
+    eu.kanade.tachiyomi.source.model.Page(index, imageUrl = imageUrl)
 }
 
 // ------------------------------------------------------------------
@@ -197,6 +231,6 @@ fun formatAtsuStatus(status: String?): Int = when (status?.lowercase()) {
     "ongoing", "releasing" -> SManga.ONGOING
     "completed" -> SManga.COMPLETED
     "hiatus", "on hiatus" -> SManga.ON_HIATUS
-    "cancelled", "discontinued" -> SManga.CANCELLED
+    "cancelled", "canceled", "discontinued" -> SManga.CANCELLED
     else -> SManga.UNKNOWN
 }

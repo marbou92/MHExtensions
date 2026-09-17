@@ -3,6 +3,7 @@ package eu.kanade.tachiyomi.extension.en.mkissa
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import kotlinx.serialization.Serializable
+import java.util.Locale
 
 // ------------------------------------------------------------------
 // GraphQL cards (shared between browse/search results)
@@ -14,14 +15,8 @@ class CardDto(
     val name: String? = null,
     val englishName: String? = null,
     val nativeName: String? = null,
-    val type: String? = null,
-    val score: Double? = null,
     val thumbnail: String? = null,
     val tbObj: ThumbObj? = null,
-    val availableChapters: AvailableChapters? = null,
-    val airedStart: AiredStart? = null,
-    val lastChapterDate: ChapterDateMap? = null,
-    val status: String? = null,
 ) {
     fun title(): String = englishName ?: name ?: nativeName ?: _id
 }
@@ -29,37 +24,6 @@ class CardDto(
 @Serializable
 class ThumbObj(
     val u: String? = null,
-    val sm: Int? = null,
-    val md: Int? = null,
-)
-
-@Serializable
-class AvailableChapters(
-    val sub: Int? = null,
-    val raw: Int? = null,
-)
-
-@Serializable
-class AiredStart(
-    val year: Int? = null,
-    val month: Int? = null,
-    val date: Int? = null,
-)
-
-@Serializable
-class ChapterDateMap(
-    val sub: ChapterDateParts? = null,
-    val raw: ChapterDateParts? = null,
-)
-
-@Serializable
-class ChapterDateParts(
-    val year: Int? = null,
-    val month: Int? = null,
-    val date: Int? = null,
-    val hour: Int? = null,
-    val minute: Int? = null,
-    val second: Int? = null,
 )
 
 fun CardDto.coverUrl(): String? = when {
@@ -68,27 +32,12 @@ fun CardDto.coverUrl(): String? = when {
     else -> null
 }
 
-fun MangaDetail.coverUrl(): String? = when {
-    tbObj?.u != null -> "https://aln.youtube-anime.com/${tbObj.u}"
-    thumbnail?.startsWith("http") == true -> thumbnail
-    else -> null
-}
-
-fun CardDto.lastChapterMillis(): Long = lastChapterDate?.sub?.toMillis() ?: 0L
-
-fun ChapterDateParts.toMillis(): Long {
-    val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
-    cal.clear()
-    if (year != null) cal.set(year, (month ?: 1) - 1, date ?: 1, hour ?: 0, minute ?: 0, second ?: 0)
-    return cal.timeInMillis
-}
-
 // ------------------------------------------------------------------
-// Popular (queryPopular persisted query)
+// Popular (queryPopular)
 // ------------------------------------------------------------------
 
 @Serializable
-class PopularResponse(
+class PopularDto(
     val data: PopularData? = null,
 )
 
@@ -99,7 +48,6 @@ class PopularData(
 
 @Serializable
 class Popular(
-    val total: Int = 0,
     val recommendations: List<Recommendation> = emptyList(),
 )
 
@@ -109,11 +57,11 @@ class Recommendation(
 )
 
 // ------------------------------------------------------------------
-// Search / browse (queryManga persisted query)
+// Search / browse (mangas)
 // ------------------------------------------------------------------
 
 @Serializable
-class MangaListResponse(
+class MangaListDto(
     val data: MangaListData? = null,
 )
 
@@ -124,46 +72,15 @@ class MangaListData(
 
 @Serializable
 class MangaList(
-    val edges: List<MangaEdge> = emptyList(),
+    val edges: List<CardDto> = emptyList(),
 )
 
-@Serializable
-class MangaEdge(
-    val _id: String,
-    val name: String? = null,
-    val englishName: String? = null,
-    val nativeName: String? = null,
-    val type: String? = null,
-    val score: Double? = null,
-    val thumbnail: String? = null,
-    val tbObj: ThumbObj? = null,
-    val availableChapters: AvailableChapters? = null,
-    val airedStart: AiredStart? = null,
-    val lastChapterDate: ChapterDateMap? = null,
-    val status: String? = null,
-) {
-    fun toCard(): CardDto = CardDto(
-        _id = _id,
-        name = name,
-        englishName = englishName,
-        nativeName = nativeName,
-        type = type,
-        score = score,
-        thumbnail = thumbnail,
-        tbObj = tbObj,
-        availableChapters = availableChapters,
-        airedStart = airedStart,
-        lastChapterDate = lastChapterDate,
-        status = status,
-    )
-}
-
 // ------------------------------------------------------------------
-// Details (queryMangaById persisted query)
+// Details (manga)
 // ------------------------------------------------------------------
 
 @Serializable
-class MangaDetailResponse(
+class MangaDetailDto(
     val data: MangaDetailData? = null,
 )
 
@@ -178,20 +95,56 @@ class MangaDetail(
     val name: String? = null,
     val englishName: String? = null,
     val nativeName: String? = null,
-    val type: String? = null,
-    val score: Double? = null,
+    val altNames: List<String> = emptyList(),
+    val authors: List<String> = emptyList(),
     val description: String? = null,
     val status: String? = null,
+    val type: String? = null,
     val genres: List<String> = emptyList(),
     val tags: List<String> = emptyList(),
     val thumbnail: String? = null,
     val tbObj: ThumbObj? = null,
     val airedStart: AiredStart? = null,
-    @kotlinx.serialization.SerialName("availableChaptersDetail")
+    // AniList-style 0-100 average, usually null for manga entries.
+    val score: Double? = null,
+    val averageScore: Int? = null,
+    val pageStatus: PageStatus? = null,
     val availableChaptersDetail: AvailableChaptersDetail? = null,
 ) {
+    @Serializable
+    class PageStatus(
+        // MKissa's own user rating out of 10 (e.g. 8.8).
+        val userScoreAverValue: Double? = null,
+    )
+
     fun title(): String = englishName ?: name ?: nativeName ?: _id
+
+    fun coverUrl(): String? = when {
+        tbObj?.u != null -> "https://aln.youtube-anime.com/${tbObj.u}"
+        thumbnail?.startsWith("http") == true -> thumbnail
+        else -> null
+    }
+
+    /**
+     * The rating shown to the user, formatted as "8.8/10" (one decimal,
+     * never the raw 8.47980-style values). Prefers MKissa's own user score,
+     * then falls back to the AniList average score.
+     */
+    fun ratingText(): String? {
+        val rating = pageStatus?.userScoreAverValue
+            ?: averageScore?.takeIf { it > 0 }?.div(10.0)
+            ?: score?.takeIf { it > 0 }?.div(10.0)
+            ?: return null
+        if (rating <= 0.0) return null
+        val text = String.format(Locale.ENGLISH, "%.1f", rating).removeSuffix(".0")
+        return "$text/10"
+    }
 }
+
+@Serializable
+class AiredStart(
+    val year: Int? = null,
+)
 
 @Serializable
 class AvailableChaptersDetail(
@@ -216,10 +169,19 @@ fun MangaDetail.toSManga(
     val dtoStatus = status
     val cover = coverUrl()
 
-    val altNames = buildList {
-        nativeName?.takeIf { it.isNotBlank() && it != dtoTitle }?.let { add(it) }
-        name?.takeIf { it.isNotBlank() && it != englishName && it != dtoTitle }?.let { add(it) }
+    val stars = ratingText()?.let { text ->
+        val rating = pageStatus?.userScoreAverValue
+            ?: averageScore?.takeIf { it > 0 }?.div(10.0)
+            ?: score?.takeIf { it > 0 }?.div(10.0)
+            ?: 0.0
+        val full = (rating / 2).toInt().coerceIn(0, 5)
+        "★".repeat(full) + "☆".repeat(5 - full) + " $text"
     }
+
+    val altNames = altNames
+        .map { it.trim() }
+        .filter { it.isNotEmpty() && !it.equals(dtoTitle, true) }
+        .distinct()
 
     val genreChips = buildList {
         addAll(genres)
@@ -235,11 +197,6 @@ fun MangaDetail.toSManga(
         .filterNot { it.lowercase() in blockedGenres }
         .joinToString(", ")
 
-    val stars = score?.takeIf { it > 0 }?.let { value ->
-        val full = (value / 2).toInt().coerceIn(0, 5)
-        "★".repeat(full) + "☆".repeat(5 - full) + " $value"
-    }
-
     val infoLine = if (showExtraInfo) {
         buildString {
             airedStart?.year?.let { append("**Year:** $it") }
@@ -251,30 +208,29 @@ fun MangaDetail.toSManga(
                 if (isNotEmpty()) append(" · ")
                 append("**Status:** $dtoStatus")
             }
-            if (stars != null) {
-                if (isNotEmpty()) append(" · ")
-                append("**$stars**")
-            }
         }.ifBlank { null }
     } else {
         null
     }
 
     val builtDescription = buildString {
-        if (scorePosition != "none" && stars != null && scorePosition != "end") {
-            // "top"
-            append(stars)
-            append("\n")
-            if (infoLine != null) {
-                append(infoLine)
-                append("\n\n")
-            }
-        } else if (infoLine != null) {
+        if (infoLine != null) {
             append(infoLine)
             append("\n\n")
         }
 
         dtoDescription?.trim()?.let { append(it) }
+
+        // The author is rendered once, in its own labelled block.
+        val authorLine = authors
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .joinToString(", ")
+        if (authorLine.isNotEmpty()) {
+            if (isNotEmpty()) append("\n\n")
+            append("**Author:** $authorLine")
+        }
 
         if (showAltNames && altNames.isNotEmpty()) {
             if (isNotEmpty()) append("\n\n")
@@ -282,7 +238,8 @@ fun MangaDetail.toSManga(
             append(altNames.joinToString("\n") { "• $it" })
         }
 
-        if (scorePosition == "end" && stars != null) {
+        // The rating is rendered exactly once, in the configured position.
+        if (scorePosition != "none" && stars != null) {
             if (isNotEmpty()) append("\n\n")
             append(stars)
         }
@@ -307,15 +264,26 @@ fun MangaDetail.toSManga(
 
 fun MangaDetail.toChapterList(): List<SChapter> {
     val mangaId = _id
-    return availableChaptersDetail?.sub.orEmpty().map { chapterString ->
-        SChapter.create().apply {
-            url = "/manga/$mangaId/chapter-$chapterString-sub"
-            name = buildString {
-                append("Ch. ")
-                append(chapterString)
-            }
-            chapter_number = chapterString.toFloatOrNull() ?: -1f
-            date_upload = 0L
+    val detail = availableChaptersDetail
+
+    val subChapters = detail?.sub.orEmpty()
+    if (subChapters.isNotEmpty()) {
+        return subChapters.map { chapterString ->
+            chapterString.toSChapter(mangaId, "sub")
         }
     }
+
+    // No sub chapters: fall back to the raw list so the chapter list is
+    // never empty for raw-only manga.
+    return detail?.raw.orEmpty().map { chapterString ->
+        chapterString.toSChapter(mangaId, "raw")
+    }
+}
+
+private fun String.toSChapter(mangaId: String, translation: String): SChapter = SChapter.create().apply {
+    val suffix = if (translation == "raw") " (Raw)" else ""
+    url = "/manga/$mangaId/chapter-$this@toSChapter-$translation"
+    name = "Ch. ${this@toSChapter.removeSuffix(".0")}$suffix"
+    chapter_number = this@toSChapter.toFloatOrNull() ?: -1f
+    date_upload = 0L
 }

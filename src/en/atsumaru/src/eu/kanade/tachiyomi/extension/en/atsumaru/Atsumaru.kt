@@ -21,6 +21,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
+import java.text.NumberFormat
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 
 @Source
@@ -55,6 +57,20 @@ abstract class Atsumaru :
     private val browsePageSize = 24
     private val searchPageSize = 24
 
+    /**
+     * Cover/poster paths returned by the API (`posters/xxx.jpg`) live under
+     * `/static/` on the CDN — `cdn.atsu.moe/posters/...` answers 404, which is
+     * why browse covers used to be broken.
+     */
+    private fun coverUrl(path: String?): String? {
+        val clean = path?.trim()?.takeIf { it.isNotEmpty() && it != "null" } ?: return null
+        return when {
+            clean.startsWith("http") -> clean
+            clean.startsWith("//") -> "https:$clean"
+            else -> "$cdnBase/static/${clean.removePrefix("/")}"
+        }
+    }
+
     private fun browseUrl(
         endpoint: String,
         page: Int,
@@ -66,7 +82,7 @@ abstract class Atsumaru :
             .addQueryParameter("offset", offset.toString())
             .addQueryParameter("limit", browsePageSize.toString())
             .addQueryParameter("types", types.joinToString(","))
-            .addQueryParameter("mediums", "Comic,Novel")
+            .addQueryParameter("mediums", "Comic")
             .addQueryParameter("contentRatings", contentRatings.joinToString(","))
             .build()
         return GET(url.toString(), apiHeaders)
@@ -77,7 +93,7 @@ abstract class Atsumaru :
     override fun popularMangaRequest(page: Int): Request = browseUrl(
         "popular",
         page,
-        types = defaultTypes(),
+        types = listOf("Manga", "Manwha", "Manhua", "OEL"),
         contentRatings = defaultContentRatings(),
     )
 
@@ -88,7 +104,7 @@ abstract class Atsumaru :
     override fun latestUpdatesRequest(page: Int): Request = browseUrl(
         "recentlyUpdated",
         page,
-        types = defaultTypes(),
+        types = listOf("Manga", "Manwha", "Manhua", "OEL"),
         contentRatings = defaultContentRatings(),
     )
 
@@ -100,7 +116,7 @@ abstract class Atsumaru :
             SManga.create().apply {
                 url = item.id
                 title = item.title
-                thumbnail_url = item.image?.let { "$cdnBase/$it" }
+                thumbnail_url = coverUrl(item.image)
             }
         }
         return MangasPage(mangas, dto.items.size >= browsePageSize)
@@ -109,31 +125,53 @@ abstract class Atsumaru :
     // =============================== Search ===============================
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        // Typesense requires `q=*` to match everything; an empty `q` returns
+        // 0 results ("no result found") even when filters would match.
         val url = "$baseUrl/collections/manga/documents/search".toHttpUrl().newBuilder()
-            .addQueryParameter("q", query)
+            .addQueryParameter("q", query.ifBlank { "*" })
             .addQueryParameter("query_by", "title")
             .addQueryParameter("per_page", searchPageSize.toString())
             .addQueryParameter("page", page.toString())
 
         val filterParts = mutableListOf<String>()
 
+        // Excluded hidden entries, novels and view-less stubs (mirrors the site).
+        filterParts.add("hidden:!=true")
+        filterParts.add("medium:!=[Novel]")
+        filterParts.add("views:>0")
+
         filters.forEach { filter ->
             when (filter) {
                 is TypeFilter -> filter.state.filter { it.state }.let { checked ->
                     val values = checked.map { it.value }
-                    if (values.isNotEmpty()) filterParts.add("type:=" + values.joinToString("|"))
+                    if (values.isNotEmpty()) filterParts.add("type:=[" + values.joinToString(",") + "]")
                 }
                 is StatusFilter -> filter.state.filter { it.state }.let { checked ->
                     val values = checked.map { it.value }
-                    if (values.isNotEmpty()) filterParts.add("status:=${values.joinToString("|")}")
+                    if (values.isNotEmpty()) filterParts.add("status:=[${values.joinToString(",")}]")
                 }
                 is ContentRatingFilter -> filter.state.filter { it.state }.let { checked ->
                     val values = checked.map { it.value }
-                    if (values.isNotEmpty()) filterParts.add("mbContentRating:=${values.joinToString("|")}")
+                    if (values.isNotEmpty()) {
+                        filterParts.add("mbContentRating:=[${values.joinToString(",")}]")
+                    } else {
+                        // Nothing selected: allow documents with any rating or none.
+                        filterParts.add("(mbContentRating:=[Safe,Suggestive,Erotica] || mbContentRating:!=*)")
+                    }
                 }
-                is GenreFilter -> filter.state.filter { it.state }.let { checked ->
-                    val ids = checked.map { it.id }
-                    if (ids.isNotEmpty()) filterParts.add("genreIds:=[${ids.joinToString(",")}]")
+                is GenreFilter -> {
+                    val included = filter.included()
+                    val excluded = filter.excluded()
+                    if (included.isNotEmpty()) {
+                        filterParts.add(included.joinToString(" && ") { "genreIds:=[$it]" })
+                    }
+                    if (excluded.isNotEmpty()) {
+                        filterParts.add("genreIds:!==[${excluded.joinToString(",")}]")
+                    }
+                }
+                is YearFilter -> {
+                    val year = filter.state.trim().toIntOrNull()
+                    if (year != null) filterParts.add("releaseYear:=[$year]")
                 }
                 else -> {}
             }
@@ -143,9 +181,13 @@ abstract class Atsumaru :
             sort.toSortBy()?.let { url.addQueryParameter("sort_by", it) }
         }
 
-        if (filterParts.isNotEmpty()) {
-            url.addQueryParameter("filter_by", filterParts.joinToString(" && "))
+        if (query.isNotBlank()) {
+            url.addQueryParameter("query_by", "title,englishTitle,otherNames,authors")
+            url.addQueryParameter("query_by_weights", "4,3,2,1")
+            url.addQueryParameter("num_typos", "4,3,2,1")
         }
+
+        url.addQueryParameter("filter_by", filterParts.joinToString(" && "))
 
         return GET(url.build().toString(), apiHeaders)
     }
@@ -157,7 +199,7 @@ abstract class Atsumaru :
             SManga.create().apply {
                 url = doc.id
                 title = doc.title
-                thumbnail_url = (doc.poster ?: doc.posterMedium)?.let { "$cdnBase$it" }
+                thumbnail_url = coverUrl(doc.poster ?: doc.posterMedium)
             }
         }
         return MangasPage(mangas, dto.hasNextPage(searchPageSize))
@@ -184,15 +226,28 @@ abstract class Atsumaru :
             .filterNot { it.lowercase() in blockedGenres }
             .joinToString(", ")
 
-        // Comix-style score stars (rating is out of 10 → 5 stars)
-        val stars = mangaPage.avgRating?.takeIf { it > 0 }?.let { score ->
-            val full = (score / 2).toInt().coerceIn(0, 5)
-            "★".repeat(full) + "☆".repeat(5 - full) + " $score"
+        // Author/artist split from the typed authors list.
+        val authors = mangaPage.authors
+            .filter { it.type == null || it.type.equals("Author", true) || it.type.equals("Story", true) }
+            .map { it.name }
+            .distinct()
+        val artists = mangaPage.authors
+            .filter { it.type?.equals("Artist", true) == true || it.type?.equals("Art", true) == true }
+            .map { it.name }
+            .distinct()
+
+        // Rating formatted to two decimals, e.g. "8.48/10" (was "8.47980").
+        val ratingText = mangaPage.avgRating
+            ?.takeIf { it > 0 }
+            ?.let { String.format(Locale.ENGLISH, "%.2f/10", it) }
+        val stars = ratingText?.let { text ->
+            val full = (mangaPage.avgRating!! / 2).toInt().coerceIn(0, 5)
+            "★".repeat(full) + "☆".repeat(5 - full) + " $text"
         }
 
         val infoLine = if (showExtraInfo) {
             buildString {
-                mangaPage.released?.let { ts ->
+                mangaPage.released?.takeIf { it > 0 }?.let { ts ->
                     val year = java.time.Instant.ofEpochMilli(ts).atZone(java.time.ZoneOffset.UTC).year
                     append("**Year:** $year")
                 }
@@ -206,11 +261,7 @@ abstract class Atsumaru :
                 }
                 mangaPage.views?.let {
                     if (isNotEmpty()) append(" · ")
-                    append("**Views:** $it")
-                }
-                if (stars != null && mangaPage.avgRating != null) {
-                    if (isNotEmpty()) append(" · ")
-                    append("**$stars**")
+                    append("**Views:** ${formatViews(it)}")
                 }
             }.ifBlank { null }
         } else {
@@ -218,14 +269,7 @@ abstract class Atsumaru :
         }
 
         val details = buildString {
-            if (scorePosition == "top" && stars != null) {
-                append(stars)
-                append("\n")
-                if (infoLine != null) {
-                    append(infoLine)
-                    append("\n\n")
-                }
-            } else if (infoLine != null) {
+            if (infoLine != null) {
                 append(infoLine)
                 append("\n\n")
             }
@@ -238,7 +282,8 @@ abstract class Atsumaru :
                 append(mangaPage.otherNames.joinToString("\n") { "• $it" })
             }
 
-            if (scorePosition == "end" && stars != null) {
+            // The rating is rendered exactly once, in the configured position.
+            if (scorePosition != "none" && stars != null) {
                 if (isNotEmpty()) append("\n\n")
                 append(stars)
             }
@@ -247,14 +292,19 @@ abstract class Atsumaru :
         return SManga.create().apply {
             url = mangaPage.id
             title = mangaPage.title
-            author = mangaPage.authors.joinToString(", ") { it.name }.ifBlank { null }
+            author = authors.joinToString(", ").ifBlank { null }
+            artist = artists.joinToString(", ").ifBlank { null }
             genre = genreChips.ifBlank { null }
             description = details.ifBlank { mangaPage.synopsis }
             status = formatAtsuStatus(mangaPage.status)
-            thumbnail_url = mangaPage.poster?.image?.let { "$cdnBase/$it" }
+            thumbnail_url = coverUrl(mangaPage.poster?.image)
             initialized = true
         }
     }
+
+    private fun formatViews(views: String): String = views.toLongOrNull()?.let {
+        NumberFormat.getIntegerInstance(Locale.ENGLISH).format(it)
+    } ?: views
 
     // ============================= Chapters ==============================
 
@@ -264,7 +314,10 @@ abstract class Atsumaru :
         val mangaId = response.request.url.queryParameter("mangaId").orEmpty()
         val chapters = response.parseAs<AllChaptersDto>().chapters.map { ch ->
             ch.toSChapter().apply { url = "$mangaId|${ch.id}" }
-        }
+        }.sortedWith(
+            compareByDescending<SChapter> { it.chapter_number }
+                .thenByDescending { it.date_upload },
+        )
 
         if (!preferences.deduplicateChapters()) return chapters
 
@@ -296,7 +349,12 @@ abstract class Atsumaru :
         return dto.readChapter.pages.toPageList(cdnBase)
     }
 
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
+    override fun imageRequest(page: Page): Request {
+        val imgHeaders = headersBuilder()
+            .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+            .build()
+        return GET(page.imageUrl!!, imgHeaders)
+    }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
@@ -314,10 +372,11 @@ abstract class Atsumaru :
 
     override fun getFilterList(): FilterList = FilterList(
         SortFilter(),
+        GenreFilter(),
         TypeFilter(),
         StatusFilter(),
         ContentRatingFilter(),
-        GenreFilter(),
+        YearFilter(),
     )
 
     private class SortFilter :
@@ -325,17 +384,62 @@ abstract class Atsumaru :
             "Sort by",
             arrayOf(
                 "Relevance",
-                "Highest rated",
+                "Most viewed",
+                "Trending",
                 "Newest added",
+                "Release date",
+                "Highest rated",
                 "Title",
             ),
             Filter.Sort.Selection(0, false),
         ) {
         fun toSortBy(): String? = when (state?.index) {
-            1 -> if (state?.ascending == true) "mbRating:asc" else "mbRating:desc"
-            2 -> if (state?.ascending == true) "dateAdded:asc" else "dateAdded:desc"
-            3 -> "title:asc"
+            1 -> if (state?.ascending == true) "views:asc" else "views:desc"
+            2 -> if (state?.ascending == true) "trending:asc" else "trending:desc"
+            3 -> if (state?.ascending == true) "dateAdded:asc" else "dateAdded:desc"
+            4 -> if (state?.ascending == true) "released:asc" else "released:desc"
+            5 -> if (state?.ascending == true) "mbRating:asc" else "mbRating:desc"
+            6 -> if (state?.ascending == true) "title:asc" else "title:desc"
             else -> null
+        }
+    }
+
+    private class GenreTriState(name: String, val id: String) : Filter.TriState(name)
+
+    private class GenreFilter :
+        Filter.Group<GenreTriState>(
+            "Genres",
+            GENRES.map { GenreTriState(it.first, it.second) },
+        ) {
+        fun included(): List<String> = state.filter { it.state == Filter.TriState.STATE_INCLUDE }.map { it.id }
+
+        fun excluded(): List<String> = state.filter { it.state == Filter.TriState.STATE_EXCLUDE }.map { it.id }
+
+        private companion object {
+            // Live values from /api/explore/availableFilters (2026-09).
+            val GENRES = listOf(
+                "Action" to "39",
+                "Adult" to "46",
+                "Adventure" to "37",
+                "Boys Love" to "180",
+                "Comedy" to "6",
+                "Drama" to "31",
+                "Fantasy" to "36",
+                "Girls Love" to "4",
+                "Hentai" to "10",
+                "Historical" to "45",
+                "Horror" to "44",
+                "Martial Arts" to "29",
+                "Mystery" to "32",
+                "Psychological" to "18",
+                "Romance" to "9",
+                "Sci-Fi" to "1",
+                "Slice of Life" to "7",
+                "Smut" to "41",
+                "Supernatural" to "22",
+                "Thriller" to "19",
+                "Tragedy" to "5",
+            )
         }
     }
 
@@ -360,6 +464,7 @@ abstract class Atsumaru :
                 TypeCheckBox("Ongoing", "Ongoing"),
                 TypeCheckBox("Completed", "Completed"),
                 TypeCheckBox("Hiatus", "Hiatus"),
+                TypeCheckBox("Canceled", "Canceled"),
             ),
         )
 
@@ -373,35 +478,7 @@ abstract class Atsumaru :
             ),
         )
 
-    private class GenreCheckBox(name: String, val id: String, state: Boolean = false) : Filter.CheckBox(name, state)
-
-    private class GenreFilter :
-        Filter.Group<GenreCheckBox>(
-            "Genres",
-            listOf(
-                GenreCheckBox("Action", "39"),
-                GenreCheckBox("Adult", "46"),
-                GenreCheckBox("Adventure", "37"),
-                GenreCheckBox("Boys Love", "180"),
-                GenreCheckBox("Comedy", "6"),
-                GenreCheckBox("Drama", "31"),
-                GenreCheckBox("Fantasy", "36"),
-                GenreCheckBox("Girls Love", "4"),
-                GenreCheckBox("Hentai", "10"),
-                GenreCheckBox("Historical", "45"),
-                GenreCheckBox("Horror", "44"),
-                GenreCheckBox("Martial Arts", "29"),
-                GenreCheckBox("Mystery", "32"),
-                GenreCheckBox("Psychological", "18"),
-                GenreCheckBox("Romance", "9"),
-                GenreCheckBox("Sci-Fi", "1"),
-                GenreCheckBox("Slice of Life", "7"),
-                GenreCheckBox("Smut", "41"),
-                GenreCheckBox("Supernatural", "22"),
-                GenreCheckBox("Thriller", "21"),
-                GenreCheckBox("Tragedy", "5"),
-            ),
-        )
+    private class YearFilter : Filter.Text("Year (e.g. 2024)")
 
     // ========================================================================
     // Settings (Comix-style)
@@ -415,15 +492,6 @@ abstract class Atsumaru :
             entries = arrayOf("Safe", "Suggestive", "Erotica")
             entryValues = arrayOf("Safe", "Suggestive", "Erotica")
             setDefaultValue(setOf("Safe", "Suggestive"))
-        }.let(screen::addPreference)
-
-        MultiSelectListPreference(screen.context).apply {
-            key = PREF_DEFAULT_TYPES
-            title = "Default type filter"
-            summary = "Manga types to show by default (empty = all)"
-            entries = arrayOf("Manga", "Manhwa", "Manhua", "OEL", "Other")
-            entryValues = arrayOf("Manga", "Manwha", "Manhua", "OEL", "Other")
-            setDefaultValue(emptySet<String>())
         }.let(screen::addPreference)
 
         EditTextPreference(screen.context).apply {
@@ -450,7 +518,7 @@ abstract class Atsumaru :
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_EXTRA_INFO
             title = "Show extra info in description"
-            summary = "Display year, type, status, views and rating"
+            summary = "Display year, type, status and views"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
@@ -464,9 +532,9 @@ abstract class Atsumaru :
         androidx.preference.ListPreference(screen.context).apply {
             key = PREF_SCORE_POSITION
             title = "Score display position"
-            summary = "Where to display the manga score"
-            entries = arrayOf("Don't show", "Top of description", "End of description")
-            entryValues = arrayOf("none", "top", "end")
+            summary = "Where to display the manga rating"
+            entries = arrayOf("Don't show", "End of description")
+            entryValues = arrayOf("none", "end")
             setDefaultValue("end")
         }.let(screen::addPreference)
     }
@@ -491,12 +559,8 @@ abstract class Atsumaru :
     private fun defaultContentRatings(): List<String> = preferences.getStringSet(PREF_CONTENT_RATING, setOf("Safe", "Suggestive"))?.toList()
         ?: listOf("Safe", "Suggestive")
 
-    private fun defaultTypes(): List<String> = preferences.getStringSet(PREF_DEFAULT_TYPES, emptySet())?.toList()
-        ?: listOf("Manga", "Manwha", "Manhua", "OEL", "Other")
-
     companion object {
         private const val PREF_CONTENT_RATING = "pref_content_rating"
-        private const val PREF_DEFAULT_TYPES = "pref_default_types"
         private const val PREF_BLOCKED_GENRES = "pref_blocked_genres"
         private const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
         private const val PREF_SHOW_ALT_NAMES = "pref_show_alt_names"

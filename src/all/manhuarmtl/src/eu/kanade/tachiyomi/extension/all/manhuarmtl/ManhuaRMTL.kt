@@ -70,21 +70,21 @@ abstract class ManhuaRMTL :
         "Adult only" to "1",
     )
 
-    // Real sort values of the site's browse dropdown (#mrm-sort)
+    // Verified against the site's own browse dropdown (#mrm-arch-sort).
+    // NOTE: the values change when the site updates its theme — v1.4.63 used
+    // views_all/recent and those silently fell back to the default (A-Z)
+    // ordering, which made Popular and Latest show the same list.
     override val orderByFilterOptions: Map<String, String> = mapOf(
-        "Best match" to "best_match",
         "Latest update" to "latest",
-        "Recently added" to "recent",
-        "Title A-Z" to "title_az",
-        "Title Z-A" to "title_za",
-        "Most viewed (all time)" to "views_all",
-        "Most viewed (month)" to "views_month",
-        "Most viewed (quarter)" to "views_quarter",
-        "Most viewed (week)" to "views_week",
-        "Top rated" to "rated",
-        "Most bookmarked" to "bookmarks",
-        "Newest year" to "year_new",
-        "Oldest year" to "year_old",
+        "Least recently updated" to "latest_asc",
+        "Trending" to "trending",
+        "Newest added" to "new",
+        "Oldest added" to "new_asc",
+        "Title A-Z" to "az",
+        "Title Z-A" to "za",
+        "Most chapters" to "chapters",
+        "Fewest chapters" to "chapters_asc",
+        "Top rated" to "rating",
     )
 
     private val preferences = getPreferences()
@@ -108,13 +108,14 @@ abstract class ManhuaRMTL :
     // ------------------------------------------------------------------
     // Browse (Popular / Latest)
     //
-    // IMPORTANT: the site IGNORES the "sort" parameter on the search URL
-    // (/?post_type=wp-manga&s=&sort=...) — every sort value returns the
-    // same list, which made Popular and Latest show identical manhuas.
-    // The /manga/ archive honours ?sort= and paginates with /page/N/,
-    // so both browse modes now use it:
-    //   Popular → sort=views_all (all-time most viewed)
-    //   Latest  → sort=latest    (recently updated)
+    // IMPORTANT: the site only honours the "sort" values rendered in its
+    // own dropdown (#mrm-arch-sort). Unknown values (like the old
+    // "views_all") silently fall back to the DEFAULT ordering, which is
+    // the same list "latest" shows — that is why Popular and Latest
+    // used to lineup identically.
+    // Verified live 2026-09:
+    //   Popular → sort=trending (Trending, the site's popularity sort)
+    //   Latest  → sort=latest   (Recently updated — the dropdown default)
     // ------------------------------------------------------------------
     private fun archiveUrl(sort: String, page: Int): String {
         val path = if (page > 1) "/manga/page/$page/" else "/manga/"
@@ -122,7 +123,7 @@ abstract class ManhuaRMTL :
         return "$baseUrl$path?sort=$sort$adult"
     }
 
-    override fun popularMangaRequest(page: Int): Request = GET(archiveUrl("views_all", page), headers)
+    override fun popularMangaRequest(page: Int): Request = GET(archiveUrl("trending", page), headers)
 
     override fun latestUpdatesRequest(page: Int): Request = GET(archiveUrl("latest", page), headers)
 
