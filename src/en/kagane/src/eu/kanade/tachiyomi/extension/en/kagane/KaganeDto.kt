@@ -7,6 +7,7 @@ import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import java.text.SimpleDateFormat
 import java.util.Locale
+import kotlin.math.roundToInt
 
 @Serializable
 class SearchDto(
@@ -42,6 +43,14 @@ class DetailsDto(
     val startYear: Int? = null,
     @SerialName("content_rating")
     val contentRating: String? = null,
+    // Site rating (0-5 scale). `average_rating` is the raw user average,
+    // `bayesian_rating` the weighted one; `total_ratings` the vote count.
+    @SerialName("average_rating")
+    val averageRating: Double? = null,
+    @SerialName("bayesian_rating")
+    val bayesianRating: Double? = null,
+    @SerialName("total_ratings")
+    val totalRatings: Int? = null,
     @SerialName("series_staff")
     val seriesStaff: List<Staff> = emptyList(),
     val genres: List<Genre> = emptyList(),
@@ -118,6 +127,7 @@ class DetailsDto(
         showExtraInfo: Boolean,
         showTagsInGenre: Boolean,
         blockedGenres: Set<String>,
+        scorePosition: String = "top",
     ): SManga = SManga.create().apply {
         url = seriesId
         title = this@DetailsDto.title.trim()
@@ -153,6 +163,16 @@ class DetailsDto(
 
         genre = genreChips.ifBlank { null }
 
+        // ---- Rating (site uses a 0-5 scale) ----
+        val rating = averageRating?.takeIf { it > 0.0 }
+            ?: bayesianRating?.takeIf { it > 0.0 }
+        val stars = rating?.let { value ->
+            val text = String.format(Locale.ENGLISH, "%.1f/5", value)
+            val votes = totalRatings?.takeIf { it > 0 }?.let { " ($it)" }.orEmpty()
+            val full = value.roundToInt().coerceIn(0, 5)
+            "★".repeat(full) + "☆".repeat(5 - full) + " $text$votes"
+        }
+
         // ---- Comix-style description ----
         val infoLine = if (showExtraInfo) {
             buildString {
@@ -175,6 +195,12 @@ class DetailsDto(
         }
 
         description = buildString {
+            // The rating is rendered exactly once, in the configured position.
+            if (scorePosition == "top" && stars != null) {
+                append(stars)
+                append("\n\n")
+            }
+
             if (infoLine != null) {
                 append(infoLine)
                 append("\n\n")
@@ -186,6 +212,11 @@ class DetailsDto(
                 if (isNotEmpty()) append("\n\n")
                 append("Alternative names:\n")
                 append(seriesAlternateTitles.joinToString("\n") { "• ${it.title}" })
+            }
+
+            if (scorePosition == "end" && stars != null) {
+                if (isNotEmpty()) append("\n\n")
+                append(stars)
             }
         }.trim().ifBlank { null }
     }
@@ -220,6 +251,16 @@ class PageDto(
     val ext: String? = null,
 )
 
+/**
+ * Normalises strings like "chapter 5", "Ch. 5", "#5", "ep 05" (any
+ * punctuation/spacing variant) down to just the number, so titles that only
+ * restate the chapter number can be detected and not duplicated.
+ */
+private val CHAPTER_NUMBER_RESTATEMENT = Regex(
+    "^(?:ch(?:apter|apiter)?|episode|ep)\\s*(?:no\\.?|#)?\\s*(\\d+(?:\\.\\d+)?)$|^(?:#)?(\\d+(?:\\.\\d+)?)$",
+    RegexOption.IGNORE_CASE,
+)
+
 fun DetailsDto.Book.toSChapter(
     seriesId: String,
 ): SChapter = SChapter.create().apply {
@@ -227,21 +268,26 @@ fun DetailsDto.Book.toSChapter(
     date_upload = KAGANE_DATE_FORMAT.tryParse(createdAt)
     chapter_number = chapterNo?.toFloatOrNull() ?: sortNo ?: -1f
     scanlator = groups.joinToString(", ") { it.title }.ifBlank { null }
-    name = buildString {
-        val chNo = chapterNo
-        val bookTitle = this@toSChapter.title.trim()
-        if (!chNo.isNullOrBlank()) {
-            append("Ch. ")
-            append(chNo.removeSuffix(".0"))
-        } else if (sortNo != null) {
-            append("Ch. ")
-            append(sortNo.toString().removeSuffix(".0"))
-        }
-        if (bookTitle.isNotEmpty() && bookTitle != "null") {
-            if (isNotEmpty()) append(" · ")
+
+    val chNo = chapterNo
+        ?.takeIf { it.isNotBlank() }
+        // "5.0" -> "5"
+        ?.let { if (it.endsWith(".0")) it.removeSuffix(".0") else it }
+    val numText = chNo ?: sortNo?.let { n ->
+        if (n == n.toInt().toFloat()) n.toInt().toString() else n.toString()
+    }
+
+    val bookTitle = this@toSChapter.title.trim().takeIf { it.isNotEmpty() && it != "null" }
+
+    name = when {
+        bookTitle == null -> "Chapter ${numText ?: id}"
+        // Title only restates the number ("Chapter 5", "#5", "5") -> show it
+        // once, exactly as the site gives it (no "Ch. N · " prefix).
+        CHAPTER_NUMBER_RESTATEMENT.matches(bookTitle) -> bookTitle
+        else -> buildString {
+            if (numText != null) append("Ch. $numText · ")
             append(bookTitle)
         }
-        if (isEmpty()) append("Chapter ${chNo ?: sortNo ?: id}")
     }
 }
 

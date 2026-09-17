@@ -17,6 +17,7 @@ import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SManga
+import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
@@ -36,6 +37,7 @@ import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 @Source
@@ -47,9 +49,22 @@ abstract class ManhuaRMTL :
 
     override val mangaSubString = "manga"
 
-    // Custom client with OCR text-overlay interceptor
+    // Custom client: Cloudflare hardening + OCR text-overlay interceptor
     override val client: OkHttpClient = network.client.newBuilder()
+        .apply {
+            CloudflareBypass(setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com")).install(this)
+        }
         .addNetworkInterceptor(::ocrImageInterceptor)
+        .build()
+
+    /**
+     * Short-timeout client for the auxiliary OCR/translation calls — a hung
+     * gate used to stall the whole chapter open path for up to a minute.
+     */
+    private val auxClient: OkHttpClient = network.client.newBuilder()
+        .connectTimeout(8, TimeUnit.SECONDS)
+        .readTimeout(12, TimeUnit.SECONDS)
+        .writeTimeout(8, TimeUnit.SECONDS)
         .build()
 
     // Thread-safe storage for OCR text boxes, keyed by full image URL
@@ -59,7 +74,7 @@ abstract class ManhuaRMTL :
     private val translationCache = ConcurrentHashMap<String, String>()
 
     // Background pool that pre-translates chapter text while images download
-    private val translateExecutor = Executors.newFixedThreadPool(3) { runnable ->
+    private val translateExecutor = Executors.newFixedThreadPool(6) { runnable ->
         Thread(runnable, "ManhuaRMTL-Translate").apply { isDaemon = true }
     }
 
@@ -166,17 +181,97 @@ abstract class ManhuaRMTL :
     override fun searchMangaNextPageSelector(): String? = "a.next.page-numbers, a.mrm-pager__btn[rel=next]"
 
     // ============================== Genres ==============================
+    //
+    // The site sits behind an intermittent Cloudflare challenge; Madara's
+    // built-in genre loader gives up FOREVER after one failed attempt
+    // (genresFetched flag), which is why the genre filters came up empty.
+    // We run our own loader with retries + backoff and two page sources:
+    // the search page (filter chips) and the homepage (genre nav links).
+
+    private fun loadGenresWithRetry() {
+        val requests = listOf(
+            genresRequest(),
+            GET("$baseUrl/", headers),
+        )
+
+        repeat(GENRE_FETCH_ATTEMPTS) { attempt ->
+            if (genresList.isNotEmpty()) return
+
+            for (request in requests) {
+                if (genresList.isNotEmpty()) return
+                try {
+                    client.newCall(request).execute().use { resp ->
+                        if (!resp.isSuccessful) return@use
+                        val parsed = parseGenres(resp.asJsoup())
+                        if (parsed.isNotEmpty()) genresList = parsed
+                    }
+                } catch (_: Exception) {
+                    // Retry below
+                }
+            }
+
+            if (genresList.isEmpty()) {
+                try {
+                    Thread.sleep(1500L * (attempt + 1))
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    return
+                }
+            }
+        }
+    }
 
     // Override the genre request — the form lives on the search results page
     override fun genresRequest(): Request = GET("$baseUrl/?post_type=wp-manga&s=", headers)
 
-    // Custom MRM chips layout — NOT the standard Madara checkbox-group
-    override fun parseGenres(document: Document): List<Genre> = document.select("div.mrm-fgroup__chips label.mrm-gchip--in")
-        .map { label ->
-            val name = label.selectFirst("span")?.text() ?: label.text()
-            val id = label.selectFirst("input[type=checkbox]")?.`val`() ?: name
-            Genre(name, id)
-        }
+    // Custom MRM chips layout — NOT the standard Madara checkbox-group.
+    // Multiple selectors so minor theme tweaks don't empty the filter list.
+    override fun parseGenres(document: Document): List<Genre> {
+        // 1) Current MRM filter chips on the search page
+        val chips = document.select("div.mrm-fgroup__chips label.mrm-gchip--in, label.mrm-gchip")
+            .mapNotNull { label ->
+                val name = label.selectFirst("span")?.text()?.takeIf { it.isNotBlank() }
+                    ?: label.ownText().takeIf { it.isNotBlank() }
+                    ?: return@mapNotNull null
+                val id = label.selectFirst("input[type=checkbox]")?.`val`()?.takeIf { it.isNotBlank() }
+                    ?: name.slugify()
+                Genre(name, id)
+            }
+            .distinctBy { it.id.lowercase() }
+        if (chips.isNotEmpty()) return chips
+
+        // 2) Standard Madara checkbox group (in case the theme reverts)
+        val checkboxes = document.selectFirst("div.checkbox-group")
+            ?.select("div.checkbox")
+            ?.mapNotNull { li ->
+                val name = li.selectFirst("label")?.text()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+                val id = li.selectFirst("input[type=checkbox]")?.`val`()?.takeIf { it.isNotBlank() }
+                    ?: name.slugify()
+                Genre(name, id)
+            }
+            .orEmpty()
+            .distinctBy { it.id.lowercase() }
+        if (checkboxes.isNotEmpty()) return checkboxes
+
+        // 3) Genre nav/tag links (homepage menus, details pages) — the href
+        //    slug is exactly what the search endpoint expects in genre[].
+        return document.select("a[href*='/genre/'], a[href*=\"/genre/\"], div.mrm-genres__list a[rel=tag]")
+            .mapNotNull { a ->
+                val href = a.attr("href")
+                val slug = href.substringAfter("/genre/").trimEnd('/').substringBefore('?').substringBefore('#')
+                if (slug.isBlank()) return@mapNotNull null
+                val name = a.text().takeIf { it.isNotBlank() }
+                    ?: slug.replace('-', ' ').replaceFirstChar { it.uppercase() }
+                Genre(name, slug)
+            }
+            .filter { it.id.isNotBlank() }
+            .distinctBy { it.id.lowercase() }
+    }
+
+    private fun String.slugify(): String = trim()
+        .lowercase()
+        .replace("[^a-z0-9]+".toRegex(), "-")
+        .trim('-')
 
     // ============================== Manga Details ==============================
 
@@ -478,7 +573,7 @@ abstract class ManhuaRMTL :
             .build()
 
         return try {
-            val response = client.newCall(request).execute()
+            val response = auxClient.newCall(request).execute()
             val body = response.body?.string()
             response.close()
 
@@ -531,7 +626,7 @@ abstract class ManhuaRMTL :
                 )
                 .build()
 
-            network.client.newCall(request).execute().use { resp ->
+            auxClient.newCall(request).execute().use { resp ->
                 if (!resp.isSuccessful) return@use null
                 val body = resp.body?.string().orEmpty()
                 if (body.isBlank()) return@use null
@@ -603,15 +698,33 @@ abstract class ManhuaRMTL :
 
     /**
      * Burn text boxes onto a raw image bitmap.
-     * Matches the site's exact rendering:
-     * - Font size: min(sqrt(w*h)/sqrt(len), w/len, h/2), clamped [8, 64]
-     * - Text centered horizontally on box center, top-aligned to box top
-     * - Vertically centered within full box height
-     * - Black text with 4-corner white outline (0 blur)
+     * Matches the site's rendering:
+     * - Font size: min(sqrt(w*h)/sqrt(len), w/len, h/2), clamped [8, 64], then
+     *   ×2 (the site's own 200% sizing) — an optional user scale is applied on
+     *   top (default 1.0 = same size as the site).
+     * - Text horizontally centered on the box center (allowed to overflow the
+     *   image edge, exactly like the site's overlay divs).
+     * - Text TOP-ALIGNED to the box top — the site anchors the first line at
+     *   the top of the box; vertically centering it made labels sit visibly
+     *   lower than on the website.
+     * - Black text with a white outline.
      */
     private fun overlayText(imageBytes: ByteArray, textBoxes: List<OcrTextBox>, targetLang: String): ByteArray? {
-        val bitmap = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: return null
-        val mutableBitmap = bitmap.copy(Bitmap.Config.ARGB_8888, true)
+        // inMutable avoids a second full-image copy (big win on the tall
+        // webtoon strips this site serves).
+        val options = BitmapFactory.Options().apply { inMutable = true }
+        var decoded = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size, options)
+        if (decoded == null) {
+            // Retry once without options in case the format choked on inMutable
+            decoded = BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size) ?: return null
+        }
+        val mutableBitmap = if (decoded.isMutable) {
+            decoded
+        } else {
+            val copy = decoded.copy(Bitmap.Config.ARGB_8888, true)
+            decoded.recycle()
+            copy ?: return null
+        }
         val canvas = Canvas(mutableBitmap)
 
         for (textBox in textBoxes) {
@@ -628,27 +741,20 @@ abstract class ManhuaRMTL :
             }
             if (text.isBlank()) continue
 
-            // ===== Font size calculation (exact match to site's JS, +35% bigger) =====
-            // Site's formula:
+            // ===== Font size calculation (the site's own formula) =====
             // 1. baseFontSize = min(sqrt(w*h)/sqrt(len), w/len, h/2)
-            // 2. Clamp baseFontSize to [8, 64]
-            // 3. finalFontSize = baseFontSize * 2  (200% user setting)
-            // 4. Clamp finalFontSize to [8, 64]
-            // 5. Custom: multiply by 1.35 for better readability
+            // 2. Clamp to [8, 64]; 3. ×2 (site's 200% sizing); 4. Clamp to [8, 64]
             val textLength = text.length
             val boxArea = w * h
             val areaFactor = Math.sqrt(boxArea.toDouble()) / Math.sqrt(textLength.toDouble())
             val widthFactor = w.toDouble() / textLength
             val heightFactor = h.toDouble() / 2.0
             val rawBase = minOf(areaFactor, widthFactor, heightFactor)
-            // Step 2: clamp base to [8, 64] BEFORE multiplying
             val clampedBase = rawBase.coerceIn(8.0, 64.0)
-            // Step 3: multiply by 2 (200% default user setting)
             val finalSize = clampedBase * 2.0
-            // Step 4: clamp final to [8, 64]
             val siteFontSize = finalSize.toFloat().coerceIn(8f, 64f)
-            // Step 5: make 35% bigger for better readability
-            val fontSize = (siteFontSize * 1.35f).coerceIn(8f, 90f)
+            // Optional user scale (default 1.0 = site-exact size)
+            val fontSize = (siteFontSize * overlayTextScale()).coerceIn(6f, 120f)
 
             // Outline width: max(0.75, fontSize * 0.08)
             val outlineWidth = maxOf(0.75f, fontSize * 0.08f)
@@ -682,22 +788,17 @@ abstract class ManhuaRMTL :
             @Suppress("DEPRECATION")
             val fillLayout = StaticLayout(text, fillPaint, maxWidth, Layout.Alignment.ALIGN_CENTER, 1.2f, 0f, false)
 
-            // Position: horizontally centered on box center, vertically centered in box height
-            // Clamp BOTH horizontal and vertical to image bounds to prevent text cut-off
+            // Position like the site: horizontally centered on the box center
+            // (no clamping — the site's overlay divs simply overflow the image
+            // edge and get clipped), vertically TOP-ALIGNED to the box top so
+            // labels sit exactly where the website puts them.
             val textHeight = strokeLayout.height.toFloat()
             val boxCenterX = x + w / 2f
-            val verticalOffset = ((h - textHeight) / 2f).coerceAtLeast(0f)
 
-            // Horizontal: clamp so text stays within image bounds
-            val imgWidth = mutableBitmap.width.toFloat()
             val imgHeight = mutableBitmap.height.toFloat()
             val layoutWidth = maxWidth.toFloat()
-            val rawTranslateX = boxCenterX - layoutWidth / 2f
-            val translateX = rawTranslateX.coerceIn(0f, (imgWidth - layoutWidth).coerceAtLeast(0f))
-
-            // Vertical: clamp so text doesn't go off the bottom of the image
-            val rawTranslateY = y + verticalOffset
-            val translateY = rawTranslateY.coerceIn(0f, (imgHeight - textHeight).coerceAtLeast(0f))
+            val translateX = boxCenterX - layoutWidth / 2f
+            val translateY = (y + TEXT_TOP_PADDING).coerceIn(0f, (imgHeight - textHeight).coerceAtLeast(0f))
 
             canvas.save()
             canvas.translate(translateX, translateY)
@@ -715,9 +816,8 @@ abstract class ManhuaRMTL :
             @Suppress("DEPRECATION")
             Bitmap.CompressFormat.WEBP
         }
-        mutableBitmap.compress(compressFormat, 90, output)
+        mutableBitmap.compress(compressFormat, OVERLAY_JPEG_QUALITY, output)
 
-        if (bitmap != mutableBitmap) bitmap.recycle()
         mutableBitmap.recycle()
 
         return output.toByteArray()
@@ -730,7 +830,9 @@ abstract class ManhuaRMTL :
     private class ExcludeGenreList(title: String, genres: List<Genre>) : Filter.Group<GenreCheckBox>(title, genres.map { GenreCheckBox(it.name, it.id) })
 
     override fun getFilterList(): FilterList {
-        launchIO { fetchGenres() }
+        if (genresList.isEmpty()) {
+            launchIO { loadGenresWithRetry() }
+        }
 
         val filters = mutableListOf<Filter<*>>(
             AuthorFilter("Author"),
@@ -773,7 +875,7 @@ abstract class ManhuaRMTL :
         } else if (fetchGenres) {
             filters += listOf(
                 Filter.Separator(),
-                Filter.Header("Press 'Reset' to attempt to load genres"),
+                Filter.Header("Genres couldn't be loaded yet — press 'Reset' to retry"),
             )
         }
 
@@ -821,6 +923,16 @@ abstract class ManhuaRMTL :
             setDefaultValue(MODE_EN)
         }.let(screen::addPreference)
 
+        // Overlay text scale
+        androidx.preference.ListPreference(screen.context).apply {
+            key = PREF_OVERLAY_TEXT_SCALE
+            title = "Overlay text size"
+            summary = "Scale of the burned-in overlay text relative to the website (100% matches the site)"
+            entries = arrayOf("75% (smaller)", "100% (same as site)", "135% (bigger)", "160% (biggest)")
+            entryValues = arrayOf("0.75", "1.0", "1.35", "1.6")
+            setDefaultValue("1.0")
+        }.let(screen::addPreference)
+
         // Hide NSFW content from browse/latest only (does NOT affect search)
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_HIDE_NSFW
@@ -865,6 +977,13 @@ abstract class ManhuaRMTL :
     }
 
     private fun chapterTextMode(): String = preferences.getString(PREF_CHAPTER_TEXT_MODE, MODE_EN) ?: MODE_EN
+
+    private fun overlayTextScale(): Float = when (preferences.getString(PREF_OVERLAY_TEXT_SCALE, "1.0")) {
+        "0.75" -> 0.75f
+        "1.35" -> 1.35f
+        "1.6" -> 1.6f
+        else -> 1.0f
+    }
     private fun android.content.SharedPreferences.hideNsfw(): Boolean = getBoolean(PREF_HIDE_NSFW, false)
     private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
     private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
@@ -875,7 +994,11 @@ abstract class ManhuaRMTL :
         private const val MODE_EN = "en"
         private const val MODE_RAW = "raw"
         private const val MAX_TRANSLATION_CACHE = 3000
+        private const val TEXT_TOP_PADDING = 2f
+        private const val OVERLAY_JPEG_QUALITY = 85
+        private const val GENRE_FETCH_ATTEMPTS = 3
         private const val PREF_CHAPTER_TEXT_MODE = "pref_chapter_text_mode"
+        private const val PREF_OVERLAY_TEXT_SCALE = "pref_overlay_text_scale"
         private const val PREF_HIDE_NSFW = "pref_hide_nsfw"
         private const val PREF_SHOW_ALT_NAMES = "pref_show_alt_names"
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"

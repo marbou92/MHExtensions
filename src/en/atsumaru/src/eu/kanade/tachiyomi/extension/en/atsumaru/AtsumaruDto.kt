@@ -94,8 +94,10 @@ class MangaPage(
     val tags: List<TagDto> = emptyList(),
     val poster: PosterDto? = null,
     val released: Long? = null,
-    val totalChapterCount: Int? = null,
     val scanlators: List<ScanlatorDto> = emptyList(),
+    // NOTE: `totalChapterCount` is deliberately NOT declared — the API sends
+    // it as an inconsistent numeric type (sometimes "112.7"), which crashed
+    // strict Int parsing with JsonDecodingException. Unknown keys are skipped.
     val chapters: List<ChapterDto> = emptyList(),
 ) {
     @Serializable
@@ -140,45 +142,28 @@ class ChapterDto(
     val number: Double? = null,
     val createdAt: Long? = null,
     val pageCount: Int? = null,
+    // Id of the scanlation group that uploaded this chapter. Resolve it to a
+    // display name via MangaPage.scanlators ("show the scanlator's name").
+    val scanlationMangaId: String? = null,
 )
 
 /**
- * Titles like "Chapter 195", "Chapiter 195" or a bare "195" only restate the
- * chapter number — the old name builder produced "Ch. 195 · Chapiter 195".
- * A real title ("Chapter 5: The Beginning") keeps its text after the number
- * prefix is stripped.
+ * Chapter naming matches the site: the scanlator-given title is shown as-is
+ * ("Chapter 195", "Episode 7", "Afterword 3", ...). Only when the site
+ * provides no usable title do we fall back to a generic "Chapter N".
  */
-private val CHAPTER_NUMBER_TITLE = Regex(
-    "^(?:ch(?:apter|apiter)?|chapiter|episode|ep|épisode)?\\s*(?:no\\.?|#)?\\s*\\d+(?:\\.\\d+)?$",
-    RegexOption.IGNORE_CASE,
-)
-
-private val CHAPTER_TITLE_PREFIX = Regex(
-    "^(?:ch(?:apter|apiter)?|episode|ep|épisode)\\s*\\d+(?:\\.\\d+)?\\s*[:\\-–—]\\s*",
-    RegexOption.IGNORE_CASE,
-)
-
-fun ChapterDto.toSChapter(): SChapter = SChapter.create().apply {
+fun ChapterDto.toSChapter(scanlatorName: String? = null): SChapter = SChapter.create().apply {
     // chapter.url is the chapter id; the manga id is joined in the source.
     url = id
     chapter_number = number?.toFloat() ?: -1f
     date_upload = createdAt ?: 0L
-    name = buildString {
-        val num = number
-        if (num != null) {
-            append("Ch. ")
-            append(num.toString().removeSuffix(".0"))
-        }
+    scanlator = scanlatorName?.takeIf { it.isNotBlank() }
 
-        var t = this@toSChapter.title.trim()
-        if (t.isNotEmpty() && t.equals("null", true)) t = ""
-        t = t.replaceFirst(CHAPTER_TITLE_PREFIX, "").trim()
-        if (t.isNotEmpty() && num != null && CHAPTER_NUMBER_TITLE.matches(t)) t = ""
-        if (t.isNotEmpty()) {
-            if (isNotEmpty()) append(" · ")
-            append(t)
-        }
-        if (isEmpty()) append("Chapter ${num?.toString()?.removeSuffix(".0") ?: id}")
+    var t = this@toSChapter.title.trim()
+    if (t.isNotEmpty() && t.equals("null", true)) t = ""
+
+    name = t.ifBlank {
+        "Chapter ${number?.toString()?.removeSuffix(".0") ?: id}"
     }
 }
 

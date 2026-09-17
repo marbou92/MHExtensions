@@ -359,9 +359,9 @@ abstract class MKissa :
             key = PREF_SCORE_POSITION
             title = "Score display position"
             summary = "Where to display the manga rating"
-            entries = arrayOf("Don't show", "End of description")
-            entryValues = arrayOf("none", "end")
-            setDefaultValue("end")
+            entries = arrayOf("Don't show", "Top of description", "End of description")
+            entryValues = arrayOf("none", "top", "end")
+            setDefaultValue("top")
         }.let(screen::addPreference)
     }
 
@@ -378,7 +378,7 @@ abstract class MKissa :
 
     private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun android.content.SharedPreferences.scorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
+    private fun android.content.SharedPreferences.scorePosition(): String = getString(PREF_SCORE_POSITION, "top") ?: "top"
 
     private fun android.content.SharedPreferences.defaultContentRatings(): Set<String> = getStringSet(PREF_CONTENT_RATING, setOf("safe", "suggestive")) ?: setOf("safe", "suggestive")
 
@@ -435,6 +435,10 @@ abstract class MKissa :
             }
         """
 
+        // IMPORTANT: `airedStart` and `availableChaptersDetail` are opaque
+        // "Object" scalar fields — they must NOT carry a sub-selection.
+        // Selecting subfields on them is a GraphQL validation error and the
+        // whole details query answers HTTP 400 (details/chapters never loaded).
         private const val QUERY_MANGA_DETAILS = """
             query(${'$'}_id: String!) {
               manga(_id: ${'$'}_id) {
@@ -451,11 +455,11 @@ abstract class MKissa :
                 tags
                 thumbnail
                 tbObj { u }
-                airedStart { year month day }
+                airedStart
                 score
                 averageScore
                 pageStatus { userScoreAverValue }
-                availableChaptersDetail { sub raw }
+                availableChaptersDetail
               }
             }
         """

@@ -213,6 +213,12 @@ abstract class Atsumaru :
 
     override fun mangaDetailsParse(response: Response): SManga {
         val mangaPage = response.parseAs<MangaPageDto>().mangaPage
+
+        // Warm the scanlator-name cache used by the chapter list.
+        if (mangaPage.scanlators.isNotEmpty()) {
+            scanlatorCache[mangaPage.id] = mangaPage.scanlators.associate { it.id to it.name }
+        }
+
         val showAltNames = preferences.showAltNames()
         val showExtraInfo = preferences.showExtraInfo()
         val showTagsInGenre = preferences.showTagsInGenre()
@@ -269,6 +275,12 @@ abstract class Atsumaru :
         }
 
         val details = buildString {
+            // The rating is rendered exactly once, in the configured position.
+            if (scorePosition == "top" && stars != null) {
+                append(stars)
+                append("\n\n")
+            }
+
             if (infoLine != null) {
                 append(infoLine)
                 append("\n\n")
@@ -282,8 +294,7 @@ abstract class Atsumaru :
                 append(mangaPage.otherNames.joinToString("\n") { "• $it" })
             }
 
-            // The rating is rendered exactly once, in the configured position.
-            if (scorePosition != "none" && stars != null) {
+            if (scorePosition == "end" && stars != null) {
                 if (isNotEmpty()) append("\n\n")
                 append(stars)
             }
@@ -312,8 +323,10 @@ abstract class Atsumaru :
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val mangaId = response.request.url.queryParameter("mangaId").orEmpty()
+        val scanlatorNames = resolveScanlators(mangaId)
         val chapters = response.parseAs<AllChaptersDto>().chapters.map { ch ->
-            ch.toSChapter().apply { url = "$mangaId|${ch.id}" }
+            ch.toSChapter(scanlatorNames[ch.scanlationMangaId])
+                .apply { url = "$mangaId|${ch.id}" }
         }.sortedWith(
             compareByDescending<SChapter> { it.chapter_number }
                 .thenByDescending { it.date_upload },
@@ -362,6 +375,33 @@ abstract class Atsumaru :
         val parts = chapter.url.split("|")
         if (parts.size != 2) throw IOException("Outdated chapter URL. Refresh the chapter list.")
         return parts[0] to parts[1]
+    }
+
+    // ----------------------------------------------------------------------
+    // Scanlator names — the allChapters payload only carries the group's id
+    // (`scanlationMangaId`); the display names live in the details response
+    // (`scanlators[]`). Details parse fills the cache; the chapter list
+    // fetches details once when the cache is cold.
+    // ----------------------------------------------------------------------
+
+    private val scanlatorCache = java.util.concurrent.ConcurrentHashMap<String, Map<String, String>>()
+
+    private fun resolveScanlators(mangaId: String): Map<String, String> {
+        scanlatorCache[mangaId]?.let { return it }
+
+        return try {
+            client.newCall(GET("$apiUrl/manga/page?id=$mangaId", apiHeaders))
+                .execute()
+                .use { resp ->
+                    val page = resp.parseAs<MangaPageDto>().mangaPage
+                    val map = page.scanlators.associate { it.id to it.name }
+                    if (map.isNotEmpty()) scanlatorCache[mangaId] = map
+                    map
+                }
+        } catch (_: Exception) {
+            // Scanlator names are cosmetic — never fail the chapter list over them.
+            emptyMap()
+        }
     }
 
     private inline fun <reified T : Filter<*>> FilterList.firstInstanceOrNull(): T? = filterIsInstance<T>().firstOrNull()
@@ -533,9 +573,9 @@ abstract class Atsumaru :
             key = PREF_SCORE_POSITION
             title = "Score display position"
             summary = "Where to display the manga rating"
-            entries = arrayOf("Don't show", "End of description")
-            entryValues = arrayOf("none", "end")
-            setDefaultValue("end")
+            entries = arrayOf("Don't show", "Top of description", "End of description")
+            entryValues = arrayOf("none", "top", "end")
+            setDefaultValue("top")
         }.let(screen::addPreference)
     }
 
@@ -554,7 +594,7 @@ abstract class Atsumaru :
 
     private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
-    private fun android.content.SharedPreferences.scorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
+    private fun android.content.SharedPreferences.scorePosition(): String = getString(PREF_SCORE_POSITION, "top") ?: "top"
 
     private fun defaultContentRatings(): List<String> = preferences.getStringSet(PREF_CONTENT_RATING, setOf("Safe", "Suggestive"))?.toList()
         ?: listOf("Safe", "Suggestive")

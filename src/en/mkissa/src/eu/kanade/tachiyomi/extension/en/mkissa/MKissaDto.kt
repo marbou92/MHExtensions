@@ -214,6 +214,12 @@ fun MangaDetail.toSManga(
     }
 
     val builtDescription = buildString {
+        // The rating is rendered exactly once, in the configured position.
+        if (scorePosition == "top" && stars != null) {
+            append(stars)
+            append("\n\n")
+        }
+
         if (infoLine != null) {
             append(infoLine)
             append("\n\n")
@@ -238,8 +244,7 @@ fun MangaDetail.toSManga(
             append(altNames.joinToString("\n") { "• $it" })
         }
 
-        // The rating is rendered exactly once, in the configured position.
-        if (scorePosition != "none" && stars != null) {
+        if (scorePosition == "end" && stars != null) {
             if (isNotEmpty()) append("\n\n")
             append(stars)
         }
