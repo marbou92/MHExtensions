@@ -53,12 +53,30 @@ abstract class Kagane :
     // Modern Cloudflare bypass (browser fingerprint + cookie sync + retry)
     // ------------------------------------------------------------------
 
+    /**
+     * Client used to mint a fresh clearance against the site ROOT when an
+     * API request gets challenged. It carries the same fingerprint/cookie
+     * hardening but no priming of its own (no recursion), so the host app's
+     * Cloudflare WebView solver runs on a real HTML page.
+     */
+    private val primeClient: OkHttpClient = network.client.newBuilder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .apply {
+            CloudflareBypass(setOf(domain)).install(this)
+        }
+        .build()
+
     override val client: OkHttpClient = network.client.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .writeTimeout(30, TimeUnit.SECONDS)
         .apply {
-            CloudflareBypass(setOf(domain)).install(this)
+            CloudflareBypass(
+                cookieHosts = setOf(domain),
+                primeUrl = "$baseUrl/",
+                primeClient = primeClient,
+            ).install(this)
         }
         .addInterceptor(::imageTokenInterceptor)
         .build()

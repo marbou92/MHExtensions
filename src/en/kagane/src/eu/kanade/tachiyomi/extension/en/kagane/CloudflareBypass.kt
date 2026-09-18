@@ -4,6 +4,7 @@ import android.webkit.CookieManager
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
 
@@ -20,7 +21,15 @@ import java.io.IOException
  *    `__cf_bm`, session cookies) to requests for the protected hosts. Belt and
  *    braces on top of the app's cookie jar; guarantees clearance cookies flow even
  *    after a WebView solve mid-session.
- * 3. **Smart retry** — detects Cloudflare block responses (403/429/503 with
+ * 3. **Root priming (reverse-engineered fix)** — the app's Cloudflare WebView
+ *    solver loads the REQUEST URL to clear a challenge, but for API endpoints
+ *    (`/api/v2/...`) that URL answers JSON/405 instead of the challenge page,
+ *    so the solve aborts and no clearance is ever minted. On a detected
+ *    challenge we therefore GET the SITE ROOT (a real HTML page) through the
+ *    priming client first — triggering the WebView solve where it can
+ *    actually succeed — then retry the original request with the fresh
+ *    `cf_clearance`.
+ * 4. **Smart retry** — detects Cloudflare block responses (403/429/503 with
  *    `cf-mitigated` / `server: cloudflare` headers) and retries with backoff,
  *    honouring `Retry-After`. Survives short rate-limit windows without failing
  *    the whole refresh.
@@ -37,6 +46,10 @@ import java.io.IOException
 class CloudflareBypass(
     /** Hosts that receive synced WebView cookies (site + API hosts). */
     private val cookieHosts: Set<String>,
+    /** URL fetched once to mint a fresh clearance (site root HTML). */
+    private val primeUrl: String? = null,
+    /** Client used for priming — must NOT have priming itself installed. */
+    private val primeClient: OkHttpClient? = null,
 ) {
     fun install(builder: OkHttpClient.Builder): OkHttpClient.Builder = builder.apply {
         addInterceptor(::cookieSyncInterceptor)
@@ -121,7 +134,31 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 3. Smart retry on Cloudflare blocks (rate limits, transient challenges)
+    // 3. Root priming — mint clearance where the WebView solve can succeed
+    // ------------------------------------------------------------------------
+
+    @Volatile
+    private var lastPrimeAt: Long = 0L
+
+    private fun primeClearance() {
+        val url = primeUrl ?: return
+        val client = primeClient ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastPrimeAt < PRIME_INTERVAL_MS) return
+        lastPrimeAt = now
+
+        try {
+            client.newCall(Request.Builder().url(url).build()).execute().use { resp ->
+                resp.body?.close()
+            }
+        } catch (_: Exception) {
+            // Best-effort: the host app may lack a WebView solver or the
+            // challenge may be interactive; the final error says what to do.
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. Smart retry on Cloudflare blocks (rate limits, transient challenges)
     // ------------------------------------------------------------------------
 
     private fun retryInterceptor(chain: Interceptor.Chain): Response {
@@ -141,6 +178,11 @@ class CloudflareBypass(
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
+
+            // Before the second attempt, mint a fresh clearance against the
+            // site root (API URLs cannot be solved inside the WebView).
+            if (attempt == 1) primeClearance()
+
             response = chain.proceed(request)
         }
 
@@ -149,7 +191,7 @@ class CloudflareBypass(
             response.close()
             throw IOException(
                 "Cloudflare is blocking requests to ${request.url.host} (HTTP $code). " +
-                    "Open the site in WebView (Browse → Sources → the source → ⋮ → " +
+                    "Open kagane.to in WebView (Browse → Sources → Kagane → ⋮ → " +
                     "Open in WebView) to solve the challenge, then try again.",
             )
         }
@@ -170,7 +212,8 @@ class CloudflareBypass(
     private fun String.toHttpUrlOrNull() = runCatching { toHttpUrl() }.getOrNull()
 
     private companion object {
-        const val MAX_RETRIES = 2
+        const val MAX_RETRIES = 3
+        const val PRIME_INTERVAL_MS = 30_000L
         val BLOCK_CODES = intArrayOf(403, 429, 503)
         val CHROME_VERSION_REGEX = Regex("""Chrome[/ ](\d+)""")
         val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp", "avif", "jxl", "svg")

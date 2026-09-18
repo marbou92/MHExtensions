@@ -2,7 +2,41 @@ package eu.kanade.tachiyomi.extension.en.atsumaru
 
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
+import kotlinx.serialization.KSerializer
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.SerializationException
+import kotlinx.serialization.builtins.serializer
+import kotlinx.serialization.descriptors.SerialDescriptor
+import kotlinx.serialization.descriptors.nullable
+import kotlinx.serialization.encoding.Decoder
+import kotlinx.serialization.encoding.Encoder
+import kotlinx.serialization.json.JsonDecoder
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
+
+/**
+ * The API is inconsistent about numeric fields: search documents send
+ * `"views": 10265475` (bare number) while browse/details send
+ * `"views": "16M"` (string). Serialising as String crashed with
+ * JsonDecodingException: "Expected quotation mark, but had '1'".
+ * This serializer accepts both shapes (null on anything else).
+ */
+object StringOrNumberSerializer : KSerializer<String?> {
+    override val descriptor: SerialDescriptor = String.serializer().descriptor.nullable
+
+    override fun deserialize(decoder: Decoder): String? {
+        if (decoder !is JsonDecoder) throw SerializationException("Expected JSON input")
+        return when (val element = decoder.decodeJsonElement()) {
+            is JsonNull -> null
+            is JsonPrimitive -> element.content
+            else -> null
+        }
+    }
+
+    override fun serialize(encoder: Encoder, value: String?) {
+        if (value == null) encoder.encodeNull() else encoder.encodeString(value)
+    }
+}
 
 // ------------------------------------------------------------------
 // Browse (home2 endpoints)
@@ -22,6 +56,7 @@ class BrowseDto(
         val type: String? = null,
         val medium: String? = null,
         val mbRating: Double? = null,
+        @Serializable(with = StringOrNumberSerializer::class)
         val views: String? = null,
         val createdAt: Long? = null,
         val updatedAt: Long? = null,
@@ -61,6 +96,9 @@ class SearchDto(
         val isAdult: Boolean = false,
         val releaseYear: Int? = null,
         val chapterCount: Int? = null,
+        // Search documents send views as a bare number ("views": 10265475)
+        // while other endpoints send strings ("16M") — accept both.
+        @Serializable(with = StringOrNumberSerializer::class)
         val views: String? = null,
         val poster: String? = null,
         val posterMedium: String? = null,
@@ -86,6 +124,7 @@ class MangaPage(
     val type: String? = null,
     val medium: String? = null,
     val isAdult: Boolean = false,
+    @Serializable(with = StringOrNumberSerializer::class)
     val views: String? = null,
     val avgRating: Double? = null,
     val otherNames: List<String> = emptyList(),

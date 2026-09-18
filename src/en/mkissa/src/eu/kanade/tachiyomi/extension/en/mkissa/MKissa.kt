@@ -90,7 +90,13 @@ abstract class MKissa :
         query: String,
         genres: List<String>,
         genresExcluded: List<String>,
+        genresMatchAll: Boolean,
+        tags: List<String>,
+        tagsExcluded: List<String>,
+        authors: List<String>,
         year: Int?,
+        season: String?,
+        minChapters: Int?,
     ): JsonObject = buildJsonObject {
         putJsonObject("search") {
             put("sortBy", sortBy)
@@ -99,7 +105,15 @@ abstract class MKissa :
             if (query.isNotBlank()) put("query", query)
             if (genres.isNotEmpty()) putJsonArray("genres") { genres.forEach { add(it) } }
             if (genresExcluded.isNotEmpty()) putJsonArray("excludeGenres") { genresExcluded.forEach { add(it) } }
+            // includeGenres=true (default) matches ALL selected genres,
+            // false matches ANY of them. Verified live.
+            if (genres.isNotEmpty()) put("includeGenres", genresMatchAll)
+            if (tags.isNotEmpty()) putJsonArray("tags") { tags.forEach { add(it) } }
+            if (tagsExcluded.isNotEmpty()) putJsonArray("excludeTags") { tagsExcluded.forEach { add(it) } }
+            if (authors.isNotEmpty()) putJsonArray("authors") { authors.forEach { add(it) } }
             if (year != null) put("year", year)
+            if (season != null) put("season", season)
+            if (minChapters != null) put("epRangeStart", minChapters)
             put("listProfile", "browse")
             put("allowAdult", allowAdult)
             put("allowUnknown", false)
@@ -155,7 +169,13 @@ abstract class MKissa :
             query = "",
             genres = emptyList(),
             genresExcluded = emptyList(),
+            genresMatchAll = true,
+            tags = emptyList(),
+            tagsExcluded = emptyList(),
+            authors = emptyList(),
             year = null,
+            season = null,
+            minChapters = null,
         ),
     )
 
@@ -168,7 +188,13 @@ abstract class MKissa :
         var ascending = false
         val genres = mutableListOf<String>()
         val genresExcluded = mutableListOf<String>()
+        var genresMatchAll = true
+        val tags = mutableListOf<String>()
+        val tagsExcluded = mutableListOf<String>()
+        val authors = mutableListOf<String>()
         var year: Int? = null
+        var season: String? = null
+        var minChapters: Int? = null
 
         filters.forEach { filter ->
             when (filter) {
@@ -180,7 +206,20 @@ abstract class MKissa :
                     genres.addAll(filter.included())
                     genresExcluded.addAll(filter.excluded())
                 }
+                is GenreMatchModeFilter -> genresMatchAll = filter.matchAll()
+                is TagFilter -> {
+                    tags.addAll(filter.included())
+                    tagsExcluded.addAll(filter.excluded())
+                }
+                is AuthorFilter -> {
+                    filter.state.split(",")
+                        .map { it.trim() }
+                        .filter { it.isNotEmpty() }
+                        .let { authors.addAll(it) }
+                }
+                is SeasonFilter -> season = filter.toValue()
                 is YearFilter -> year = filter.state.trim().toIntOrNull()
+                is MinChaptersFilter -> minChapters = filter.state.trim().toIntOrNull()
                 else -> {}
             }
         }
@@ -194,7 +233,13 @@ abstract class MKissa :
                 query = query,
                 genres = genres,
                 genresExcluded = genresExcluded,
+                genresMatchAll = genresMatchAll,
+                tags = tags,
+                tagsExcluded = tagsExcluded,
+                authors = authors,
                 year = year,
+                season = season,
+                minChapters = minChapters,
             ),
         )
     }
@@ -254,8 +299,10 @@ abstract class MKissa :
     override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl/", headers)
 
     override fun pageListParse(response: Response): List<Page> = throw IOException(
-        "MKissa gates chapter pages behind a captcha that this extension cannot " +
-            "solve. Open $baseUrl in your browser to read this chapter on the site.",
+        "MKissa requires an interactive Cloudflare Turnstile security check " +
+            "before serving chapter images (the API answers NEED_CAPTCHA and " +
+            "verifies the token server-side, so it cannot be reproduced outside " +
+            "a browser). Read this chapter on the site: $baseUrl/manga/",
     )
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
@@ -266,8 +313,17 @@ abstract class MKissa :
 
     override fun getFilterList(): FilterList = FilterList(
         SortFilter(),
+        GenreMatchModeFilter(),
         GenreFilter(),
-        YearFilter(),
+        Filter.Separator(),
+        Filter.Header("Tags (site tags like \"theme:monsters\")"),
+        TagFilter(),
+        Filter.Separator(),
+        Filter.Header("Filter by author name"),
+        AuthorFilter("Author"),
+        SeasonFilter(),
+        YearFilter("Year (e.g. 2024)"),
+        MinChaptersFilter("Minimum chapters (e.g. 50)"),
     )
 
     private class SortFilter :
@@ -286,6 +342,15 @@ abstract class MKissa :
             Filter.Sort.Selection(0, false),
         )
 
+    /** ALL (default) = manga must have every selected genre; ANY = at least one. */
+    private class GenreMatchModeFilter :
+        Filter.Select<String>(
+            "Genre match mode",
+            arrayOf("All selected genres", "Any selected genre"),
+        ) {
+        fun matchAll(): Boolean = state == 0
+    }
+
     private class GenreTriState(name: String, val value: String) : Filter.TriState(name)
 
     private class GenreFilter :
@@ -298,20 +363,141 @@ abstract class MKissa :
         fun excluded(): List<String> = state.filter { it.state == Filter.TriState.STATE_EXCLUDE }.map { it.value }
 
         private companion object {
-            // Site genre/tag names (AniList-style spelling, verified live).
+            // Site genre/tag names (verified live against the API, 2026-09).
             val GENRES = listOf(
-                "Action", "Adventure", "Comedy", "Crossdressing", "Demons", "Drama",
-                "Ecchi", "Fantasy", "Gender Bender", "Harem", "Historical", "Horror",
-                "Isekai", "Josei", "Magic", "Martial Arts", "Mecha", "Military",
-                "Music", "Mystery", "One Shot", "Police", "Psychological", "Romance",
+                "Action", "Adult", "Adventure", "Comedy", "Cooking", "Crossdressing",
+                "Demons", "Doujinshi", "Drama", "Ecchi", "Fantasy", "Gender Bender",
+                "Harem", "Hentai", "Historical", "Horror", "Isekai", "Josei",
+                "Magic", "Manhwa", "Martial Arts", "Mature", "Mecha", "Medical",
+                "Military", "Music", "Mystery", "One Shot", "Parody", "Philosophical",
+                "Police", "Psychological", "Reincarnation", "Romance", "Samurai",
                 "School", "Sci-Fi", "Seinen", "Shoujo", "Shounen", "Slice of Life",
                 "Space", "Sports", "Super Power", "Supernatural", "Thriller",
-                "Tragedy", "Vampires", "Webtoons", "Manhua", "Manhwa", "Doujinshi",
+                "Tragedy", "Webtoons",
             )
         }
     }
 
-    private class YearFilter : Filter.Text("Year (e.g. 2024)")
+    private class TagTriState(name: String, val value: String) : Filter.TriState(name)
+
+    /**
+     * Tags carry the site's own values ("theme:monsters", "format:full_color"
+     * plus plain AniList-style names) — verified live. Sending display names
+     * that don't exist server-side simply matches nothing, never errors.
+     */
+    private class TagFilter :
+        Filter.Group<TagTriState>(
+            "Tags",
+            TAGS.map { TagTriState(it.first, it.second) },
+        ) {
+        fun included(): List<String> = state.filter { it.state == Filter.TriState.STATE_INCLUDE }.map { it.value }
+
+        fun excluded(): List<String> = state.filter { it.state == Filter.TriState.STATE_EXCLUDE }.map { it.value }
+
+        private companion object {
+            val TAGS = listOf(
+                "Full color" to "format:full_color",
+                "Web comic" to "format:web_comic",
+                "Long strip" to "format:long_strip",
+                "Adaptation" to "format:adaptation",
+                "Award winning" to "format:award_winning",
+                "Episodic" to "format:episodic",
+                "Fan colored" to "format:fan_colored",
+                "Isekai" to "theme:isekai",
+                "Reincarnation" to "theme:reincarnation",
+                "Cultivation" to "theme:cultivation",
+                "Monsters" to "theme:monsters",
+                "Vampires" to "theme:vampires",
+                "Ghosts" to "theme:ghost",
+                "Witches" to "theme:witch",
+                "Gods" to "theme:gods",
+                "Demons" to "theme:demons",
+                "Elves" to "theme:elf",
+                "Mythology" to "theme:mythology",
+                "Superhero" to "theme:superhero",
+                "Time travel" to "theme:time_travel",
+                "Time skip" to "theme:time_skip",
+                "Alternate universe" to "theme:alternate_universe",
+                "Post-apocalyptic" to "theme:post_apocalyptic",
+                "Dystopian" to "theme:dystopian",
+                "Survival" to "theme:survival",
+                "War" to "theme:war",
+                "Military" to "theme:military",
+                "Politics" to "theme:politics",
+                "Conspiracy" to "theme:conspiracy",
+                "Revenge" to "theme:revenge",
+                "Crime" to "theme:crime",
+                "Detective" to "theme:detective",
+                "Noir" to "theme:noir",
+                "Assassins" to "theme:assassins",
+                "Martial arts" to "theme:martial_arts",
+                "Swordplay" to "theme:swordplay",
+                "Boxing" to "theme:boxing",
+                "Athletics" to "theme:athletics",
+                "Video games" to "theme:video_games",
+                "Game elements" to "theme:game_elements",
+                "Virtual world" to "theme:virtual_world",
+                "School life" to "theme:school_life",
+                "School club" to "theme:school_club",
+                "Delinquents" to "theme:delinquents",
+                "Family life" to "theme:family_life",
+                "Parenthood" to "theme:parenthood",
+                "Childcare" to "theme:childcare",
+                "Found family" to "theme:found_family",
+                "Romance" to "theme:romance",
+                "Love triangle" to "theme:love_triangle",
+                "Yuri" to "theme:yuri",
+                "Yaoi" to "theme:yaoi",
+                "LGBTQIA themes" to "theme:lgbtq_themes",
+                "Crossdressing" to "theme:crossdressing",
+                "Gender bender" to "theme:gender_bender",
+                "Harem" to "theme:harem",
+                "Reverse harem" to "theme:reverse_harem",
+                "Villainess" to "theme:villainess",
+                "Royal affairs" to "theme:royal_affairs",
+                "Kingdom management" to "theme:kingdom_management",
+                "Ancient china" to "theme:ancient_china",
+                "Historical" to "theme:historical",
+                "Rural" to "theme:rural",
+                "Urban" to "theme:urban",
+                "Office workers" to "theme:office_workers",
+                "Cooking" to "theme:cooking",
+                "Medicine" to "theme:medicine",
+                "Music" to "theme:music",
+                "Meta" to "theme:meta",
+                "4-koma" to "theme:4_koma",
+                "Gore" to "theme:gore",
+                "Body horror" to "theme:body_horror",
+                "Tragedy" to "theme:tragedy",
+                "Suicide" to "theme:suicide",
+                "Female protagonist" to "theme:female_protagonist",
+                "Male protagonist" to "theme:male_protagonist",
+                "Anti-hero" to "theme:anti_hero",
+                "Clever protagonist" to "theme:clever_protagonist",
+                "Vampires (plain)" to "vampires",
+            )
+        }
+    }
+
+    private class AuthorFilter(title: String) : Filter.Text(title)
+
+    private class SeasonFilter :
+        Filter.Select<String>(
+            "Season",
+            arrayOf("Any", "Winter", "Spring", "Summer", "Fall"),
+        ) {
+        fun toValue(): String? = when (state) {
+            1 -> "Winter"
+            2 -> "Spring"
+            3 -> "Summer"
+            4 -> "Fall"
+            else -> null
+        }
+    }
+
+    private class YearFilter(title: String) : Filter.Text(title)
+
+    private class MinChaptersFilter(title: String) : Filter.Text(title)
 
     // ========================================================================
     // Settings (Comix-style)
@@ -456,6 +642,7 @@ abstract class MKissa :
                 thumbnail
                 tbObj { u }
                 airedStart
+                lastChapterDate
                 score
                 averageScore
                 pageStatus { userScoreAverValue }

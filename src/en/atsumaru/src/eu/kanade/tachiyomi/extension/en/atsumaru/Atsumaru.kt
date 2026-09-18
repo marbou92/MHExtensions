@@ -173,6 +173,10 @@ abstract class Atsumaru :
                     val year = filter.state.trim().toIntOrNull()
                     if (year != null) filterParts.add("releaseYear:=[$year]")
                 }
+                is MinChaptersFilter -> {
+                    val min = filter.state.trim().toIntOrNull()
+                    if (min != null && min > 0) filterParts.add("chapterCount:>=$min")
+                }
                 else -> {}
             }
         }
@@ -417,6 +421,7 @@ abstract class Atsumaru :
         StatusFilter(),
         ContentRatingFilter(),
         YearFilter(),
+        MinChaptersFilter(),
     )
 
     private class SortFilter :
@@ -519,6 +524,9 @@ abstract class Atsumaru :
         )
 
     private class YearFilter : Filter.Text("Year (e.g. 2024)")
+
+    /** Typesense numeric facet — verified live (chapterCount:>=100). */
+    private class MinChaptersFilter : Filter.Text("Minimum chapters (e.g. 50)")
 
     // ========================================================================
     // Settings (Comix-style)

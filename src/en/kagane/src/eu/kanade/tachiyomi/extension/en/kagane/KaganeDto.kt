@@ -163,9 +163,17 @@ class DetailsDto(
 
         genre = genreChips.ifBlank { null }
 
-        // ---- Rating (site uses a 0-5 scale) ----
-        val rating = averageRating?.takeIf { it > 0.0 }
-            ?: bayesianRating?.takeIf { it > 0.0 }
+        // ---- Rating ----
+        // The API returns the rating on a percentile scale (e.g. 70.1 == 70%),
+        // while older fixtures used 0-5. Normalise: anything above 5 is
+        // treated as a 0-100 value and converted to the site's 0-5 display
+        // scale (70.1 -> 3.5/5).
+        fun normalizedRating(raw: Double?): Double? = raw
+            ?.takeIf { it > 0.0 }
+            ?.let { if (it > 5.0) it / 20.0 else it }
+
+        val rating = normalizedRating(averageRating)
+            ?: normalizedRating(bayesianRating)
         val stars = rating?.let { value ->
             val text = String.format(Locale.ENGLISH, "%.1f/5", value)
             val votes = totalRatings?.takeIf { it > 0 }?.let { " ($it)" }.orEmpty()
@@ -252,12 +260,17 @@ class PageDto(
 )
 
 /**
- * Normalises strings like "chapter 5", "Ch. 5", "#5", "ep 05" (any
- * punctuation/spacing variant) down to just the number, so titles that only
- * restate the chapter number can be detected and not duplicated.
+ * Leading chapter-number restatements: "Chapter 5", "Ch. 5", "Episode 5",
+ * "#5", "5", "Chapter 5.1", ... optionally followed by a separator
+ * (":", "-", "·", ".", "|"). Stripping them keeps real titles while making
+ * restatement-only titles fall back to the plain "Chapter N" form.
  */
-private val CHAPTER_NUMBER_RESTATEMENT = Regex(
-    "^(?:ch(?:apter|apiter)?|episode|ep)\\s*(?:no\\.?|#)?\\s*(\\d+(?:\\.\\d+)?)$|^(?:#)?(\\d+(?:\\.\\d+)?)$",
+private val CHAPTER_PREFIX = Regex(
+    "^\\s*(?:ch(?:apter|apiter)?|episode|ep)\\s*(?:no\\.?|#)?\\s*\\d+(?:\\.\\d+)?\\s*(?:[:,.\u00b7\\-|]\\s*)?" +
+        "|^\\s*#\\s*\\d+(?:\\.\\d+)?\\s*(?:[:,.\u00b7\\-|]\\s*)?" +
+        // A bare number only counts as a restatement when it is the WHOLE
+        // title ("5" -> restatement); "5 Centimeters" keeps its title.
+        "|^\\s*\\d+(?:\\.\\d+)?\\s*[:,.\u00b7\\-|]?\\s*$",
     RegexOption.IGNORE_CASE,
 )
 
@@ -279,14 +292,18 @@ fun DetailsDto.Book.toSChapter(
 
     val bookTitle = this@toSChapter.title.trim().takeIf { it.isNotEmpty() && it != "null" }
 
+    // Chapter names follow the Atsumaru convention: show the site-given
+    // title as-is. Titles that merely restate the chapter number
+    // ("Chapter 5", "#5", "5") fall back to the plain "Chapter N" form
+    // instead of being duplicated ("Ch. 5 · Chapter 5").
     name = when {
         bookTitle == null -> "Chapter ${numText ?: id}"
-        // Title only restates the number ("Chapter 5", "#5", "5") -> show it
-        // once, exactly as the site gives it (no "Ch. N · " prefix).
-        CHAPTER_NUMBER_RESTATEMENT.matches(bookTitle) -> bookTitle
-        else -> buildString {
-            if (numText != null) append("Ch. $numText · ")
-            append(bookTitle)
+        else -> {
+            val stripped = CHAPTER_PREFIX.replace(bookTitle, "").trim()
+            when {
+                stripped.isEmpty() -> "Chapter ${numText ?: id}"
+                else -> stripped
+            }
         }
     }
 }

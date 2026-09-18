@@ -69,6 +69,86 @@ data class OcrTextBox(
     val text: String,
 )
 
+/**
+ * Groups per-line OCR boxes into paragraph blocks the way the site's overlay
+ * renders them: consecutive lines that sit close together and overlap
+ * horizontally become ONE overlay block (union box, texts joined), so the
+ * burned text wraps naturally like a paragraph instead of appearing as
+ * fragmented single lines.
+ */
+fun groupIntoParagraphs(boxes: List<OcrTextBox>): List<OcrTextBox> {
+    if (boxes.size <= 1) return boxes
+
+    // Reading order: top-to-bottom, then left-to-right.
+    val sorted = boxes.sortedWith(compareBy({ it.box.getOrElse(1) { 0f } }, { it.box.getOrElse(0) { 0f } }))
+
+    val paragraphs = mutableListOf<ParagraphAccumulator>()
+    for (box in sorted) {
+        val target = paragraphs.lastOrNull { it.canAbsorb(box) }
+        if (target != null) {
+            target.absorb(box)
+        } else {
+            paragraphs.add(ParagraphAccumulator(box))
+        }
+    }
+    return paragraphs.map { it.toTextBox() }
+}
+
+/**
+ * Mutable paragraph builder. Lines are absorbed while they are vertically
+ * adjacent (gap smaller than ~70% of the shorter line height) and horizontally
+ * overlapping (at least 30% of the narrower box) — the geometric footprint of
+ * lines belonging to the same text block. Different columns/balloons don't
+ * overlap and therefore stay separate blocks.
+ */
+private class ParagraphAccumulator(first: OcrTextBox) {
+    var left: Float = first.box.getOrElse(0) { 0f }
+    var top: Float = first.box.getOrElse(1) { 0f }
+    var right: Float = left + first.box.getOrElse(2) { 0f }
+    var bottom: Float = top + first.box.getOrElse(3) { 0f }
+    var lastHeight: Float = first.box.getOrElse(3) { 0f }
+    private val texts = mutableListOf(first.text)
+
+    val width: Float get() = right - left
+    val height: Float get() = bottom - top
+
+    fun canAbsorb(box: OcrTextBox): Boolean {
+        val bx = box.box.getOrElse(0) { 0f }
+        val by = box.box.getOrElse(1) { 0f }
+        val bw = box.box.getOrElse(2) { 0f }
+        val bh = box.box.getOrElse(3) { 0f }
+
+        // Vertical proximity: the new line must start at/near the block's
+        // bottom (within 70% of the shorter of the two line heights).
+        val gap = by - bottom
+        val tolerance = 0.7f * minOf(bh, lastHeight) + 2f
+        if (gap > tolerance || gap < -bh) return false // below block, or way above (out of order)
+
+        // Horizontal overlap of at least 30% of the narrower box.
+        val overlap = minOf(right, bx + bw) - maxOf(left, bx)
+        return overlap >= 0.3f * minOf(width, bw)
+    }
+
+    fun absorb(box: OcrTextBox) {
+        val bx = box.box.getOrElse(0) { 0f }
+        val by = box.box.getOrElse(1) { 0f }
+        val bw = box.box.getOrElse(2) { 0f }
+        val bh = box.box.getOrElse(3) { 0f }
+
+        left = minOf(left, bx)
+        top = minOf(top, by)
+        right = maxOf(right, bx + bw)
+        bottom = maxOf(bottom, by + bh)
+        lastHeight = bh
+        texts.add(box.text)
+    }
+
+    fun toTextBox(): OcrTextBox = OcrTextBox(
+        floatArrayOf(left, top, width, height),
+        texts.joinToString(" ") { it.trim() }.trim(),
+    )
+}
+
 data class OcrCredentials(
     val cid: String,
     val token: String,

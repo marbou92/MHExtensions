@@ -49,10 +49,27 @@ abstract class ManhuaRMTL :
 
     override val mangaSubString = "manga"
 
+    /**
+     * Client for minting a fresh clearance against the site root when an
+     * image/XHR request gets challenged. Hardened identically but without
+     * priming of its own (no recursion).
+     */
+    private val primeClient: OkHttpClient = network.client.newBuilder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(45, TimeUnit.SECONDS)
+        .apply {
+            CloudflareBypass(setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com")).install(this)
+        }
+        .build()
+
     // Custom client: Cloudflare hardening + OCR text-overlay interceptor
     override val client: OkHttpClient = network.client.newBuilder()
         .apply {
-            CloudflareBypass(setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com")).install(this)
+            CloudflareBypass(
+                cookieHosts = setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com"),
+                primeUrl = "$baseUrl/",
+                primeClient = primeClient,
+            ).install(this)
         }
         .addNetworkInterceptor(::ocrImageInterceptor)
         .build()
@@ -465,9 +482,23 @@ abstract class ManhuaRMTL :
                     if (ocrPages != null && ocrPages.isNotEmpty()) {
                         // Build filename → text boxes map (try multiple key formats for robust matching)
                         val ocrByFilename = mutableMapOf<String, List<OcrTextBox>>()
+                        val grouping = ocrTextGrouping()
                         for (ocrPage in ocrPages) {
                             val filename = ocrPage.image ?: continue
-                            val textBoxes = ocrPage.normalisedTexts()
+                            val rawBoxes = ocrPage.normalisedTexts()
+                            if (rawBoxes.isEmpty()) continue
+                            // Site-like rendering: merge consecutive line boxes
+                            // into paragraph blocks (union box + joined text).
+                            val textBoxes = when (grouping) {
+                                GROUP_PARAGRAPH -> groupIntoParagraphs(
+                                    rawBoxes.distinctBy { b ->
+                                        "${b.text}|${b.box.map { (it * 10).toInt() }}"
+                                    },
+                                )
+                                else -> rawBoxes.distinctBy { b ->
+                                    "${b.text}|${b.box.map { (it * 10).toInt() }}"
+                                }
+                            }
                             if (textBoxes.isNotEmpty()) {
                                 // Store under original name AND URL-decoded name
                                 ocrByFilename[filename] = textBoxes
@@ -933,6 +964,16 @@ abstract class ManhuaRMTL :
             setDefaultValue("1.0")
         }.let(screen::addPreference)
 
+        // OCR text grouping
+        androidx.preference.ListPreference(screen.context).apply {
+            key = PREF_OCR_GROUPING
+            title = "OCR text grouping"
+            summary = "Paragraphs merge the site's per-line OCR boxes into flowing text blocks like the website; Per line keeps every detected line as its own overlay"
+            entries = arrayOf("Paragraphs (like the site)", "Per line (raw boxes)")
+            entryValues = arrayOf(GROUP_PARAGRAPH, GROUP_LINE)
+            setDefaultValue(GROUP_PARAGRAPH)
+        }.let(screen::addPreference)
+
         // Hide NSFW content from browse/latest only (does NOT affect search)
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_HIDE_NSFW
@@ -984,6 +1025,8 @@ abstract class ManhuaRMTL :
         "1.6" -> 1.6f
         else -> 1.0f
     }
+
+    private fun ocrTextGrouping(): String = preferences.getString(PREF_OCR_GROUPING, GROUP_PARAGRAPH) ?: GROUP_PARAGRAPH
     private fun android.content.SharedPreferences.hideNsfw(): Boolean = getBoolean(PREF_HIDE_NSFW, false)
     private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
     private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
@@ -993,12 +1036,15 @@ abstract class ManhuaRMTL :
     companion object {
         private const val MODE_EN = "en"
         private const val MODE_RAW = "raw"
+        private const val GROUP_PARAGRAPH = "paragraph"
+        private const val GROUP_LINE = "line"
         private const val MAX_TRANSLATION_CACHE = 3000
         private const val TEXT_TOP_PADDING = 2f
         private const val OVERLAY_JPEG_QUALITY = 85
         private const val GENRE_FETCH_ATTEMPTS = 3
         private const val PREF_CHAPTER_TEXT_MODE = "pref_chapter_text_mode"
         private const val PREF_OVERLAY_TEXT_SCALE = "pref_overlay_text_scale"
+        private const val PREF_OCR_GROUPING = "pref_ocr_grouping"
         private const val PREF_HIDE_NSFW = "pref_hide_nsfw"
         private const val PREF_SHOW_ALT_NAMES = "pref_show_alt_names"
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"

@@ -105,6 +105,9 @@ class MangaDetail(
     val thumbnail: String? = null,
     val tbObj: ThumbObj? = null,
     val airedStart: AiredStart? = null,
+    // Date of the most recent chapter, per translation type:
+    // {"sub":{"year":2025,"month":8,"date":4,"hour":14,"minute":30}, ...}
+    val lastChapterDate: LastChapterDate? = null,
     // AniList-style 0-100 average, usually null for manga entries.
     val score: Double? = null,
     val averageScore: Int? = null,
@@ -145,6 +148,46 @@ class MangaDetail(
 class AiredStart(
     val year: Int? = null,
 )
+
+/**
+ * `lastChapterDate` shape: `{"sub":{year,month,date,hour,minute,second},
+ * "raw":{...}}`. Months are 1-based as sent by the API.
+ */
+@Serializable
+class LastChapterDate(
+    val sub: ChapterDateParts? = null,
+    val raw: ChapterDateParts? = null,
+) {
+    @Serializable
+    class ChapterDateParts(
+        val year: Int? = null,
+        val month: Int? = null,
+        val date: Int? = null,
+        val hour: Int? = null,
+        val minute: Int? = null,
+        val second: Int? = null,
+    )
+
+    /** Epoch millis of the newest chapter of the given translation (0 if absent). */
+    fun forTranslation(translation: String): Long {
+        val parts = when (translation.lowercase()) {
+            "raw" -> raw ?: sub
+            else -> sub ?: raw
+        } ?: return 0L
+        val y = parts.year ?: return 0L
+        val cal = java.util.Calendar.getInstance(java.util.TimeZone.getTimeZone("UTC"))
+        cal.clear()
+        cal.set(
+            y,
+            (parts.month ?: 1) - 1,
+            parts.date ?: 1,
+            parts.hour ?: 0,
+            parts.minute ?: 0,
+            parts.second ?: 0,
+        )
+        return cal.timeInMillis
+    }
+}
 
 @Serializable
 class AvailableChaptersDetail(
@@ -227,16 +270,8 @@ fun MangaDetail.toSManga(
 
         dtoDescription?.trim()?.let { append(it) }
 
-        // The author is rendered once, in its own labelled block.
-        val authorLine = authors
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
-            .joinToString(", ")
-        if (authorLine.isNotEmpty()) {
-            if (isNotEmpty()) append("\n\n")
-            append("**Author:** $authorLine")
-        }
+        // Author is shown in Mihon's dedicated author row (SManga.author);
+        // no need to duplicate it inside the description.
 
         if (showAltNames && altNames.isNotEmpty()) {
             if (isNotEmpty()) append("\n\n")
@@ -262,9 +297,32 @@ fun MangaDetail.toSManga(
             else -> SManga.UNKNOWN
         }
         genre = genreChips.ifBlank { null }
+        // Without this, Mihon's info tab shows "Unknown" for the author row.
+        // Authors arrive duplicated across spellings ("Neida (네이다)",
+        // "Neida", "네이다") — collapse the contained variants.
+        author = dedupeAuthors(authors).joinToString(", ").ifBlank { null }
         thumbnail_url = cover
         initialized = true
     }
+}
+
+/**
+ * Collapses author name variants: a name that is contained inside another
+ * kept entry ("Neida" ⊂ "Neida (네이다)") is treated as the same person.
+ */
+internal fun dedupeAuthors(authors: List<String>): List<String> {
+    val kept = mutableListOf<String>()
+    for (raw in authors) {
+        val name = raw.trim()
+        if (name.isEmpty()) continue
+        val lower = name.lowercase()
+        val isVariant = kept.any { existing ->
+            val existingLower = existing.lowercase()
+            existingLower.contains(lower) || lower.contains(existingLower)
+        }
+        if (!isVariant) kept.add(name)
+    }
+    return kept
 }
 
 fun MangaDetail.toChapterList(): List<SChapter> {
@@ -273,22 +331,48 @@ fun MangaDetail.toChapterList(): List<SChapter> {
 
     val subChapters = detail?.sub.orEmpty()
     if (subChapters.isNotEmpty()) {
-        return subChapters.map { chapterString ->
-            chapterString.toSChapter(mangaId, "sub")
-        }
+        return datedChapters(mangaId, subChapters, "sub")
     }
 
     // No sub chapters: fall back to the raw list so the chapter list is
     // never empty for raw-only manga.
-    return detail?.raw.orEmpty().map { chapterString ->
-        chapterString.toSChapter(mangaId, "raw")
+    return datedChapters(mangaId, detail?.raw.orEmpty(), "raw")
+}
+
+/**
+ * Builds the chapter list with upload dates.
+ *
+ * The API only exposes the date of the NEWEST chapter (`lastChapterDate`);
+ * older chapters carry no dates anywhere (the site's own chapter list shows
+ * none either). Leaving `date_upload` at 0 made every entry render as
+ * "posted today" in the app, so the older chapters get evenly spaced
+ * estimates walking backwards from the real newest date (one week apart —
+ * typical weekly serialisation cadence). The newest chapter always carries
+ * the exact date from the API.
+ */
+private fun MangaDetail.datedChapters(
+    mangaId: String,
+    chapterStrings: List<String>,
+    translation: String,
+): List<SChapter> {
+    val newestDate = lastChapterDate?.forTranslation(translation) ?: 0L
+    val chapterCount = chapterStrings.size
+    val week = 7L * 24 * 60 * 60 * 1000
+
+    return chapterStrings.mapIndexed { index, chapterString ->
+        val date = when {
+            newestDate <= 0L -> 0L
+            index <= 0 -> newestDate
+            else -> newestDate - (index.toLong().coerceAtMost(chapterCount.toLong()) * week)
+        }
+        chapterString.toSChapter(mangaId, translation, date)
     }
 }
 
-private fun String.toSChapter(mangaId: String, translation: String): SChapter = SChapter.create().apply {
+private fun String.toSChapter(mangaId: String, translation: String, date: Long): SChapter = SChapter.create().apply {
     val suffix = if (translation == "raw") " (Raw)" else ""
     url = "/manga/$mangaId/chapter-$this@toSChapter-$translation"
     name = "Ch. ${this@toSChapter.removeSuffix(".0")}$suffix"
     chapter_number = this@toSChapter.toFloatOrNull() ?: -1f
-    date_upload = 0L
+    date_upload = date
 }

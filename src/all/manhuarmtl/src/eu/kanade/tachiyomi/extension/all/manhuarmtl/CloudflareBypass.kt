@@ -17,7 +17,12 @@ import java.io.IOException
  *    browser that solved the challenge.
  * 2. **Cookie sync** — explicitly attaches WebView cookies (`cf_clearance`,
  *    `__cf_bm`, ...) to requests for the protected hosts.
- * 3. **Smart retry** — transparent retries with backoff for transient
+ * 3. **Root priming** — when a challenge appears on an image/XHR URL (whose
+ *    GET answer is never a challenge page, so the app's WebView solver cannot
+ *    clear it there), we first GET the SITE ROOT through the priming client.
+ *    That triggers the host app's Cloudflare WebView solve on a real HTML
+ *    page, minting a fresh `cf_clearance` which the retry then reuses.
+ * 4. **Smart retry** — transparent retries with backoff for transient
  *    Cloudflare blocks (429/503, `Retry-After`).
  *
  * The user agent is intentionally NOT overridden: `cf_clearance` is bound to
@@ -27,6 +32,10 @@ import java.io.IOException
 class CloudflareBypass(
     /** Hosts that receive synced WebView cookies (site + CDN hosts). */
     private val cookieHosts: Set<String>,
+    /** URL fetched once to mint a fresh clearance (site root HTML). */
+    private val primeUrl: String? = null,
+    /** Client used for priming — must NOT have priming itself installed. */
+    private val primeClient: OkHttpClient? = null,
 ) {
     fun install(builder: OkHttpClient.Builder): OkHttpClient.Builder = builder.apply {
         addInterceptor(::cookieSyncInterceptor)
@@ -127,7 +136,31 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 3. Smart retry
+    // 3. Root priming — mint clearance where the WebView solve can succeed
+    // ------------------------------------------------------------------------
+
+    @Volatile
+    private var lastPrimeAt: Long = 0L
+
+    private fun primeClearance() {
+        val url = primeUrl ?: return
+        val client = primeClient ?: return
+        val now = System.currentTimeMillis()
+        if (now - lastPrimeAt < PRIME_INTERVAL_MS) return
+        lastPrimeAt = now
+
+        try {
+            client.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { resp ->
+                resp.body?.close()
+            }
+        } catch (_: Exception) {
+            // Best-effort: without a host-side WebView solver the retry below
+            // still runs; the final error tells the user what to do manually.
+        }
+    }
+
+    // ------------------------------------------------------------------------
+    // 4. Smart retry
     // ------------------------------------------------------------------------
 
     private fun retryInterceptor(chain: Interceptor.Chain): Response {
@@ -147,6 +180,11 @@ class CloudflareBypass(
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
+
+            // Mint a fresh clearance against the site root before retrying
+            // (image/XHR URLs cannot be solved inside the WebView directly).
+            if (attempt == 1) primeClearance()
+
             response = chain.proceed(request)
         }
 
@@ -176,7 +214,8 @@ class CloudflareBypass(
     private fun String.toHttpUrlOrNull() = runCatching { toHttpUrl() }.getOrNull()
 
     private companion object {
-        const val MAX_RETRIES = 2
+        const val MAX_RETRIES = 3
+        const val PRIME_INTERVAL_MS = 30_000L
         val BLOCK_CODES = intArrayOf(403, 429, 503)
         val CHROME_VERSION_REGEX = Regex("""Chrome[/ ](\d+)""")
         val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp", "avif", "jxl", "svg")
