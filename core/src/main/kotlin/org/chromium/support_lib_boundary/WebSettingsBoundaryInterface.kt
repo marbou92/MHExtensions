@@ -1,11 +1,8 @@
 @file:Suppress("ktlint:standard:package-name")
 
-// Neutralized: this file belonged to the temporary tachiyomix-1.6 migration
-// (commit 17d546b). The extensions build on the stable 1.4 extension library
-// again, so the original content is gone and only this placeholder remains.
-// The placeholder keeps ktlint's no-empty-file rule happy; the file is safe
-// to delete.
-
 package org.chromium.support_lib_boundary
 
-internal const val WEB_SETTINGS_BOUNDARY_INTERFACE_NEUTRALIZED = true
+internal interface WebSettingsBoundaryInterface {
+    fun setUserAgentMetadataFromMap(uaMetadata: MutableMap<String, Any>)
+    val userAgentMetadataMap: MutableMap<String, Any>
+}

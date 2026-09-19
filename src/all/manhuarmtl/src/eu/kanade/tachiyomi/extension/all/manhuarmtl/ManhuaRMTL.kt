@@ -10,18 +10,23 @@ import android.os.Build
 import android.text.Layout
 import android.text.StaticLayout
 import android.text.TextPaint
+import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
 import eu.kanade.tachiyomi.multisrc.madara.Madara
-import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
+import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
+import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.get
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.toJsonElement
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -32,9 +37,9 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
-import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
@@ -45,8 +50,6 @@ abstract class ManhuaRMTL :
     Madara(),
     ConfigurableSource {
 
-    override val useLoadMoreRequest = LoadMoreStrategy.Never
-
     override val mangaSubString = "manga"
 
     /**
@@ -54,35 +57,41 @@ abstract class ManhuaRMTL :
      * image/XHR request gets challenged. Hardened identically but without
      * priming of its own (no recursion).
      */
-    private val primeClient: OkHttpClient = network.client.newBuilder()
-        .connectTimeout(30, TimeUnit.SECONDS)
-        .readTimeout(45, TimeUnit.SECONDS)
-        .apply {
-            CloudflareBypass(setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com")).install(this)
-        }
-        .build()
-
-    // Custom client: Cloudflare hardening + OCR text-overlay interceptor
-    override val client: OkHttpClient = network.client.newBuilder()
-        .apply {
-            CloudflareBypass(
-                cookieHosts = setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com"),
-                primeUrl = "$baseUrl/",
-                primeClient = primeClient,
-            ).install(this)
-        }
-        .addNetworkInterceptor(::ocrImageInterceptor)
-        .build()
+    private val primeClient: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .apply {
+                CloudflareBypass(setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com")).install(this)
+            }
+            .build()
+    }
 
     /**
      * Short-timeout client for the auxiliary OCR/translation calls — a hung
      * gate used to stall the whole chapter open path for up to a minute.
      */
-    private val auxClient: OkHttpClient = network.client.newBuilder()
-        .connectTimeout(8, TimeUnit.SECONDS)
-        .readTimeout(12, TimeUnit.SECONDS)
-        .writeTimeout(8, TimeUnit.SECONDS)
-        .build()
+    private val auxClient: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(12, TimeUnit.SECONDS)
+            .writeTimeout(8, TimeUnit.SECONDS)
+            .build()
+    }
+
+    override fun OkHttpClient.Builder.configureClient() = apply {
+        // Cloudflare hardening for the site + CDN, applied through the
+        // KeiSource hook so the app's own Cloudflare interceptor stays
+        // last (it re-orders itself below source interceptors).
+        CloudflareBypass(
+            cookieHosts = setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com"),
+            primeUrl = "$baseUrl/",
+            primeClient = primeClient,
+        ).install(this)
+
+        // Burn translated OCR text onto raw chapter images.
+        addNetworkInterceptor(::ocrImageInterceptor)
+    }
 
     // Thread-safe storage for OCR text boxes, keyed by full image URL
     private val ocrData = ConcurrentHashMap<String, List<OcrTextBox>>()
@@ -95,81 +104,66 @@ abstract class ManhuaRMTL :
         Thread(runnable, "ManhuaRMTL-Translate").apply { isDaemon = true }
     }
 
-    // Site excludes adult content by default; override to show everything unless the user opts out
-    override val adultContentFilterOptions: Map<String, String> = mapOf(
-        "Show all (incl. adult)" to "",
-        "Hide adult" to "0",
-        "Adult only" to "1",
-    )
-
-    // Verified against the site's own browse dropdown (#mrm-arch-sort).
-    // NOTE: the values change when the site updates its theme — v1.4.63 used
-    // views_all/recent and those silently fell back to the default (A-Z)
-    // ordering, which made Popular and Latest show the same list.
-    override val orderByFilterOptions: Map<String, String> = mapOf(
-        "Latest update" to "latest",
-        "Least recently updated" to "latest_asc",
-        "Trending" to "trending",
-        "Newest added" to "new",
-        "Oldest added" to "new_asc",
-        "Title A-Z" to "az",
-        "Title Z-A" to "za",
-        "Most chapters" to "chapters",
-        "Fewest chapters" to "chapters_asc",
-        "Top rated" to "rating",
-    )
+    // Raw HTML of the chapter page last fetched via fetchChapterDocument —
+    // carries the OCR gate credentials for the overlay.
+    @Volatile
+    private var lastChapterHtml: String? = null
 
     private val preferences = getPreferences()
 
     // ============================== Popular / Latest ==============================
-
-    // Custom MRM card layout instead of standard Madara
-    override fun popularMangaSelector() = "li.mrm-r-item"
-    override fun latestUpdatesSelector() = popularMangaSelector()
-    override fun searchMangaSelector() = popularMangaSelector()
-
-    override fun popularMangaFromElement(element: Element): SManga = SManga.create().apply {
-        url = element.selectFirst("a.mrm-r-item__link")?.attr("href")?.substringAfter(baseUrl) ?: ""
-        title = element.selectFirst("a.mrm-r-item__link")?.attr("title") ?: ""
-        thumbnail_url = element.selectFirst("span.mrm-r-item__art img")?.attr("abs:src")?.trim()
-    }
-
-    override fun latestUpdatesFromElement(element: Element): SManga = popularMangaFromElement(element)
-    override fun searchMangaFromElement(element: Element): SManga = popularMangaFromElement(element)
-
-    // ------------------------------------------------------------------
-    // Browse (Popular / Latest)
+    //
+    // The site does not answer the standard madara_load_more AJAX endpoint;
+    // its archives are plain HTML pages ordered by ?sort=, rendered with a
+    // custom MRM card layout (li.mrm-r-item).
     //
     // IMPORTANT: the site only honours the "sort" values rendered in its
     // own dropdown (#mrm-arch-sort). Unknown values (like the old
     // "views_all") silently fall back to the DEFAULT ordering, which is
     // the same list "latest" shows — that is why Popular and Latest
-    // used to lineup identically.
-    // Verified live 2026-09:
+    // used to line up identically. Verified live 2026-09:
     //   Popular → sort=trending (Trending, the site's popularity sort)
     //   Latest  → sort=latest   (Recently updated — the dropdown default)
-    // ------------------------------------------------------------------
+
     private fun archiveUrl(sort: String, page: Int): String {
         val path = if (page > 1) "/manga/page/$page/" else "/manga/"
         val adult = if (preferences.hideNsfw()) "&adult=0" else ""
         return "$baseUrl$path?sort=$sort$adult"
     }
 
-    override fun popularMangaRequest(page: Int): Request = GET(archiveUrl("trending", page), headers)
+    override suspend fun getPopularManga(page: Int): MangasPage = browseArchive("trending", page)
 
-    override fun latestUpdatesRequest(page: Int): Request = GET(archiveUrl("latest", page), headers)
+    override suspend fun getLatestUpdates(page: Int): MangasPage = browseArchive("latest", page)
 
-    override fun popularMangaNextPageSelector(): String? = "a.next.page-numbers, a.mrm-pager__btn[rel=next]"
+    private suspend fun browseArchive(sort: String, page: Int): MangasPage {
+        val document = client.get(archiveUrl(sort, page)).asJsoup()
+        val mangas = document.select("li.mrm-r-item").mapNotNull(::mrmCardToSManga)
+        return MangasPage(mangas, hasNextPageSelector(document))
+    }
+
+    private fun hasNextPageSelector(document: Document): Boolean = document.selectFirst("a.next.page-numbers, a.mrm-pager__btn[rel=next]") != null
+
+    /** Custom MRM card layout — used by archives AND the search page. */
+    private fun mrmCardToSManga(element: Element): SManga? {
+        val link = element.selectFirst("a.mrm-r-item__link") ?: return null
+        val href = link.attr("abs:href").takeIf(String::isNotBlank) ?: return null
+        val path = runCatching { href.toHttpUrl().encodedPath }.getOrNull() ?: return null
+
+        return SManga.create().apply {
+            url = path
+            title = link.attr("title").ifBlank { link.ownText() }
+            thumbnail_url = element.selectFirst("span.mrm-r-item__art img")?.let { imageFromElement(it) }
+            memo = mangaMemo(path, emptyList())
+        }
+    }
 
     // ============================== Search ==============================
     // Search ALWAYS shows everything — the NSFW setting does NOT filter search.
     // The user can still find NSFW content via search even when "Hide NSFW" is ON.
 
-    override fun searchRequest(page: Int, query: String, filters: FilterList): Request {
-        // Check if user explicitly selected an Adult content filter
-        val adultFilter = filters.filterIsInstance<AdultContentFilter>().firstOrNull()
+    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         // Default to "show all" in search — the NSFW setting doesn't affect search
-        val adultValue = adultFilter?.toUriPart() ?: ""
+        val adultValue = filters.filterIsInstance<AdultContentFilter>().firstOrNull()?.toUriPart() ?: ""
 
         val url = "$baseUrl/".toHttpUrl().newBuilder().apply {
             addQueryParameter("post_type", "wp-manga")
@@ -179,71 +173,49 @@ abstract class ManhuaRMTL :
 
             filters.forEach { filter ->
                 when (filter) {
-                    is AuthorFilter -> if (filter.state.isNotBlank()) addQueryParameter("author", filter.state)
-                    is ArtistFilter -> if (filter.state.isNotBlank()) addQueryParameter("artist", filter.state)
-                    is YearFilter -> if (filter.state.isNotBlank()) addQueryParameter("release", filter.state)
-                    is StatusFilter -> filter.state.forEach { if (it.state) addQueryParameter("status[]", it.id) }
-                    is OrderByFilter -> if (filter.toUriPart().isNotBlank()) addQueryParameter("sort", filter.toUriPart())
-                    is GenreConditionFilter -> addQueryParameter("op", filter.toUriPart())
-                    is GenreList -> filter.state.filter { it.state }.forEach { addQueryParameter("genre[]", it.id) }
-                    is ExcludeGenreList -> filter.state.filter { it.state }.forEach { addQueryParameter("exclude_genre[]", it.id) }
+                    is TextParamFilter -> if (filter.state.isNotBlank()) addQueryParameter(filter.param, filter.state)
+                    is StatusParamFilter -> filter.state.forEach { if (it.state) addQueryParameter("status[]", it.value) }
+                    is SortParamFilter -> if (filter.toUriPart().isNotBlank()) addQueryParameter("sort", filter.toUriPart())
+                    is GenreConditionParamFilter -> addQueryParameter("op", filter.toUriPart())
+                    is GenreParamFilter -> filter.state.filter { it.state }.forEach { addQueryParameter("genre[]", it.value) }
+                    is ExcludeGenreParamFilter -> filter.state.filter { it.state }.forEach { addQueryParameter("exclude_genre[]", it.value) }
                     else -> {}
                 }
             }
         }.build()
 
-        return GET(url, headers)
+        val document = client.get(url.toString()).asJsoup()
+        val mangas = document.select("li.mrm-r-item").mapNotNull(::mrmCardToSManga)
+        return MangasPage(mangas, hasNextPageSelector(document))
     }
-
-    override fun searchMangaNextPageSelector(): String? = "a.next.page-numbers, a.mrm-pager__btn[rel=next]"
 
     // ============================== Genres ==============================
     //
-    // The site sits behind an intermittent Cloudflare challenge; Madara's
-    // built-in genre loader gives up FOREVER after one failed attempt
-    // (genresFetched flag), which is why the genre filters came up empty.
-    // We run our own loader with retries + backoff and two page sources:
-    // the search page (filter chips) and the homepage (genre nav links).
+    // The site sits behind an intermittent Cloudflare challenge; genre chips
+    // live on the search page (custom MRM markup), with a fallback to the
+    // homepage genre nav links. KeiSource's filter-fetch mechanism handles
+    // caching and retries (up to 3 attempts, then "press Reset").
 
-    private fun loadGenresWithRetry() {
+    override suspend fun fetchFilterData(): JsonElement {
         val requests = listOf(
-            genresRequest(),
-            GET("$baseUrl/", headers),
+            "$baseUrl/?post_type=wp-manga&s=",
+            "$baseUrl/",
         )
 
-        repeat(GENRE_FETCH_ATTEMPTS) { attempt ->
-            if (genresList.isNotEmpty()) return
-
-            for (request in requests) {
-                if (genresList.isNotEmpty()) return
-                try {
-                    client.newCall(request).execute().use { resp ->
-                        if (!resp.isSuccessful) return@use
-                        val parsed = parseGenres(resp.asJsoup())
-                        if (parsed.isNotEmpty()) genresList = parsed
-                    }
-                } catch (_: Exception) {
-                    // Retry below
-                }
-            }
-
-            if (genresList.isEmpty()) {
-                try {
-                    Thread.sleep(1500L * (attempt + 1))
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                    return
+        for (request in requests) {
+            runCatching {
+                val parsed = parseGenreOptions(client.get(request).asJsoup())
+                if (parsed.isNotEmpty()) {
+                    return parsed.map { GenreRoute(it.first, it.second, "/genre/${it.second}/") }.toJsonElement()
                 }
             }
         }
+
+        throw IOException("Could not load genres")
     }
 
-    // Override the genre request — the form lives on the search results page
-    override fun genresRequest(): Request = GET("$baseUrl/?post_type=wp-manga&s=", headers)
-
-    // Custom MRM chips layout — NOT the standard Madara checkbox-group.
-    // Multiple selectors so minor theme tweaks don't empty the filter list.
-    override fun parseGenres(document: Document): List<Genre> {
+    /** Genre options in (name, slug) pairs, from several possible site layouts. */
+    private fun parseGenreOptions(document: Document): List<Pair<String, String>> {
         // 1) Current MRM filter chips on the search page
         val chips = document.select("div.mrm-fgroup__chips label.mrm-gchip--in, label.mrm-gchip")
             .mapNotNull { label ->
@@ -252,9 +224,9 @@ abstract class ManhuaRMTL :
                     ?: return@mapNotNull null
                 val id = label.selectFirst("input[type=checkbox]")?.`val`()?.takeIf { it.isNotBlank() }
                     ?: name.slugify()
-                Genre(name, id)
+                name to id
             }
-            .distinctBy { it.id.lowercase() }
+            .distinctBy { it.second.lowercase() }
         if (chips.isNotEmpty()) return chips
 
         // 2) Standard Madara checkbox group (in case the theme reverts)
@@ -264,10 +236,10 @@ abstract class ManhuaRMTL :
                 val name = li.selectFirst("label")?.text()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
                 val id = li.selectFirst("input[type=checkbox]")?.`val`()?.takeIf { it.isNotBlank() }
                     ?: name.slugify()
-                Genre(name, id)
+                name to id
             }
             .orEmpty()
-            .distinctBy { it.id.lowercase() }
+            .distinctBy { it.second.lowercase() }
         if (checkboxes.isNotEmpty()) return checkboxes
 
         // 3) Genre nav/tag links (homepage menus, details pages) — the href
@@ -279,10 +251,10 @@ abstract class ManhuaRMTL :
                 if (slug.isBlank()) return@mapNotNull null
                 val name = a.text().takeIf { it.isNotBlank() }
                     ?: slug.replace('-', ' ').replaceFirstChar { it.uppercase() }
-                Genre(name, slug)
+                name to slug
             }
-            .filter { it.id.isNotBlank() }
-            .distinctBy { it.id.lowercase() }
+            .filter { it.second.isNotBlank() }
+            .distinctBy { it.second.lowercase() }
     }
 
     private fun String.slugify(): String = trim()
@@ -295,7 +267,7 @@ abstract class ManhuaRMTL :
     // Custom MRM "hero" layout selectors
     override val mangaDetailsSelectorTitle = "h1.mrm-hero__title"
     override val mangaDetailsSelectorThumbnail = "div.mrm-hero__cover img"
-    override val mangaDetailsSelectorAuthor = ".post-content_item:contains(Author) .author-content a, .post-content_item:contains(Author) .summary-content a"
+    override val mangaDetailsSelectorAuthor = ".post-content_item:contains(Author) .author-content a, .post-content_item:contains(Author) .summary-content a, .post-content_item:contains(Author) .summary-content"
     override val mangaDetailsSelectorArtist = ".post-content_item:contains(Artist) .artist-content a, .post-content_item:contains(Artist) .summary-content a"
     override val mangaDetailsSelectorStatus = ".post-content_item:contains(Status) .summary-content"
     override val mangaDetailsSelectorDescription = "div.description-summary div.summary__content, div.summary_content div.post-content_item > h5:contains(Summary) + div, div.mrm-panel div.summary__content"
@@ -306,141 +278,144 @@ abstract class ManhuaRMTL :
     // Alt names live in the MRM hero block, not the standard post-content row
     override val altNameSelector = "p.mrm-hero__alt"
 
-    override fun mangaDetailsParse(document: Document): SManga {
+    override fun parseDetails(document: Document, id: String, preserveUrl: String?): SManga {
         val manga = SManga.create()
-        with(document) {
-            manga.title = selectFirst(mangaDetailsSelectorTitle)?.ownText() ?: ""
-            select(mangaDetailsSelectorAuthor).map { it.text() }.filter { it.notUpdating() }.joinToString().takeIf { it.isNotBlank() }?.let { manga.author = it }
-            select(mangaDetailsSelectorArtist).map { it.text() }.filter { it.notUpdating() }.joinToString().takeIf { it.isNotBlank() }?.let { manga.artist = it }
 
-            // Raw synopsis
-            val synopsis = selectFirst(mangaDetailsSelectorDescription)?.let {
-                if (it.select("p").text().isNotEmpty()) {
-                    it.select("p").joinToString(separator = "\n\n") { p -> p.text().replace("<br>", "\n") }
-                } else {
-                    it.text()
+        val path = runCatching { document.location().toHttpUrl().encodedPath }.getOrDefault("/$mangaSubString/")
+        val genres = document.select(mangaDetailsSelectorGenre).mapNotNull { element ->
+            val href = element.attr("abs:href").takeIf(String::isNotBlank) ?: return@mapNotNull null
+            val genrePath = runCatching { href.toHttpUrl().encodedPath }.getOrNull() ?: return@mapNotNull null
+            val slug = genrePath.trimEnd('/').substringAfterLast('/').takeIf(String::isNotEmpty) ?: return@mapNotNull null
+            GenreRoute(element.text(), slug, genrePath)
+        }
+
+        manga.url = preserveUrl?.takeIf { !it.all(Char::isDigit) } ?: id
+        manga.title = document.selectFirst(mangaDetailsSelectorTitle)?.ownText() ?: ""
+        document.select(mangaDetailsSelectorAuthor).eachText().filterNot(::isUpdating).joinToString().takeIf { it.isNotBlank() }?.let { manga.author = it }
+        document.select(mangaDetailsSelectorArtist).eachText().filterNot(::isUpdating).joinToString().takeIf { it.isNotBlank() }?.let { manga.artist = it }
+
+        // Raw synopsis
+        val synopsis = document.selectFirst(mangaDetailsSelectorDescription)?.let {
+            if (it.select("p").text().isNotEmpty()) {
+                it.select("p").joinToString(separator = "\n\n") { p -> p.text().replace("<br>", "\n") }
+            } else {
+                it.text()
+            }
+        }
+
+        document.selectFirst(mangaDetailsSelectorThumbnail)?.let { manga.thumbnail_url = imageFromElement(it) }
+
+        document.selectFirst(mangaDetailsSelectorStatus)?.let {
+            val statusText = it.text().filter { ch -> ch.isLetterOrDigit() || ch.isWhitespace() }.trim()
+            manga.status = statusText.toStatus()
+        }
+
+        // Extract type early — used for both genre chips and info line
+        val type = document.selectFirst(seriesTypeSelector)?.ownText()?.takeIf { it.isNotBlank() && !isUpdating(it) }
+
+        // Genres (optionally include type: Manhwa/Manhua/Manga)
+        val genreList = genres.map(GenreRoute::name).toMutableList()
+        if (preferences.showTypeInGenre() && type != null) {
+            genreList.add(type)
+        }
+        manga.genre = genreList.distinctBy(String::lowercase).joinToString().ifBlank { null }
+
+        // ===== Build comix-style description =====
+        val showAltNames = preferences.showAltNames()
+        val showExtraInfo = preferences.showExtraInfo()
+        val scorePosition = preferences.getScorePosition()
+
+        // Alt names
+        val altNames = document.selectFirst(altNameSelector)?.ownText()?.takeIf { it.isNotBlank() && !isUpdating(it) }
+
+        // Rating / votes from MRM facts — site uses a 0-5 scale (NOT 0-10 like comix)
+        val ratingText = document.selectFirst("li.mrm-facts__item--rating strong")?.text()
+        val ratingScore = ratingText?.toFloatOrNull()
+        val votesText = document.selectFirst("li.mrm-facts__item--rating .mrm-facts__sub")?.text()
+        val votesCount = Regex("""(\d+)""").find(votesText ?: "")?.value?.toIntOrNull() ?: 0
+        val hasScore = ratingScore != null && votesCount > 0
+
+        val stars = if (hasScore) {
+            val score = ratingScore
+            // Site uses 0-5 scale: round to nearest int (5.0 → 5 stars, 4.4 → 4, 4.8 → 5)
+            val fullStars = score.roundToInt().coerceIn(0, 5)
+            "★".repeat(fullStars) + "☆".repeat(5 - fullStars) + " $score"
+        } else {
+            null
+        }
+
+        // Type / chapters / views / release year
+        val chaptersText = document.selectFirst(".post-content_item:contains(Chapters) .summary-content")?.text()
+        val chaptersNum = chaptersText?.filter { it.isDigit() }?.toIntOrNull()
+        val releaseYear = document.selectFirst(".post-content_item:contains(Release) .summary-content a")?.text()
+            ?: document.selectFirst(".post-content_item:contains(Release) .summary-content")?.ownText()
+        val viewsText = document.selectFirst("li.mrm-facts__item:has(i.ion-md-eye)")?.text()
+        val views = viewsText?.filter { it.isDigit() }
+
+        val infoLine = if (showExtraInfo) {
+            buildString {
+                if (type != null) append("**Type:** $type")
+                if (releaseYear != null) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Year:** $releaseYear")
+                }
+                if (chaptersNum != null && chaptersNum > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Chapters:** $chaptersNum")
+                }
+                if (views != null && views.isNotBlank()) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Views:** $views")
+                }
+                if (manga.status != SManga.UNKNOWN) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Status:** ${formatStatus(manga.status)}")
+                }
+                if (hasScore) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**$votesCount ratings**")
+                }
+            }.ifBlank { null }
+        } else {
+            null
+        }
+
+        val desc = buildString {
+            if (scorePosition == "top" && stars != null) {
+                append(stars)
+                append("\n")
+                if (infoLine != null) {
+                    append(infoLine)
+                    append("\n\n")
                 }
             }
 
-            selectFirst(mangaDetailsSelectorThumbnail)?.let { manga.thumbnail_url = imageFromElement(it) }
+            synopsis?.let { append(it) }
 
-            selectFirst(mangaDetailsSelectorStatus)?.let {
-                val statusText = it.text().filter { ch -> ch.isLetterOrDigit() || ch.isWhitespace() }.trim()
-                manga.status = when {
-                    completedStatusList.any { c -> c.equals(statusText, true) } -> SManga.COMPLETED
-                    ongoingStatusList.any { c -> c.equals(statusText, true) } -> SManga.ONGOING
-                    hiatusStatusList.any { c -> c.equals(statusText, true) } -> SManga.ON_HIATUS
-                    canceledStatusList.any { c -> c.equals(statusText, true) } -> SManga.CANCELLED
-                    else -> SManga.UNKNOWN
-                }
+            if (showAltNames && altNames != null) {
+                if (isNotEmpty()) append("\n\n")
+                append("Alternative names:\n")
+                append("• $altNames")
             }
 
-            // Extract type early — used for both genre chips and info line
-            val type = selectFirst(seriesTypeSelector)?.ownText()?.takeIf { it.isNotBlank() && it.notUpdating() }
-
-            // Genres (optionally include type: Manhwa/Manhua/Manga)
-            val genreList = select(mangaDetailsSelectorGenre).mapTo(ArrayList()) { it.text() }
-            if (preferences.showTypeInGenre() && type != null) {
-                genreList.add(type)
-            }
-            manga.genre = genreList.distinctBy(String::lowercase).joinToString().ifBlank { null }
-
-            // ===== Build comix-style description =====
-            val showAltNames = preferences.showAltNames()
-            val showExtraInfo = preferences.showExtraInfo()
-            val scorePosition = preferences.getScorePosition()
-
-            // Alt names
-            val altNames = selectFirst(altNameSelector)?.ownText()?.takeIf { it.isNotBlank() && it.notUpdating() }
-
-            // Rating / votes from MRM facts — site uses a 0-5 scale (NOT 0-10 like comix)
-            val ratingText = selectFirst("li.mrm-facts__item--rating strong")?.text()
-            val ratingScore = ratingText?.toFloatOrNull()
-            val votesText = selectFirst("li.mrm-facts__item--rating .mrm-facts__sub")?.text()
-            val votesCount = Regex("""(\d+)""").find(votesText ?: "")?.value?.toIntOrNull() ?: 0
-            val hasScore = ratingScore != null && votesCount > 0
-
-            val stars = if (hasScore) {
-                val score = ratingScore
-                // Site uses 0-5 scale: round to nearest int (5.0 → 5 stars, 4.4 → 4, 4.8 → 5)
-                val fullStars = score.roundToInt().coerceIn(0, 5)
-                "★".repeat(fullStars) + "☆".repeat(5 - fullStars) + " $score"
-            } else {
-                null
-            }
-
-            // Type / chapters / views / release year
-            val chaptersText = selectFirst(".post-content_item:contains(Chapters) .summary-content")?.text()
-            val chaptersNum = chaptersText?.filter { it.isDigit() }?.toIntOrNull()
-            val releaseYear = selectFirst(".post-content_item:contains(Release) .summary-content a")?.text()
-                ?: selectFirst(".post-content_item:contains(Release) .summary-content")?.ownText()
-            val viewsText = selectFirst("li.mrm-facts__item:has(i.ion-md-eye)")?.text()
-            val views = viewsText?.filter { it.isDigit() }
-
-            val infoLine = if (showExtraInfo) {
-                buildString {
-                    if (type != null) append("**Type:** $type")
-                    if (releaseYear != null) {
-                        if (isNotEmpty()) append(" · ")
-                        append("**Year:** $releaseYear")
-                    }
-                    if (chaptersNum != null && chaptersNum > 0) {
-                        if (isNotEmpty()) append(" · ")
-                        append("**Chapters:** $chaptersNum")
-                    }
-                    if (views != null && views.isNotBlank()) {
-                        if (isNotEmpty()) append(" · ")
-                        append("**Views:** $views")
-                    }
-                    if (manga.status != SManga.UNKNOWN) {
-                        if (isNotEmpty()) append(" · ")
-                        append("**Status:** ${formatStatus(manga.status)}")
-                    }
-                    if (hasScore) {
-                        if (isNotEmpty()) append(" · ")
-                        append("**$votesCount ratings**")
-                    }
-                }.ifBlank { null }
-            } else {
-                null
-            }
-
-            val desc = buildString {
-                if (scorePosition == "top" && stars != null) {
-                    append(stars)
+            if (scorePosition == "end" && stars != null) {
+                if (isNotEmpty()) append("\n\n")
+                append(stars)
+                if (infoLine != null) {
                     append("\n")
-                    if (infoLine != null) {
-                        append(infoLine)
-                        append("\n\n")
-                    }
-                }
-
-                synopsis?.let { append(it) }
-
-                if (showAltNames && altNames != null) {
-                    if (isNotEmpty()) append("\n\n")
-                    append("Alternative names:\n")
-                    append("• $altNames")
-                }
-
-                if (scorePosition == "end" && stars != null) {
-                    if (isNotEmpty()) append("\n\n")
-                    append(stars)
-                    if (infoLine != null) {
-                        append("\n")
-                        append(infoLine)
-                    }
-                }
-
-                if (scorePosition == "none" && infoLine != null) {
-                    if (isNotEmpty()) append("\n\n")
                     append(infoLine)
                 }
-            }.trim()
+            }
 
-            manga.description = desc.ifBlank { synopsis }
-            manga.initialized = true
-        }
+            if (scorePosition == "none" && infoLine != null) {
+                if (isNotEmpty()) append("\n\n")
+                append(infoLine)
+            }
+        }.trim()
+
+        manga.description = desc.ifBlank { synopsis }
+        manga.initialized = true
+        manga.memo = mangaMemo(path, genres, legacyId = id.takeIf { preserveUrl?.all(Char::isDigit) == false })
 
         return manga
     }
@@ -453,42 +428,44 @@ abstract class ManhuaRMTL :
         else -> "Unknown"
     }
 
-    // ============================== Chapters ==============================
-    // Standard Madara selectors work — li.wp-manga-chapter is present in the detail HTML.
-    // All chapters are in the initial page load (no AJAX needed).
-
     // ============================== Pages + OCR ==============================
     // The site serves RAW images. Translated text is a JS overlay fetched from
     // fetch-ocr.php. We parse the _0xvault credentials from the reading page,
     // fetch the text data, translate it to the user's language, and burn it
     // onto the images via a network interceptor.
 
-    override fun pageListParse(response: Response): List<Page> {
-        val html = response.body.string()
-        val readingPageUrl = response.request.url.toString()
-        val document = Jsoup.parse(html, readingPageUrl)
+    override suspend fun fetchChapterDocument(chapterUrl: String): Document {
+        val response = client.get(chapterUrl)
+        val html = response.use { it.body.string() }
+        lastChapterHtml = html
+        return html.asJsoup(chapterUrl)
+    }
 
-        val pages = pageListParse(document)
+    override suspend fun getPageList(chapter: SChapter): List<Page> {
+        val pages = super.getPageList(chapter)
+
+        val html = lastChapterHtml
+        lastChapterHtml = null
 
         val mode = chapterTextMode()
-        if (mode != MODE_RAW && html.isNotBlank()) {
+        if (mode != MODE_RAW && !html.isNullOrBlank()) {
             // Clear previous chapter's OCR data
             ocrData.clear()
 
             try {
                 val credentials = parseOcrCredentials(html)
                 if (credentials != null) {
-                    val ocrPages = fetchOcrData(credentials, readingPageUrl)
+                    val ocrPages = fetchOcrData(credentials, getChapterUrl(chapter))
                     if (ocrPages != null && ocrPages.isNotEmpty()) {
                         // Build filename → text boxes map (try multiple key formats for robust matching)
                         val ocrByFilename = mutableMapOf<String, List<OcrTextBox>>()
-                        val grouping = ocrTextGrouping()
                         for (ocrPage in ocrPages) {
                             val filename = ocrPage.image ?: continue
                             val rawBoxes = ocrPage.normalisedTexts()
                             if (rawBoxes.isEmpty()) continue
-                            // Site-like rendering: merge consecutive line boxes
-                            // into paragraph blocks (union box + joined text).
+                            // Rendering modes: the SITE renders each OCR entry as
+                            // its own overlay box (it cuts text into many small
+                            // blocks); paragraph merging is an optional mode.
                             val textBoxes = when (grouping) {
                                 GROUP_PARAGRAPH -> groupIntoParagraphs(
                                     rawBoxes.distinctBy { b ->
@@ -854,64 +831,78 @@ abstract class ManhuaRMTL :
         return output.toByteArray()
     }
 
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!.trim(), headers.newBuilder().set("Referer", baseUrl).build())
-
     // ============================== Filters ==============================
 
-    private class ExcludeGenreList(title: String, genres: List<Genre>) : Filter.Group<GenreCheckBox>(title, genres.map { GenreCheckBox(it.name, it.id) })
+    private class TextParamFilter(title: String, val param: String) : Filter.Text(title)
 
-    override fun getFilterList(): FilterList {
-        if (genresList.isEmpty()) {
-            launchIO { loadGenresWithRetry() }
-        }
+    private class StatusTag(name: String, val value: String) : Filter.CheckBox(name)
 
-        val filters = mutableListOf<Filter<*>>(
-            AuthorFilter("Author"),
-            ArtistFilter("Artist"),
-            YearFilter("Release year"),
-            StatusFilter(
-                title = "Status",
-                status = statusFilterOptions.map { Tag(it.key, it.value) },
-            ),
-            OrderByFilter(
-                title = "Sort by",
-                options = orderByFilterOptions.toList(),
-                state = 1, // Default: Latest
-            ),
-            AdultContentFilter(
-                title = "Adult content",
-                options = adultContentFilterOptions.toList(),
-            ),
-        )
+    private class StatusParamFilter(title: String, values: List<Pair<String, String>>) : Filter.Group<StatusTag>(title, values.map { StatusTag(it.first, it.second) })
 
-        if (genresList.isNotEmpty()) {
-            filters += listOf(
-                Filter.Separator(),
-                Filter.Header("Genres (include)"),
-                GenreConditionFilter(
-                    title = "Genre match mode",
-                    options = genreConditionFilterOptions.toList(),
-                ),
-                GenreList(
-                    title = "Genres",
-                    genres = genresList,
-                ),
-                Filter.Separator(),
-                Filter.Header("Genres (exclude)"),
-                ExcludeGenreList(
-                    title = "Exclude genres",
-                    genres = genresList,
-                ),
-            )
-        } else if (fetchGenres) {
-            filters += listOf(
-                Filter.Separator(),
-                Filter.Header("Genres couldn't be loaded yet — press 'Reset' to retry"),
-            )
-        }
-
-        return FilterList(filters)
+    private class SortParamFilter(title: String, private val sortOptions: List<Pair<String, String>>) : Filter.Select<String>(title, sortOptions.map { it.first }.toTypedArray()) {
+        fun toUriPart(): String = sortOptions[state].second
     }
+
+    private class AdultContentFilter(title: String, private val adultOptions: List<Pair<String, String>>) : Filter.Select<String>(title, adultOptions.map { it.first }.toTypedArray()) {
+        fun toUriPart(): String = adultOptions[state].second
+    }
+
+    private class GenreConditionParamFilter(title: String, private val conditionOptions: List<Pair<String, String>>) : Filter.Select<String>(title, conditionOptions.map { it.first }.toTypedArray()) {
+        fun toUriPart(): String = conditionOptions[state].second
+    }
+
+    private class GenreTag(name: String, val value: String) : Filter.CheckBox(name)
+
+    private class GenreParamFilter(title: String, genres: List<GenreRoute>) : Filter.Group<GenreTag>(title, genres.map { GenreTag(it.name, it.slug) })
+
+    private class ExcludeGenreParamFilter(title: String, genres: List<GenreRoute>) : Filter.Group<GenreTag>(title, genres.map { GenreTag(it.name, it.slug) })
+
+    override fun getFilterList(data: JsonElement?): FilterList {
+        val genres = runCatching { data?.parseAs<List<GenreRoute>>() }.getOrNull().orEmpty()
+
+        return FilterList(
+            buildList {
+                add(TextParamFilter(intl["author_filter_title"], "author"))
+                add(TextParamFilter(intl["artist_filter_title"], "artist"))
+                add(TextParamFilter(intl["year_filter_title"], "release"))
+                add(StatusParamFilter(intl["status_filter_title"], statusFilterOptions))
+                add(SortParamFilter("Sort by", orderByFilterOptions))
+                add(AdultContentFilter(intl["adult_content_filter_title"], adultFilterOptions))
+                if (genres.isNotEmpty()) {
+                    add(Filter.Separator())
+                    add(Filter.Header(intl["genre_filter_header"]))
+                    add(GenreConditionParamFilter(intl["genre_condition_filter_title"], genreConditionFilterOptions))
+                    add(GenreParamFilter(intl["genre_filter_title"], genres))
+                    add(Filter.Header("Genres (exclude)"))
+                    add(ExcludeGenreParamFilter("Exclude genres", genres))
+                } else {
+                    add(Filter.Separator())
+                    add(Filter.Header("Genres are loading — press 'Reset' to retry"))
+                }
+            },
+        )
+    }
+
+    // Site-specific sort values — verified against the site's own dropdown.
+    override val orderByFilterOptions = listOf(
+        "Latest update" to "latest",
+        "Least recently updated" to "latest_asc",
+        "Trending" to "trending",
+        "Newest added" to "new",
+        "Oldest added" to "new_asc",
+        "Title A-Z" to "az",
+        "Title Z-A" to "za",
+        "Most chapters" to "chapters",
+        "Fewest chapters" to "chapters_asc",
+        "Top rated" to "rating",
+    )
+
+    // Site excludes adult content by default; override to show everything unless the user opts out
+    override val adultFilterOptions = listOf(
+        "Show all (incl. adult)" to "",
+        "Hide adult" to "0",
+        "Adult only" to "1",
+    )
 
     // ============================== Settings ==============================
 
@@ -964,14 +955,15 @@ abstract class ManhuaRMTL :
             setDefaultValue("1.0")
         }.let(screen::addPreference)
 
-        // OCR text grouping
+        // OCR text grouping — the site keeps every OCR block separate (it cuts
+        // text into many small boxes); merging is offered as an extra option.
         androidx.preference.ListPreference(screen.context).apply {
             key = PREF_OCR_GROUPING
             title = "OCR text grouping"
-            summary = "Paragraphs merge the site's per-line OCR boxes into flowing text blocks like the website; Per line keeps every detected line as its own overlay"
-            entries = arrayOf("Paragraphs (like the site)", "Per line (raw boxes)")
-            entryValues = arrayOf(GROUP_PARAGRAPH, GROUP_LINE)
-            setDefaultValue(GROUP_PARAGRAPH)
+            summary = "Same as the site renders every OCR box on its own; Merged paragraphs stitches consecutive lines into flowing blocks instead"
+            entries = arrayOf("Same as the site (one box per OCR entry)", "Merged paragraphs")
+            entryValues = arrayOf(GROUP_LINE, GROUP_PARAGRAPH)
+            setDefaultValue(GROUP_LINE)
         }.let(screen::addPreference)
 
         // Hide NSFW content from browse/latest only (does NOT affect search)
@@ -1017,6 +1009,9 @@ abstract class ManhuaRMTL :
         }.let(screen::addPreference)
     }
 
+    private val grouping: String
+        get() = preferences.getString(PREF_OCR_GROUPING, GROUP_LINE) ?: GROUP_LINE
+
     private fun chapterTextMode(): String = preferences.getString(PREF_CHAPTER_TEXT_MODE, MODE_EN) ?: MODE_EN
 
     private fun overlayTextScale(): Float = when (preferences.getString(PREF_OVERLAY_TEXT_SCALE, "1.0")) {
@@ -1026,7 +1021,6 @@ abstract class ManhuaRMTL :
         else -> 1.0f
     }
 
-    private fun ocrTextGrouping(): String = preferences.getString(PREF_OCR_GROUPING, GROUP_PARAGRAPH) ?: GROUP_PARAGRAPH
     private fun android.content.SharedPreferences.hideNsfw(): Boolean = getBoolean(PREF_HIDE_NSFW, false)
     private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
     private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
@@ -1041,7 +1035,6 @@ abstract class ManhuaRMTL :
         private const val MAX_TRANSLATION_CACHE = 3000
         private const val TEXT_TOP_PADDING = 2f
         private const val OVERLAY_JPEG_QUALITY = 85
-        private const val GENRE_FETCH_ATTEMPTS = 3
         private const val PREF_CHAPTER_TEXT_MODE = "pref_chapter_text_mode"
         private const val PREF_OVERLAY_TEXT_SCALE = "pref_overlay_text_scale"
         private const val PREF_OCR_GROUPING = "pref_ocr_grouping"
