@@ -336,7 +336,7 @@ abstract class ManhuaRMTL :
         val hasScore = ratingScore != null && votesCount > 0
 
         val stars = if (hasScore) {
-            val score = ratingScore!!
+            val score = ratingScore
             // Site uses 0-5 scale: round to nearest int (5.0 → 5 stars, 4.4 → 4, 4.8 → 5)
             val fullStars = score.roundToInt().coerceIn(0, 5)
             "★".repeat(fullStars) + "☆".repeat(5 - fullStars) + " $score"
@@ -436,7 +436,7 @@ abstract class ManhuaRMTL :
 
     override suspend fun fetchChapterDocument(chapterUrl: String): Document {
         val response = client.get(chapterUrl)
-        val html = response.use { it.body?.string().orEmpty() }
+        val html = response.use { it.body.string() }
         lastChapterHtml = html
         return html.asJsoup(chapterUrl)
     }
@@ -582,7 +582,7 @@ abstract class ManhuaRMTL :
 
         return try {
             val response = auxClient.newCall(request).execute()
-            val body = response.body?.string()
+            val body = response.body.string()
             response.close()
 
             if (body.isNullOrBlank()) return null
@@ -636,7 +636,7 @@ abstract class ManhuaRMTL :
 
             auxClient.newCall(request).execute().use { resp ->
                 if (!resp.isSuccessful) return@use null
-                val body = resp.body?.string().orEmpty()
+                val body = resp.body.string()
                 if (body.isBlank()) return@use null
                 parseGtxResponse(body)
             }
@@ -689,14 +689,14 @@ abstract class ManhuaRMTL :
         if (textBoxes.isEmpty()) return response
 
         // Read the image bytes
-        val imageBytes = response.body?.bytes() ?: return response
+        val imageBytes = response.body.bytes()
         if (imageBytes.isEmpty()) return response
 
         // Overlay text on the image
         val modifiedBytes = overlayText(imageBytes, textBoxes, mode) ?: return response
 
         // Build new response with modified image
-        val contentType = response.body?.contentType()
+        val contentType = response.body.contentType()
         val newBody = modifiedBytes.toResponseBody(contentType)
 
         return response.newBuilder()

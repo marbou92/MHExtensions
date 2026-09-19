@@ -103,7 +103,7 @@ abstract class MKissa :
 
     /** Runs [parse] and reports whether the GraphQL body contains NEED_CAPTCHA. */
     private inline fun <T> Response.useAndDetectCaptcha(parse: (Response) -> T): Pair<T?, Boolean> = use { response ->
-        val body = response.body?.string().orEmpty()
+        val body = response.body.string()
         val captcha = body.contains("NEED_CAPTCHA")
         if (captcha) {
             null to true
@@ -111,7 +111,7 @@ abstract class MKissa :
             // Re-wrap the already-read body so parse() can treat it normally
             parse(
                 response.newBuilder()
-                    .body(body.toResponseBody(response.body?.contentType()))
+                    .body(body.toResponseBody(response.body.contentType()))
                     .build(),
             ) to false
         }
@@ -308,7 +308,7 @@ abstract class MKissa :
         if (url.host != baseUrl.removePrefix("https://")) return null
         val segments = url.pathSegments
         if (segments.size < 2 || segments[0] != "manga") return null
-        val mangaId = segments[1] ?: return null
+        val mangaId = segments[1]
 
         return fetchMangaDetails(mangaId).apply { initialized = true }
     }

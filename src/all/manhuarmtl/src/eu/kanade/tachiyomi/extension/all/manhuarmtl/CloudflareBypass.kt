@@ -151,7 +151,7 @@ class CloudflareBypass(
 
         try {
             client.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { resp ->
-                resp.body?.close()
+                resp.body.close()
             }
         } catch (_: Exception) {
             // Best-effort: without a host-side WebView solver the retry below

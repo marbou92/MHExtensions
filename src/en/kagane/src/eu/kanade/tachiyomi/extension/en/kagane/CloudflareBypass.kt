@@ -149,7 +149,7 @@ class CloudflareBypass(
 
         try {
             client.newCall(Request.Builder().url(url).build()).execute().use { resp ->
-                resp.body?.close()
+                resp.body.close()
             }
         } catch (_: Exception) {
             // Best-effort: the host app may lack a WebView solver or the
