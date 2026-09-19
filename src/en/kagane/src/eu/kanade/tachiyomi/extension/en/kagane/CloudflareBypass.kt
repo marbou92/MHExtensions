@@ -168,20 +168,31 @@ class CloudflareBypass(
         var attempt = 0
         while (isCloudflareBlock(response) && attempt < MAX_RETRIES) {
             attempt++
+            val isChallenge = isChallengeResponse(response)
             val retryAfterMs = response.header("Retry-After")
                 ?.trim()?.toLongOrNull()?.times(1000)
                 ?: (attempt * 1200L)
-
             response.close()
+
+            // Challenge pages resolve on the WebView's own clock — waiting a
+            // long backoff on top of the solve just adds latency. Rate limits
+            // (429) keep the real Retry-After / stepped backoff.
+            val backoffMs = if (isChallenge) CHALLENGE_BACKOFF_MS else retryAfterMs.coerceAtMost(5_000L)
+
+            // Mint a fresh clearance against the site root in parallel with
+            // the backoff (API URLs cannot be solved inside the WebView
+            // directly), then wait for the solve before retrying.
+            var primeThread: Thread? = null
+            if (isChallenge || attempt == 1) {
+                primeThread = Thread({ primeClearance() }, "CF-Prime").also { it.start() }
+            }
+
             try {
-                Thread.sleep(retryAfterMs.coerceAtMost(5_000L))
+                Thread.sleep(backoffMs)
             } catch (_: InterruptedException) {
                 Thread.currentThread().interrupt()
             }
-
-            // Before the second attempt, mint a fresh clearance against the
-            // site root (API URLs cannot be solved inside the WebView).
-            if (attempt == 1) primeClearance()
+            primeThread?.join(PRIME_JOIN_TIMEOUT_MS)
 
             response = chain.proceed(request)
         }
@@ -209,11 +220,15 @@ class CloudflareBypass(
         return server.contains("cloudflare", ignoreCase = true)
     }
 
+    private fun isChallengeResponse(response: Response): Boolean = response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true
+
     private fun String.toHttpUrlOrNull() = runCatching { toHttpUrl() }.getOrNull()
 
     private companion object {
         const val MAX_RETRIES = 3
-        const val PRIME_INTERVAL_MS = 30_000L
+        const val PRIME_INTERVAL_MS = 10_000L
+        const val PRIME_JOIN_TIMEOUT_MS = 30_000L
+        const val CHALLENGE_BACKOFF_MS = 300L
         val BLOCK_CODES = intArrayOf(403, 429, 503)
         val CHROME_VERSION_REGEX = Regex("""Chrome[/ ](\d+)""")
         val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp", "avif", "jxl", "svg")

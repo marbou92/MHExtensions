@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.all.manhuarmtl
 
+import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonElement
@@ -182,3 +183,14 @@ fun extractEnglish(raw: String): String {
 
     return result.trim()
 }
+
+/**
+ * Filter taxonomy payload cached by KeiSource between [ManhuaRMTL.getFilterList]
+ * invocations. Genres and tags are separate taxonomies on the site; keeping
+ * them apart is what keeps the Genres dialog small and fast.
+ */
+@Serializable
+internal class FilterTaxonomyDto(
+    val genres: List<GenreRoute> = emptyList(),
+    val tags: List<GenreRoute> = emptyList(),
+)

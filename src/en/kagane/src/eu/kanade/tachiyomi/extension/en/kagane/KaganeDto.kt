@@ -8,6 +8,7 @@ import kotlinx.serialization.Serializable
 import org.jsoup.Jsoup
 import java.text.SimpleDateFormat
 import java.util.Locale
+import kotlin.math.roundToInt
 
 @Serializable
 class GenreDto(
@@ -127,6 +128,11 @@ class DetailsDto(
     val trackerId: String? = null,
     @SerialName("series_covers")
     val covers: List<SeriesCover> = emptyList(),
+    // Optional rating fields — parsed when the API exposes them, silently
+    // null otherwise (kotlinx skips unknown keys both ways).
+    val rating: Double? = null,
+    @SerialName("average_rating")
+    val averageRating: Double? = null,
 ) {
     @Serializable
     class SeriesStaff(
@@ -158,6 +164,21 @@ class DetailsDto(
         val imageId: String,
     )
 
+    /**
+     * Star rating line (like our other sources), e.g. "★★★★☆ 4.2/5". The API's
+     * scale is not documented — values ≤ 5 are treated as 0–5, larger values
+     * as 0–10 (halved for the stars).
+     */
+    fun ratingStars(): String? {
+        val rating = rating ?: averageRating ?: return null
+        if (rating <= 0.0) return null
+        val outOfFive = rating <= 5.0
+        val normalized = if (outOfFive) rating else rating / 2.0
+        val full = normalized.roundToInt().coerceIn(0, 5)
+        val text = String.format(Locale.ENGLISH, "%.1f", normalized).removeSuffix(".0")
+        return "★".repeat(full) + "☆".repeat(5 - full) + " $text" + if (outOfFive) "/5" else "/10"
+    }
+
     fun toSManga(apiUrl: String, sourceName: String? = null, baseUrl: String = "", showEdition: Boolean = false, showSource: Boolean = false, cleanTitle: Boolean): SManga = SManga.create().apply {
         val base = this@DetailsDto.title.trim()
         val withEdition = if (showEdition && !this@DetailsDto.editionInfo.isNullOrBlank()) "$base (${this@DetailsDto.editionInfo})" else base
@@ -165,21 +186,45 @@ class DetailsDto(
         thumbnail_url = covers.firstOrNull()?.imageId?.let { "$apiUrl/image/$it" }
         val desc = StringBuilder()
 
-        // Add main description
+        // Rating stars (rendered once, at the top — like MKissa/ManhuaRMTL)
+        ratingStars()?.let {
+            desc.append(it).append("\n\n")
+        }
+
+        // Extra info block: publisher platform, publication status, book count
+        val infoLine = buildString {
+            this@DetailsDto.format?.takeIf { it.isNotBlank() }?.let { append("**Publisher:** $it") }
+            if (this@DetailsDto.publicationStatus.isNotBlank()) {
+                if (isNotEmpty()) append(" · ")
+                append("**Status:** ${this@DetailsDto.publicationStatus.trim().replaceFirstChar { c -> c.uppercase() }}")
+            }
+            if (this@DetailsDto.seriesBooks.isNotEmpty()) {
+                if (isNotEmpty()) append(" · ")
+                append("**Books:** ${this@DetailsDto.seriesBooks.size}")
+            }
+        }.ifBlank { null }
+        if (infoLine != null) {
+            desc.append(infoLine).append("\n\n")
+        }
+
+        // Tag list (tags are not part of the genre chips)
+        if (tags.isNotEmpty()) {
+            desc.append("**Tags:** ").append(tags.joinToString(", ") { it.tagName }).append("\n\n")
+        }
+
+        // Main description
         this@DetailsDto.description?.takeIf { it.isNotBlank() }?.let {
             desc.append(Jsoup.parse(it.trim().replace("\n", "<br>")).wholeText())
-            desc.append("\n")
+            desc.append("\n\n")
         }
 
-        // Add source name
+        // Source name
         if (sourceName != null && this@DetailsDto.sourceId != null) {
-            if (desc.isNotEmpty()) desc.append("\n")
-            desc.append("Source: [$sourceName]($baseUrl/sources/${this@DetailsDto.sourceId})\n")
+            desc.append("Source: [$sourceName]($baseUrl/sources/${this@DetailsDto.sourceId})\n\n")
         }
 
-        // Add alternate titles at the end
+        // Alternate titles at the end
         if (seriesAlternateTitles.isNotEmpty()) {
-            if (desc.isNotEmpty()) desc.append("\n")
             desc.append("Associated Name(s):\n")
             seriesAlternateTitles.forEach {
                 desc.append("• ${it.title}\n")

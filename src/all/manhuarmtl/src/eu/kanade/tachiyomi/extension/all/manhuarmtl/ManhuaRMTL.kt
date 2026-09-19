@@ -179,6 +179,7 @@ abstract class ManhuaRMTL :
                     is GenreConditionParamFilter -> addQueryParameter("op", filter.toUriPart())
                     is GenreParamFilter -> filter.state.filter { it.state }.forEach { addQueryParameter("genre[]", it.value) }
                     is ExcludeGenreParamFilter -> filter.state.filter { it.state }.forEach { addQueryParameter("exclude_genre[]", it.value) }
+                    is TagParamFilter -> filter.state.filter { it.state }.forEach { addQueryParameter("tag[]", it.value) }
                     else -> {}
                 }
             }
@@ -204,9 +205,12 @@ abstract class ManhuaRMTL :
 
         for (request in requests) {
             runCatching {
-                val parsed = parseGenreOptions(client.get(request).asJsoup())
-                if (parsed.isNotEmpty()) {
-                    return parsed.map { GenreRoute(it.first, it.second, "/genre/${it.second}/") }.toJsonElement()
+                val (genres, tags) = parseTaxonomy(client.get(request).asJsoup())
+                if (genres.isNotEmpty() || tags.isNotEmpty()) {
+                    return FilterTaxonomyDto(
+                        genres = genres.map { GenreRoute(it.first, it.second, "/genre/${it.second}/") },
+                        tags = tags.map { GenreRoute(it.first, it.second, "/tag/${it.second}/") },
+                    ).toJsonElement()
                 }
             }
         }
@@ -214,47 +218,95 @@ abstract class ManhuaRMTL :
         throw IOException("Could not load genres")
     }
 
-    /** Genre options in (name, slug) pairs, from several possible site layouts. */
-    private fun parseGenreOptions(document: Document): List<Pair<String, String>> {
-        // 1) Current MRM filter chips on the search page
-        val chips = document.select("div.mrm-fgroup__chips label.mrm-gchip--in, label.mrm-gchip")
-            .mapNotNull { label ->
+    /**
+     * Genre and tag options in (name, slug) pairs, from several possible site
+     * layouts. Genres and tags are kept SEPARATE: they used to be merged into
+     * one giant filter group, which made the Genres dialog enormous (both
+     * taxonomies rendered twice — include + exclude) and laggy to open.
+     */
+    private fun parseTaxonomy(document: Document): Pair<List<Pair<String, String>>, List<Pair<String, String>>> {
+        val genres = linkedMapOf<String, Pair<String, String>>()
+        val tags = linkedMapOf<String, Pair<String, String>>()
+
+        fun put(bucket: MutableMap<String, Pair<String, String>>, name: String, slug: String) {
+            if (name.isNotBlank() && slug.isNotBlank()) bucket.putIfAbsent(slug.lowercase(), name to slug)
+        }
+
+        // 1) Current MRM filter groups on the search page. Each group has a
+        //    title, which lets us split GENRE chips from TAG chips (both use
+        //    the same mrm-gchip markup — this is how tags used to end up
+        //    inside the Genres filter).
+        val groups = document.select("div.mrm-fgroup")
+        for (group in groups) {
+            val title = group.selectFirst(
+                "[class*='fgroup__title'], [class*=\"fgroup__title\"], h3, h4, h5, legend",
+            )?.text()?.lowercase().orEmpty()
+            val isTagGroup = title.contains("tag")
+
+            for (label in group.select("label.mrm-gchip--in, label.mrm-gchip")) {
                 val name = label.selectFirst("span")?.text()?.takeIf { it.isNotBlank() }
                     ?: label.ownText().takeIf { it.isNotBlank() }
-                    ?: return@mapNotNull null
+                    ?: continue
                 val id = label.selectFirst("input[type=checkbox]")?.`val`()?.takeIf { it.isNotBlank() }
                     ?: name.slugify()
-                name to id
+                put(if (isTagGroup) tags else genres, name, id)
             }
-            .distinctBy { it.second.lowercase() }
-        if (chips.isNotEmpty()) return chips
+        }
+
+        // 1b) Chips without group titles (or groups the selector missed):
+        //     treat every chip as a GENRE (the historical behaviour) — never
+        //     guess tags from unlabelled chips.
+        if (groups.isEmpty()) {
+            document.select("div.mrm-fgroup__chips label.mrm-gchip--in, label.mrm-gchip")
+                .forEach { label ->
+                    val name = label.selectFirst("span")?.text()?.takeIf { it.isNotBlank() }
+                        ?: label.ownText().takeIf { it.isNotBlank() }
+                        ?: return@forEach
+                    val id = label.selectFirst("input[type=checkbox]")?.`val`()?.takeIf { it.isNotBlank() }
+                        ?: name.slugify()
+                    put(genres, name, id)
+                }
+        }
+
+        if (genres.isNotEmpty() || tags.isNotEmpty()) {
+            return genres.values.toList() to tags.values.toList()
+        }
 
         // 2) Standard Madara checkbox group (in case the theme reverts)
-        val checkboxes = document.selectFirst("div.checkbox-group")
+        document.selectFirst("div.checkbox-group")
             ?.select("div.checkbox")
-            ?.mapNotNull { li ->
-                val name = li.selectFirst("label")?.text()?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            ?.forEach { li ->
+                val name = li.selectFirst("label")?.text()?.takeIf { it.isNotBlank() } ?: return@forEach
                 val id = li.selectFirst("input[type=checkbox]")?.`val`()?.takeIf { it.isNotBlank() }
                     ?: name.slugify()
-                name to id
+                put(genres, name, id)
             }
-            .orEmpty()
-            .distinctBy { it.second.lowercase() }
-        if (checkboxes.isNotEmpty()) return checkboxes
+        if (genres.isNotEmpty()) return genres.values.toList() to tags.values.toList()
 
-        // 3) Genre nav/tag links (homepage menus, details pages) — the href
-        //    slug is exactly what the search endpoint expects in genre[].
-        return document.select("a[href*='/genre/'], a[href*=\"/genre/\"], div.mrm-genres__list a[rel=tag]")
-            .mapNotNull { a ->
+        // 3) Taxonomy nav links (homepage menus, details pages) — the href
+        //    slug is exactly what the search endpoint expects. Genre links
+        //    carry /genre/<slug>/, tag links /tag/<slug>/; rel=tag is generic
+        //    WordPress taxonomy markup and appears on BOTH, so the href wins.
+        document.select("a[href*='/genre/'], a[href*=\"/genre/\"], div.mrm-genres__list a")
+            .forEach { a ->
                 val href = a.attr("href")
                 val slug = href.substringAfter("/genre/").trimEnd('/').substringBefore('?').substringBefore('#')
-                if (slug.isBlank()) return@mapNotNull null
+                if (slug.isBlank()) return@forEach
                 val name = a.text().takeIf { it.isNotBlank() }
                     ?: slug.replace('-', ' ').replaceFirstChar { it.uppercase() }
-                name to slug
+                put(genres, name, slug)
             }
-            .filter { it.second.isNotBlank() }
-            .distinctBy { it.second.lowercase() }
+        document.select("a[href*='/tag/'], a[href*=\"/tag/\"]")
+            .forEach { a ->
+                val href = a.attr("href")
+                val slug = href.substringAfter("/tag/").trimEnd('/').substringBefore('?').substringBefore('#')
+                if (slug.isBlank()) return@forEach
+                val name = a.text().takeIf { it.isNotBlank() }
+                    ?: slug.replace('-', ' ').replaceFirstChar { it.uppercase() }
+                put(tags, name, slug)
+            }
+
+        return genres.values.toList() to tags.values.toList()
     }
 
     private fun String.slugify(): String = trim()
@@ -901,8 +953,12 @@ abstract class ManhuaRMTL :
 
     private class ExcludeGenreParamFilter(title: String, genres: List<GenreRoute>) : Filter.Group<GenreTag>(title, genres.map { GenreTag(it.name, it.slug) })
 
+    private class TagParamFilter(title: String, tags: List<GenreRoute>) : Filter.Group<GenreTag>(title, tags.map { GenreTag(it.name, it.slug) })
+
     override fun getFilterList(data: JsonElement?): FilterList {
-        val genres = runCatching { data?.parseAs<List<GenreRoute>>() }.getOrNull().orEmpty()
+        val taxonomy = runCatching { data?.parseAs<FilterTaxonomyDto>() }.getOrNull()
+        val genres = taxonomy?.genres.orEmpty()
+        val tags = taxonomy?.tags.orEmpty()
 
         return FilterList(
             buildList {
@@ -922,6 +978,11 @@ abstract class ManhuaRMTL :
                 } else {
                     add(Filter.Separator())
                     add(Filter.Header("Genres are loading — press 'Reset' to retry"))
+                }
+                if (tags.isNotEmpty()) {
+                    add(Filter.Separator())
+                    add(Filter.Header("Tags (separate from genres — e.g. Full color)"))
+                    add(TagParamFilter("Tags", tags))
                 }
             },
         )
@@ -993,10 +1054,12 @@ abstract class ManhuaRMTL :
         androidx.preference.ListPreference(screen.context).apply {
             key = PREF_OVERLAY_TEXT_SCALE
             title = "Overlay text size"
-            summary = "Scale of the burned-in overlay text relative to the website (the middle option matches the site)"
-            entries = arrayOf("75% (smaller)", "100% (same as site)", "135% (bigger)", "160% (biggest)")
+            // NOTE: ListPreference summaries are printf format strings — write
+            // literal percent signs as %% or the settings screen crashes.
+            summary = "Scale of the burned-in overlay text relative to the website (135%% is the default)"
+            entries = arrayOf("75% (smaller)", "100% (same as site)", "135% (default)", "160% (biggest)")
             entryValues = arrayOf("0.75", "1.0", "1.35", "1.6")
-            setDefaultValue("1.0")
+            setDefaultValue("1.35")
         }.let(screen::addPreference)
 
         // OCR text grouping — the site keeps every OCR block separate (it cuts
@@ -1058,11 +1121,11 @@ abstract class ManhuaRMTL :
 
     private fun chapterTextMode(): String = preferences.getString(PREF_CHAPTER_TEXT_MODE, MODE_EN) ?: MODE_EN
 
-    private fun overlayTextScale(): Float = when (preferences.getString(PREF_OVERLAY_TEXT_SCALE, "1.0")) {
+    private fun overlayTextScale(): Float = when (preferences.getString(PREF_OVERLAY_TEXT_SCALE, "1.35")) {
         "0.75" -> 0.75f
-        "1.35" -> 1.35f
+        "1.0" -> 1.0f
         "1.6" -> 1.6f
-        else -> 1.0f
+        else -> 1.35f
     }
 
     private fun android.content.SharedPreferences.hideNsfw(): Boolean = getBoolean(PREF_HIDE_NSFW, false)

@@ -431,9 +431,19 @@ abstract class MKissa :
             }
         }
 
-        val edges = parsed?.data?.chapterPages?.edges.orEmpty()
+        val result = parsed
+        val edges = result?.data?.chapterPages?.edges.orEmpty()
         val edge = edges.firstOrNull { it.pictureUrls.isNotEmpty() }
-            ?: throw IOException("No pages found for chapter $chapterString")
+
+        if (edge == null) {
+            // Surface the API's own reason (e.g. "Error Re-captcha!", bad
+            // chapter id) instead of the misleading "no pages" message.
+            result?.firstErrorMessage()?.let { throw IOException("MKissa: $it") }
+            throw IOException(
+                "No pages found for chapter $chapterString. " +
+                    "Refresh the chapter list; if it persists, the chapter may have no readable pages yet.",
+            )
+        }
 
         val head = edge.pictureUrlHead?.takeIf { it.isNotBlank() } ?: ""
         return edge.pictureUrls.mapIndexed { index, rawUrl ->

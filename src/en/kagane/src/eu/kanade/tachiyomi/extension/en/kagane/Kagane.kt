@@ -40,6 +40,7 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import okio.IOException
+import java.util.concurrent.TimeUnit
 
 @Source
 abstract class Kagane :
@@ -54,8 +55,34 @@ abstract class Kagane :
 
     private val prefs = getPreferences()
 
+    /**
+     * Client used to prime Cloudflare clearance against the site root. It must
+     * NOT have the [CloudflareBypass] priming itself installed (the app's own
+     * Cloudflare WebView interceptor on network.client performs the solve) —
+     * only the cookie-sync/fingerprint/retry hardening, no primeUrl.
+     */
+    private val primeClient: OkHttpClient by lazy {
+        network.client.newBuilder()
+            .connectTimeout(30, TimeUnit.SECONDS)
+            .readTimeout(45, TimeUnit.SECONDS)
+            .apply {
+                CloudflareBypass(cookieHosts = setOf(domain)).install(this)
+            }
+            .build()
+    }
+
     override fun OkHttpClient.Builder.configureClient() = apply {
         addInterceptor(::refreshTokenInterceptor)
+
+        // The API shares kagane.to with the site, so Cloudflare challenges on
+        // /api/v2 XHR URLs can never be solved by the app's WebView directly;
+        // the bypass primes the site root (a real HTML page) and retries.
+        CloudflareBypass(
+            cookieHosts = setOf(domain),
+            primeUrl = "$baseUrl/",
+            primeClient = primeClient,
+        ).install(this)
+
         rateLimit(3)
     }
 
@@ -341,19 +368,50 @@ abstract class Kagane :
     private var integrityToken: String = ""
     private var integrityExp = System.currentTimeMillis()
 
+    /**
+     * Integrity token with a persistent cache. The token used to live in
+     * memory only, so EVERY app start paid a site-root GET plus an
+     * /api/integrity POST before the first details/chapter/pages call could
+     * even begin — the main reason entering Kagane felt slow. The token is
+     * bound to the device (IP/UA), not to a session, so caching it in the
+     * source prefs is safe.
+     */
     private suspend fun getIntegrityToken(): String {
-        if (integrityExp < System.currentTimeMillis()) {
-            client.get("$baseUrl/").close()
+        val now = System.currentTimeMillis()
+        if (integrityExp > now + INTEGRITY_SAFETY_WINDOW_MS) return integrityToken
 
-            val res = client.post(
-                "$baseUrl/api/integrity",
-                "".toJsonRequestBody(),
-            ).parseAs<IntegrityDto>()
-            integrityToken = res.token
-            integrityExp = res.exp * 1000
+        // Memory cache miss — try the persistent cache (survives restarts)
+        val cachedToken = prefs.getStringSafe(PREF_INTEGRITY_TOKEN, null)
+        val cachedExp = prefs.getStringSafe(PREF_INTEGRITY_EXP, null)?.toLongOrNull() ?: 0L
+        if (!cachedToken.isNullOrBlank() && cachedExp > now + INTEGRITY_SAFETY_WINDOW_MS) {
+            integrityToken = cachedToken
+            integrityExp = cachedExp
+            return cachedToken
         }
 
+        client.get("$baseUrl/").close()
+
+        val res = client.post(
+            "$baseUrl/api/integrity",
+            "".toJsonRequestBody(),
+        ).parseAs<IntegrityDto>()
+        integrityToken = res.token
+        integrityExp = res.exp * 1000
+        prefs.edit()
+            .putString(PREF_INTEGRITY_TOKEN, res.token)
+            .putString(PREF_INTEGRITY_EXP, (res.exp * 1000).toString())
+            .apply()
         return integrityToken
+    }
+
+    /** Drops a possibly-stale cached token so the next attempt re-mints it. */
+    private fun clearIntegrityToken() {
+        integrityToken = ""
+        integrityExp = System.currentTimeMillis()
+        prefs.edit()
+            .remove(PREF_INTEGRITY_TOKEN)
+            .remove(PREF_INTEGRITY_EXP)
+            .apply()
     }
 
     private suspend fun getChallengeResponse(chapterId: String): ChallengeDto {
@@ -368,6 +426,15 @@ abstract class Kagane :
         val headers = headers.newBuilder().add("x-integrity-token", integrityToken).build()
 
         val response = client.post(challengeUrl.toString(), headers, challengeBody)
+
+        if (!response.isSuccessful) {
+            val code = response.code
+            response.close()
+            // 401/403 usually mean the cached integrity token went stale —
+            // drop it so the next attempt re-mints instead of failing forever.
+            if (code == 401 || code == 403) clearIntegrityToken()
+            throw IOException("Kagane returned HTTP $code while requesting the book")
+        }
 
         return response.parseAs<ChallengeDto>()
     }
@@ -514,6 +581,10 @@ abstract class Kagane :
         private const val SHOW_EDITION_DEFAULT = false
 
         private const val DATA_SAVER = "kagane_data_saver"
+
+        private const val PREF_INTEGRITY_TOKEN = "kagane_integrity_token"
+        private const val PREF_INTEGRITY_EXP = "kagane_integrity_exp"
+        private const val INTEGRITY_SAFETY_WINDOW_MS = 60_000L
 
         private const val CHAPTER_TITLE_MODE = "kagane_chapter_title_mode"
         private const val CHAPTER_TITLE_MODE_DEFAULT = "optional"

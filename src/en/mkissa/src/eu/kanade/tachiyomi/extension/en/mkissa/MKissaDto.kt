@@ -371,7 +371,11 @@ private fun MangaDetail.datedChapters(
 
 private fun String.toSChapter(mangaId: String, translation: String, date: Long): SChapter = SChapter.create().apply {
     val suffix = if (translation == "raw") " (Raw)" else ""
-    url = "/manga/$mangaId/chapter-$this@toSChapter-$translation"
+    // NOTE: must be "${this@toSChapter}" — without braces "$this" interpolates
+    // the SChapter object being built (toString -> "SChapterImpl@..."), which
+    // poisoned every chapter URL with the object identity string and broke
+    // all page fetches.
+    url = "/manga/$mangaId/chapter-${this@toSChapter}-$translation"
     name = "Ch. ${this@toSChapter.removeSuffix(".0")}$suffix"
     chapter_number = this@toSChapter.toFloatOrNull() ?: -1f
     date_upload = date
@@ -390,6 +394,15 @@ private fun String.toSChapter(mangaId: String, translation: String, date: Long):
 @Serializable
 class ChapterPagesDto(
     val data: ChapterPagesData? = null,
+    val errors: List<ChapterPagesError> = emptyList(),
+) {
+    /** First server-side error message, if the API rejected the query. */
+    fun firstErrorMessage(): String? = errors.firstOrNull()?.message?.takeIf(String::isNotBlank)
+}
+
+@Serializable
+class ChapterPagesError(
+    val message: String? = null,
 )
 
 @Serializable
