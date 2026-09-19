@@ -11,12 +11,7 @@ internal fun DependencyHandlerScope.api(dependencyNotation: Provider<MinimalExte
     add("api", dependencyNotation)
 }
 
-@JvmName("compileOnlyBundle")
 internal fun DependencyHandlerScope.compileOnly(dependencyNotation: Provider<ExternalModuleDependencyBundle>) {
-    add("compileOnly", dependencyNotation)
-}
-
-internal fun DependencyHandlerScope.compileOnly(dependencyNotation: Provider<MinimalExternalModuleDependency>) {
     add("compileOnly", dependencyNotation)
 }
 

@@ -3,12 +3,13 @@ plugins {
 }
 
 dependencies {
+    api(project(":lib:cryptoaes"))
     api(project(":lib:i18n"))
 }
 
 keiyoushi {
-    baseVersionCode = 55
-    libVersion = "1.6"
+    baseVersionCode = 51
+    libVersion = "1.4"
 
     deeplink {
         path("/.*/..*")

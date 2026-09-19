@@ -4,6 +4,8 @@ import androidx.preference.EditTextPreference
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
+import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.POST
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -11,111 +13,71 @@ import eu.kanade.tachiyomi.source.model.MangasPage
 import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
-import eu.kanade.tachiyomi.source.model.SMangaUpdate
+import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
-import keiyoushi.network.post
-import keiyoushi.network.rateLimit
-import keiyoushi.source.KeiSource
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
-import keiyoushi.utils.runWebView
-import keiyoushi.utils.toJsonRequestBody
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
-import okhttp3.Headers
-import okhttp3.HttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.IOException
-import kotlin.time.Duration.Companion.seconds
+import java.util.concurrent.TimeUnit
+
+private val JSON_MEDIA = "application/json".toMediaType()
 
 @Source
 abstract class MKissa :
-    KeiSource(),
+    HttpSource(),
     ConfigurableSource {
+
+    override val supportsLatest = true
 
     private val preferences = getPreferences()
 
     private val apiHost = "api.mkissa.net"
     private val apiUrl = "https://$apiHost/api"
 
-    override fun OkHttpClient.Builder.configureClient() = apply {
-        connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
-        readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
-        writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+    override val client: OkHttpClient = network.client.newBuilder()
+        .connectTimeout(30, TimeUnit.SECONDS)
+        .readTimeout(60, TimeUnit.SECONDS)
+        .writeTimeout(30, TimeUnit.SECONDS)
+        .apply {
+            // MKissa's API sits on a separate host: sync WebView cookies for both
+            // the site and the API host and fingerprint all requests.
+            CloudflareBypass(setOf(baseUrl.removePrefix("https://"), apiHost)).install(this)
+        }
+        .build()
 
-        // MKissa's API sits on a separate host: sync WebView cookies for both
-        // the site and the API host and fingerprint all requests.
-        CloudflareBypass(setOf(baseUrl.removePrefix("https://"), apiHost)).install(this)
+    override fun headersBuilder() = super.headersBuilder()
+        .add("Referer", "$baseUrl/")
+        .add("Origin", baseUrl)
+        .add("Accept", "application/json")
 
-        rateLimit(2)
-    }
-
-    override fun Headers.Builder.configureHeaders() = apply {
-        add("Referer", "$baseUrl/")
-        add("Origin", baseUrl)
-        add("Accept", "application/json")
+    private val apiHeaders by lazy {
+        headersBuilder().set("Content-Type", "application/json").build()
     }
 
     /**
      * Executes a plain GraphQL query against the API. The API supports
-     * introspection and full queries, so we do not depend on fragile
+     * introspection and full queries, so we no longer depend on fragile
      * persisted-query hashes.
-     *
-     * `captchaToken` (optional) is attached as `extensions.captcha` exactly
-     * like the site's own client does after solving its Turnstile challenge:
-     * `{"query":..., "variables":..., "extensions":{"captcha":{"token":..,"provider":..}}}`
      */
-    private suspend fun graphql(
-        query: String,
-        variables: JsonObject,
-        captchaToken: Pair<String, String>? = null,
-    ): Response = client.post(
+    private fun graphqlRequest(query: String, variables: JsonObject): Request = POST(
         apiUrl,
+        apiHeaders,
         buildJsonObject {
             put("query", query)
             put("variables", variables)
-            if (captchaToken != null) {
-                put(
-                    "extensions",
-                    buildJsonObject {
-                        put(
-                            "captcha",
-                            buildJsonObject {
-                                put("token", captchaToken.first)
-                                put("provider", captchaToken.second)
-                            },
-                        )
-                    },
-                )
-            }
-        }.toJsonRequestBody(),
+        }.toString().toRequestBody(JSON_MEDIA),
     )
-
-    /** Runs [parse] and reports whether the GraphQL body contains NEED_CAPTCHA. */
-    private inline fun <T> Response.useAndDetectCaptcha(parse: (Response) -> T): Pair<T?, Boolean> = use { response ->
-        val body = response.body.string()
-        val captcha = body.contains("NEED_CAPTCHA")
-        if (captcha) {
-            null to true
-        } else {
-            // Re-wrap the already-read body so parse() can treat it normally
-            parse(
-                response.newBuilder()
-                    .body(body.toResponseBody(response.body.contentType()))
-                    .build(),
-            ) to false
-        }
-    }
 
     private val allowAdult: Boolean
         get() = preferences.defaultContentRatings().contains("Pornographic") ||
@@ -165,20 +127,20 @@ abstract class MKissa :
 
     // ============================== Popular ==============================
 
-    override suspend fun getPopularManga(page: Int): MangasPage {
-        val response = graphql(
-            query = QUERY_POPULAR,
-            variables = buildJsonObject {
-                put("type", "manga")
-                put("size", PAGE_SIZE)
-                put("page", page)
-                put("dateRange", 1)
-                put("allowAdult", allowAdult)
-                put("allowUnknown", false)
-                put("denyEcchi", false)
-            },
-        )
+    override fun popularMangaRequest(page: Int): Request = graphqlRequest(
+        query = QUERY_POPULAR,
+        variables = buildJsonObject {
+            put("type", "manga")
+            put("size", PAGE_SIZE)
+            put("page", page)
+            put("dateRange", 1)
+            put("allowAdult", allowAdult)
+            put("allowUnknown", false)
+            put("denyEcchi", false)
+        },
+    )
 
+    override fun popularMangaParse(response: Response): MangasPage {
         val popular = response.parseAs<PopularDto>().data?.queryPopular
         val cards = popular?.recommendations?.mapNotNull { it.anyCard }.orEmpty()
 
@@ -198,32 +160,30 @@ abstract class MKissa :
     // "Latest_Update" is the API's own sort value for recently-updated manga.
     // The old build used "Trending" here, which surfaced almost the same
     // entries as the Popular tab.
-    override suspend fun getLatestUpdates(page: Int): MangasPage {
-        val response = graphql(
-            query = QUERY_MANGA_LIST,
-            variables = baseSearchVariables(
-                page = page,
-                sortBy = "Latest_Update",
-                ascending = false,
-                query = "",
-                genres = emptyList(),
-                genresExcluded = emptyList(),
-                genresMatchAll = true,
-                tags = emptyList(),
-                tagsExcluded = emptyList(),
-                authors = emptyList(),
-                year = null,
-                season = null,
-                minChapters = null,
-            ),
-        )
+    override fun latestUpdatesRequest(page: Int): Request = graphqlRequest(
+        query = QUERY_MANGA_LIST,
+        variables = baseSearchVariables(
+            page = page,
+            sortBy = "Latest_Update",
+            ascending = false,
+            query = "",
+            genres = emptyList(),
+            genresExcluded = emptyList(),
+            genresMatchAll = true,
+            tags = emptyList(),
+            tagsExcluded = emptyList(),
+            authors = emptyList(),
+            year = null,
+            season = null,
+            minChapters = null,
+        ),
+    )
 
-        return mangaListParse(response)
-    }
+    override fun latestUpdatesParse(response: Response): MangasPage = mangaListParse(response)
 
     // =============================== Search ===============================
 
-    override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         var sortBy = "Top"
         var ascending = false
         val genres = mutableListOf<String>()
@@ -264,7 +224,7 @@ abstract class MKissa :
             }
         }
 
-        val response = graphql(
+        return graphqlRequest(
             query = QUERY_MANGA_LIST,
             variables = baseSearchVariables(
                 page = page,
@@ -282,9 +242,9 @@ abstract class MKissa :
                 minChapters = minChapters,
             ),
         )
-
-        return mangaListParse(response)
     }
+
+    override fun searchMangaParse(response: Response): MangasPage = mangaListParse(response)
 
     private fun mangaListParse(response: Response): MangasPage {
         val mangas = response.parseAs<MangaListDto>()
@@ -300,25 +260,18 @@ abstract class MKissa :
         return MangasPage(mangas, mangas.size >= PAGE_SIZE)
     }
 
-    // ====================== Manga Details + Chapters ======================
+    // ============================== Details ==============================
+
+    override fun mangaDetailsRequest(manga: SManga): Request = graphqlRequest(
+        query = QUERY_MANGA_DETAILS,
+        variables = buildJsonObject {
+            put("_id", manga.url)
+        },
+    )
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl/manga/${manga.url}"
 
-    override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (url.host != baseUrl.removePrefix("https://")) return null
-        val segments = url.pathSegments
-        if (segments.size < 2 || segments[0] != "manga") return null
-        val mangaId = segments[1]
-
-        return fetchMangaDetails(mangaId).apply { initialized = true }
-    }
-
-    private suspend fun fetchMangaDetails(mangaId: String): SManga {
-        val response = graphql(
-            query = QUERY_MANGA_DETAILS,
-            variables = buildJsonObject { put("_id", mangaId) },
-        )
-
+    override fun mangaDetailsParse(response: Response): SManga {
         val detail = response.parseAs<MangaDetailDto>().data?.manga
             ?: throw IOException("Manga not found")
 
@@ -331,196 +284,34 @@ abstract class MKissa :
         )
     }
 
-    override suspend fun fetchMangaUpdate(
-        manga: SManga,
-        chapters: List<SChapter>,
-        fetchDetails: Boolean,
-        fetchChapters: Boolean,
-    ): SMangaUpdate = coroutineScope {
-        val response = graphql(
-            query = QUERY_MANGA_DETAILS,
-            variables = buildJsonObject { put("_id", manga.url) },
-        )
+    // ============================= Chapters ==============================
 
+    override fun chapterListRequest(manga: SManga): Request = mangaDetailsRequest(manga)
+
+    override fun chapterListParse(response: Response): List<SChapter> {
         val detail = response.parseAs<MangaDetailDto>().data?.manga
             ?: throw IOException("Manga not found")
-
-        val detailsDeferred = async {
-            if (fetchDetails) {
-                detail.toSManga(
-                    showAltNames = preferences.showAltNames(),
-                    showExtraInfo = preferences.showExtraInfo(),
-                    showTagsInGenre = preferences.showTagsInGenre(),
-                    blockedGenres = preferences.blockedGenres(),
-                    scorePosition = preferences.scorePosition(),
-                )
-            } else {
-                manga
-            }
-        }
-
-        val chaptersDeferred = async {
-            if (fetchChapters) {
-                detail.toChapterList()
-            } else {
-                chapters
-            }
-        }
-
-        SMangaUpdate(detailsDeferred.await(), chaptersDeferred.await())
+        return detail.toChapterList()
     }
 
     // =============================== Pages ===============================
-    //
-    // Reverse engineered reader flow (verified against the site's JS, 2026-09):
-    //
-    // 1. The reader POSTs `chapterPages` GraphQL queries to api.mkissa.net.
-    // 2. The server answers NEED_CAPTCHA until the request carries the site's
-    //    Cloudflare Turnstile token inside `extensions.captcha`
-    //    ({"token": <token>, "provider": "turnstile1"}) — verified live: the
-    //    error changes from NEED_CAPTCHA to "Error Re-captcha!" once the
-    //    extensions block exists, so this is the accepted envelope.
-    // 3. The site solves Turnstile in a hidden iframe page
-    //    (https://api.mkissa.net/captcha/turnstile, sitekey
-    //    0x4AAAAAADXpHZ1lTeqKwhch) which posts {type:"sitea-captcha-ready",
-    //    token, provider} to its parent window (class "LL" in the site bundle).
-    // 4. The retry returns `chapterPages.edges[].pictureUrls` — relative paths
-    //    resolved against `pictureUrlHead` (or absolute URLs used as-is).
 
-    override suspend fun getPageList(chapter: SChapter): List<Page> {
-        // url format: "/manga/<mangaId>/chapter-<chapterString>-<translation>"
-        val parts = chapter.url.split("/")
-        if (parts.size < 5) throw IOException("Outdated chapter URL. Refresh the chapter list.")
-        val mangaId = parts[2]
-        val chapterInfo = parts[4].removePrefix("chapter-")
-        val chapterString = chapterInfo.substringBeforeLast("-")
-        val translation = chapterInfo.substringAfterLast("-", "sub")
+    override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl/", headers)
 
-        var response = graphql(
-            query = QUERY_CHAPTER_PAGES,
-            variables = buildJsonObject {
-                put("_id", mangaId)
-                put("translationType", translation)
-                put("chapterString", chapterString)
-            },
-        )
+    override fun pageListParse(response: Response): List<Page> = throw IOException(
+        "MKissa requires an interactive Cloudflare Turnstile security check " +
+            "before serving chapter images (the API answers NEED_CAPTCHA and " +
+            "verifies the token server-side, so it cannot be reproduced outside " +
+            "a browser). Read this chapter on the site: $baseUrl/manga/",
+    )
 
-        var captchaDetected = false
-        var parsed: ChapterPagesDto? = null
-        response.useAndDetectCaptcha { r -> r.parseAs<ChapterPagesDto>() }.let { (result, captcha) ->
-            parsed = result
-            captchaDetected = captcha
-        }
-
-        if (captchaDetected) {
-            val (token, provider) = solveCaptchaToken()
-            response = graphql(
-                query = QUERY_CHAPTER_PAGES,
-                variables = buildJsonObject {
-                    put("_id", mangaId)
-                    put("translationType", translation)
-                    put("chapterString", chapterString)
-                },
-                captchaToken = token to provider,
-            )
-
-            response.useAndDetectCaptcha { r -> r.parseAs<ChapterPagesDto>() }.let { (result, captcha) ->
-                if (captcha) throw IOException("MKissa rejected the security check. Try again in a few moments.")
-                parsed = result
-            }
-        }
-
-        val edges = parsed?.data?.chapterPages?.edges.orEmpty()
-        val edge = edges.firstOrNull { it.pictureUrls.isNotEmpty() }
-            ?: throw IOException("No pages found for chapter $chapterString")
-
-        val head = edge.pictureUrlHead?.takeIf { it.isNotBlank() } ?: ""
-        return edge.pictureUrls.mapIndexed { index, rawUrl ->
-            val imageUrl = when {
-                rawUrl.startsWith("http") -> rawUrl
-                head.isBlank() -> rawUrl.trimStart('/')
-                else -> head.trimEnd('/') + "/" + rawUrl.trimStart('/')
-            }
-            Page(index, imageUrl = imageUrl)
-        }
-    }
-
-    /**
-     * Solves MKissa's Turnstile challenge exactly like the site does:
-     * a small host page (origin api.mkissa.net, the same origin the site's
-     * own iframe page lives on) embeds the site's captcha iframe and forwards
-     * its `sitea-captcha-ready` postMessage to a JS bridge.
-     *
-     * The Turnstile widget usually resolves by itself in the off-screen
-     * WebView; a real token is bound to the device IP, which is exactly what
-     * the subsequent GraphQL request needs.
-     */
-    private suspend fun solveCaptchaToken(): Pair<String, String> = runWebView(timeout = 90.seconds) {
-        var done = false
-
-        fun parseMessageField(message: String, field: String): String? = runCatching {
-            (Json.parseToJsonElement(message) as? JsonObject)?.get(field)?.let { element ->
-                (element as? JsonPrimitive)?.content
-            }
-        }.getOrNull()
-
-        jsBridge("mkCaptcha") { message ->
-            if (done) return@jsBridge
-            val token = parseMessageField(message, "token")
-
-            if (!token.isNullOrBlank()) {
-                val provider = parseMessageField(message, "provider") ?: "turnstile1"
-                done = true
-                resolve(token to provider)
-            } else {
-                reject(IOException("MKissa security check failed. Please try again."))
-            }
-        }
-
-        onPageFinished { _ ->
-            // Nudge the iframe to (re)execute if it is still waiting after load.
-            evaluateJs(
-                """
-                (function () {
-                  try {
-                    var f = document.getElementById('cap');
-                    if (f && f.contentWindow && f.contentWindow.parent === window) {
-                      f.contentWindow.postMessage({ type: 'sitea-captcha-execute' }, '*');
-                    }
-                  } catch (e) {}
-                })();
-                """,
-            )
-        }
-
-        loadData(
-            baseUrl = "https://$apiHost/",
-            html = """
-                <html>
-                  <body style="margin:0;background:transparent">
-                    <iframe id="cap" src="https://$apiHost/captcha/turnstile"
-                            style="width:320px;height:80px;border:0" allow="cross-origin-isolated"></iframe>
-                    <script>
-                      window.addEventListener('message', function (e) {
-                        try {
-                          var d = e.data;
-                          if (d && (d.type === 'sitea-captcha-ready')) {
-                            window.mkCaptcha.post(JSON.stringify(d));
-                          }
-                        } catch (err) {}
-                      });
-                    </script>
-                  </body>
-                </html>
-            """.trimIndent(),
-        )
-    }
+    override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
     // ========================================================================
     // Filters
     // ========================================================================
 
-    override fun getFilterList(data: kotlinx.serialization.json.JsonElement?): FilterList = FilterList(
+    override fun getFilterList(): FilterList = FilterList(
         SortFilter(),
         GenreMatchModeFilter(),
         GenreFilter(),
@@ -779,7 +570,6 @@ abstract class MKissa :
 
     companion object {
         private const val PAGE_SIZE = 24
-
         private val SORT_OPTIONS = arrayOf(
             "Top",
             "Trending",
@@ -857,22 +647,6 @@ abstract class MKissa :
                 averageScore
                 pageStatus { userScoreAverValue }
                 availableChaptersDetail
-              }
-            }
-        """
-
-        // Matches the site's reader document ($j in its bundle): pages live in
-        // chapterPages.edges[].pictureUrls (paths resolved against
-        // pictureUrlHead).
-        private const val QUERY_CHAPTER_PAGES = """
-            query(${'$'}_id: String!, ${'$'}translationType: VaildTranslationTypeMangaEnumType!, ${'$'}chapterString: String!) {
-              chapterPages(mangaId: ${'$'}_id, translationType: ${'$'}translationType, chapterString: ${'$'}chapterString, limit: 400) {
-                edges {
-                  chapterString
-                  pictureUrls
-                  pictureUrlHead
-                  sourceName
-                }
               }
             }
         """

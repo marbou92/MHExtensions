@@ -376,36 +376,3 @@ private fun String.toSChapter(mangaId: String, translation: String, date: Long):
     chapter_number = this@toSChapter.toFloatOrNull() ?: -1f
     date_upload = date
 }
-
-// ------------------------------------------------------------------
-// Chapter pages (reverse engineered reader response)
-// ------------------------------------------------------------------
-
-/**
- * Response of the `chapterPages` GraphQL query used by the site's reader.
- * `pictureUrls` is an opaque Object scalar in the schema — live responses
- * carry an array of image paths/URLs; `pictureUrlHead` is the prefix those
- * relative paths resolve against.
- */
-@Serializable
-class ChapterPagesDto(
-    val data: ChapterPagesData? = null,
-)
-
-@Serializable
-class ChapterPagesData(
-    val chapterPages: ChapterPagesConnection? = null,
-)
-
-@Serializable
-class ChapterPagesConnection(
-    val edges: List<ChapterPageEdge> = emptyList(),
-)
-
-@Serializable
-class ChapterPageEdge(
-    val chapterString: String? = null,
-    val pictureUrls: List<String> = emptyList(),
-    val pictureUrlHead: String? = null,
-    val sourceName: String? = null,
-)

@@ -33,14 +33,12 @@ data class PartialLocaleStrings(
     val mirrorTitle: String? = null,
     val customUrlTitle: String? = null,
     val customUrlDialogMessage: String? = null,
-    val filterFetchHint: String? = null,
 )
 
 data class LocaleStrings(
     val mirrorTitle: String,
     val customUrlTitle: String,
     val customUrlDialogMessage: String,
-    val filterFetchHint: String,
 )
 
 @Serializable
@@ -65,12 +63,6 @@ data class SourceDef(
 )
 
 private const val HTTP_SOURCE = "eu.kanade.tachiyomi.source.online.HttpSource"
-private const val KEI_SOURCE = "keiyoushi.source.KeiSource"
-
-// Fixed entry point FQN referenced by the generated manifest; independent of the module
-// directory, the @Source class's package, and the pkgName override.
-private const val GENERATED_CLASS_PACKAGE = "keiyoushi.source"
-private const val GENERATED_CLASS_NAME = "Generated"
 
 private fun KSClassDeclaration.derivesFromHttpSource(): Boolean =
     getAllSuperTypes().any { it.declaration.qualifiedName?.asString() == HTTP_SOURCE }
@@ -104,7 +96,6 @@ class SourceProcessor(
             mirrorTitle = locale?.mirrorTitle ?: en.mirrorTitle!!,
             customUrlTitle = locale?.customUrlTitle ?: en.customUrlTitle!!,
             customUrlDialogMessage = locale?.customUrlDialogMessage ?: en.customUrlDialogMessage!!,
-            filterFetchHint = locale?.filterFetchHint ?: en.filterFetchHint!!,
         )
     }
 
@@ -147,12 +138,12 @@ class SourceProcessor(
             return emptyList()
         }
 
+        val pkg = annotated.packageName.asString()
         val annotatedClass = annotated.toClassName()
         val superTypeNames = annotated.getAllSuperTypes()
             .mapNotNull { it.declaration.qualifiedName?.asString() }
             .toSet()
         val isConfigurable = "eu.kanade.tachiyomi.source.ConfigurableSource" in superTypeNames
-        val isKeiSource = KEI_SOURCE in superTypeNames
 
         if (HTTP_SOURCE !in superTypeNames) {
             logger.error("@Source class must derive from HttpSource", annotated)
@@ -173,12 +164,12 @@ class SourceProcessor(
 
         val isConcrete = Modifier.ABSTRACT !in annotated.modifiers
         val generatedClass = if (sources.size == 1 && !isConcrete) {
-            buildSingleSourceClass(annotatedClass, sources.single(), isConfigurable, isKeiSource, overridden, annotated, fileProps)
+            buildSingleSourceClass(annotatedClass, sources.single(), isConfigurable, overridden, annotated, fileProps)
         } else {
-            buildSourceFactoryClass(annotatedClass, sources, isConfigurable, isKeiSource, overridden, annotated, fileProps)
+            buildSourceFactoryClass(annotatedClass, sources, isConfigurable, overridden, annotated, fileProps)
         }
 
-        FileSpec.builder(GENERATED_CLASS_PACKAGE, GENERATED_CLASS_NAME)
+        FileSpec.builder(pkg, "ExtensionGenerated")
             .apply { fileProps.forEach(::addProperty) }
             .addType(generatedClass)
             .build()
@@ -191,21 +182,19 @@ class SourceProcessor(
         annotatedClass: ClassName,
         source: SourceDef,
         isConfigurable: Boolean,
-        isKeiSource: Boolean,
         overridden: Set<String>,
         node: KSClassDeclaration,
         fileProps: MutableList<PropertySpec>,
-    ): TypeSpec = TypeSpec.classBuilder(GENERATED_CLASS_NAME)
+    ): TypeSpec = TypeSpec.classBuilder("ExtensionGenerated")
         .addModifiers(KModifier.INTERNAL)
         .superclass(annotatedClass)
-        .applySourceMembers(source, "", fileProps, isConfigurable, isKeiSource, overridden, node)
+        .applySourceMembers(source, "", fileProps, isConfigurable, overridden, node)
         .build()
 
     private fun buildSourceFactoryClass(
         annotatedClass: ClassName,
         sources: List<SourceDef>,
         isConfigurable: Boolean,
-        isKeiSource: Boolean,
         overridden: Set<String>,
         node: KSClassDeclaration,
         fileProps: MutableList<PropertySpec>,
@@ -237,7 +226,7 @@ class SourceProcessor(
                             "%L,\n",
                             TypeSpec.anonymousClassBuilder()
                                 .superclass(annotatedClass)
-                                .applySourceMembers(source, index.toString(), fileProps, isConfigurable, isKeiSource, overridden, node)
+                                .applySourceMembers(source, index.toString(), fileProps, isConfigurable, overridden, node)
                                 .build(),
                         )
                     }
@@ -247,7 +236,7 @@ class SourceProcessor(
             .add(")")
             .build()
 
-        return TypeSpec.classBuilder(GENERATED_CLASS_NAME)
+        return TypeSpec.classBuilder("ExtensionGenerated")
             .addModifiers(KModifier.INTERNAL)
             .addSuperinterface(sourceFactoryType)
             .addFunction(
@@ -321,23 +310,10 @@ class SourceProcessor(
         suffix: String,
         fileProps: MutableList<PropertySpec>,
         isConfigurable: Boolean,
-        isKeiSource: Boolean,
         overridden: Set<String>,
         node: KSClassDeclaration,
     ): TypeSpec.Builder = apply {
         val className = node.simpleName.asString()
-
-        if (isKeiSource) {
-            if ("filterFetchHint" in overridden) {
-                logger.error("filterFetchHint is owned by the DSL; remove 'override val filterFetchHint' from $className (it is generated per language from core/translations)", node)
-            } else {
-                addProperty(
-                    PropertySpec.builder("filterFetchHint", String::class.asClassName(), KModifier.OVERRIDE, KModifier.PROTECTED)
-                        .getter(FunSpec.getterBuilder().addStatement("return %S", stringsForLang(source.lang).filterFetchHint).build())
-                        .build(),
-                )
-            }
-        }
 
         if ("name" in overridden) {
             logger.warn("name is provided by $className; skipping generated name (DSL name is used for metadata only)", node)

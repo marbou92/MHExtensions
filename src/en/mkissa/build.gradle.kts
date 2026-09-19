@@ -6,9 +6,9 @@ plugins {
 
 keiyoushi {
     name = "MKissa"
-    versionCode = 5
+    versionCode = 6
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.6"
+    libVersion = "1.4"
 
     source {
         lang = "en"
