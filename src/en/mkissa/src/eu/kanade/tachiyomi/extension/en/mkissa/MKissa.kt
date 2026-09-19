@@ -389,10 +389,11 @@ abstract class MKissa :
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         // url format: "/manga/<mangaId>/chapter-<chapterString>-<translation>"
-        val parts = chapter.url.split("/")
-        if (parts.size < 5) throw IOException("Outdated chapter URL. Refresh the chapter list.")
-        val mangaId = parts[2]
-        val chapterInfo = parts[4].removePrefix("chapter-")
+        // (blank segments filtered so leading/trailing slashes don't matter)
+        val parts = chapter.url.split("/").filter(String::isNotBlank)
+        if (parts.size < 3) throw IOException("Outdated chapter URL. Refresh the chapter list.")
+        val mangaId = parts[1]
+        val chapterInfo = parts[2].removePrefix("chapter-")
         val chapterString = chapterInfo.substringBeforeLast("-")
         val translation = chapterInfo.substringAfterLast("-", "sub")
 

@@ -267,8 +267,11 @@ abstract class ManhuaRMTL :
     // Custom MRM "hero" layout selectors
     override val mangaDetailsSelectorTitle = "h1.mrm-hero__title"
     override val mangaDetailsSelectorThumbnail = "div.mrm-hero__cover img"
-    override val mangaDetailsSelectorAuthor = ".post-content_item:contains(Author) .author-content a, .post-content_item:contains(Author) .summary-content a, .post-content_item:contains(Author) .summary-content"
-    override val mangaDetailsSelectorArtist = ".post-content_item:contains(Artist) .artist-content a, .post-content_item:contains(Artist) .summary-content a"
+
+    // Author/Artist extraction does NOT use these selectors directly; see staffValue().
+    // Kept for compatibility with theme internals that may reference them.
+    override val mangaDetailsSelectorAuthor = "div.author-content > a, div.manga-authors > a"
+    override val mangaDetailsSelectorArtist = "div.artist-content > a, div.manga-artists > a"
     override val mangaDetailsSelectorStatus = ".post-content_item:contains(Status) .summary-content"
     override val mangaDetailsSelectorDescription = "div.description-summary div.summary__content, div.summary_content div.post-content_item > h5:contains(Summary) + div, div.mrm-panel div.summary__content"
     override val mangaDetailsSelectorGenre = "div.mrm-genres__list a[rel=tag]"
@@ -277,6 +280,47 @@ abstract class ManhuaRMTL :
 
     // Alt names live in the MRM hero block, not the standard post-content row
     override val altNameSelector = "p.mrm-hero__alt"
+
+    /**
+     * Extracts staff names (Author/Artist) robustly across MRM's mixed markup:
+     *
+     * 1. Standard madara meta rows — a `.post-content_item` row is only used
+     *    when its own heading text equals the field ("Author"/"Artist"), so a
+     *    combined "Author & Artist" row is never mistaken for either.
+     * 2. MRM custom facts list — `li.mrm-facts__item` labelled by its <strong>.
+     * 3. Generic madara author/artist content blocks as a final fallback.
+     *
+     * Values are read as block text (not per-link texts), so names rendered as
+     * separate links ("John" + "Doe") join as "John Doe" instead of "John, Doe",
+     * and repeated selectors can no longer duplicate a name.
+     */
+    private fun staffValue(document: Document, heading: String): String? {
+        fun String?.clean(): String? = this
+            ?.replace(Regex("^\\s*$heading\\s*:?\\s*", RegexOption.IGNORE_CASE), "")
+            ?.trim()
+            ?.takeIf { it.isNotBlank() && !isUpdating(it) }
+
+        // 1) Madara meta rows — the row's own heading must match the field exactly
+        val row = document.select("div.post-content_item, li.post-content_item").firstOrNull { item ->
+            item.selectFirst(".summary-heading, h5")?.ownText().equals(heading, ignoreCase = true)
+        }
+        row?.selectFirst(".author-content, .artist-content, .summary-content")?.text()?.clean()?.let { return it }
+
+        // 2) MRM facts items — <li class="mrm-facts__item"><strong>Label</strong>…</li>
+        val fact = document.select("li.mrm-facts__item").firstOrNull { item ->
+            item.selectFirst("strong")?.ownText().equals(heading, ignoreCase = true)
+        }
+        if (fact != null) {
+            fact.select("a").eachText().filter(String::isNotBlank).distinct().joinToString().clean()?.let { return it }
+            fact.text().clean()?.let { return it }
+        }
+
+        // 3) Generic madara author/artist blocks
+        val genericSelector = if (heading == "Author") "div.author-content, div.manga-authors" else "div.artist-content, div.manga-artists"
+        document.selectFirst(genericSelector)?.text()?.clean()?.let { return it }
+
+        return null
+    }
 
     override fun parseDetails(document: Document, id: String, preserveUrl: String?): SManga {
         val manga = SManga.create()
@@ -291,8 +335,8 @@ abstract class ManhuaRMTL :
 
         manga.url = preserveUrl?.takeIf { !it.all(Char::isDigit) } ?: id
         manga.title = document.selectFirst(mangaDetailsSelectorTitle)?.ownText() ?: ""
-        document.select(mangaDetailsSelectorAuthor).eachText().filterNot(::isUpdating).joinToString().takeIf { it.isNotBlank() }?.let { manga.author = it }
-        document.select(mangaDetailsSelectorArtist).eachText().filterNot(::isUpdating).joinToString().takeIf { it.isNotBlank() }?.let { manga.artist = it }
+        staffValue(document, "Author")?.let { manga.author = it }
+        staffValue(document, "Artist")?.let { manga.artist = it }
 
         // Raw synopsis
         val synopsis = document.selectFirst(mangaDetailsSelectorDescription)?.let {
@@ -949,7 +993,7 @@ abstract class ManhuaRMTL :
         androidx.preference.ListPreference(screen.context).apply {
             key = PREF_OVERLAY_TEXT_SCALE
             title = "Overlay text size"
-            summary = "Scale of the burned-in overlay text relative to the website (100% matches the site)"
+            summary = "Scale of the burned-in overlay text relative to the website (the middle option matches the site)"
             entries = arrayOf("75% (smaller)", "100% (same as site)", "135% (bigger)", "160% (biggest)")
             entryValues = arrayOf("0.75", "1.0", "1.35", "1.6")
             setDefaultValue("1.0")

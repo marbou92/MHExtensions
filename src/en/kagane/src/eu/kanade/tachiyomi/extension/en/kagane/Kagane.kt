@@ -19,6 +19,8 @@ import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
+import keiyoushi.utils.getStringSafe
+import keiyoushi.utils.getStringSetSafe
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.string
 import keiyoushi.utils.toJsonElement
@@ -374,16 +376,16 @@ abstract class Kagane :
 
     private val contentRating: List<String>
         get() {
-            val maxRating = prefs.getString(CONTENT_RATING, CONTENT_RATING_DEFAULT)
+            val maxRating = prefs.getStringSafe(CONTENT_RATING, CONTENT_RATING_DEFAULT)
             val index = CONTENT_RATINGS.indexOfFirst { it == maxRating }
             return CONTENT_RATINGS.slice(0..index.coerceAtLeast(0))
         }
 
     private val excludedGenreIds: Set<String>
-        get() = prefs.getStringSet(GENRES_ID_PREF, emptySet()) ?: emptySet()
+        get() = prefs.getStringSetSafe(GENRES_ID_PREF, emptySet())
 
     private val sourceDisplayMode: String
-        get() = prefs.getString(SOURCE_DISPLAY_MODE, SOURCE_DISPLAY_MODE_DEFAULT) ?: SOURCE_DISPLAY_MODE_DEFAULT
+        get() = prefs.getStringSafe(SOURCE_DISPLAY_MODE, SOURCE_DISPLAY_MODE_DEFAULT) ?: SOURCE_DISPLAY_MODE_DEFAULT
 
     private val cleanTitle: Boolean
         get() = prefs.getBoolean(CLEAN_TITLE, CLEAN_TITLE_DEFAULT)
@@ -398,7 +400,7 @@ abstract class Kagane :
         get() = prefs.getBoolean(DATA_SAVER, false)
 
     private val chapterTitleMode
-        get() = prefs.getString(CHAPTER_TITLE_MODE, CHAPTER_TITLE_MODE_DEFAULT)!!
+        get() = prefs.getStringSafe(CHAPTER_TITLE_MODE, CHAPTER_TITLE_MODE_DEFAULT)!!
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
         ListPreference(screen.context).apply {
@@ -488,7 +490,7 @@ abstract class Kagane :
     // ============================= Utilities ==============================
 
     companion object {
-        private const val CONTENT_RATING = "pref_content_rating"
+        private const val CONTENT_RATING = "kagane_content_rating"
         private const val CONTENT_RATING_DEFAULT = "pornographic"
         internal val CONTENT_RATINGS = arrayOf(
             "safe",
@@ -497,23 +499,23 @@ abstract class Kagane :
             "pornographic",
         )
 
-        private const val GENRES_ID_PREF = "pref_genre_id_exclude"
+        private const val GENRES_ID_PREF = "kagane_genre_id_exclude"
 
-        private const val SOURCE_DISPLAY_MODE = "pref_source_display_mode"
+        private const val SOURCE_DISPLAY_MODE = "kagane_source_display_mode"
         private const val SOURCE_DISPLAY_MODE_DEFAULT = "all"
 
-        private const val CLEAN_TITLE = "pref_clean_title"
+        private const val CLEAN_TITLE = "kagane_clean_title"
         private const val CLEAN_TITLE_DEFAULT = false
 
-        private const val SHOW_SOURCE = "pref_show_source"
+        private const val SHOW_SOURCE = "kagane_show_source"
         private const val SHOW_SOURCE_DEFAULT = false
 
-        private const val SHOW_EDITION = "pref_show_edition"
+        private const val SHOW_EDITION = "kagane_show_edition"
         private const val SHOW_EDITION_DEFAULT = false
 
-        private const val DATA_SAVER = "data_saver_default"
+        private const val DATA_SAVER = "kagane_data_saver"
 
-        private const val CHAPTER_TITLE_MODE = "chapter_title_mode"
+        private const val CHAPTER_TITLE_MODE = "kagane_chapter_title_mode"
         private const val CHAPTER_TITLE_MODE_DEFAULT = "optional"
         internal val CHAPTER_TITLE_MODES = arrayOf(
             "optional",

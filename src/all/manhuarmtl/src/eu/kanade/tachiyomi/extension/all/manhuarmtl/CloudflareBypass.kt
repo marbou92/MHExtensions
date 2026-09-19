@@ -45,7 +45,37 @@ class CloudflareBypass(
 
     // ------------------------------------------------------------------------
     // 1. Cookie sync
+    //
+    // `CookieManager.getInstance().getCookie()` synchronously talks to the
+    // WebView process — the first call after a cold app start can block for
+    // seconds, and every call costs a round trip. Cached per host with a
+    // short TTL; the cache is invalidated when a CF retry re-primes.
     // ------------------------------------------------------------------------
+
+    @Volatile
+    private var cookieCache: MutableMap<String, Pair<Long, String?>>? = null
+
+    @Volatile
+    private var lastPrimeAt: Long = 0L
+
+    private fun webviewCookies(host: String, ttlMs: Long = 30_000L): String? {
+        val cache = cookieCache ?: synchronized(this) {
+            cookieCache ?: mutableMapOf<String, Pair<Long, String?>>().also { cookieCache = it }
+        }
+        val now = System.currentTimeMillis()
+        cache[host]?.let { (stamp, cookies) ->
+            if (now - stamp < ttlMs) return cookies
+        }
+        val cookies = runCatching {
+            CookieManager.getInstance().getCookie("https://$host/")
+        }.getOrNull()
+        cache[host] = now to cookies
+        return cookies
+    }
+
+    private fun invalidateCookieCache() {
+        cookieCache?.clear()
+    }
 
     private fun cookieSyncInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -55,9 +85,7 @@ class CloudflareBypass(
             return chain.proceed(request)
         }
 
-        val cookies = runCatching {
-            CookieManager.getInstance().getCookie("https://$host/")
-        }.getOrNull()
+        val cookies = webviewCookies(host)
 
         return if (cookies.isNullOrEmpty()) {
             chain.proceed(request)
@@ -139,9 +167,6 @@ class CloudflareBypass(
     // 3. Root priming — mint clearance where the WebView solve can succeed
     // ------------------------------------------------------------------------
 
-    @Volatile
-    private var lastPrimeAt: Long = 0L
-
     private fun primeClearance() {
         val url = primeUrl ?: return
         val client = primeClient ?: return
@@ -153,6 +178,7 @@ class CloudflareBypass(
             client.newCall(okhttp3.Request.Builder().url(url).build()).execute().use { resp ->
                 resp.body.close()
             }
+            invalidateCookieCache()
         } catch (_: Exception) {
             // Best-effort: without a host-side WebView solver the retry below
             // still runs; the final error tells the user what to do manually.
