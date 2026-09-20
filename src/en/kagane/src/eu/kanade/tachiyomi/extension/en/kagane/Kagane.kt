@@ -40,7 +40,6 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
 import okio.IOException
-import java.util.concurrent.TimeUnit
 
 @Source
 abstract class Kagane :
@@ -55,34 +54,15 @@ abstract class Kagane :
 
     private val prefs = getPreferences()
 
-    /**
-     * Client used to prime Cloudflare clearance against the site root. It must
-     * NOT have the [CloudflareBypass] priming itself installed (the app's own
-     * Cloudflare WebView interceptor on network.client performs the solve) —
-     * only the cookie-sync/fingerprint/retry hardening, no primeUrl.
-     */
-    private val primeClient: OkHttpClient by lazy {
-        network.client.newBuilder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(45, TimeUnit.SECONDS)
-            .apply {
-                CloudflareBypass(cookieHosts = setOf(domain)).install(this)
-            }
-            .build()
-    }
-
     override fun OkHttpClient.Builder.configureClient() = apply {
         addInterceptor(::refreshTokenInterceptor)
 
-        // The API shares kagane.to with the site, so Cloudflare challenges on
-        // /api/v2 XHR URLs can never be solved by the app's WebView directly;
-        // the bypass primes the site root (a real HTML page) and retries.
-        CloudflareBypass(
-            cookieHosts = setOf(domain),
-            primeUrl = "$baseUrl/",
-            primeClient = primeClient,
-        ).install(this)
-
+        // No custom Cloudflare machinery (same decision as keiyoushi's
+        // mangadotnet): the source sends plain requests and the host app's
+        // own Cloudflare WebView interceptor solves challenges when they
+        // appear. The old custom bypass (cookie sync + fingerprint headers +
+        // site-root priming + retries) added extra round-trips in front of
+        // every request — the main reason Kagane felt slow.
         rateLimit(3)
     }
 
@@ -389,7 +369,9 @@ abstract class Kagane :
             return cachedToken
         }
 
-        client.get("$baseUrl/").close()
+        // (No site-root "priming" GET here anymore — the app's Cloudflare
+        // interceptor solves a challenge on this POST itself, and skipping
+        // the extra round-trip makes the first mint noticeably faster.)
 
         val res = client.post(
             "$baseUrl/api/integrity",

@@ -39,10 +39,10 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
-import java.io.IOException
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import kotlin.math.min
 import kotlin.math.roundToInt
 
 @Source
@@ -51,21 +51,6 @@ abstract class ManhuaRMTL :
     ConfigurableSource {
 
     override val mangaSubString = "manga"
-
-    /**
-     * Client for minting a fresh clearance against the site root when an
-     * image/XHR request gets challenged. Hardened identically but without
-     * priming of its own (no recursion).
-     */
-    private val primeClient: OkHttpClient by lazy {
-        network.client.newBuilder()
-            .connectTimeout(30, TimeUnit.SECONDS)
-            .readTimeout(45, TimeUnit.SECONDS)
-            .apply {
-                CloudflareBypass(setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com")).install(this)
-            }
-            .build()
-    }
 
     /**
      * Short-timeout client for the auxiliary OCR/translation calls — a hung
@@ -80,16 +65,14 @@ abstract class ManhuaRMTL :
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // Cloudflare hardening for the site + CDN, applied through the
-        // KeiSource hook so the app's own Cloudflare interceptor stays
-        // last (it re-orders itself below source interceptors).
-        CloudflareBypass(
-            cookieHosts = setOf(baseUrl.removePrefix("https://"), "cdn.manhuarmtl.com"),
-            primeUrl = "$baseUrl/",
-            primeClient = primeClient,
-        ).install(this)
-
         // Burn translated OCR text onto raw chapter images.
+        //
+        // No custom Cloudflare machinery: like keiyoushi's mangadotnet, the
+        // source sends plain requests and the host app's own Cloudflare
+        // WebView interceptor solves challenges when they appear. The old
+        // custom bypass (cookie sync + fingerprint headers + root priming +
+        // retries) added seconds of serial round-trips to every request and
+        // could still fail the filter-data fetch outright.
         addNetworkInterceptor(::ocrImageInterceptor)
     }
 
@@ -198,8 +181,12 @@ abstract class ManhuaRMTL :
     // caching and retries (up to 3 attempts, then "press Reset").
 
     override suspend fun fetchFilterData(): JsonElement {
+        // Three fallback sources, most specific first. All are real HTML
+        // pages, so the app's own Cloudflare WebView solve can clear them
+        // directly when a challenge shows up.
         val requests = listOf(
             "$baseUrl/?post_type=wp-manga&s=",
+            "$baseUrl/manga/",
             "$baseUrl/",
         )
 
@@ -215,7 +202,12 @@ abstract class ManhuaRMTL :
             }
         }
 
-        throw IOException("Could not load genres")
+        // Every fetch failed (challenge the app couldn't clear, hard 429s…).
+        // Ship the built-in genre list so the Genres filter still works —
+        // "press Reset" replaces it with the live list once the site answers.
+        return FilterTaxonomyDto(
+            genres = fallbackGenres.map { GenreRoute(it.first, it.second, "/genre/${it.second}/") },
+        ).toJsonElement()
     }
 
     /**
@@ -313,6 +305,42 @@ abstract class ManhuaRMTL :
         .lowercase()
         .replace("[^a-z0-9]+".toRegex(), "-")
         .trim('-')
+
+    /**
+     * Last-resort genre list for when the site blocks every filter-data
+     * request (a challenge the app cannot clear, repeated 429s, …). Slugs are
+     * the site's /genre/<slug>/ paths collected from its own navigation; the
+     * built-in list guarantees the Genres filter is never empty — the site's
+     * live list replaces it as soon as a fetch succeeds.
+     */
+    private val fallbackGenres: List<Pair<String, String>> = listOf(
+        "Action" to "action",
+        "Adventure" to "adventure",
+        "Comedy" to "comedy",
+        "Cooking" to "cooking",
+        "Drama" to "drama",
+        "Fantasy" to "fantasy",
+        "Historical" to "historical",
+        "Horror" to "horror",
+        "Isekai" to "isekai",
+        "Josei" to "josei",
+        "Martial Arts" to "martial-arts",
+        "Mature" to "mature",
+        "Mecha" to "mecha",
+        "Mystery" to "mystery",
+        "Psychological" to "psychological",
+        "Romance" to "romance",
+        "School Life" to "school-life",
+        "Sci-Fi" to "sci-fi",
+        "Seinen" to "seinen",
+        "Shoujo" to "shoujo",
+        "Shounen" to "shounen",
+        "Slice of Life" to "slice-of-life",
+        "Sports" to "sports",
+        "Supernatural" to "supernatural",
+        "Tragedy" to "tragedy",
+        "Webtoons" to "webtoons",
+    )
 
     // ============================== Manga Details ==============================
 
@@ -830,6 +858,7 @@ abstract class ManhuaRMTL :
             copy ?: return null
         }
         val canvas = Canvas(mutableBitmap)
+        val imgWidth = mutableBitmap.width.toFloat()
 
         for (textBox in textBoxes) {
             val x = textBox.box.getOrElse(0) { 0f }
@@ -863,8 +892,11 @@ abstract class ManhuaRMTL :
             // Outline width: max(0.75, fontSize * 0.08)
             val outlineWidth = maxOf(0.75f, fontSize * 0.08f)
 
-            // maxWidth = w * 1.4 (text can extend beyond box)
-            val maxWidth = (w * 1.4f).toInt()
+            // maxWidth = w * 1.4 (text may extend beyond its box), but never
+            // wider than the image itself — at 135% scale, edge boxes used to
+            // lay their text out past the bitmap border where it got clipped
+            // ("text goes out of the screen").
+            val maxWidth = min(w * 1.4f, imgWidth).toInt().coerceAtLeast(8)
 
             // Stroke paint (white outline — 4-corner shadow simulation)
             // Using "casual" font family for a more comic/manga look (closest to Anime Ace)
@@ -892,16 +924,17 @@ abstract class ManhuaRMTL :
             @Suppress("DEPRECATION")
             val fillLayout = StaticLayout(text, fillPaint, maxWidth, Layout.Alignment.ALIGN_CENTER, 1.2f, 0f, false)
 
-            // Position like the site: horizontally centered on the box center
-            // (no clamping — the site's overlay divs simply overflow the image
-            // edge and get clipped), vertically TOP-ALIGNED to the box top so
-            // labels sit exactly where the website puts them.
+            // Position like the site: horizontally centered on the box center,
+            // then CLAMPED so the whole layout stays inside the image — text
+            // hanging off the left/right edge was cut off entirely. Vertical
+            // position stays top-aligned to the box top (site behaviour),
+            // clamped so tall layouts don't spill past the bottom.
             val textHeight = strokeLayout.height.toFloat()
             val boxCenterX = x + w / 2f
 
             val imgHeight = mutableBitmap.height.toFloat()
             val layoutWidth = maxWidth.toFloat()
-            val translateX = boxCenterX - layoutWidth / 2f
+            val translateX = (boxCenterX - layoutWidth / 2f).coerceIn(0f, (imgWidth - layoutWidth).coerceAtLeast(0f))
             val translateY = (y + TEXT_TOP_PADDING).coerceIn(0f, (imgHeight - textHeight).coerceAtLeast(0f))
 
             canvas.save()

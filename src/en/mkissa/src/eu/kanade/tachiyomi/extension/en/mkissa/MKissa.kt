@@ -16,6 +16,7 @@ import keiyoushi.annotation.Source
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.WebViewTimeoutException
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.runWebView
@@ -23,6 +24,7 @@ import keiyoushi.utils.toJsonRequestBody
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -32,10 +34,12 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import okhttp3.Headers
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Response
-import okhttp3.ResponseBody.Companion.toResponseBody
 import java.io.IOException
+import java.util.Collections
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 @Source
@@ -71,51 +75,20 @@ abstract class MKissa :
      * introspection and full queries, so we do not depend on fragile
      * persisted-query hashes.
      *
-     * `captchaToken` (optional) is attached as `extensions.captcha` exactly
-     * like the site's own client does after solving its Turnstile challenge:
-     * `{"query":..., "variables":..., "extensions":{"captcha":{"token":..,"provider":..}}}`
+     * (Browsing/details/chapters are not captcha-gated; the captcha+AA-crypto
+     * gates only apply to `chapterPages`, which is now harvested from the
+     * reader WebView — see getPageList.)
      */
     private suspend fun graphql(
         query: String,
         variables: JsonObject,
-        captchaToken: Pair<String, String>? = null,
     ): Response = client.post(
         apiUrl,
         buildJsonObject {
             put("query", query)
             put("variables", variables)
-            if (captchaToken != null) {
-                put(
-                    "extensions",
-                    buildJsonObject {
-                        put(
-                            "captcha",
-                            buildJsonObject {
-                                put("token", captchaToken.first)
-                                put("provider", captchaToken.second)
-                            },
-                        )
-                    },
-                )
-            }
         }.toJsonRequestBody(),
     )
-
-    /** Runs [parse] and reports whether the GraphQL body contains NEED_CAPTCHA. */
-    private inline fun <T> Response.useAndDetectCaptcha(parse: (Response) -> T): Pair<T?, Boolean> = use { response ->
-        val body = response.body.string()
-        val captcha = body.contains("NEED_CAPTCHA")
-        if (captcha) {
-            null to true
-        } else {
-            // Re-wrap the already-read body so parse() can treat it normally
-            parse(
-                response.newBuilder()
-                    .body(body.toResponseBody(response.body.contentType()))
-                    .build(),
-            ) to false
-        }
-    }
 
     private val allowAdult: Boolean
         get() = preferences.defaultContentRatings().contains("Pornographic") ||
@@ -372,159 +345,135 @@ abstract class MKissa :
 
     // =============================== Pages ===============================
     //
-    // Reverse engineered reader flow (verified against the site's JS, 2026-09):
+    // The reader is opened in an off-screen WebView and the page image URLs
+    // are collected from it. Why (verified against the live site, 2026-09):
     //
-    // 1. The reader POSTs `chapterPages` GraphQL queries to api.mkissa.net.
-    // 2. The server answers NEED_CAPTCHA until the request carries the site's
-    //    Cloudflare Turnstile token inside `extensions.captcha`
-    //    ({"token": <token>, "provider": "turnstile1"}) — verified live: the
-    //    error changes from NEED_CAPTCHA to "Error Re-captcha!" once the
-    //    extensions block exists, so this is the accepted envelope.
-    // 3. The site solves Turnstile in a hidden iframe page
-    //    (https://api.mkissa.net/captcha/turnstile, sitekey
-    //    0x4AAAAAADXpHZ1lTeqKwhch) which posts {type:"sitea-captcha-ready",
-    //    token, provider} to its parent window (class "LL" in the site bundle).
-    // 4. The retry returns `chapterPages.edges[].pictureUrls` — relative paths
-    //    resolved against `pictureUrlHead` (or absolute URLs used as-is).
+    // - The `chapterPages` GraphQL query answers NEED_CAPTCHA without a
+    //   Turnstile token — and even WITH a valid token the server now enforces
+    //   an additional anti-abuse crypto proof. The site's own bundle builds
+    //   that artifact ("aaReq", x-aa-boot, x-build-id — WebCrypto SHA-256 over
+    //   epoch/lane/build material) with deliberately obfuscated code and
+    //   answers AA_CRYPTO_MISSING to requests without it. That is exactly the
+    //   error users saw after a WebView solve minted trusted cookies.
+    // - The site's READER page runs the whole pipeline itself — Turnstile,
+    //   the AA crypto proof and the GraphQL call — inside a real WebView.
+    //   Reading through WebView has always worked, so instead of fighting the
+    //   anti-abuse layer we let the site's own reader do the work off-screen.
+    //
+    // The image URLs are harvested two ways at once:
+    // 1. Request interception — every image the reader downloads is logged,
+    //    which survives reader virtualisation (off-screen <img> nodes get
+    //    recycled while their URLs were still requested once), and
+    // 2. DOM scraping on a poll — catches images served straight from the
+    //    WebView cache that no longer produce network requests.
+    // Each poll scrolls to the bottom so lazy-loaded pages keep arriving;
+    // the collection resolves once it stops growing.
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         // url format: "/manga/<mangaId>/chapter-<chapterString>-<translation>"
         // (blank segments filtered so leading/trailing slashes don't matter)
         val parts = chapter.url.split("/").filter(String::isNotBlank)
         if (parts.size < 3) throw IOException("Outdated chapter URL. Refresh the chapter list.")
-        val mangaId = parts[1]
-        val chapterInfo = parts[2].removePrefix("chapter-")
-        val chapterString = chapterInfo.substringBeforeLast("-")
-        val translation = chapterInfo.substringAfterLast("-", "sub")
 
-        var response = graphql(
-            query = QUERY_CHAPTER_PAGES,
-            variables = buildJsonObject {
-                put("_id", mangaId)
-                put("translationType", translation)
-                put("chapterString", chapterString)
-            },
-        )
+        val readerUrl = "$baseUrl${chapter.url}"
 
-        var captchaDetected = false
-        var parsed: ChapterPagesDto? = null
-        response.useAndDetectCaptcha { r -> r.parseAs<ChapterPagesDto>() }.let { (result, captcha) ->
-            parsed = result
-            captchaDetected = captcha
-        }
-
-        if (captchaDetected) {
-            val (token, provider) = solveCaptchaToken()
-            response = graphql(
-                query = QUERY_CHAPTER_PAGES,
-                variables = buildJsonObject {
-                    put("_id", mangaId)
-                    put("translationType", translation)
-                    put("chapterString", chapterString)
-                },
-                captchaToken = token to provider,
-            )
-
-            response.useAndDetectCaptcha { r -> r.parseAs<ChapterPagesDto>() }.let { (result, captcha) ->
-                if (captcha) throw IOException("MKissa rejected the security check. Try again in a few moments.")
-                parsed = result
-            }
-        }
-
-        val result = parsed
-        val edges = result?.data?.chapterPages?.edges.orEmpty()
-        val edge = edges.firstOrNull { it.pictureUrls.isNotEmpty() }
-
-        if (edge == null) {
-            // Surface the API's own reason (e.g. "Error Re-captcha!", bad
-            // chapter id) instead of the misleading "no pages" message.
-            result?.firstErrorMessage()?.let { throw IOException("MKissa: $it") }
+        val imageUrls = try {
+            collectReaderImages(readerUrl)
+        } catch (e: WebViewTimeoutException) {
             throw IOException(
-                "No pages found for chapter $chapterString. " +
-                    "Refresh the chapter list; if it persists, the chapter may have no readable pages yet.",
+                "MKissa reader didn't finish loading. Open the chapter once in WebView " +
+                    "(Browse → Sources → MKissa → ⋮ → Open in WebView), then try again.",
+                e,
             )
         }
 
-        val head = edge.pictureUrlHead?.takeIf { it.isNotBlank() } ?: ""
-        return edge.pictureUrls.mapIndexed { index, rawUrl ->
-            val imageUrl = when {
-                rawUrl.startsWith("http") -> rawUrl
-                head.isBlank() -> rawUrl.trimStart('/')
-                else -> head.trimEnd('/') + "/" + rawUrl.trimStart('/')
-            }
-            Page(index, imageUrl = imageUrl)
+        if (imageUrls.isEmpty()) {
+            throw IOException(
+                "MKissa reader didn't expose any pages. Open the chapter once in WebView " +
+                    "(Browse → Sources → MKissa → ⋮ → Open in WebView), then try again.",
+            )
         }
+
+        return imageUrls.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
     }
 
     /**
-     * Solves MKissa's Turnstile challenge exactly like the site does:
-     * a small host page (origin api.mkissa.net, the same origin the site's
-     * own iframe page lives on) embeds the site's captcha iframe and forwards
-     * its `sitea-captcha-ready` postMessage to a JS bridge.
-     *
-     * The Turnstile widget usually resolves by itself in the off-screen
-     * WebView; a real token is bound to the device IP, which is exactly what
-     * the subsequent GraphQL request needs.
+     * Loads the site's own reader page in an off-screen WebView and collects
+     * the chapter's image URLs. Resolves once the collection is stable (no
+     * new URLs for several polls after the page finished loading).
      */
-    private suspend fun solveCaptchaToken(): Pair<String, String> = runWebView(timeout = 90.seconds) {
-        var done = false
+    private suspend fun collectReaderImages(readerUrl: String): List<String> = runWebView(timeout = 3.minutes) {
+        val collected = Collections.synchronizedSet(LinkedHashSet<String>())
+        var lastCount = 0
+        var stablePolls = 0
+        var finished = false
 
-        fun parseMessageField(message: String, field: String): String? = runCatching {
-            (Json.parseToJsonElement(message) as? JsonObject)?.get(field)?.let { element ->
-                (element as? JsonPrimitive)?.content
-            }
-        }.getOrNull()
-
-        jsBridge("mkCaptcha") { message ->
-            if (done) return@jsBridge
-            val token = parseMessageField(message, "token")
-
-            if (!token.isNullOrBlank()) {
-                val provider = parseMessageField(message, "provider") ?: "turnstile1"
-                done = true
-                resolve(token to provider)
-            } else {
-                reject(IOException("MKissa security check failed. Please try again."))
-            }
+        fun consider(url: String) {
+            val cleaned = url.trim().takeIf { it.startsWith("http") } ?: return
+            if (isPageImageUrl(cleaned)) collected.add(cleaned)
         }
 
-        onPageFinished { _ ->
-            // Nudge the iframe to (re)execute if it is still waiting after load.
+        interceptRequest { request ->
+            consider(request.url.toString())
+            // WebView "Accept: image/..." header is a solid image signal even
+            // when the CDN path has no file extension.
+            val accept = request.requestHeaders?.get("Accept")
+            if (accept?.contains("image/") == true) {
+                collected.add(request.url.toString())
+            }
+            null
+        }
+
+        onPageFinished { _ -> finished = true }
+
+        poll(1.seconds) {
+            // Nudge lazy loaders — jump to the bottom of the strip.
+            evaluateJs(
+                "try{window.scrollTo(0,(document.scrollingElement||document.body).scrollHeight)}catch(e){}",
+            )
+
             evaluateJs(
                 """
                 (function () {
                   try {
-                    var f = document.getElementById('cap');
-                    if (f && f.contentWindow && f.contentWindow.parent === window) {
-                      f.contentWindow.postMessage({ type: 'sitea-captcha-execute' }, '*');
+                    var out = [];
+                    var imgs = document.images;
+                    for (var i = 0; i < imgs.length; i++) {
+                      var im = imgs[i];
+                      var s = im.currentSrc || im.src || im.getAttribute('data-src') || '';
+                      if (s) out.push(String(s));
                     }
-                  } catch (e) {}
+                    return JSON.stringify(out);
+                  } catch (e) { return '[]'; }
                 })();
-                """,
-            )
-        }
+                """.trimIndent(),
+            ) { value ->
+                runCatching {
+                    val element = Json.parseToJsonElement(value)
+                    val inner = (element as? JsonPrimitive)?.content ?: value
+                    (Json.parseToJsonElement(inner) as? JsonArray)?.forEach { item ->
+                        (item as? JsonPrimitive)?.content?.let(::consider)
+                    }
+                }
+            }
 
-        loadData(
-            baseUrl = "https://$apiHost/",
-            html = """
-                <html>
-                  <body style="margin:0;background:transparent">
-                    <iframe id="cap" src="https://$apiHost/captcha/turnstile"
-                            style="width:320px;height:80px;border:0" allow="cross-origin-isolated"></iframe>
-                    <script>
-                      window.addEventListener('message', function (e) {
-                        try {
-                          var d = e.data;
-                          if (d && (d.type === 'sitea-captcha-ready')) {
-                            window.mkCaptcha.post(JSON.stringify(d));
-                          }
-                        } catch (err) {}
-                      });
-                    </script>
-                  </body>
-                </html>
-            """.trimIndent(),
-        )
+            val count = collected.size
+            if (finished && count > 0 && count == lastCount) {
+                stablePolls++
+                if (stablePolls >= 4) resolve(collected.toList())
+            } else {
+                stablePolls = 0
+                lastCount = count
+            }
+        }
+    }
+
+    /** True for URLs that look like page images — never site UI, API or captcha traffic. */
+    private fun isPageImageUrl(url: String): Boolean {
+        val host = runCatching { url.toHttpUrl().host }.getOrNull() ?: return false
+        if (host == "challenges.cloudflare.com" || host == apiHost) return false
+        val path = url.substringBefore('?').substringBefore('#').lowercase()
+        return path.substringAfterLast('.').substringBefore('%') in PAGE_IMAGE_EXTENSIONS
     }
 
     // ========================================================================
@@ -872,20 +821,12 @@ abstract class MKissa :
             }
         """
 
-        // Matches the site's reader document ($j in its bundle): pages live in
-        // chapterPages.edges[].pictureUrls (paths resolved against
-        // pictureUrlHead).
-        private const val QUERY_CHAPTER_PAGES = """
-            query(${'$'}_id: String!, ${'$'}translationType: VaildTranslationTypeMangaEnumType!, ${'$'}chapterString: String!) {
-              chapterPages(mangaId: ${'$'}_id, translationType: ${'$'}translationType, chapterString: ${'$'}chapterString, limit: 400) {
-                edges {
-                  chapterString
-                  pictureUrls
-                  pictureUrlHead
-                  sourceName
-                }
-              }
-            }
-        """
+        // (The chapter-pages GraphQL document was removed: the server now
+        // answers AA_CRYPTO_MISSING to any request lacking the site's own
+        // obfuscated anti-abuse crypto proof, so pages are collected from the
+        // real reader in an off-screen WebView instead — see getPageList.)
+
+        /** File extensions the chapter-page image harvester accepts. */
+        private val PAGE_IMAGE_EXTENSIONS = setOf("webp", "jpg", "jpeg", "png", "avif", "gif", "jfif")
     }
 }

@@ -165,18 +165,21 @@ class DetailsDto(
     )
 
     /**
-     * Star rating line (like our other sources), e.g. "★★★★☆ 4.2/5". The API's
-     * scale is not documented — values ≤ 5 are treated as 0–5, larger values
-     * as 0–10 (halved for the stars).
+     * Star rating line (like our other sources), e.g. "★★★★☆ 4.3/5".
+     *
+     * The API's `rating`/`average_rating` values are 0–100 PERCENTILES
+     * (observed live: 70.1, 85.6 — the old code treated anything >5 as a
+     * 0–10 scale and users saw "42.8/10" for 85.6). Small values are only
+     * plausible as true 0–5 scores, so: ≤5 → as-is, otherwise divide by 20.
      */
     fun ratingStars(): String? {
         val rating = rating ?: averageRating ?: return null
         if (rating <= 0.0) return null
         val outOfFive = rating <= 5.0
-        val normalized = if (outOfFive) rating else rating / 2.0
+        val normalized = if (outOfFive) rating else rating / 20.0
         val full = normalized.roundToInt().coerceIn(0, 5)
         val text = String.format(Locale.ENGLISH, "%.1f", normalized).removeSuffix(".0")
-        return "★".repeat(full) + "☆".repeat(5 - full) + " $text" + if (outOfFive) "/5" else "/10"
+        return "★".repeat(full) + "☆".repeat(5 - full) + " $text/5"
     }
 
     fun toSManga(apiUrl: String, sourceName: String? = null, baseUrl: String = "", showEdition: Boolean = false, showSource: Boolean = false, cleanTitle: Boolean): SManga = SManga.create().apply {
