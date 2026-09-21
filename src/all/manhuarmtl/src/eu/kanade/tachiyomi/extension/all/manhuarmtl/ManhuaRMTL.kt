@@ -65,14 +65,18 @@ abstract class ManhuaRMTL :
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
+        // Extension-level Cloudflare handling, MangaFire-style: browser
+        // fingerprint headers (client hints + sec-fetch-*), WebView cookie
+        // sync, and an off-screen WebView solve + single retry when a
+        // challenge response slips past the app's own interceptor. Happy
+        // path adds no round-trips (the previous v13 decision to ship no
+        // bypass at all left challenge variants the app interceptor doesn't
+        // recognise unanswered — that is the "slow bypass" users felt).
+        CloudflareBypass(
+            protectedHosts = setOf("manhuarmtl.com", "www.manhuarmtl.com", "cdn.manhuarmtl.com"),
+        ).install(this)
+
         // Burn translated OCR text onto raw chapter images.
-        //
-        // No custom Cloudflare machinery: like keiyoushi's mangadotnet, the
-        // source sends plain requests and the host app's own Cloudflare
-        // WebView interceptor solves challenges when they appear. The old
-        // custom bypass (cookie sync + fingerprint headers + root priming +
-        // retries) added seconds of serial round-trips to every request and
-        // could still fail the filter-data fetch outright.
         addNetworkInterceptor(::ocrImageInterceptor)
     }
 

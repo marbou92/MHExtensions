@@ -25,6 +25,7 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
 import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
@@ -345,29 +346,37 @@ abstract class MKissa :
 
     // =============================== Pages ===============================
     //
-    // The reader is opened in an off-screen WebView and the page image URLs
-    // are collected from it. Why (verified against the live site, 2026-09):
+    // The reader is opened in an off-screen WebView and the page list is
+    // captured from the site's OWN pipeline. Why (verified against the live
+    // site, 2026-09):
     //
     // - The `chapterPages` GraphQL query answers NEED_CAPTCHA without a
-    //   Turnstile token — and even WITH a valid token the server now enforces
-    //   an additional anti-abuse crypto proof. The site's own bundle builds
-    //   that artifact ("aaReq", x-aa-boot, x-build-id — WebCrypto SHA-256 over
-    //   epoch/lane/build material) with deliberately obfuscated code and
-    //   answers AA_CRYPTO_MISSING to requests without it. That is exactly the
-    //   error users saw after a WebView solve minted trusted cookies.
-    // - The site's READER page runs the whole pipeline itself — Turnstile,
+    //   Turnstile token — and even WITH a token the server enforces an
+    //   additional anti-abuse crypto proof ("aaReq" / x-aa-boot / x-build-id,
+    //   WebCrypto over epoch/lane/build material) built by deliberately
+    //   obfuscated code, answering AA_CRYPTO_MISSING to requests without it.
+    // - The site's READER page runs that whole pipeline itself — Turnstile,
     //   the AA crypto proof and the GraphQL call — inside a real WebView.
-    //   Reading through WebView has always worked, so instead of fighting the
-    //   anti-abuse layer we let the site's own reader do the work off-screen.
     //
-    // The image URLs are harvested two ways at once:
-    // 1. Request interception — every image the reader downloads is logged,
-    //    which survives reader virtualisation (off-screen <img> nodes get
-    //    recycled while their URLs were still requested once), and
-    // 2. DOM scraping on a poll — catches images served straight from the
-    //    WebView cache that no longer produce network requests.
-    // Each poll scrolls to the bottom so lazy-loaded pages keep arriving;
-    // the collection resolves once it stops growing.
+    // How the list is captured (three signals, strongest first):
+    // 1. **Fetch/XHR hook** — injected at page start; wraps window.fetch and
+    //    XMLHttpRequest and forwards every API response that contains the
+    //    chapterPages payload through a jsBridge. One response carries the
+    //    FULL page list (edges[].pictureUrls + pictureUrlHead), so this
+    //    resolves immediately when the reader's API call lands — no waiting
+    //    for images, no virtualisation gaps. (This is what the v13 build was
+    //    missing: it scraped <img> tags, but the reader virtualises/recycles
+    //    its page nodes, so the collection never stabilised and the chapter
+    //    appeared to "load endlessly".)
+    // 2. **Request interception** — every image the reader downloads is
+    //    logged (survives virtualisation, catches URLs without extensions).
+    // 3. **DOM scrape** on each poll — catches images served from cache.
+    //
+    // A stuck challenge (title still "Just a moment…" after 45s with nothing
+    // captured) fails FAST with an actionable message instead of spinning.
+    // Successful results are cached in the source prefs — chapter pages are
+    // immutable, so re-opening a chapter (or retrying after a WebView solve)
+    // is instant.
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         // url format: "/manga/<mangaId>/chapter-<chapterString>-<translation>"
@@ -377,8 +386,13 @@ abstract class MKissa :
 
         val readerUrl = "$baseUrl${chapter.url}"
 
+        // Chapter pages are immutable — serve the cached list instantly when
+        // we already captured it once (covers re-opens and retries).
+        val cached = readPageCache(chapter.url)
+        if (cached != null) return cached.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
+
         val imageUrls = try {
-            collectReaderImages(readerUrl)
+            collectReaderPages(readerUrl)
         } catch (e: WebViewTimeoutException) {
             throw IOException(
                 "MKissa reader didn't finish loading. Open the chapter once in WebView " +
@@ -394,23 +408,58 @@ abstract class MKissa :
             )
         }
 
+        writePageCache(chapter.url, imageUrls)
         return imageUrls.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
     }
 
+    // ----------------------------- page cache -----------------------------
+
+    private fun readPageCache(chapterUrl: String): List<String>? {
+        val raw = preferences.getString("$PAGE_CACHE_PREFIX$chapterUrl", null) ?: return null
+        return raw.split('\n').filter(String::isNotBlank).takeIf { it.isNotEmpty() }
+    }
+
+    private fun writePageCache(chapterUrl: String, urls: List<String>) {
+        // Keep the cache bounded — drop the oldest entries beyond the cap.
+        val keys = preferences.all.keys
+            .filter { it.startsWith(PAGE_CACHE_PREFIX) }
+            .toMutableSet()
+        if (keys.size >= PAGE_CACHE_MAX_ENTRIES) {
+            keys.take(keys.size - PAGE_CACHE_MAX_ENTRIES + 1).forEach { key ->
+                preferences.edit().remove(key).apply()
+            }
+        }
+        preferences.edit()
+            .putString("$PAGE_CACHE_PREFIX$chapterUrl", urls.joinToString("\n"))
+            .apply()
+    }
+
+    // --------------------------- WebView capture ---------------------------
+
     /**
-     * Loads the site's own reader page in an off-screen WebView and collects
-     * the chapter's image URLs. Resolves once the collection is stable (no
-     * new URLs for several polls after the page finished loading).
+     * Loads the site's own reader page in an off-screen WebView and captures
+     * the chapter's page URLs. The fetch/XHR hook delivers the chapterPages
+     * GraphQL response through the jsBridge; request interception and DOM
+     * scraping run as fallbacks until then.
      */
-    private suspend fun collectReaderImages(readerUrl: String): List<String> = runWebView(timeout = 3.minutes) {
+    private suspend fun collectReaderPages(readerUrl: String): List<String> = runWebView(timeout = 2.minutes) {
         val collected = Collections.synchronizedSet(LinkedHashSet<String>())
         var lastCount = 0
         var stablePolls = 0
         var finished = false
+        var challengePolls = 0
 
         fun consider(url: String) {
             val cleaned = url.trim().takeIf { it.startsWith("http") } ?: return
             if (isPageImageUrl(cleaned)) collected.add(cleaned)
+        }
+
+        // Receives raw API response bodies from the injected fetch/XHR hook.
+        jsBridge("mhbridge") { message ->
+            runCatching {
+                val pages = extractPageUrls(message, readerUrl)
+                if (pages.isNotEmpty()) resolve(pages)
+            }
         }
 
         interceptRequest { request ->
@@ -424,30 +473,22 @@ abstract class MKissa :
             null
         }
 
+        onPageStarted { _ ->
+            evaluateJs(FETCH_HOOK_JS)
+        }
+
         onPageFinished { _ -> finished = true }
 
         poll(1.seconds) {
+            // Re-install the hook if the page re-navigated before it ran.
+            evaluateJs("window.__mhHookInstalled===true||(${FETCH_HOOK_JS})")
+
             // Nudge lazy loaders — jump to the bottom of the strip.
             evaluateJs(
                 "try{window.scrollTo(0,(document.scrollingElement||document.body).scrollHeight)}catch(e){}",
             )
 
-            evaluateJs(
-                """
-                (function () {
-                  try {
-                    var out = [];
-                    var imgs = document.images;
-                    for (var i = 0; i < imgs.length; i++) {
-                      var im = imgs[i];
-                      var s = im.currentSrc || im.src || im.getAttribute('data-src') || '';
-                      if (s) out.push(String(s));
-                    }
-                    return JSON.stringify(out);
-                  } catch (e) { return '[]'; }
-                })();
-                """.trimIndent(),
-            ) { value ->
+            evaluateJs(DOM_IMAGES_JS) { value ->
                 runCatching {
                     val element = Json.parseToJsonElement(value)
                     val inner = (element as? JsonPrimitive)?.content ?: value
@@ -458,6 +499,31 @@ abstract class MKissa :
             }
 
             val count = collected.size
+
+            // Fail fast when the reader is stuck on a Cloudflare check —
+            // sitting for 45s with zero progress means the challenge needs a
+            // real browser (or interaction); spinning for minutes won't fix it.
+            evaluateJs(DOM_TITLE_JS) { value ->
+                val title = value
+                    ?.removeSurrounding("\"")
+                    ?.replace("\\\"", "\"")
+                    .orEmpty()
+                if (title.isEmpty() || CHALLENGE_TITLE_REGEX.containsMatchIn(title)) {
+                    challengePolls++
+                } else {
+                    challengePolls = 0
+                }
+                if (challengePolls >= 45 && count == 0) {
+                    reject(
+                        IOException(
+                            "MKissa reader is stuck on a Cloudflare check. Open the site once in " +
+                                "WebView (Browse → Sources → MKissa → ⋮ → Open in WebView), solve it, then try again.",
+                        ),
+                    )
+                }
+            }
+
+            // Fallback resolution: image harvesting stable after page finish.
             if (finished && count > 0 && count == lastCount) {
                 stablePolls++
                 if (stablePolls >= 4) resolve(collected.toList())
@@ -466,7 +532,54 @@ abstract class MKissa :
                 lastCount = count
             }
         }
+
+        loadUrl(readerUrl)
     }
+
+    /**
+     * Pulls the page list out of a captured chapterPages GraphQL response:
+     * picks the highest-priority edge that has pictureUrls and normalises
+     * every entry the way the site's own reader does (absolute URLs pass
+     * through, "//"-prefixed get https:, relative paths join the edge's
+     * pictureUrlHead, falling back to the reader page origin).
+     */
+    private fun extractPageUrls(rawBody: String, readerUrl: String): List<String> {
+        if (!rawBody.contains("chapterPages") || !rawBody.contains("pictureUrls")) return emptyList()
+
+        val root = runCatching { Json.parseToJsonElement(rawBody) }.getOrNull() ?: return emptyList()
+        val edges = root.jsonObjectOrNull("data")
+            ?.jsonObjectOrNull("chapterPages")
+            ?.jsonArrayOrNull("edges")
+            ?: return emptyList()
+
+        val best = edges
+            .mapNotNull { it as? JsonObject }
+            .filter { edge -> (edge["pictureUrls"] as? JsonArray)?.isNotEmpty() == true }
+            .maxByOrNull { edge -> (edge["priority"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0f }
+            ?: return emptyList()
+
+        val head = (best["pictureUrlHead"] as? JsonPrimitive)?.content?.trim().orEmpty()
+        val pageOrigin = readerUrl.toHttpUrl()
+
+        return (best["pictureUrls"] as? JsonArray)
+            ?.mapNotNull { item -> (item as? JsonPrimitive)?.content?.trim() }
+            .orEmpty()
+            .mapNotNull { url ->
+                when {
+                    url.startsWith("http://") || url.startsWith("https://") -> url
+                    url.startsWith("//") -> "https:$url"
+                    url.startsWith("blob:") -> null // can't be fetched outside the page
+                    head.isNotBlank() -> head.trimEnd('/') + "/" + url.trimStart('/')
+                    else -> pageOrigin.resolve(url)?.toString()
+                }
+            }
+            .filter { it.startsWith("http") }
+            .distinct()
+    }
+
+    private fun JsonElement?.jsonObjectOrNull(key: String): JsonObject? = (this as? JsonObject)?.get(key) as? JsonObject
+
+    private fun JsonElement?.jsonArrayOrNull(key: String): JsonArray? = (this as? JsonObject)?.get(key) as? JsonArray
 
     /** True for URLs that look like page images — never site UI, API or captcha traffic. */
     private fun isPageImageUrl(url: String): Boolean {
@@ -825,6 +938,89 @@ abstract class MKissa :
         // answers AA_CRYPTO_MISSING to any request lacking the site's own
         // obfuscated anti-abuse crypto proof, so pages are collected from the
         // real reader in an off-screen WebView instead — see getPageList.)
+
+        private const val PAGE_CACHE_PREFIX = "mkissa_pages_"
+        private const val PAGE_CACHE_MAX_ENTRIES = 60
+
+        /** Challenge-page title markers used by the stuck-detection poll. */
+        private val CHALLENGE_TITLE_REGEX = Regex(
+            "just a moment|attention required|security verification|verify you are human|checking your browser",
+            RegexOption.IGNORE_CASE,
+        )
+
+        /**
+         * Injected at page start (and re-installed by the poll loop): wraps
+         * window.fetch and XMLHttpRequest so every response from the API host
+         * whose body carries the chapterPages payload is forwarded to the
+         * jsBridge. Our .then handler is attached before the promise is
+         * handed back to the site, so the response body is teed before the
+         * site consumes it.
+         */
+        private val FETCH_HOOK_JS = """
+            (function(){
+              if(window.__mhHookInstalled) return;
+              window.__mhHookInstalled=true;
+              function send(t){
+                try{
+                  t=String(t||'');
+                  if(t.indexOf('chapterPages')!==-1 && t.indexOf('pictureUrls')!==-1){
+                    window.mhbridge.post(t.slice(0,2000000));
+                  }
+                }catch(e){}
+              }
+              var of=window.fetch;
+              if(of){
+                window.fetch=function(){
+                  var p=of.apply(this,arguments);
+                  try{
+                    var a0=arguments[0];
+                    var url=typeof a0==='string'?a0:(a0&&a0.url)||'';
+                    if(url.indexOf('api.mkissa.net')!==-1){
+                      p.then(function(r){
+                        try{ r.clone().text().then(send).catch(function(){}); }catch(e){}
+                      }).catch(function(){});
+                    }
+                  }catch(e){}
+                  return p;
+                };
+              }
+              var oo=XMLHttpRequest.prototype.open, os=XMLHttpRequest.prototype.send;
+              XMLHttpRequest.prototype.open=function(m,u){
+                this.__mhUrl=u; return oo.apply(this,arguments);
+              };
+              XMLHttpRequest.prototype.send=function(){
+                var x=this;
+                try{
+                  x.addEventListener('load',function(){
+                    try{
+                      var u=String(x.__mhUrl||'');
+                      if(u.indexOf('api.mkissa.net')!==-1) send(x.responseText);
+                    }catch(e){}
+                  });
+                }catch(e){}
+                return os.apply(this,arguments);
+              };
+            })();
+        """.trimIndent()
+
+        /** Collects every page-image URL currently in the DOM. */
+        private val DOM_IMAGES_JS = """
+            (function () {
+              try {
+                var out = [];
+                var imgs = document.images;
+                for (var i = 0; i < imgs.length; i++) {
+                  var im = imgs[i];
+                  var s = im.currentSrc || im.src || im.getAttribute('data-src') || '';
+                  if (s) out.push(String(s));
+                }
+                return JSON.stringify(out);
+              } catch (e) { return '[]'; }
+            })();
+        """.trimIndent()
+
+        /** Current page title — used to detect a stuck Cloudflare challenge. */
+        private const val DOM_TITLE_JS = "document.title"
 
         /** File extensions the chapter-page image harvester accepts. */
         private val PAGE_IMAGE_EXTENSIONS = setOf("webp", "jpg", "jpeg", "png", "avif", "gif", "jfif")

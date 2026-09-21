@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.en.kagane
 
+import android.util.Log
 import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
@@ -33,7 +34,6 @@ import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
-import kotlinx.serialization.json.putJsonObject
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -55,15 +55,21 @@ abstract class Kagane :
     private val prefs = getPreferences()
 
     override fun OkHttpClient.Builder.configureClient() = apply {
+        // Extension-level Cloudflare handling, MangaFire-style: browser
+        // fingerprint headers (client hints + sec-fetch-*) so requests score
+        // like a browser, WebView cookie sync, and an off-screen WebView
+        // solve + single retry when a challenge response slips past the
+        // app's own interceptor. Happy path adds no round-trips.
+        CloudflareBypass(
+            protectedHosts = setOf(domain, "kstatic.to", "cdn.kagane.to"),
+        ).install(this)
+
         addInterceptor(::refreshTokenInterceptor)
 
-        // No custom Cloudflare machinery (same decision as keiyoushi's
-        // mangadotnet): the source sends plain requests and the host app's
-        // own Cloudflare WebView interceptor solves challenges when they
-        // appear. The old custom bypass (cookie sync + fingerprint headers +
+        // The old custom bypass (cookie sync + fingerprint headers +
         // site-root priming + retries) added extra round-trips in front of
         // every request — the main reason Kagane felt slow.
-        rateLimit(3)
+        rateLimit(4)
     }
 
     private fun refreshTokenInterceptor(chain: Interceptor.Chain): Response {
@@ -85,7 +91,15 @@ abstract class Kagane :
                 .build(),
         )
 
-        if (response.code == 401 || response.code == 403 || response.code == 507) {
+        // Cloudflare responses (challenge pages or WAF blocks) are NOT token
+        // errors — refreshing the token here would fire a pointless challenge
+        // POST while the real fix (the bypass's WebView solve) handles the
+        // clearance. Only Kagane's own auth errors trigger a token refresh.
+        val isCloudflareResponse =
+            response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true ||
+                response.header("server")?.contains("cloudflare", ignoreCase = true) == true
+
+        if (response.code in listOf(401, 403, 507) && !isCloudflareResponse) {
             response.close()
             val challenge = runBlocking {
                 runCatching { getChallengeResponse(chapterId) }
@@ -171,42 +185,8 @@ abstract class Kagane :
                         filter.addToJsonObject(this, "genres", genresMatchAll)
                     }
 
-                    is TagsSearchFilter -> {
-                        val rawInput = filter.state.trim()
-                        if (rawInput.isNotBlank()) {
-                            val tagEntries = rawInput.split(",").map { it.trim() }.filter { it.isNotEmpty() }
-
-                            val includeIds = mutableListOf<String>()
-                            val excludeIds = mutableListOf<String>()
-
-                            tagEntries.forEach { entry ->
-                                val isExclude = entry.startsWith("-")
-                                val tagName = if (isExclude) entry.removePrefix("-").trim() else entry
-
-                                val tagId = filter.tagData[tagName.lowercase()]
-                                if (tagId != null) {
-                                    if (isExclude) excludeIds.add(tagId) else includeIds.add(tagId)
-                                }
-                            }
-
-                            if (includeIds.isNotEmpty() || excludeIds.isNotEmpty()) {
-                                putJsonObject("tags") {
-                                    if (tagsMatchAll == true) {
-                                        put("match_all", true)
-                                    }
-
-                                    putJsonArray("values") {
-                                        includeIds.forEach { add(it) }
-                                    }
-
-                                    if (excludeIds.isNotEmpty()) {
-                                        putJsonArray("exclude") {
-                                            excludeIds.forEach { add(it) }
-                                        }
-                                    }
-                                }
-                            }
-                        }
+                    is TagFilter -> {
+                        filter.addToJsonObject(this, "tags", tagsMatchAll)
                     }
 
                     is SourcesFilter -> {
@@ -589,26 +569,53 @@ abstract class Kagane :
     override val supportsFilterFetching = true
 
     override suspend fun fetchFilterData(): JsonElement = coroutineScope {
+        // Fault isolation: each endpoint is independent, so a single failure
+        // (rate limit, transient 403) no longer discards the whole filter
+        // cache. When EVERYTHING fails we still throw so KeiSource retries
+        // its background fetch and keeps its "press Reset" hint instead of
+        // caching an empty taxonomy for 3 days.
         val genresDeferred = async {
-            client.get("$apiUrl/genres/list")
-                .parseAs<List<GenreDto>>()
-                .associate { it.id to it.genreName }
+            runCatching {
+                client.get("$apiUrl/genres/list")
+                    .parseAs<List<GenreDto>>()
+                    .associate { it.id to it.genreName }
+            }.getOrElse {
+                Log.e("Kagane", "Failed to fetch genres for filters", it)
+                emptyMap()
+            }
         }
 
         val tagsDeferred = async {
-            client.get("$apiUrl/tags/list")
-                .parseAs<List<TagDto>>()
-                .associate { it.tagName.lowercase() to it.id }
+            runCatching {
+                client.get("$apiUrl/tags/list")
+                    .parseAs<List<TagDto>>()
+                    .associate { it.tagName.lowercase() to it.id }
+            }.getOrElse {
+                Log.e("Kagane", "Failed to fetch tags for filters", it)
+                emptyMap()
+            }
         }
         val sourcesDeferred = async {
-            client.post(
-                "$apiUrl/sources/list",
-                buildJsonObject { put("source_types", null) }.toJsonRequestBody(),
-            )
-                .parseAs<SourcesDto>().sources
+            runCatching {
+                client.post(
+                    "$apiUrl/sources/list",
+                    buildJsonObject { put("source_types", null) }.toJsonRequestBody(),
+                )
+                    .parseAs<SourcesDto>().sources
+            }.getOrElse {
+                Log.e("Kagane", "Failed to fetch sources for filters", it)
+                emptyList()
+            }
         }
 
-        MetadataDto(genresDeferred.await(), tagsDeferred.await(), sourcesDeferred.await())
+        val genres = genresDeferred.await()
+        val tags = tagsDeferred.await()
+        val sources = sourcesDeferred.await()
+        if (genres.isEmpty() && tags.isEmpty() && sources.isEmpty()) {
+            throw IOException("Kagane filter metadata unavailable")
+        }
+
+        MetadataDto(genres, tags, sources)
             .toJsonElement()
     }
 
@@ -650,13 +657,17 @@ abstract class Kagane :
 
             filters.addAll(
                 listOf(
+                    Filter.Header("Genres (tap to include → exclude)"),
                     MatchAllGenresFilter(),
                     GenresFilter(
                         meta.getGenresList(),
                         excludedGenreIds,
                     ),
+                    Filter.Header("Tags (tap to include → exclude)"),
                     MatchAllTagsFilter(),
-                    TagsSearchFilter(meta.tags),
+                    TagFilter(meta.tags),
+                    Filter.Separator(),
+                    Filter.Header("Sources"),
                     SourcesFilter(sourceFilters),
                 ),
             )

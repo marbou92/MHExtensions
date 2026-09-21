@@ -79,9 +79,20 @@ internal class GenresFilter(
     extraExcluded = excludedIds,
 )
 
-internal class TagsSearchFilter(
-    val tagData: Map<String, String>,
-) : Filter.Text(" Tags (e.g. Medieval, -Politics)")
+/**
+ * Tags as a proper multi-select — the old free-text input ("Medieval,
+ * -Politics") is gone: tags come from the fetched metadata, include/exclude
+ * via the tri-state cycle, and unknown names simply match nothing.
+ */
+internal class TagFilter(
+    tags: Map<String, String>,
+) : JsonMultiSelectTriFilter(
+    "Tags",
+    "tags",
+    tags.map { (name, id) ->
+        MultiSelectTriOption(name.replaceFirstChar { c -> c.uppercase() }, id)
+    }.sortedBy { it.name },
+)
 
 internal class SourcesFilter(
     sources: List<FilterData>,
