@@ -12,6 +12,7 @@ import android.text.StaticLayout
 import android.text.TextPaint
 import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
 import eu.kanade.tachiyomi.multisrc.madara.Madara
+import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
@@ -21,6 +22,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
+import keiyoushi.network.rateLimit
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
@@ -44,6 +46,7 @@ import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
 import kotlin.math.min
 import kotlin.math.roundToInt
+import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class ManhuaRMTL :
@@ -64,20 +67,47 @@ abstract class ManhuaRMTL :
             .build()
     }
 
+    /** Keiyoushi-manhuarm-style Cloudflare warm-up — see the interceptor. */
+    private val warmupInterceptor = CloudflareWarmupInterceptor(baseUrl, headers)
+
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // Extension-level Cloudflare handling, MangaFire-style: browser
-        // fingerprint headers (client hints + sec-fetch-*), WebView cookie
-        // sync, and an off-screen WebView solve + single retry when a
-        // challenge response slips past the app's own interceptor. Happy
-        // path adds no round-trips (the previous v13 decision to ship no
-        // bypass at all left challenge variants the app interceptor doesn't
-        // recognise unanswered — that is the "slow bypass" users felt).
-        CloudflareBypass(
-            protectedHosts = setOf("manhuarmtl.com", "www.manhuarmtl.com", "cdn.manhuarmtl.com"),
-        ).install(this)
+        // Same client shape as keiyoushi's own manhuarm source for this
+        // exact site (manhuarmtl.com): generous timeouts + a one-shot
+        // warm-up on the first failed request so the app-level
+        // CloudflareInterceptor can mint cf_clearance, then a retry.
+        // No extension-level WebView solving, no fingerprint header
+        // overrides — v14's custom solver was both slower and MORE
+        // challenge-prone than plain keiyoushi behaviour (fetch-like
+        // sec-fetch-* on document navigations is itself a bot signal).
+        connectTimeout(1, TimeUnit.MINUTES)
+        readTimeout(2, TimeUnit.MINUTES)
+        writeTimeout(1, TimeUnit.MINUTES)
+
+        addInterceptor(warmupInterceptor)
 
         // Burn translated OCR text onto raw chapter images.
         addNetworkInterceptor(::ocrImageInterceptor)
+
+        rateLimit(2, 1.seconds)
+    }
+
+    /** Browser-like image headers — keiyoushi manhuarm's exact set. */
+    override fun imageRequest(page: Page): Request {
+        val imageHeaders = headersBuilder()
+            .set("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+            .set("Referer", "$baseUrl/")
+            .set("Connection", "keep-alive")
+            .set("Accept-Language", "en-US,en-US;q=0.9,en;q=0.8")
+            .set("Accept-Encoding", "gzip, deflate, br, zstd")
+            .set("Sec-Fetch-Dest", "image")
+            .set("Sec-Fetch-Mode", "no-cors")
+            .set("Sec-Fetch-Site", "cross-site")
+            .set("Sec-Fetch-Storage-Access", "none")
+            .set("Priority", "u=5, i")
+            .set("TE", "trailers")
+            .build()
+
+        return GET(page.imageUrl!!, imageHeaders)
     }
 
     // Thread-safe storage for OCR text boxes, keyed by full image URL

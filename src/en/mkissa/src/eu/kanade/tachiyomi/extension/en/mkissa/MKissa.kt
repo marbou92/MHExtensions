@@ -37,6 +37,7 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
 import java.util.Collections
@@ -58,10 +59,13 @@ abstract class MKissa :
         readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
 
-        // MKissa's API sits on a separate host: sync WebView cookies for both
-        // the site and the API host and fingerprint all requests.
-        CloudflareBypass(setOf(baseUrl.removePrefix("https://"), apiHost)).install(this)
-
+        // v15: plain client, exactly like keiyoushi sources. Browsing goes to
+        // api.mkissa.net (open), reading happens inside the site's own reader
+        // WebView (which solves Cloudflare + Turnstile + AA crypto itself),
+        // and page images load from the CDN with browser-like image headers
+        // (see imageRequest). The v14 CloudflareBypass forced fetch-like
+        // sec-fetch-* headers onto every request — a bot signal that made
+        // Cloudflare challenges MORE likely, not less.
         rateLimit(2)
     }
 
@@ -70,6 +74,28 @@ abstract class MKissa :
         add("Origin", baseUrl)
         add("Accept", "application/json")
     }
+
+    /**
+     * Browser-like headers for page images. The source-wide headers above
+     * send `Accept: application/json` (right for GraphQL, wrong for <img>);
+     * an image CDN that content-negotiates on Accept can return an HTML/JSON
+     * error for such requests, which the reader then fails to decode
+     * ("Failed to initialize decoder"). Mirror what a real <img> load sends.
+     */
+    override fun imageRequest(page: Page): Request = Request.Builder()
+        .url(page.imageUrl!!)
+        .headers(
+            headers.newBuilder()
+                .removeAll("Origin")
+                .set("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
+                .set("Accept-Language", "en-US,en;q=0.9")
+                .set("Sec-Fetch-Dest", "image")
+                .set("Sec-Fetch-Mode", "no-cors")
+                .set("Sec-Fetch-Site", "cross-site")
+                .build(),
+        )
+        .get()
+        .build()
 
     /**
      * Executes a plain GraphQL query against the API. The API supports
@@ -420,17 +446,24 @@ abstract class MKissa :
     }
 
     private fun writePageCache(chapterUrl: String, urls: List<String>) {
+        val editor = preferences.edit()
+
+        // Purge lists captured by the v14 build — they were harvested from
+        // partially-rendered DOM trees and carry wrong counts.
+        preferences.all.keys
+            .filter { it.startsWith(LEGACY_PAGE_CACHE_PREFIX) && !it.startsWith(PAGE_CACHE_PREFIX) }
+            .forEach { editor.remove(it) }
+
         // Keep the cache bounded — drop the oldest entries beyond the cap.
         val keys = preferences.all.keys
             .filter { it.startsWith(PAGE_CACHE_PREFIX) }
             .toMutableSet()
         if (keys.size >= PAGE_CACHE_MAX_ENTRIES) {
             keys.take(keys.size - PAGE_CACHE_MAX_ENTRIES + 1).forEach { key ->
-                preferences.edit().remove(key).apply()
+                editor.remove(key)
             }
         }
-        preferences.edit()
-            .putString("$PAGE_CACHE_PREFIX$chapterUrl", urls.joinToString("\n"))
+        editor.putString("$PAGE_CACHE_PREFIX$chapterUrl", urls.joinToString("\n"))
             .apply()
     }
 
@@ -454,10 +487,14 @@ abstract class MKissa :
             if (isPageImageUrl(cleaned)) collected.add(cleaned)
         }
 
-        // Receives raw API response bodies from the injected fetch/XHR hook.
+        // Receives {url, req, res} envelopes from the injected fetch/XHR
+        // hook: the request body lets us verify the payload belongs to the
+        // chapter being opened (the reader can also fire chapterPages for
+        // other chapters), the response body carries the pages.
         jsBridge("mhbridge") { message ->
             runCatching {
-                val pages = extractPageUrls(message, readerUrl)
+                val (reqBody, resBody) = parseBridgeEnvelope(message)
+                val pages = extractPageUrls(resBody, reqBody, readerUrl)
                 if (pages.isNotEmpty()) resolve(pages)
             }
         }
@@ -537,13 +574,84 @@ abstract class MKissa :
     }
 
     /**
-     * Pulls the page list out of a captured chapterPages GraphQL response:
-     * picks the highest-priority edge that has pictureUrls and normalises
-     * every entry the way the site's own reader does (absolute URLs pass
-     * through, "//"-prefixed get https:, relative paths join the edge's
-     * pictureUrlHead, falling back to the reader page origin).
+     * The bridge message is our own JSON envelope {url, req, res} (v15+).
+     * Anything that isn't the envelope is treated as a raw response body
+     * (defensive compatibility).
      */
-    private fun extractPageUrls(rawBody: String, readerUrl: String): List<String> {
+    private fun parseBridgeEnvelope(message: String): Pair<String?, String> {
+        val root = runCatching { Json.parseToJsonElement(message) }.getOrNull() as? JsonObject
+            ?: return null to message
+        val res = (root["res"] as? JsonPrimitive)?.content
+            ?: return null to message
+        val req = (root["req"] as? JsonPrimitive)?.content?.takeIf { it.isNotBlank() }
+        return req to res
+    }
+
+    /**
+     * GraphQL variables from the captured request: a POST body
+     * {"query":..., "variables":{...}} or a GET "...variables=<urlencoded>".
+     */
+    private fun requestVariables(rawRequest: String?): JsonObject? {
+        val raw = rawRequest?.trim().orEmpty()
+        if (raw.isEmpty()) return null
+
+        if (raw.startsWith("{")) {
+            val obj = runCatching { Json.parseToJsonElement(raw) }.getOrNull() as? JsonObject ?: return null
+            return (obj["variables"] as? JsonObject) ?: obj.takeIf { it.containsKey("chapterString") }
+        }
+
+        val marker = "variables="
+        val index = raw.indexOf(marker)
+        if (index >= 0) {
+            val encoded = raw.substring(index + marker.length).substringBefore('&')
+            val decoded = runCatching { java.net.URLDecoder.decode(encoded, "UTF-8") }.getOrNull()
+            val obj = decoded?.let { runCatching { Json.parseToJsonElement(it) }.getOrNull() as? JsonObject }
+            if (obj != null) return (obj["variables"] as? JsonObject) ?: obj
+        }
+        return null
+    }
+
+    private data class ChapterRef(val mangaId: String, val chapterString: String, val translation: String)
+
+    /** Parses "/manga/<mangaId>/chapter-<chapterString>-<translation>". */
+    private fun chapterRefFromUrl(readerUrl: String): ChapterRef? {
+        val segments = runCatching { readerUrl.toHttpUrl().pathSegments.filter(String::isNotBlank) }.getOrNull()
+        if (segments == null || segments.size < 3 || segments[0] != "manga") return null
+        val segment = segments[2]
+        if (!segment.startsWith("chapter-")) return null
+        val body = segment.removePrefix("chapter-")
+        val translation = body.substringAfterLast('-')
+        val chapterString = body.removeSuffix("-$translation")
+        if (chapterString.isBlank() || translation !in TRANSLATION_TYPES) return null
+        return ChapterRef(segments[1], chapterString, translation)
+    }
+
+    /**
+     * Pulls the page list out of a captured chapterPages GraphQL response,
+     * mirroring the site reader's own pipeline (verified against the site
+     * bundle, 2026-09):
+     *
+     * - `chapterPages` returns `edges[]` where EACH edge is one page-source
+     *   offering (streamerId + sourceName + priority) carrying the chapter's
+     *   FULL page list in `pictureUrls`. `pageInfo.total` counts SOURCES,
+     *   and the site requests them in batches (`limit: 10, offset`) to fill
+     *   its source picker — the first response already carries every page.
+     * - `pictureUrls` is a list of OBJECTS `{num, url}` (a.k.a. `{n, u}`),
+     *   sometimes wrapped as a JSON string, ordered by page number — NOT a
+     *   list of plain URL strings. (This is exactly what v14 got wrong: it
+     *   read the entries as strings, dropped them all, and fell back to
+     *   partial DOM harvesting — hence wrong page counts.)
+     * - Source choice (the reader's `foe`/`goe`): skip edges whose
+     *   sourceName is missing/"unkonw"/"Wp-*", dedupe by
+     *   `streamerId|sourceName` keeping the highest priority, sort by
+     *   priority descending, and take the first edge whose normalized list
+     *   is non-empty.
+     * - URL joining (the reader's `KP`/`yP`): absolute and `//`-prefixed
+     *   URLs pass through; otherwise they join `pictureUrlHead` — after
+     *   `https://` is added when the head carries no scheme. Relative URLs
+     *   without a head resolve against the reader page origin.
+     */
+    private fun extractPageUrls(rawBody: String, rawRequestBody: String?, readerUrl: String): List<String> {
         if (!rawBody.contains("chapterPages") || !rawBody.contains("pictureUrls")) return emptyList()
 
         val root = runCatching { Json.parseToJsonElement(rawBody) }.getOrNull() ?: return emptyList()
@@ -552,30 +660,117 @@ abstract class MKissa :
             ?.jsonArrayOrNull("edges")
             ?: return emptyList()
 
-        val best = edges
-            .mapNotNull { it as? JsonObject }
-            .filter { edge -> (edge["pictureUrls"] as? JsonArray)?.isNotEmpty() == true }
-            .maxByOrNull { edge -> (edge["priority"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0f }
-            ?: return emptyList()
-
-        val head = (best["pictureUrlHead"] as? JsonPrimitive)?.content?.trim().orEmpty()
-        val pageOrigin = readerUrl.toHttpUrl()
-
-        return (best["pictureUrls"] as? JsonArray)
-            ?.mapNotNull { item -> (item as? JsonPrimitive)?.content?.trim() }
+        val chapterSegment = runCatching { readerUrl.toHttpUrl().pathSegments }
+            .getOrNull()
+            ?.filter(String::isNotBlank)
+            ?.getOrNull(2)
             .orEmpty()
-            .mapNotNull { url ->
-                when {
-                    url.startsWith("http://") || url.startsWith("https://") -> url
-                    url.startsWith("//") -> "https:$url"
-                    url.startsWith("blob:") -> null // can't be fetched outside the page
-                    head.isNotBlank() -> head.trimEnd('/') + "/" + url.trimStart('/')
-                    else -> pageOrigin.resolve(url)?.toString()
-                }
+
+        // Strong request-side match: reject payloads minted for another
+        // manga/chapter (the variables echo the reader's own query).
+        requestVariables(rawRequestBody)?.let { vars ->
+            fun str(key: String) = (vars[key] as? JsonPrimitive)?.content?.trim()
+            val ref = chapterRefFromUrl(readerUrl)
+            val mangaId = str("mangaId")
+            if (mangaId != null && ref != null && !mangaId.equals(ref.mangaId, ignoreCase = true)) return emptyList()
+            val chapterString = str("chapterString")
+            if (!chapterString.isNullOrBlank() && chapterSegment.isNotBlank() && !chapterSegment.contains(chapterString)) {
+                return emptyList()
             }
-            .filter { it.startsWith("http") }
-            .distinct()
+        }
+
+        // Soft response-side match: when every edge names a chapterString and
+        // none appears in our reader URL, this payload is another chapter's.
+        val edgeChapterStrings = edges.mapNotNull { edge ->
+            ((edge as? JsonObject)?.get("chapterString") as? JsonPrimitive)?.content?.trim()
+        }.filter { it.isNotBlank() }
+        if (edgeChapterStrings.isNotEmpty() && chapterSegment.isNotBlank() &&
+            edgeChapterStrings.none(chapterSegment::contains)
+        ) {
+            return emptyList()
+        }
+
+        // foe(): keep the highest-priority edge per source group.
+        val groups = LinkedHashMap<String, JsonObject>()
+        for (element in edges) {
+            val edge = element as? JsonObject ?: continue
+            val sourceName = (edge["sourceName"] as? JsonPrimitive)?.content?.trim().orEmpty()
+            if (sourceName.isEmpty() || sourceName == "unkonw" || sourceName.contains("Wp-")) continue
+            val streamerId = (edge["streamerId"] as? JsonPrimitive)?.content?.trim().orEmpty()
+            val key = "$streamerId|$sourceName"
+            val existing = groups[key]
+            if (existing == null || edgePriority(edge) > edgePriority(existing)) groups[key] = edge
+        }
+
+        // goe(): first source (highest priority) with a usable page list.
+        for (edge in groups.values.sortedByDescending(::edgePriority)) {
+            val pages = normalizeEdgePages(edge, readerUrl)
+            if (pages.isNotEmpty()) return pages
+        }
+        return emptyList()
     }
+
+    private fun edgePriority(edge: JsonObject): Float = (edge["priority"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0f
+
+    /**
+     * The reader's KP()/yP(): normalise every entry of one edge's
+     * pictureUrls into an absolute URL, ordered by page number.
+     */
+    private fun normalizeEdgePages(edge: JsonObject, readerUrl: String): List<String> {
+        val rawHead = (edge["pictureUrlHead"] as? JsonPrimitive)?.content?.trim().orEmpty()
+        // yP: a head without "//" gets https:// prepended.
+        val head = when {
+            rawHead.isEmpty() -> ""
+            rawHead.contains("//") -> rawHead
+            else -> "https://$rawHead"
+        }
+
+        return parsePictureUrlEntries(edge["pictureUrls"])
+            .mapNotNull { (num, raw) ->
+                val url = when {
+                    raw.startsWith("http://") || raw.startsWith("https://") -> raw
+                    raw.startsWith("//") -> "https:$raw"
+                    raw.startsWith("blob:") -> return@mapNotNull null // can't be fetched outside the page
+                    head.isNotBlank() -> head.trimEnd('/') + "/" + raw.trimStart('/')
+                    else -> runCatching { readerUrl.toHttpUrl().resolve(raw)?.toString() }.getOrNull()
+                }
+                if (url != null && url.startsWith("http")) num to url else null
+            }
+            .sortedBy { it.first } // stable sort by page number, site order within equals
+            .map { it.second }
+    }
+
+    /**
+     * The reader's GE()/VE(): pictureUrls is a list of `{num, url}` objects
+     * (aliases `{n, u}`), possibly JSON-encoded as a string; plain string
+     * entries are accepted as a fallback with their index as page number.
+     */
+    private fun parsePictureUrlEntries(element: JsonElement?): List<Pair<Float, String>> {
+        val array = when (element) {
+            is JsonArray -> element
+            is JsonPrimitive -> runCatching { Json.parseToJsonElement(element.content) }
+                .getOrNull()
+                .asOrNull<JsonArray>()
+                ?: return emptyList()
+            else -> return emptyList()
+        }
+
+        return array.mapIndexedNotNull { index, item ->
+            when (item) {
+                is JsonObject -> {
+                    val url = ((item["url"] ?: item["u"]) as? JsonPrimitive)?.content?.trim().orEmpty()
+                    if (url.isEmpty()) return@mapIndexedNotNull null
+                    val num = ((item["num"] ?: item["n"]) as? JsonPrimitive)?.content?.toFloatOrNull()
+                        ?: index.toFloat()
+                    num to url
+                }
+                is JsonPrimitive -> item.content.trim().takeIf(String::isNotEmpty)?.let { index.toFloat() to it }
+                else -> null
+            }
+        }
+    }
+
+    private inline fun <reified T> JsonElement?.asOrNull(): T? = this as? T
 
     private fun JsonElement?.jsonObjectOrNull(key: String): JsonObject? = (this as? JsonObject)?.get(key) as? JsonObject
 
@@ -939,8 +1134,14 @@ abstract class MKissa :
         // obfuscated anti-abuse crypto proof, so pages are collected from the
         // real reader in an off-screen WebView instead — see getPageList.)
 
-        private const val PAGE_CACHE_PREFIX = "mkissa_pages_"
+        // v15: prefix bumped so page lists captured by the v14 build (built
+        // from partial DOM harvests — wrong counts) are never served.
+        private const val PAGE_CACHE_PREFIX = "mkissa_pages_v2_"
+        private const val LEGACY_PAGE_CACHE_PREFIX = "mkissa_pages_"
         private const val PAGE_CACHE_MAX_ENTRIES = 60
+
+        /** Reader URL translation suffixes ("chapter-<cs>-<tt>"). */
+        private val TRANSLATION_TYPES = setOf("sub", "dub", "raw")
 
         /** Challenge-page title markers used by the stuck-detection poll. */
         private val CHALLENGE_TITLE_REGEX = Regex(
@@ -952,20 +1153,20 @@ abstract class MKissa :
          * Injected at page start (and re-installed by the poll loop): wraps
          * window.fetch and XMLHttpRequest so every response from the API host
          * whose body carries the chapterPages payload is forwarded to the
-         * jsBridge. Our .then handler is attached before the promise is
-         * handed back to the site, so the response body is teed before the
-         * site consumes it.
+         * jsBridge together with the request body (so we can verify the
+         * payload belongs to the chapter being opened). Our .then handler is
+         * attached before the promise is handed back to the site, so the
+         * response body is teed before the site consumes it.
          */
         private val FETCH_HOOK_JS = """
             (function(){
               if(window.__mhHookInstalled) return;
               window.__mhHookInstalled=true;
-              function send(t){
+              function sendPair(url, req, res){
                 try{
-                  t=String(t||'');
-                  if(t.indexOf('chapterPages')!==-1 && t.indexOf('pictureUrls')!==-1){
-                    window.mhbridge.post(t.slice(0,2000000));
-                  }
+                  res=String(res||'');
+                  if(res.indexOf('chapterPages')===-1 || res.indexOf('pictureUrls')===-1) return;
+                  window.mhbridge.post(JSON.stringify({url:String(url||''),req:String(req||''),res:res.slice(0,2000000)}));
                 }catch(e){}
               }
               var of=window.fetch;
@@ -973,11 +1174,12 @@ abstract class MKissa :
                 window.fetch=function(){
                   var p=of.apply(this,arguments);
                   try{
-                    var a0=arguments[0];
+                    var a0=arguments[0], a1=arguments[1];
                     var url=typeof a0==='string'?a0:(a0&&a0.url)||'';
+                    var req=(a1&&a1.body!=null)?String(a1.body):'';
                     if(url.indexOf('api.mkissa.net')!==-1){
                       p.then(function(r){
-                        try{ r.clone().text().then(send).catch(function(){}); }catch(e){}
+                        try{ r.clone().text().then(function(txt){ sendPair(url,req,txt); }).catch(function(){}); }catch(e){}
                       }).catch(function(){});
                     }
                   }catch(e){}
@@ -990,11 +1192,12 @@ abstract class MKissa :
               };
               XMLHttpRequest.prototype.send=function(){
                 var x=this;
+                var req=(arguments[0]!=null)?String(arguments[0]):'';
                 try{
                   x.addEventListener('load',function(){
                     try{
                       var u=String(x.__mhUrl||'');
-                      if(u.indexOf('api.mkissa.net')!==-1) send(x.responseText);
+                      if(u.indexOf('api.mkissa.net')!==-1) sendPair(u,req,x.responseText);
                     }catch(e){}
                   });
                 }catch(e){}

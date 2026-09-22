@@ -55,21 +55,16 @@ abstract class Kagane :
     private val prefs = getPreferences()
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // Extension-level Cloudflare handling, MangaFire-style: browser
-        // fingerprint headers (client hints + sec-fetch-*) so requests score
-        // like a browser, WebView cookie sync, and an off-screen WebView
-        // solve + single retry when a challenge response slips past the
-        // app's own interceptor. Happy path adds no round-trips.
-        CloudflareBypass(
-            protectedHosts = setOf(domain, "kstatic.to", "cdn.kagane.to"),
-        ).install(this)
-
+        // Byte-equivalent to keiyoushi's own kagane source: just the token
+        // interceptor and a rate limit. NO custom Cloudflare layer — v14's
+        // solver (fingerprint headers + off-screen WebView solve) was slower
+        // AND more challenge-prone than plain keiyoushi behaviour; the
+        // app-level CloudflareInterceptor (moved after source interceptors
+        // by KeiSource) plus the shared WebView cookie jar is what makes
+        // keiyoushi sources feel instant.
         addInterceptor(::refreshTokenInterceptor)
 
-        // The old custom bypass (cookie sync + fingerprint headers +
-        // site-root priming + retries) added extra round-trips in front of
-        // every request — the main reason Kagane felt slow.
-        rateLimit(4)
+        rateLimit(3)
     }
 
     private fun refreshTokenInterceptor(chain: Interceptor.Chain): Response {
@@ -91,15 +86,11 @@ abstract class Kagane :
                 .build(),
         )
 
-        // Cloudflare responses (challenge pages or WAF blocks) are NOT token
-        // errors — refreshing the token here would fire a pointless challenge
-        // POST while the real fix (the bypass's WebView solve) handles the
-        // clearance. Only Kagane's own auth errors trigger a token refresh.
-        val isCloudflareResponse =
-            response.header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true ||
-                response.header("server")?.contains("cloudflare", ignoreCase = true) == true
-
-        if (response.code in listOf(401, 403, 507) && !isCloudflareResponse) {
+        // Upstream-exact: a 401/403/507 from a token-bearing URL is treated
+        // as a Kagane auth failure and triggers a token refresh. A CF
+        // challenge on this path bubbles up to the app-level interceptor,
+        // exactly as it does for keiyoushi's kagane.
+        if (response.code in listOf(401, 403, 507)) {
             response.close()
             val challenge = runBlocking {
                 runCatching { getChallengeResponse(chapterId) }
