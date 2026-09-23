@@ -208,7 +208,7 @@ fun MangaDetail.toSManga(
 ): SManga {
     val dtoId = _id
     val dtoTitle = title()
-    val dtoDescription = description
+    val dtoDescription = description?.let(::cleanDescription)
     val dtoStatus = status
     val cover = coverUrl()
 
@@ -324,6 +324,38 @@ internal fun dedupeAuthors(authors: List<String>): List<String> {
     }
     return kept
 }
+
+/**
+ * The site's descriptions arrive as HTML — "<br>" line breaks, "<b>" /
+ * "<i>" emphasis, HTML entities — which Mihon's Markdown renderer shows as
+ * literal tag text ("Guts...<br> <br>[Written by MAL Rewrite]<br>"). Convert
+ * to clean text: real newlines, Markdown emphasis, decoded entities.
+ */
+internal fun cleanDescription(raw: String): String {
+    if (!HTML_TAG_REGEX.containsMatchIn(raw) && !raw.contains('&')) return raw.trim()
+
+    var text = raw
+        .replace(Regex("(?i)<br\\s*/?>"), "\n")
+        .replace(Regex("(?i)<b>(.*?)</b>"), "**$1**")
+        .replace(Regex("(?i)<strong>(.*?)</strong>"), "**$1**")
+        .replace(Regex("(?i)<i>(.*?)</i>"), "*$1*")
+        .replace(Regex("(?i)<em>(.*?)</em>"), "*$1*")
+        .replace(HTML_TAG_REGEX, "") // strip any remaining tags
+        .replace(Regex("\\n{3,}"), "\n\n")
+
+    // Decode HTML entities (&amp; &#39; &hellip; ...) via the platform
+    // parser, then normalise the non-breaking spaces it emits.
+    text = runCatching {
+        android.text.Html.fromHtml(text, android.text.Html.FROM_HTML_MODE_LEGACY).toString()
+    }.getOrDefault(text)
+        .replace('\u00A0', ' ')
+        .replace(Regex("[ \\t]+\\n"), "\n")
+        .replace(Regex("\\n{3,}"), "\n\n")
+
+    return text.trim()
+}
+
+private val HTML_TAG_REGEX = Regex("<[a-zA-Z/][^>]*>")
 
 fun MangaDetail.toChapterList(): List<SChapter> {
     val mangaId = _id

@@ -55,21 +55,24 @@ abstract class Kagane :
     private val prefs = getPreferences()
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // Token interceptor + a rate limit, like upstream — NO custom
-        // Cloudflare layer. The app-level CloudflareInterceptor (KeiSource
-        // moves it after source interceptors) plus the shared WebView cookie
-        // jar is what makes keiyoushi sources feel instant.
+        // The Comix Cloudflare method (ported from our working comixto
+        // source): WebView-cookie sync + browser fingerprint (sec-ch-ua,
+        // sec-fetch-*) + smart retry on CF blocks. That trio is what keeps
+        // comix.to riding a single WebView solve instead of re-challenging
+        // every hour — CF's bot scoring checks header consistency beyond
+        // the clearance cookie, and the retry eats transient blocks that
+        // used to cost a manual WebView visit.
         //
-        // Two of OUR OWN behaviours were making it slow (audited 2026-09):
-        // 1. KeiSource stamps "Origin: <baseUrl>" onto every request, but
-        //    browsers NEVER send Origin on document GETs (the site-root
-        //    priming GET is one) — an inconsistent Origin is a Cloudflare
-        //    bot signal that kept challenging clean traffic.
-        // 2. refreshTokenInterceptor treated ANY 403 from a token-bearing
-        //    URL as a Kagane auth failure and burned a full integrity+token
-        //    round-trip per challenged image BEFORE the app-level solver
-        //    ever saw the challenge. CF-challenge responses are now handed
-        //    straight to the app-level interceptor instead.
+        // Kept from the 2026-09 audit:
+        // - originSanitizer: KeiSource stamps "Origin: <baseUrl>" onto every
+        //   request, but browsers NEVER send Origin on document GETs — an
+        //   inconsistent Origin is a bot signal that kept challenging clean
+        //   traffic.
+        // - refreshTokenInterceptor: Kagane's own auth (token-bearing URLs)
+        //   stays handled here; CF-challenge responses pass through it
+        //   untouched (they can't be fixed by a token refresh).
+        CloudflareBypass(setOf(domain)).install(this)
+
         addInterceptor(::originSanitizerInterceptor)
         addInterceptor(::refreshTokenInterceptor)
 

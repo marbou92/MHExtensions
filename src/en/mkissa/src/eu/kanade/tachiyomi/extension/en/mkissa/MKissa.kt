@@ -418,25 +418,59 @@ abstract class MKissa :
         val cached = readPageCache(chapter.url)
         if (cached != null) return cached.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
 
+        primeReaderPath(readerUrl)
+
         val imageUrls = try {
             collectReaderPages(readerUrl)
         } catch (e: WebViewTimeoutException) {
-            throw IOException(
-                "MKissa reader didn't finish loading. Open the chapter once in WebView " +
-                    "(Browse → Sources → MKissa → ⋮ → Open in WebView), then try again.",
-                e,
-            )
+            throw IOException(webViewHelpMessage, e)
         }
 
         if (imageUrls.isEmpty()) {
-            throw IOException(
-                "MKissa reader didn't expose any pages. Open the chapter once in WebView " +
-                    "(Browse → Sources → MKissa → ⋮ → Open in WebView), then try again.",
-            )
+            throw IOException(webViewHelpMessage)
         }
 
         writePageCache(chapter.url, imageUrls)
         return imageUrls.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
+    }
+
+    /**
+     * The user-facing guidance for every chapter-load failure. The site's
+     * CHALLENGE sits on the reader path (verified live, 2026-09: the
+     * homepage and manga pages answer a plain client with 200 while
+     * /manga/<id>/chapter-... answers a cf-mitigated challenge), so the
+     * advice must be to open and solve a CHAPTER in WebView — opening the
+     * homepage shows no check at all and fixes nothing.
+     */
+    private val webViewHelpMessage =
+        "MKissa's chapter page is behind a Cloudflare check that only a real WebView can solve. " +
+            "Open any chapter once in WebView (in the reader, tap the WebView icon in the top bar; " +
+            "or Browse → Sources → MKissa → ⋮ → Open in WebView and open a chapter there), " +
+            "solve the check, then reload the chapter here."
+
+    /**
+     * Prime the reader path with a plain okhttp GET before the off-screen
+     * WebView capture. When the clearance cookie is missing or stale, this
+     * is the request that lets the app-level CloudflareInterceptor solve
+     * the challenge in its OWN WebView (with UI) and store cf_clearance in
+     * the shared cookie jar — after which the off-screen WebView below
+     * loads the reader cleanly and the site's own pipeline (Turnstile +
+     * AA crypto + GraphQL) runs untouched. Without this priming the
+     * off-screen WebView is the first thing to hit the challenge — and an
+     * off-screen WebView can neither solve an interactive challenge nor
+     * show the user anything (the reported "chapter never loads; I check
+     * the website and nothing happens" deadlock).
+     */
+    private fun primeReaderPath(readerUrl: String) {
+        try {
+            client.newCall(Request.Builder().url(readerUrl).headers(headers).build())
+                .execute()
+                .close()
+        } catch (_: Exception) {
+            // Best-effort: no app-level solver, already solved, or the site
+            // simply isn't challenging right now — the capture below runs
+            // either way.
+        }
     }
 
     // ----------------------------- page cache -----------------------------
@@ -490,6 +524,7 @@ abstract class MKissa :
         var stablePolls = 0
         var finished = false
         var challengePolls = 0
+        var challengeReloaded = false
 
         fun consider(url: String) {
             val cleaned = url.trim().takeIf { it.startsWith("http") } ?: return
@@ -575,26 +610,33 @@ abstract class MKissa :
 
             val count = collected.size
 
-            // Fail fast when the reader is stuck on a Cloudflare check —
-            // sitting for 45s with zero progress means the challenge needs a
-            // real browser (or interaction); spinning for minutes won't fix it.
+            // Cloudflare check handling. A managed challenge often clears on
+            // a second load (and by then the priming GET above may already
+            // have landed cf_clearance in the shared cookie jar), so reload
+            // ONCE after ~25s of challenge title. If the check is still
+            // there 45s after that with zero candidates, fail fast with the
+            // actionable message instead of spinning for minutes.
             evaluateJs(DOM_TITLE_JS) { value ->
                 val title = value
                     ?.removeSurrounding("\"")
                     ?.replace("\\\"", "\"")
                     .orEmpty()
-                if (title.isEmpty() || CHALLENGE_TITLE_REGEX.containsMatchIn(title)) {
+                val challengeTitle = CHALLENGE_TITLE_REGEX.containsMatchIn(title)
+                if (challengeTitle) {
                     challengePolls++
-                } else {
+                } else if (title.isNotEmpty()) {
                     challengePolls = 0
                 }
-                if (challengePolls >= 45 && count == 0) {
-                    reject(
-                        IOException(
-                            "MKissa reader is stuck on a Cloudflare check. Open the site once in " +
-                                "WebView (Browse → Sources → MKissa → ⋮ → Open in WebView), solve it, then try again.",
-                        ),
-                    )
+
+                if (challengeTitle && challengePolls >= 25 && !challengeReloaded) {
+                    challengeReloaded = true
+                    challengePolls = 0
+                    evaluateJs("try{location.reload()}catch(e){}")
+                    return@evaluateJs
+                }
+
+                if (challengePolls >= 45 && count == 0 && challengeReloaded) {
+                    reject(IOException(webViewHelpMessage))
                 }
             }
 
@@ -781,7 +823,7 @@ abstract class MKissa :
             fun walk(element: JsonElement?) {
                 when (element) {
                     is JsonObject -> {
-                        if (element.containsKey("pictureUrls")) {
+                        if (element.containsKey("pictureUrls") || element.containsKey("pictureUrlsProcessed")) {
                             val joined = normalizeEdgePages(element, readerUrl)
                             if (joined.isNotEmpty()) {
                                 found.putIfAbsent(element.hashCode().toString(), joined)
@@ -800,10 +842,11 @@ abstract class MKissa :
         }
 
         // Not parseable as JSON with pictureUrls anywhere — try regexing
-        // "pictureUrls":[...] fragments out of the raw text (inline scripts,
-        // JSON-string-encoded payloads). Entries are flat {num,url} objects,
-        // so a bracket-balanced-enough scan is workable.
-        val regex = Regex("\"pictureUrls\"\\s*:\\s*(\\[.*?\\])", RegexOption.DOT_MATCHES_ALL)
+        // "pictureUrls"/"pictureUrlsProcessed" fragments out of the raw
+        // text (inline scripts, JSON-string-encoded payloads). Entries are
+        // flat {num,url} objects, so a bracket-balanced-enough scan is
+        // workable.
+        val regex = Regex("\"(?:pictureUrls|pictureUrlsProcessed)\"\\s*:\\s*(\\[.*?\\])", RegexOption.DOT_MATCHES_ALL)
         for (match in regex.findAll(rawBody)) {
             val arrayText = match.groupValues[1].takeIf { it.length < 400_000 } ?: continue
             val array = runCatching { Json.parseToJsonElement(arrayText) }.getOrNull() as? JsonArray ?: continue
@@ -828,6 +871,9 @@ abstract class MKissa :
     /**
      * The reader's KP()/yP(): normalise every entry of one edge's
      * pictureUrls into an absolute URL, ordered by page number.
+     * Some streamers only fill `pictureUrlsProcessed` (the site's own
+     * chapterPages query selects both fields) — it carries the same
+     * entries, so it is used as a fallback when pictureUrls is empty.
      */
     private fun normalizeEdgePages(edge: JsonObject, readerUrl: String): List<String> {
         val rawHead = (edge["pictureUrlHead"] as? JsonPrimitive)?.content?.trim().orEmpty()
@@ -838,7 +884,10 @@ abstract class MKissa :
             else -> "https://$rawHead"
         }
 
-        return parsePictureUrlEntries(edge["pictureUrls"])
+        val pages = parsePictureUrlEntries(edge["pictureUrls"])
+            .ifEmpty { parsePictureUrlEntries(edge["pictureUrlsProcessed"]) }
+
+        return pages
             .mapNotNull { (num, raw) ->
                 val url = when {
                     raw.startsWith("http://") || raw.startsWith("https://") -> raw

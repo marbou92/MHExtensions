@@ -22,7 +22,6 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
 import keiyoushi.network.get
-import keiyoushi.network.rateLimit
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
@@ -44,10 +43,8 @@ import org.jsoup.nodes.Element
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
-import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 import kotlin.math.roundToInt
-import kotlin.time.Duration.Companion.seconds
 
 @Source
 abstract class ManhuaRMTL :
@@ -68,67 +65,36 @@ abstract class ManhuaRMTL :
             .build()
     }
 
-    /** Keiyoushi-manhuarm-style Cloudflare warm-up — see the interceptor. */
-    private val warmupInterceptor = CloudflareWarmupInterceptor(baseUrl, headers)
-
-    /** Ensures the one-shot session warm-up below only ever runs once. */
-    private val primed = AtomicBoolean(false)
-
-    /**
-     * Proactive, one-shot Cloudflare warm-up: BEFORE the session's first
-     * request, do a plain GET to the base URL and only then run the real
-     * request. When the clearance cookie is missing or stale, the app's
-     * CloudflareInterceptor (which KeiSource keeps right after the source
-     * interceptors) solves the challenge on that homepage GET — a URL a
-     * WebView can actually navigate. The upstream warmup interceptor only
-     * reacts AFTER a request has already failed, so every session paid
-     * "fail -> warm-up -> retry" first; priming shaves that whole cycle
-     * off the first open and keeps the POST-free GET solve path.
-     */
-    private fun primingInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        if (!primed.compareAndSet(false, true)) return chain.proceed(request)
-
-        try {
-            if (request.url.host != baseUrl.toHttpUrl().host) {
-                chain.proceed(GET(baseUrl, headers)).close()
-            }
-        } catch (_: Exception) {
-            // Priming is best-effort; the warmup interceptor + the app's
-            // CloudflareInterceptor still cover the failure case.
-        }
-
-        return chain.proceed(request)
-    }
-
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // One-shot session warm-up (priming) + keiyoushi-manhuarm-style
-        // warm-up on the first failed request, so the app-level
-        // CloudflareInterceptor mints cf_clearance on a URL a WebView can
-        // actually navigate. No extension-level WebView solving.
+        // The Comix Cloudflare method (ported from our working comixto
+        // source): WebView-cookie sync + browser fingerprint (sec-ch-ua,
+        // sec-fetch-*) + smart retry on CF blocks. That trio is what keeps
+        // comix.to riding a single WebView solve instead of re-challenging
+        // every hour — CF's bot scoring checks header consistency beyond
+        // the clearance cookie, and the retry eats transient blocks that
+        // used to cost a manual WebView visit.
         //
-        // What made THIS extension slower than the rest (audited in our own
-        // code, 2026-09): KeiSource stamps "Origin: <baseUrl>" onto EVERY
-        // request — but real browsers never send Origin on document
-        // navigations or <img> loads (only on CORS fetch/XHR/POST). That
-        // inconsistent Origin is exactly the kind of header Cloudflare's bot
-        // scoring flags, which kept challenging otherwise-clean traffic and
-        // made every browse pay a WebView solve. OriginSanitizer strips it
-        // from GETs (documents, images — the whole browsing path) and keeps
-        // it on POSTs (madara AJAX, fetch-ocr.php) where the browser does
-        // send it.
+        // Kept from the 2026-09 audit: OriginSanitizer strips the "Origin:
+        // <baseUrl>" header KeiSource stamps onto every request — real
+        // browsers never send Origin on document navigations or <img>
+        // loads, and that inconsistent Origin is exactly the kind of header
+        // Cloudflare's bot scoring flags.
+        //
+        // The old one-shot priming + warm-up GETs are gone: they added a
+        // whole "fail -> warm-up -> retry" cycle to the first open without
+        // making the traffic itself any more browser-like. No rateLimit
+        // either — chapters pay a fixed 0.5s/image tax under it, which the
+        // user reads as "slow", and the comix build has none.
         connectTimeout(15, TimeUnit.SECONDS)
         readTimeout(30, TimeUnit.SECONDS)
         writeTimeout(15, TimeUnit.SECONDS)
 
+        CloudflareBypass(setOf(baseUrl.toHttpUrl().host)).install(this)
+
         addInterceptor(::originSanitizerInterceptor)
-        addInterceptor(::primingInterceptor)
-        addInterceptor(warmupInterceptor)
 
         // Burn translated OCR text onto raw chapter images.
         addNetworkInterceptor(::ocrImageInterceptor)
-
-        rateLimit(2, 1.seconds)
     }
 
     /**
@@ -145,7 +111,7 @@ abstract class ManhuaRMTL :
         return chain.proceed(request)
     }
 
-    /** Browser-like image headers — keiyoushi manhuarm's exact set. */
+    /** Browser-like image headers for the CDN (chapter pages + covers). */
     override fun imageRequest(page: Page): Request {
         val imageHeaders = headersBuilder()
             .set("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
