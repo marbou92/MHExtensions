@@ -102,18 +102,26 @@ abstract class ManhuaRMTL :
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // Same client shape as keiyoushi's own manhuarm source for this
-        // exact site (manhuarmtl.com): generous timeouts + a one-shot
-        // warm-up on the first failed request so the app-level
-        // CloudflareInterceptor can mint cf_clearance, then a retry.
-        // No extension-level WebView solving, no fingerprint header
-        // overrides — v14's custom solver was both slower and MORE
-        // challenge-prone than plain keiyoushi behaviour (fetch-like
-        // sec-fetch-* on document navigations is itself a bot signal).
-        connectTimeout(1, TimeUnit.MINUTES)
-        readTimeout(2, TimeUnit.MINUTES)
-        writeTimeout(1, TimeUnit.MINUTES)
+        // One-shot session warm-up (priming) + keiyoushi-manhuarm-style
+        // warm-up on the first failed request, so the app-level
+        // CloudflareInterceptor mints cf_clearance on a URL a WebView can
+        // actually navigate. No extension-level WebView solving.
+        //
+        // What made THIS extension slower than the rest (audited in our own
+        // code, 2026-09): KeiSource stamps "Origin: <baseUrl>" onto EVERY
+        // request — but real browsers never send Origin on document
+        // navigations or <img> loads (only on CORS fetch/XHR/POST). That
+        // inconsistent Origin is exactly the kind of header Cloudflare's bot
+        // scoring flags, which kept challenging otherwise-clean traffic and
+        // made every browse pay a WebView solve. OriginSanitizer strips it
+        // from GETs (documents, images — the whole browsing path) and keeps
+        // it on POSTs (madara AJAX, fetch-ocr.php) where the browser does
+        // send it.
+        connectTimeout(15, TimeUnit.SECONDS)
+        readTimeout(30, TimeUnit.SECONDS)
+        writeTimeout(15, TimeUnit.SECONDS)
 
+        addInterceptor(::originSanitizerInterceptor)
         addInterceptor(::primingInterceptor)
         addInterceptor(warmupInterceptor)
 
@@ -121,6 +129,20 @@ abstract class ManhuaRMTL :
         addNetworkInterceptor(::ocrImageInterceptor)
 
         rateLimit(2, 1.seconds)
+    }
+
+    /**
+     * Strips the "Origin" header from GET requests. Browsers only send
+     * Origin on CORS fetch/XHR and POSTs — never on top-level document GETs
+     * or <img> loads — so sending it there is a bot signal that keeps
+     * Cloudflare challenge-prone (the reported "bypass is slow").
+     */
+    private fun originSanitizerInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.method == "GET" && request.header("Origin") != null) {
+            return chain.proceed(request.newBuilder().removeHeader("Origin").build())
+        }
+        return chain.proceed(request)
     }
 
     /** Browser-like image headers — keiyoushi manhuarm's exact set. */
@@ -691,21 +713,15 @@ abstract class ManhuaRMTL :
                         }
 
                         // Pre-translate all text boxes in the background so the
-                        // overlay is ready by the time images arrive (non-English modes)
+                        // overlay is ready by the time images arrive (non-English modes).
+                        // The futures are shared: the image interceptor awaits the SAME
+                        // request instead of issuing its own serial network calls.
                         if (mode != MODE_EN) {
                             ocrData.values
                                 .flatMap { boxes -> boxes.map { it.text } }
                                 .filter { it.isNotBlank() }
                                 .distinct()
-                                .forEach { text ->
-                                    translateExecutor.execute {
-                                        try {
-                                            translateText(text, mode)
-                                        } catch (_: Exception) {
-                                            // Interceptor falls back to the English text
-                                        }
-                                    }
-                                }
+                                .forEach { text -> prefetchTranslation(text, mode) }
                         }
                     }
                 }
@@ -802,6 +818,55 @@ abstract class ManhuaRMTL :
     // we translate each text box (Google's public gtx endpoint) and cache the
     // result, so each string is translated at most once.
 
+    // In-flight translation requests, deduplicated so the image interceptor
+    // can piggyback on the background prefetch instead of doing its own
+    // serial network calls (which used to hold every page response hostage
+    // for one RTT PER TEXT BOX — the real "chapter loading is slow").
+    private val translationsInFlight = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<String>>()
+
+    /**
+     * Submits a background translation and registers the shared future so
+     * [getTranslation] can await it (bounded) instead of re-requesting.
+     */
+    private fun prefetchTranslation(text: String, target: String) {
+        val key = "$target|$text"
+        if (translationCache.containsKey(key)) return
+        if (translationsInFlight.containsKey(key)) return
+
+        val future = java.util.concurrent.CompletableFuture.supplyAsync({
+            try {
+                translateText(text, target)
+            } catch (_: Exception) {
+                text
+            }
+        }, translateExecutor)
+        translationsInFlight.putIfAbsent(key, future)
+    }
+
+    /**
+     * Cache-only-with-shared-wait lookup used by the IMAGE interceptor.
+     * NEVER performs its own network call: the image response must not be
+     * held hostage for translation round-trips. Order of preference:
+     * 1. translated value already cached,
+     * 2. a translation that is already in flight (awaited up to 3s),
+     * 3. the original English text (drawn as-is).
+     */
+    private fun getTranslation(text: String, target: String): String {
+        val key = "$target|$text"
+        translationCache[key]?.let { return it }
+
+        val future = translationsInFlight[key]
+        if (future != null) {
+            try {
+                return future.get(3, TimeUnit.SECONDS)
+            } catch (_: Exception) {
+                // Timeout/cancel/interrupt — fall through to English text
+            }
+        }
+
+        return text
+    }
+
     private fun translateText(text: String, target: String): String {
         val key = "$target|$text"
         translationCache[key]?.let { return it }
@@ -839,6 +904,7 @@ abstract class ManhuaRMTL :
 
         if (translationCache.size > MAX_TRANSLATION_CACHE) translationCache.clear()
         translationCache[key] = result
+        translationsInFlight.remove(key)
         return result
     }
 
@@ -936,7 +1002,7 @@ abstract class ManhuaRMTL :
 
             val text = when (targetLang) {
                 MODE_EN -> textBox.text
-                else -> translateText(textBox.text, targetLang)
+                else -> getTranslation(textBox.text, targetLang)
             }
             if (text.isBlank()) continue
 

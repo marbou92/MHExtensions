@@ -11,17 +11,18 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
-import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okhttp3.ResponseBody.Companion.asResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
+import okio.Buffer
+import java.io.IOException
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
 
@@ -34,31 +35,23 @@ abstract class Comix :
 
     private val preferences = getPreferences()
 
-    // keiyoushi-parity networking (their Comix source targets this exact
-    // site): the app-level CloudflareInterceptor (already included in the
-    // network client on current Mihon builds) + shared WebView cookie jar
-    // handle CF; the v14-era custom CloudflareBypass layer (fingerprint
-    // headers on every request + Thread.sleep retries) was slower AND more
-    // challenge-prone than plain app behaviour, so it is gone.
     override val client: OkHttpClient = network.client.newBuilder()
         .connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
+        .apply {
+            // Modern Cloudflare bypass: browser fingerprint headers, WebView cookie
+            // sync and smart retry on CF blocks (rate limits / transient challenges).
+            CloudflareBypass(setOf("comix.to")).install(this)
+        }
         .addInterceptor(::signRequestInterceptor)
         .addInterceptor(::decryptResponseInterceptor)
-        .addInterceptor(Descrambler.interceptor)
-        .addInterceptor(::fallbackPathInterceptor)
-        .rateLimit(5)
+        .addNetworkInterceptor(::descrambleImageInterceptor)
         .build()
 
-    // Default headers. Origin matters for images: legacy byte-XOR pages
-    // only receive their x-enc-seed header when the request carries
-    // Origin (imageRequest strips it again for third-party CDN hosts,
-    // exactly like keiyoushi's Comix does).
+    // Default headers: only Referer (safe for both API and image requests)
     override fun headersBuilder() = super.headersBuilder()
-        .set("Referer", "$baseUrl/")
-        .set("Origin", baseUrl)
-        .set("Accept", "*/*")
+        .add("Referer", "$baseUrl/")
 
     // API-specific headers (JSON + XHR) — used only for /api/v1/ calls
     private val apiHeaders by lazy {
@@ -161,25 +154,29 @@ abstract class Comix :
             .substringAfter("/manga/")
             .substringBefore("/chapters")
 
-        // Big manga used to paginate strictly sequentially (up to 19 extra
-        // requests, each waiting for the previous one) — fetch the remaining
-        // pages with a small worker pool instead. Results are re-assembled in
-        // page order, so the chapter list order is unchanged.
+        // Remaining chapter-list pages are fetched IN PARALLEL (bounded pool)
+        // instead of one-by-one: a 900-chapter manga used to pay 8 serial
+        // signed+decrypted round-trips before the list even opened.
         if (data.meta?.hasNext == true) {
-            val lastPage = (data.meta?.lastPage ?: 20L).toInt().coerceIn(2, 20)
-            val remainingPages = (2..lastPage).toList()
-
-            if (remainingPages.isNotEmpty()) {
-                val pool = Executors.newFixedThreadPool(minOf(4, remainingPages.size))
+            val maxPage = minOf(data.meta?.lastPage ?: 2, 20)
+            val pages = (2..maxPage).toList()
+            if (pages.isNotEmpty()) {
+                val pool = Executors.newFixedThreadPool(minOf(4, pages.size)) { runnable ->
+                    Thread(runnable, "Comix-ChapterList").apply { isDaemon = true }
+                }
                 try {
-                    val futures = remainingPages.map { p ->
-                        pool.submit(Callable { p to fetchChapterPage(hid, p) })
+                    val futures = pages.map { page ->
+                        pool.submit(
+                            Callable {
+                                val nextReq = GET("$apiBaseUrl/manga/$hid/chapters?page=$page&limit=100", apiHeaders)
+                                client.newCall(nextReq).execute().use { nextResp ->
+                                    nextResp.parseAs<ComixChapterListDto>().items
+                                }
+                            },
+                        )
                     }
-                    // get() in submission order => ordered assembly
-                    futures.forEach { future ->
-                        val (_, pageItems) = future.get()
-                        items.addAll(pageItems)
-                    }
+                    // Page order matters (site order), so collect in page order.
+                    futures.forEach { future -> items.addAll(future.get()) }
                 } finally {
                     pool.shutdown()
                 }
@@ -245,100 +242,18 @@ abstract class Comix :
         return "$baseUrl/title/${chapter.url}"
     }
 
-    private fun fetchChapterPage(hid: String, page: Int): List<ComixChapterDto> = try {
-        client.newCall(GET("$apiBaseUrl/manga/$hid/chapters?page=$page&limit=100", apiHeaders))
-            .execute()
-            .use { resp -> resp.parseAs<ComixChapterListDto>().items }
-    } catch (_: Exception) {
-        emptyList()
-    }
-
-    // keiyoushi buildPages(): V3 pages NEED the ?v3 query flag or the
-    // server withholds the scramble headers; legacy byte-XOR pages (every
-    // 4th entry, no v3 flag) get a #scrambled fragment so imageRequest
-    // keeps Origin (the seed header is only sent to Origin-bearing
-    // requests). The previous build STRIPPED all query parameters, which
-    // silently broke V3 pages.
     override fun pageListParse(response: Response): List<Page> {
         val data = response.parseAs<ComixChapterPagesDto>()
         val container = data.pages
-        val base = container?.baseUrl.orEmpty().trimEnd('/')
+        val base = container?.baseUrl.orEmpty()
         val pages = container?.items ?: emptyList()
-
         return pages.mapIndexed { index, pageDto ->
-            val full = if (pageDto.url.startsWith("http")) {
-                pageDto.url
-            } else {
-                "$base/${pageDto.url.trimStart('/')}"
-            }
-            val isV3 = pageDto.s == 1 || full.contains("?v3")
-            val isLegacyScramble = !isV3 && (index + 1) % 4 == 0
-            val url = when {
-                isV3 -> full.toHttpUrl().newBuilder().apply {
-                    if (!full.toHttpUrl().queryParameterNames.contains("v3")) {
-                        addQueryParameter("v3", null)
-                    }
-                }.build().toString()
-                isLegacyScramble -> "$full#scrambled"
-                else -> full
-            }
-            Page(index, imageUrl = url)
+            val cleanUrl = (base + pageDto.url).substringBefore("?")
+            Page(index, imageUrl = cleanUrl)
         }
     }
 
-    // keiyoushi imageRequest(): V3 grid-scramble pages must NOT send
-    // Origin (the server withholds X-Scramble-Seed when it is present);
-    // legacy byte-XOR pages need it to receive X-Enc-Seed.
-    override fun imageRequest(page: Page): Request {
-        val imageUrl = page.imageUrl ?: return super.imageRequest(page)
-        val urlWithoutFragment = imageUrl.substringBefore('#')
-        val imageHost = urlWithoutFragment.toHttpUrlOrNull()?.host.orEmpty()
-        val isScrambled = imageUrl.contains("#scrambled")
-        val isV3 = urlWithoutFragment.toHttpUrlOrNull()?.queryParameterNames?.contains("v3") == true
-        val isLegacyScramble = isScrambled && !isV3
-        val baseUrlHost = baseUrl.toHttpUrl().host
-        val requestHeaders = if (
-            imageHost.isNotEmpty() &&
-            !imageHost.endsWith(baseUrlHost) &&
-            !isLegacyScramble
-        ) {
-            headersBuilder()
-                .removeAll("Origin")
-                .build()
-        } else {
-            headers
-        }
-        return GET(urlWithoutFragment, requestHeaders)
-    }
-
-    /**
-     * Ported from keiyoushi's Comix: the site rotates its image path
-     * prefix over time, so a page URL captured from an older chapter
-     * payload can 404 until the list is refreshed (the "page won't load
-     * until you refresh twice" report). Transparently retry the same
-     * file under the alternative prefixes instead.
-     */
-    private fun fallbackPathInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-
-        val response = chain.proceed(request)
-        if (response.code != 404) return response
-
-        val url = request.url.toString()
-        val fallbacks = listOf("/i5/", "/si/", "/i/", "/sii/", "/ii/")
-            .map { url.replaceFirst(SCRAMBLE_PATH_FALLBACK_REGEX, it) }
-            .filter { it != url }
-
-        if (fallbacks.isEmpty()) return response
-
-        var lastResponse = response
-        for (fallbackUrl in fallbacks) {
-            lastResponse.close()
-            lastResponse = chain.proceed(request.newBuilder().url(fallbackUrl).build())
-            if (lastResponse.code != 404) break
-        }
-        return lastResponse
-    }
+    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
@@ -622,6 +537,151 @@ abstract class Comix :
         return response.newBuilder()
             .body(content.toResponseBody("application/json".toMediaType()))
             .build()
+    }
+
+    /**
+     * Descrambles images with x-scramble-* headers.
+     * Uses xorshift(13,17,5) + Fisher-Yates with inverse permutation.
+     */
+    private fun descrambleImageInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+        if (!response.isSuccessful) return response
+
+        val rawScrambleSeed = response.header("x-scramble-seed")
+        val rawScrambleGrid = response.header("x-scramble-grid")
+        val rawScrambleAlgo = response.header("x-scramble-algo")
+        val rawScrambleHash = response.header("x-scramble-hash")
+
+        val scrambleSeed = rawScrambleSeed?.toLongOrNull()?.toInt()
+        val scrambleHash = when (rawScrambleHash?.trim()) {
+            "03632" -> 58414
+            "02900" -> 117532
+            else -> 0
+        }
+
+        val shouldDescramble = rawScrambleGrid == "5x5" &&
+            (rawScrambleAlgo == null || rawScrambleAlgo == "1" || rawScrambleAlgo == "2" || rawScrambleAlgo == "3") &&
+            scrambleSeed != null && scrambleSeed != 0
+
+        if (!shouldDescramble) return response
+
+        val body = response.body
+        val imageBytes = body.bytes()
+
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+
+        // A scrambled page whose body doesn't decode is a transient bad fetch
+        // (CDN hiccup / interrupted stream). Handing the undecodable bytes to
+        // the reader is the "page only loads after refreshing twice" bug: the
+        // broken response counts as delivered, so Mihon shows a blank/error
+        // page until the user re-requests it manually. Retry the same request
+        // a couple of times right here instead — a fresh download decodes and
+        // the reader never sees the bad bytes.
+        var decoded: android.graphics.Bitmap? = bitmap
+        var currentResponse = response
+        var retries = 0
+        while (decoded == null && retries < 2) {
+            retries++
+            currentResponse.close()
+            currentResponse = chain.proceed(request)
+            if (!currentResponse.isSuccessful) return currentResponse
+            val retryBytes = currentResponse.body.bytes()
+            decoded = android.graphics.BitmapFactory.decodeByteArray(retryBytes, 0, retryBytes.size)
+        }
+
+        if (decoded == null) {
+            currentResponse.close()
+            throw IOException("Comix page image didn't download correctly (tried ${retries + 1} times) — tap the page to retry")
+        }
+
+        return finishDescramble(currentResponse, decoded, rawScrambleAlgo, scrambleSeed, scrambleHash)
+    }
+
+    /**
+     * Descrambles [bitmap] (from [imageBytes] of [response]) using the
+     * xorshift(13,17,5) / LCG + Fisher-Yates inverse permutation and returns
+     * the rewritten response.
+     */
+    private fun finishDescramble(
+        response: Response,
+        bitmap: android.graphics.Bitmap,
+        rawScrambleAlgo: String?,
+        scrambleSeed: Int,
+        scrambleHash: Int,
+    ): Response {
+        val cols = 5
+        val rows = 5
+        val numTiles = cols * rows
+        val tileW = bitmap.width / cols
+        val tileH = bitmap.height / rows
+
+        val seed = scrambleSeed xor scrambleHash
+        val order = if (rawScrambleAlgo == "3") buildOrderXorshift(seed, numTiles) else buildOrderLcg(seed, numTiles)
+
+        val output = android.graphics.Bitmap.createBitmap(bitmap.width, bitmap.height, android.graphics.Bitmap.Config.ARGB_8888)
+        val canvas = android.graphics.Canvas(output)
+        canvas.drawBitmap(bitmap, 0f, 0f, null)
+
+        for (dstIdx in 0 until numTiles) {
+            val srcIdx = order[dstIdx]
+            val srcCol = srcIdx % cols
+            val srcRow = srcIdx / cols
+            val dstCol = dstIdx % cols
+            val dstRow = dstIdx / cols
+            val srcRect = android.graphics.Rect(srcCol * tileW, srcRow * tileH, (srcCol + 1) * tileW, (srcRow + 1) * tileH)
+            val dstRect = android.graphics.Rect(dstCol * tileW, dstRow * tileH, (dstCol + 1) * tileW, (dstRow + 1) * tileH)
+            canvas.drawBitmap(bitmap, srcRect, dstRect, null)
+        }
+
+        bitmap.recycle()
+
+        val jpegMedia = "image/jpeg".toMediaType()
+        val buffer = Buffer()
+        output.compress(android.graphics.Bitmap.CompressFormat.JPEG, 90, buffer.outputStream())
+        output.recycle()
+
+        return response.newBuilder()
+            .removeHeader("Content-Length")
+            .removeHeader("Content-Type")
+            .body(buffer.asResponseBody(jpegMedia, buffer.size))
+            .build()
+    }
+
+    private fun buildOrderXorshift(seed: Int, n: Int): IntArray {
+        val arr = IntArray(n) { it }
+        var state = seed or 1
+        for (i in n - 1 downTo 1) {
+            state = state xor (state shl 13)
+            state = state xor (state ushr 17)
+            state = state xor (state shl 5)
+            val j = (state.toLong() and 0xFFFFFFFFL) % (i + 1)
+            val tmp = arr[i]
+            arr[i] = arr[j.toInt()]
+            arr[j.toInt()] = tmp
+        }
+        return IntArray(n).also { inverse ->
+            for (i in arr.indices) {
+                inverse[arr[i]] = i
+            }
+        }
+    }
+
+    private fun buildOrderLcg(seed: Int, n: Int): IntArray {
+        val arr = IntArray(n) { it }
+        var state = seed
+        for (i in n - 1 downTo 1) {
+            state = state * 1664525 + 1013904223
+            val j = (state.toLong() and 0xFFFFFFFFL) % (i + 1)
+            val tmp = arr[i]
+            arr[i] = arr[j.toInt()]
+            arr[j.toInt()] = tmp
+        }
+        return IntArray(n).also { inverse ->
+            for (i in arr.indices) {
+                inverse[arr[i]] = i
+            }
+        }
     }
 
     // --- S-box constants (extracted from the site JS) ---
@@ -1005,8 +1065,6 @@ abstract class Comix :
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
         private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
         private const val PREF_SCORE_POSITION = "pref_score_position"
-
-        private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
 
         private const val SBOX1_B64 = "gbicCvAMzfcXEtGAyjvvhmb2yCWzWhjqcxXZ7ZhpzANOzoQLo3nuPZ2vK9dkb9hJExC0Vni/hdQBceI+mw611gkhQFjBuf4bJg1TxYqM+SL4YDqtwjxiGSdeH7so7Fn1HiRo37Z+RNvl44twXWVhomtMjw+8bemfmv9XEXr7mS82MxaCOJZRR0oHd9PLI5O+gyBGT6hcLoduNa7yCObVVCk3bFWsoD+xcqTrBcP6dNJN/NB1Br2QGhSN2snHAqeRNKVFQiyeAFLPSKGwY8aq9EPgsi17qd4ywPMxiH8w6N1qX1tLKtzhOeemHWeJQfFQ5H23q7qSlJUcjgTEl3x2/Q=="
         private const val KEY1_B64 = "rafYl4oSAKQX+GYoic9oW4iGwiYpZzs0"

@@ -55,16 +55,53 @@ abstract class Kagane :
     private val prefs = getPreferences()
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // Byte-equivalent to keiyoushi's own kagane source: just the token
-        // interceptor and a rate limit. NO custom Cloudflare layer — v14's
-        // solver (fingerprint headers + off-screen WebView solve) was slower
-        // AND more challenge-prone than plain keiyoushi behaviour; the
-        // app-level CloudflareInterceptor (moved after source interceptors
-        // by KeiSource) plus the shared WebView cookie jar is what makes
-        // keiyoushi sources feel instant.
+        // Token interceptor + a rate limit, like upstream — NO custom
+        // Cloudflare layer. The app-level CloudflareInterceptor (KeiSource
+        // moves it after source interceptors) plus the shared WebView cookie
+        // jar is what makes keiyoushi sources feel instant.
+        //
+        // Two of OUR OWN behaviours were making it slow (audited 2026-09):
+        // 1. KeiSource stamps "Origin: <baseUrl>" onto every request, but
+        //    browsers NEVER send Origin on document GETs (the site-root
+        //    priming GET is one) — an inconsistent Origin is a Cloudflare
+        //    bot signal that kept challenging clean traffic.
+        // 2. refreshTokenInterceptor treated ANY 403 from a token-bearing
+        //    URL as a Kagane auth failure and burned a full integrity+token
+        //    round-trip per challenged image BEFORE the app-level solver
+        //    ever saw the challenge. CF-challenge responses are now handed
+        //    straight to the app-level interceptor instead.
+        addInterceptor(::originSanitizerInterceptor)
         addInterceptor(::refreshTokenInterceptor)
 
         rateLimit(3)
+    }
+
+    /**
+     * Strips "Origin" from GET requests — browsers only send Origin on
+     * CORS fetch/XHR and POSTs, never on document navigations or <img>
+     * loads. Carrying it on every GET is a bot signal that keeps
+     * Cloudflare challenging otherwise-clean traffic (the reported
+     * "bypass is slow").
+     */
+    private fun originSanitizerInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.method == "GET" && request.header("Origin") != null) {
+            return chain.proceed(request.newBuilder().removeHeader("Origin").build())
+        }
+        return chain.proceed(request)
+    }
+
+    /**
+     * True when the response is a Cloudflare challenge rather than a
+     * Kagane application error — those must NOT be consumed here (the
+     * token refresh can't fix them and the detour wastes seconds); they
+     * bubble up to the app-level CloudflareInterceptor, which solves them
+     * in the shared WebView and retries.
+     */
+    private fun Response.isCloudflareChallenge(): Boolean {
+        if (header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true) return true
+        if (header("server")?.contains("cloudflare", ignoreCase = true) == true && code in listOf(403, 429, 503)) return true
+        return false
     }
 
     private fun refreshTokenInterceptor(chain: Interceptor.Chain): Response {
@@ -87,10 +124,11 @@ abstract class Kagane :
         )
 
         // Upstream-exact: a 401/403/507 from a token-bearing URL is treated
-        // as a Kagane auth failure and triggers a token refresh. A CF
-        // challenge on this path bubbles up to the app-level interceptor,
-        // exactly as it does for keiyoushi's kagane.
-        if (response.code in listOf(401, 403, 507)) {
+        // as a Kagane auth failure and triggers a token refresh — EXCEPT
+        // Cloudflare challenges (see isCloudflareChallenge), which fall
+        // through to the app-level interceptor instead of burning a token
+        // refresh per challenged request (the reported slowness).
+        if (response.code in listOf(401, 403, 507) && !response.isCloudflareChallenge()) {
             response.close()
             val challenge = runBlocking {
                 runCatching { getChallengeResponse(chapterId) }

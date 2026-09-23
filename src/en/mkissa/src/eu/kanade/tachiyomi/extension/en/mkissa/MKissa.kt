@@ -36,6 +36,7 @@ import kotlinx.serialization.json.putJsonObject
 import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -448,8 +449,9 @@ abstract class MKissa :
     private fun writePageCache(chapterUrl: String, urls: List<String>) {
         val editor = preferences.edit()
 
-        // Purge lists captured by the v14 build — they were harvested from
-        // partially-rendered DOM trees and carry wrong counts.
+        // Purge lists captured by older builds — v14 harvested partially-
+        // rendered DOM trees (wrong counts); v15/v16 could capture nothing
+        // but the browser's favicon request (one "page" per chapter).
         preferences.all.keys
             .filter { it.startsWith(LEGACY_PAGE_CACHE_PREFIX) && !it.startsWith(PAGE_CACHE_PREFIX) }
             .forEach { editor.remove(it) }
@@ -477,6 +479,13 @@ abstract class MKissa :
      */
     private suspend fun collectReaderPages(readerUrl: String): List<String> = runWebView(timeout = 2.minutes) {
         val collected = Collections.synchronizedSet(LinkedHashSet<String>())
+        // Whether we saw at least one REAL page candidate (extension-based
+        // image URL or an extensionless non-site-host CDN URL). The v15
+        // build resolved its fallback with whatever was in the set — which,
+        // when the fetch hook never fired, was just the browser's favicon
+        // request — and every chapter ended up as a single page pointing at
+        // /favicon.ico. The fallback may now only resolve on real evidence.
+        val sawRealCandidate = java.util.concurrent.atomic.AtomicBoolean(false)
         var lastCount = 0
         var stablePolls = 0
         var finished = false
@@ -484,7 +493,10 @@ abstract class MKissa :
 
         fun consider(url: String) {
             val cleaned = url.trim().takeIf { it.startsWith("http") } ?: return
-            if (isHarvestablePageUrl(cleaned) && isPageImageUrl(cleaned)) collected.add(cleaned)
+            if (isHarvestablePageUrl(cleaned) && isPageImageUrl(cleaned)) {
+                collected.add(cleaned)
+                sawRealCandidate.set(true)
+            }
         }
 
         // Receives {url, req, res} envelopes from the injected fetch/XHR
@@ -511,10 +523,17 @@ abstract class MKissa :
                 if (isHarvestablePageUrl(url)) {
                     consider(url)
                     // WebView "Accept: image/..." header is a solid image signal
-                    // even when the CDN path has no file extension.
+                    // even when the CDN path has no file extension. STRICTLY
+                    // GATED now: extensionless URLs only count on non-site
+                    // hosts (real page images come from the CDN) — this is the
+                    // exact path that let /favicon.ico (requested with an
+                    // image Accept) masquerade as "page 1" for every chapter.
                     val accept = request.requestHeaders?.get("Accept")
-                    if (accept?.contains("image/") == true) {
+                    if (accept?.contains("image/") == true &&
+                        url.toHttpUrlOrNull()?.let { !isSiteHost(it.host) } == true
+                    ) {
                         collected.add(url)
+                        sawRealCandidate.set(true)
                     }
                 }
             }
@@ -525,7 +544,15 @@ abstract class MKissa :
             evaluateJs(FETCH_HOOK_JS)
         }
 
-        onPageFinished { _ -> finished = true }
+        onPageFinished { _ ->
+            finished = true
+            // Hedge: the reader can embed the chapterPages payload directly
+            // in the page (SSR state / inline JSON), especially now the site
+            // pins realm-isolated primitives specifically so extension hooks
+            // can't intercept its fetch calls. Scan inline scripts and push
+            // any embedded payload through the same bridge path.
+            evaluateJs(INLINE_PAYLOAD_JS)
+        }
 
         poll(1.seconds) {
             // Re-install the hook if the page re-navigated before it ran.
@@ -571,8 +598,11 @@ abstract class MKissa :
                 }
             }
 
-            // Fallback resolution: image harvesting stable after page finish.
-            if (finished && count > 0 && count == lastCount) {
+            // Fallback resolution: real image harvesting stable after page
+            // finish. Never resolves on UI-asset-only collections (favicon
+            // etc.) — if the reader produced no real candidates we keep
+            // waiting (the timeout then fails with the actionable message).
+            if (finished && sawRealCandidate.get() && count > 0 && count == lastCount) {
                 stablePolls++
                 if (stablePolls >= 4) resolve(collected.toList())
             } else {
@@ -665,11 +695,18 @@ abstract class MKissa :
     private fun extractPageUrls(rawBody: String, rawRequestBody: String?, readerUrl: String): List<String> {
         if (!rawBody.contains("chapterPages") || !rawBody.contains("pictureUrls")) return emptyList()
 
-        val root = runCatching { Json.parseToJsonElement(rawBody) }.getOrNull() ?: return emptyList()
+        val root = runCatching { Json.parseToJsonElement(rawBody) }.getOrNull()
+        if (root == null) {
+            // Inline-script/SSR text (not pure JSON): the regex path inside
+            // deepScanPictureUrls is the only chance to recover the payload.
+            return deepScanPictureUrls(null, rawBody, readerUrl)?.let { sanitizePageUrls(it, readerUrl) }
+                ?: emptyList()
+        }
         val edges = root.jsonObjectOrNull("data")
             ?.jsonObjectOrNull("chapterPages")
             ?.jsonArrayOrNull("edges")
-            ?: return emptyList()
+            ?: return deepScanPictureUrls(root, rawBody, readerUrl)?.let { sanitizePageUrls(it, readerUrl) }
+                ?: emptyList()
 
         val chapterSegment = runCatching { readerUrl.toHttpUrl().pathSegments }
             .getOrNull()
@@ -726,7 +763,64 @@ abstract class MKissa :
 
         return candidates.firstOrNull { it.size > 1 }
             ?: candidates.firstOrNull()
+            ?: deepScanPictureUrls(root, rawBody, readerUrl)?.let { sanitizePageUrls(it, readerUrl) }
             ?: emptyList()
+    }
+
+    /**
+     * Shape-drift safety net: recursively walks ANY JSON payload and
+     * collects every object that carries a "pictureUrls" array, wherever
+     * it now lives (the site actively reshapes its payloads to break
+     * extension scrapers — the structured path above can come up empty
+     * while the data is right there under a new envelope). Falls back to
+     * regex extraction when the body isn't pure JSON (inline script text).
+     */
+    private fun deepScanPictureUrls(root: JsonElement?, rawBody: String, readerUrl: String): List<String>? {
+        if (root != null) {
+            val found = LinkedHashMap<String, List<String>>()
+            fun walk(element: JsonElement?) {
+                when (element) {
+                    is JsonObject -> {
+                        if (element.containsKey("pictureUrls")) {
+                            val joined = normalizeEdgePages(element, readerUrl)
+                            if (joined.isNotEmpty()) {
+                                found.putIfAbsent(element.hashCode().toString(), joined)
+                            }
+                        }
+                        element.values.forEach(::walk)
+                    }
+                    is JsonArray -> element.forEach(::walk)
+                    else -> {}
+                }
+            }
+            walk(root)
+            if (found.isNotEmpty()) {
+                return found.values.firstOrNull { it.size > 1 } ?: found.values.first()
+            }
+        }
+
+        // Not parseable as JSON with pictureUrls anywhere — try regexing
+        // "pictureUrls":[...] fragments out of the raw text (inline scripts,
+        // JSON-string-encoded payloads). Entries are flat {num,url} objects,
+        // so a bracket-balanced-enough scan is workable.
+        val regex = Regex("\"pictureUrls\"\\s*:\\s*(\\[.*?\\])", RegexOption.DOT_MATCHES_ALL)
+        for (match in regex.findAll(rawBody)) {
+            val arrayText = match.groupValues[1].takeIf { it.length < 400_000 } ?: continue
+            val array = runCatching { Json.parseToJsonElement(arrayText) }.getOrNull() as? JsonArray ?: continue
+            val urls = parsePictureUrlEntries(array)
+                .mapNotNull { (num, raw) ->
+                    val url = when {
+                        raw.startsWith("http://") || raw.startsWith("https://") -> raw
+                        raw.startsWith("//") -> "https:$raw"
+                        else -> runCatching { readerUrl.toHttpUrl().resolve(raw)?.toString() }.getOrNull()
+                    }
+                    if (url != null && url.startsWith("http")) num to url else null
+                }
+                .sortedBy { it.first }
+                .map { it.second }
+            if (urls.isNotEmpty()) return urls
+        }
+        return null
     }
 
     private fun edgePriority(edge: JsonObject): Float = (edge["priority"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0f
@@ -800,8 +894,32 @@ abstract class MKissa :
         val host = runCatching { url.toHttpUrl().host }.getOrNull() ?: return false
         if (host == "challenges.cloudflare.com" || host == apiHost) return false
         val path = url.substringBefore('?').substringBefore('#').lowercase()
+        if (isSiteUiAssetPath(path)) return false
         return path.substringAfterLast('.').substringBefore('%') in PAGE_IMAGE_EXTENSIONS
     }
+
+    /**
+     * Site chrome assets that browsers auto-request but are NOT chapter
+     * pages: favicons of every flavour, PWA icons, manifest. This is what
+     * the v15 build harvested as "page 1" for EVERY chapter (the browser
+     * requests /favicon.ico with an Accept: image/... header, and the old
+     * interceptRequest added any accept-image URL without an extension
+     * check) — the page list then collapsed to a single favicon image.
+     */
+    private fun isSiteUiAssetPath(path: String): Boolean {
+        if (path.endsWith(".ico") || path.endsWith(".icon")) return true
+        return path.substringAfterLast('/').let { name ->
+            name.startsWith("favicon") ||
+                name.startsWith("apple-touch-icon") ||
+                name.startsWith("android-chrome") ||
+                name.startsWith("mstile") ||
+                name == "site.webmanifest" ||
+                name == "manifest.json"
+        }
+    }
+
+    /** The site itself and any of its subdomains (www., cdn. UI, …). */
+    private fun isSiteHost(host: String): Boolean = host == baseUrl.removePrefix("https://") || host.endsWith(".${baseUrl.removePrefix("https://")}")
 
     /**
      * True when a URL may enter the harvested/extracted page list at all.
@@ -814,9 +932,10 @@ abstract class MKissa :
      * site-hosted image paths is safer than dropping them blindly.
      */
     private fun isHarvestablePageUrl(url: String): Boolean {
-        val httpUrl = runCatching { url.toHttpUrl() }.getOrNull() ?: return false
+        val httpUrl = url.toHttpUrlOrNull() ?: return false
         if (httpUrl.host == "challenges.cloudflare.com") return false
         if (httpUrl.host == apiHost || httpUrl.host.endsWith(".$apiHost")) return false
+        if (isSiteUiAssetPath(httpUrl.encodedPath.lowercase())) return false
         val path = httpUrl.encodedPath.lowercase()
         if (path == "/" || path.startsWith("/manga/") || path.startsWith("/api")) return false
         return true
@@ -1175,11 +1294,11 @@ abstract class MKissa :
         // obfuscated anti-abuse crypto proof, so pages are collected from the
         // real reader in an off-screen WebView instead — see getPageList.)
 
-        // v16: prefix bumped again so page lists captured by the v15 build
-        // (whose extraction could keep the reader URL itself as "page 1" —
-        // the whole chapter on one URL, hence "Failed to initialize
-        // decoder") are never served.
-        private const val PAGE_CACHE_PREFIX = "mkissa_pages_v3_"
+        // v17: prefix bumped again so page lists captured by the v15/v16
+        // builds (favicon-only lists — the harvester picked up the browser's
+        // /favicon.ico request as "page 1" for EVERY chapter) are never
+        // served.
+        private const val PAGE_CACHE_PREFIX = "mkissa_pages_v4_"
         private const val LEGACY_PAGE_CACHE_PREFIX = "mkissa_pages_"
         private const val PAGE_CACHE_MAX_ENTRIES = 60
 
@@ -1212,6 +1331,10 @@ abstract class MKissa :
                   window.mhbridge.post(JSON.stringify({url:String(url||''),req:String(req||''),res:res.slice(0,2000000)}));
                 }catch(e){}
               }
+              function isApiUrl(u){
+                u=String(u||'');
+                return u.indexOf('mkissa')!==-1 || u.indexOf('graphql')!==-1;
+              }
               var of=window.fetch;
               if(of){
                 window.fetch=function(){
@@ -1220,7 +1343,7 @@ abstract class MKissa :
                     var a0=arguments[0], a1=arguments[1];
                     var url=typeof a0==='string'?a0:(a0&&a0.url)||'';
                     var req=(a1&&a1.body!=null)?String(a1.body):'';
-                    if(url.indexOf('api.mkissa.net')!==-1){
+                    if(isApiUrl(url)){
                       p.then(function(r){
                         try{ r.clone().text().then(function(txt){ sendPair(url,req,txt); }).catch(function(){}); }catch(e){}
                       }).catch(function(){});
@@ -1240,7 +1363,7 @@ abstract class MKissa :
                   x.addEventListener('load',function(){
                     try{
                       var u=String(x.__mhUrl||'');
-                      if(u.indexOf('api.mkissa.net')!==-1) sendPair(u,req,x.responseText);
+                      if(isApiUrl(u)) sendPair(u,req,x.responseText);
                     }catch(e){}
                   });
                 }catch(e){}
@@ -1262,6 +1385,31 @@ abstract class MKissa :
                 }
                 return JSON.stringify(out);
               } catch (e) { return '[]'; }
+            })();
+        """.trimIndent()
+
+        /**
+         * Scans inline <script> payloads (SSR state / embedded JSON) for the
+         * chapterPages payload and pushes hits through the same bridge path
+         * as the fetch hook. The site pins realm-isolated primitives so
+         * extension fetch hooks can't see its API calls — embedded state is
+         * the remaining in-page copy of the same data.
+         */
+        private val INLINE_PAYLOAD_JS = """
+            (function(){
+              try{
+                if(window.__mhInlineScan) return;
+                window.__mhInlineScan=true;
+                var scripts=document.querySelectorAll('script:not([src])');
+                for(var i=0;i<scripts.length;i++){
+                  var t=String(scripts[i].textContent||'');
+                  if(t.indexOf('chapterPages')!==-1 && t.indexOf('pictureUrls')!==-1){
+                    try{
+                      window.mhbridge.post(JSON.stringify({url:location.href,req:'',res:t.slice(0,2000000)}));
+                    }catch(e){}
+                  }
+                }
+              }catch(e){}
             })();
         """.trimIndent()
 
