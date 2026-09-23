@@ -44,6 +44,7 @@ import org.jsoup.nodes.Element
 import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.Executors
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.math.min
 import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.seconds
@@ -70,6 +71,36 @@ abstract class ManhuaRMTL :
     /** Keiyoushi-manhuarm-style Cloudflare warm-up — see the interceptor. */
     private val warmupInterceptor = CloudflareWarmupInterceptor(baseUrl, headers)
 
+    /** Ensures the one-shot session warm-up below only ever runs once. */
+    private val primed = AtomicBoolean(false)
+
+    /**
+     * Proactive, one-shot Cloudflare warm-up: BEFORE the session's first
+     * request, do a plain GET to the base URL and only then run the real
+     * request. When the clearance cookie is missing or stale, the app's
+     * CloudflareInterceptor (which KeiSource keeps right after the source
+     * interceptors) solves the challenge on that homepage GET — a URL a
+     * WebView can actually navigate. The upstream warmup interceptor only
+     * reacts AFTER a request has already failed, so every session paid
+     * "fail -> warm-up -> retry" first; priming shaves that whole cycle
+     * off the first open and keeps the POST-free GET solve path.
+     */
+    private fun primingInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (!primed.compareAndSet(false, true)) return chain.proceed(request)
+
+        try {
+            if (request.url.host != baseUrl.toHttpUrl().host) {
+                chain.proceed(GET(baseUrl, headers)).close()
+            }
+        } catch (_: Exception) {
+            // Priming is best-effort; the warmup interceptor + the app's
+            // CloudflareInterceptor still cover the failure case.
+        }
+
+        return chain.proceed(request)
+    }
+
     override fun OkHttpClient.Builder.configureClient() = apply {
         // Same client shape as keiyoushi's own manhuarm source for this
         // exact site (manhuarmtl.com): generous timeouts + a one-shot
@@ -83,6 +114,7 @@ abstract class ManhuaRMTL :
         readTimeout(2, TimeUnit.MINUTES)
         writeTimeout(1, TimeUnit.MINUTES)
 
+        addInterceptor(::primingInterceptor)
         addInterceptor(warmupInterceptor)
 
         // Burn translated OCR text onto raw chapter images.

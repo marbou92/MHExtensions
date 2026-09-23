@@ -320,51 +320,31 @@ abstract class Kagane :
     private var integrityExp = System.currentTimeMillis()
 
     /**
-     * Integrity token with a persistent cache. The token used to live in
-     * memory only, so EVERY app start paid a site-root GET plus an
-     * /api/integrity POST before the first details/chapter/pages call could
-     * even begin — the main reason entering Kagane felt slow. The token is
-     * bound to the device (IP/UA), not to a session, so caching it in the
-     * source prefs is safe.
+     * Upstream-verbatim keiyoushi behaviour, including the site-root
+     * "priming" GET. That GET looks redundant but is load-bearing for
+     * Cloudflare: it is a plain GET to kagane.to, so when the clearance
+     * cookie is missing the app's CloudflareInterceptor can solve the
+     * challenge there (a WebView can only navigate with GET). Without it
+     * the FIRST thing to hit Cloudflare is the POST below / the POST to
+     * /books/{id} — and a challenged POST cannot be solved by the app's
+     * WebView flow, so users saw "Failed to bypass Cloudflare". The v15
+     * persistent token cache skipped this priming whenever a stale token
+     * was still cached, which is exactly why v15 failed where upstream
+     * works.
      */
     private suspend fun getIntegrityToken(): String {
-        val now = System.currentTimeMillis()
-        if (integrityExp > now + INTEGRITY_SAFETY_WINDOW_MS) return integrityToken
+        if (integrityExp < System.currentTimeMillis()) {
+            client.get("$baseUrl/").close()
 
-        // Memory cache miss — try the persistent cache (survives restarts)
-        val cachedToken = prefs.getStringSafe(PREF_INTEGRITY_TOKEN, null)
-        val cachedExp = prefs.getStringSafe(PREF_INTEGRITY_EXP, null)?.toLongOrNull() ?: 0L
-        if (!cachedToken.isNullOrBlank() && cachedExp > now + INTEGRITY_SAFETY_WINDOW_MS) {
-            integrityToken = cachedToken
-            integrityExp = cachedExp
-            return cachedToken
+            val res = client.post(
+                "$baseUrl/api/integrity",
+                "".toJsonRequestBody(),
+            ).parseAs<IntegrityDto>()
+            integrityToken = res.token
+            integrityExp = res.exp * 1000
         }
 
-        // (No site-root "priming" GET here anymore — the app's Cloudflare
-        // interceptor solves a challenge on this POST itself, and skipping
-        // the extra round-trip makes the first mint noticeably faster.)
-
-        val res = client.post(
-            "$baseUrl/api/integrity",
-            "".toJsonRequestBody(),
-        ).parseAs<IntegrityDto>()
-        integrityToken = res.token
-        integrityExp = res.exp * 1000
-        prefs.edit()
-            .putString(PREF_INTEGRITY_TOKEN, res.token)
-            .putString(PREF_INTEGRITY_EXP, (res.exp * 1000).toString())
-            .apply()
         return integrityToken
-    }
-
-    /** Drops a possibly-stale cached token so the next attempt re-mints it. */
-    private fun clearIntegrityToken() {
-        integrityToken = ""
-        integrityExp = System.currentTimeMillis()
-        prefs.edit()
-            .remove(PREF_INTEGRITY_TOKEN)
-            .remove(PREF_INTEGRITY_EXP)
-            .apply()
     }
 
     private suspend fun getChallengeResponse(chapterId: String): ChallengeDto {
@@ -379,15 +359,6 @@ abstract class Kagane :
         val headers = headers.newBuilder().add("x-integrity-token", integrityToken).build()
 
         val response = client.post(challengeUrl.toString(), headers, challengeBody)
-
-        if (!response.isSuccessful) {
-            val code = response.code
-            response.close()
-            // 401/403 usually mean the cached integrity token went stale —
-            // drop it so the next attempt re-mints instead of failing forever.
-            if (code == 401 || code == 403) clearIntegrityToken()
-            throw IOException("Kagane returned HTTP $code while requesting the book")
-        }
 
         return response.parseAs<ChallengeDto>()
     }
@@ -534,10 +505,6 @@ abstract class Kagane :
         private const val SHOW_EDITION_DEFAULT = false
 
         private const val DATA_SAVER = "kagane_data_saver"
-
-        private const val PREF_INTEGRITY_TOKEN = "kagane_integrity_token"
-        private const val PREF_INTEGRITY_EXP = "kagane_integrity_exp"
-        private const val INTEGRITY_SAFETY_WINDOW_MS = 60_000L
 
         private const val CHAPTER_TITLE_MODE = "kagane_chapter_title_mode"
         private const val CHAPTER_TITLE_MODE_DEFAULT = "optional"

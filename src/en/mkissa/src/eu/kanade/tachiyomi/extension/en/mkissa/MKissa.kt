@@ -484,7 +484,7 @@ abstract class MKissa :
 
         fun consider(url: String) {
             val cleaned = url.trim().takeIf { it.startsWith("http") } ?: return
-            if (isPageImageUrl(cleaned)) collected.add(cleaned)
+            if (isHarvestablePageUrl(cleaned) && isPageImageUrl(cleaned)) collected.add(cleaned)
         }
 
         // Receives {url, req, res} envelopes from the injected fetch/XHR
@@ -500,12 +500,23 @@ abstract class MKissa :
         }
 
         interceptRequest { request ->
-            consider(request.url.toString())
-            // WebView "Accept: image/..." header is a solid image signal even
-            // when the CDN path has no file extension.
-            val accept = request.requestHeaders?.get("Accept")
-            if (accept?.contains("image/") == true) {
-                collected.add(request.url.toString())
+            // NEVER harvest the reader page itself: that single URL serves
+            // the entire chapter, and treating it as "page 1" is exactly the
+            // reported bug (page 1 just opens the chapter on the site; once
+            // cached, the HTML bytes hit the image decoder and fail with
+            // "Failed to initialize decoder"). Main-frame navigations and
+            // site-host URLs are not page images.
+            if (!request.isForMainFrame) {
+                val url = request.url.toString()
+                if (isHarvestablePageUrl(url)) {
+                    consider(url)
+                    // WebView "Accept: image/..." header is a solid image signal
+                    // even when the CDN path has no file extension.
+                    val accept = request.requestHeaders?.get("Accept")
+                    if (accept?.contains("image/") == true) {
+                        collected.add(url)
+                    }
+                }
             }
             null
         }
@@ -702,12 +713,20 @@ abstract class MKissa :
             if (existing == null || edgePriority(edge) > edgePriority(existing)) groups[key] = edge
         }
 
-        // goe(): first source (highest priority) with a usable page list.
-        for (edge in groups.values.sortedByDescending(::edgePriority)) {
-            val pages = normalizeEdgePages(edge, readerUrl)
-            if (pages.isNotEmpty()) return pages
-        }
-        return emptyList()
+        // goe(): first source (highest priority) with a usable page list,
+        // AFTER sanitising every candidate (drops reader-page links and any
+        // site-host entry — the payload can hand out a link back to the
+        // reader as "page 1"). Some streamers also expose the ENTIRE
+        // chapter as a single strip; the site reader effectively prefers
+        // proper per-page sources, and so do we: a multi-entry list beats
+        // a single-entry one unless nothing else exists.
+        val candidates = groups.values.sortedByDescending(::edgePriority)
+            .map { edge -> sanitizePageUrls(normalizeEdgePages(edge, readerUrl), readerUrl) }
+            .filter { it.isNotEmpty() }
+
+        return candidates.firstOrNull { it.size > 1 }
+            ?: candidates.firstOrNull()
+            ?: emptyList()
     }
 
     private fun edgePriority(edge: JsonObject): Float = (edge["priority"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0f
@@ -783,6 +802,28 @@ abstract class MKissa :
         val path = url.substringBefore('?').substringBefore('#').lowercase()
         return path.substringAfterLast('.').substringBefore('%') in PAGE_IMAGE_EXTENSIONS
     }
+
+    /**
+     * True when a URL may enter the harvested/extracted page list at all.
+     * The site reader hands out payload entries that link BACK to the
+     * reader page ("/manga/..." — that single URL serves the WHOLE
+     * chapter; loading it as an image is the "first page is the entire
+     * chapter" bug and, once cached, the "Failed to initialize decoder"
+     * HTML-into-decoder error). Filter by path, not by host: page images
+     * live on CDN hosts via pictureUrlHead, but keeping the door open for
+     * site-hosted image paths is safer than dropping them blindly.
+     */
+    private fun isHarvestablePageUrl(url: String): Boolean {
+        val httpUrl = runCatching { url.toHttpUrl() }.getOrNull() ?: return false
+        if (httpUrl.host == "challenges.cloudflare.com") return false
+        if (httpUrl.host == apiHost || httpUrl.host.endsWith(".$apiHost")) return false
+        val path = httpUrl.encodedPath.lowercase()
+        if (path == "/" || path.startsWith("/manga/") || path.startsWith("/api")) return false
+        return true
+    }
+
+    /** Applies [isHarvestablePageUrl] to extractor output, preserving order. */
+    private fun sanitizePageUrls(pages: List<String>, readerUrl: String): List<String> = pages.filter { url -> isHarvestablePageUrl(url) && url.substringBefore('#') != readerUrl }
 
     // ========================================================================
     // Filters
@@ -1134,9 +1175,11 @@ abstract class MKissa :
         // obfuscated anti-abuse crypto proof, so pages are collected from the
         // real reader in an off-screen WebView instead — see getPageList.)
 
-        // v15: prefix bumped so page lists captured by the v14 build (built
-        // from partial DOM harvests — wrong counts) are never served.
-        private const val PAGE_CACHE_PREFIX = "mkissa_pages_v2_"
+        // v16: prefix bumped again so page lists captured by the v15 build
+        // (whose extraction could keep the reader URL itself as "page 1" —
+        // the whole chapter on one URL, hence "Failed to initialize
+        // decoder") are never served.
+        private const val PAGE_CACHE_PREFIX = "mkissa_pages_v3_"
         private const val LEGACY_PAGE_CACHE_PREFIX = "mkissa_pages_"
         private const val PAGE_CACHE_MAX_ENTRIES = 60
 
