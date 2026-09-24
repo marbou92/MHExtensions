@@ -1,8 +1,12 @@
 package keiyoushi.cloudflare
 
 import android.annotation.SuppressLint
+import android.content.res.Resources
 import android.webkit.CookieManager
 import keiyoushi.utils.runWebViewBlocking
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.Call
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -37,9 +41,16 @@ import kotlin.time.Duration.Companion.seconds
  *     bot score — Mihon deletes it before solving too).
  *  3. Solves headless in a `runWebViewBlocking` session: loads the challenged
  *     URL (GETs) or the site root (non-GETs), spoofs `Sec-CH-UA` client hints
- *     from the request UA, listens for the challenge escalating to interactive
- *     (`interactiveBegin` postMessage) and aborts fast in that case.
- *  4. Retries the original request once with the fresh clearance.
+ *     from the request UA, and — when the challenge escalates to the
+ *     interactive Turnstile checkbox — TAPS it: synthetic MotionEvents enter
+ *     at the platform input layer and reach through the cross-origin widget
+ *     iframe that page JavaScript can never click (the same mechanism MKissa
+ *     uses to click its captcha widgets). This turns the once-aborted
+ *     interactive branch into a completed solve instead of a user prompt.
+ *  4. Retries the original request once with the fresh clearance; if the
+ *     retry is challenged AGAIN, one more full solve round runs before the
+ *     challenge is handed back (second loads clear far more often than
+ *     first loads).
  *  5. Last resort: hands the challenge response back so the app-level
  *     CloudflareInterceptor (or a manual "Open in WebView") can still solve it.
  *
@@ -89,18 +100,36 @@ class CloudflareSolverInterceptor(
         // ---- Cloudflare challenge: solve headless, then retry. ----
         response.close()
 
+        var solvedRecently = false
         solveLock.withLock {
             // Parallel challenged requests queue on this lock; whoever enters
             // right after a successful solve must NOT wipe the fresh cookie —
             // just retry on it.
             if (System.currentTimeMillis() - lastSolveAt > SOLVE_DEDUPE_MS) {
-                clearStaleClearance(request1.url)
-                solveInWebView(request1, chain.call())
-                lastSolveAt = System.currentTimeMillis()
+                // Up to two rounds: some challenges simply clear on the
+                // second load (fresh cookie state, warmed JS). One extra
+                // automatic round beats handing a WebView prompt to the user.
+                var round = 0
+                while (round < SOLVE_ROUNDS) {
+                    round++
+                    clearStaleClearance(request1.url)
+                    solveInWebView(request1, chain.call())
+                    lastSolveAt = System.currentTimeMillis()
+
+                    response = chain.proceed(request1)
+                    if (!response.isCloudflareChallenge()) return@withLock
+                    // Keep the LAST response open — it is what we return.
+                    if (round < SOLVE_ROUNDS) response.close()
+                }
+                return@withLock
             }
+            solvedRecently = true
         }
 
-        response = chain.proceed(request1)
+        if (solvedRecently) {
+            // A parallel request solved moments ago — retry on its cookie.
+            response = chain.proceed(request1)
+        }
 
         if (response.isCloudflareChallenge()) {
             // Last resort: let the app-level interceptor (or a manual WebView
@@ -120,6 +149,7 @@ class CloudflareSolverInterceptor(
         val scheme = request.url.scheme
         val oldCookie = currentClearance(host, scheme)
         val loadUrl = if (request.method == "GET") request.url.toString() else "$scheme://$host/"
+        val density = Resources.getSystem().displayMetrics.density
 
         try {
             runWebViewBlocking(call, timeout = SOLVE_TIMEOUT) {
@@ -128,22 +158,63 @@ class CloudflareSolverInterceptor(
                 // The setter also spoofs Sec-CH-UA client hints to match.
                 userAgent = request.header("User-Agent") ?: FALLBACK_UA
 
+                // "interactive" no longer aborts: it flips the run into tap
+                // mode so the Turnstile checkbox gets tapped (below).
+                var interactive = false
                 jsBridge(BRIDGE_NAME) { message ->
-                    if (message == "interactive") {
-                        // The challenge escalated — abort fast instead of
-                        // hanging for the full timeout (Mihon-main behaviour).
-                        reject(InteractiveChallengeException())
-                    }
+                    if (message == "interactive") interactive = true
                 }
 
                 onPageStarted { _ ->
                     evaluateJs(INTERACTIVE_HOOK_JS)
                 }
 
+                var tapAttempts = 0
+                var lastTapAt = 0L
+                val startedAt = System.currentTimeMillis()
                 poll(500.milliseconds) {
                     val clearance = currentClearance(host, scheme)
                     if (clearance != null && clearance != oldCookie) {
                         resolve(Unit)
+                        return@poll
+                    }
+
+                    // Tap the Turnstile checkbox when the challenge is (or
+                    // might be) interactive. The widget lives in a
+                    // cross-origin iframe; the synthetic tap enters at the
+                    // platform input layer and reaches it anyway. A few
+                    // spaced attempts, then give up for this round.
+                    val now = System.currentTimeMillis()
+                    val shouldTap = interactive || now - startedAt > TAP_AFTER_MS
+                    if (shouldTap && tapAttempts < MAX_TAP_ATTEMPTS && now - lastTapAt >= TAP_SPACING_MS) {
+                        lastTapAt = now
+                        evaluateJs(WIDGET_RECT_JS) { rectJson ->
+                            runCatching {
+                                // The JS returns the rect object directly (or
+                                // null); evaluateJs hands us its JSON text.
+                                val element = runCatching { Json.parseToJsonElement(rectJson.orEmpty()) }
+                                    .getOrNull()
+                                val rect = when (element) {
+                                    is JsonObject -> element
+                                    is JsonPrimitive -> runCatching { Json.parseToJsonElement(element.content) }
+                                        .getOrNull() as? JsonObject
+                                    else -> null
+                                } ?: return@runCatching
+                                val x = (rect["x"] as? JsonPrimitive)?.content?.toFloatOrNull()
+                                    ?: return@runCatching
+                                val y = (rect["y"] as? JsonPrimitive)?.content?.toFloatOrNull()
+                                    ?: return@runCatching
+                                val h = (rect["h"] as? JsonPrimitive)?.content?.toFloatOrNull()
+                                    ?: 65f
+                                // Checkbox sits at the widget's left edge,
+                                // mid-height (Turnstile and reCAPTCHA both).
+                                dispatchTap(
+                                    (x + CHECKBOX_OFFSET_X_DP) * density,
+                                    (y + h / 2f) * density,
+                                )
+                                tapAttempts++
+                            }
+                        }
                     }
                 }
 
@@ -258,6 +329,21 @@ class CloudflareSolverInterceptor(
         /** Queued requests within this window after a solve skip re-solving. */
         const val SOLVE_DEDUPE_MS = 20_000L
 
+        /** Solve rounds per challenge before handing it to the app flow. */
+        const val SOLVE_ROUNDS = 2
+
+        /** Start probing for the widget after this many ms even without an interactive signal. */
+        const val TAP_AFTER_MS = 8_000L
+
+        /** Spacing between synthetic widget taps. */
+        const val TAP_SPACING_MS = 2_500L
+
+        /** Checkbox position inside the captcha widget (CSS dp, both providers). */
+        const val CHECKBOX_OFFSET_X_DP = 30f
+
+        /** Cap for the widget taps within one solve round. */
+        const val MAX_TAP_ATTEMPTS = 8
+
         const val CLEARANCE_COOKIE = "cf_clearance="
         const val BRIDGE_NAME = "mhcfbridge"
         const val MAX_RATE_LIMIT_RETRIES = 2
@@ -269,8 +355,8 @@ class CloudflareSolverInterceptor(
 
         /**
          * Cloudflare's challenge iframe posts progress messages to its parent.
-         * `interactiveBegin` means the challenge now requires a human — signal
-         * the bridge so the solve aborts immediately instead of timing out.
+         * `interactiveBegin` means the challenge now requires a human — the
+         * solve switches to tapping the widget checkbox instead of aborting.
          */
         private val INTERACTIVE_HOOK_JS = """
             (function(){
@@ -286,6 +372,34 @@ class CloudflareSolverInterceptor(
                   }catch(err){}
                 });
               }catch(e){}
+            })();
+        """.trimIndent()
+
+        /**
+         * Locates the captcha widget iframe (Cloudflare Turnstile / challenge
+         * widget / reCAPTCHA) and returns its rect as JSON, for the synthetic
+         * tap. Falls back to the widest reasonably-sized iframe on the page.
+         */
+        private val WIDGET_RECT_JS = """
+            (function(){
+              try{
+                var sel='iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"],iframe[src*="/captcha/"],iframe[title*="Cloudflare"],iframe[title*="Security"],iframe[title*="security"],iframe[src*="recaptcha"]';
+                var fr=document.querySelector(sel);
+                if(!fr){
+                  var frs=document.querySelectorAll('iframe');
+                  var best=null,bestArea=0;
+                  for(var i=0;i<frs.length;i++){
+                    var r=frs[i].getBoundingClientRect();
+                    var area=r.width*r.height;
+                    if(r.width>=200&&r.height>=50&&area>bestArea){ best=frs[i]; bestArea=area; }
+                  }
+                  fr=best;
+                }
+                if(!fr) return null;
+                var b=fr.getBoundingClientRect();
+                if(b.width<40||b.height<20) return null;
+                return {x:b.x,y:b.y,w:b.width,h:b.height};
+              }catch(e){ return null; }
             })();
         """.trimIndent()
     }
