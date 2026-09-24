@@ -41,6 +41,7 @@ loadIndividualExtension("all", "manhuarmtl")
 loadIndividualExtension("en", "kagane")
 loadIndividualExtension("en", "atsumaru")
 loadIndividualExtension("en", "mkissa")
+loadIndividualExtension("en", "mangaball")
 // loadAllIndividualExtensions()
 
 /**
