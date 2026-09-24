@@ -37,8 +37,10 @@ import okhttp3.Headers
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 import java.util.Collections
@@ -374,60 +376,59 @@ abstract class MKissa :
     // =============================== Pages ===============================
     //
     // The reader is opened in an off-screen WebView and the page list is
-    // captured from the site's OWN pipeline. Why (verified against the live
-    // site, 2026-09):
+    // captured from the site's OWN pipeline. Live-verified against the site
+    // and its bundle, 2026-09 (this is why every previous build dead-ended
+    // on "open the chapter in WebView" — and why opening WebView never
+    // actually fixed it):
     //
-    // - The `chapterPages` GraphQL query answers NEED_CAPTCHA without a
-    //   Turnstile token — and even WITH a token the server enforces an
-    //   additional anti-abuse crypto proof ("aaReq" / x-aa-boot / x-build-id,
-    //   WebCrypto over epoch/lane/build material) built by deliberately
-    //   obfuscated code, answering AA_CRYPTO_MISSING to requests without it.
-    // - The site's READER page runs that whole pipeline itself — Turnstile,
-    //   the AA crypto proof and the GraphQL call — inside a real WebView.
+    // 1. The reader document route is Cloudflare-challenged for non-browser
+    //    TLS, but the SPA path is NOT: loading the SERIES page and clicking
+    //    the chapter row (div.media-ep-item[data-href=…]) navigates to the
+    //    reader client-side without ever fetching the challenged document.
+    //    So the capture WebView loads the series page, never the reader URL.
+    // 2. `chapterPages` answers NEED_CAPTCHA until a fresh captcha token is
+    //    presented — Turnstile on production (rendered directly into
+    //    #captcha-root; the token lands in input[name="cf-turnstile-response"]).
+    //    A Cloudflare/WebView solve alone does NOT produce that token, which
+    //    is exactly why "go to webview, solve, come back" never helped.
+    // 3. Once a token exists the site re-executes the query itself
+    //    (POST + extensions.captcha) and the response carries the FULL page
+    //    list per source offering (edges[].pictureUrls) — our fetch/XHR hook
+    //    tees that response. Everything below the token already worked.
     //
-    // How the list is captured (three signals, strongest first):
-    // 1. **Fetch/XHR hook** — injected at page start; wraps window.fetch and
-    //    XMLHttpRequest and forwards every API response that contains the
-    //    chapterPages payload through a jsBridge. One response carries the
-    //    FULL page list (edges[].pictureUrls + pictureUrlHead), so this
-    //    resolves immediately when the reader's API call lands — no waiting
-    //    for images, no virtualisation gaps. (This is what the v13 build was
-    //    missing: it scraped <img> tags, but the reader virtualises/recycles
-    //    its page nodes, so the collection never stabilised and the chapter
-    //    appeared to "load endlessly".)
-    // 2. **Request interception** — every image the reader downloads is
-    //    logged (survives virtualisation, catches URLs without extensions).
-    // 3. **DOM scrape** on each poll — catches images served from cache.
+    // So the capture flow is now an active pipeline, not a passive wait:
+    //   series page → SPA-click the chapter row → captcha modal →
+    //   token arrives (Turnstile auto-solve, or reCAPTCHA switch, or a
+    //   synthetic checkbox tap that reaches through the cross-origin iframe)
+    //   → site retries → hook captures the payload → resolve.
+    // As a safety net, the harvested token + the site's own `aaReq` crypto
+    // proof (teed from its requests) are replayed in OUR own POST if the
+    // site's retry does not produce a payload within a few seconds.
     //
-    // A stuck challenge (title still "Just a moment…" after 45s with nothing
-    // captured) fails FAST with an actionable message instead of spinning.
     // Successful results are cached in the source prefs — chapter pages are
-    // immutable, so re-opening a chapter (or retrying after a WebView solve)
-    // is instant.
+    // immutable, so re-opening a chapter is instant.
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         // url format: "/manga/<mangaId>/chapter-<chapterString>-<translation>"
         // (blank segments filtered so leading/trailing slashes don't matter)
         val parts = chapter.url.split("/").filter(String::isNotBlank)
         if (parts.size < 3) throw IOException("Outdated chapter URL. Refresh the chapter list.")
-
-        val readerUrl = "$baseUrl${chapter.url}"
+        val chapterPath = "/" + parts.joinToString("/")
+        val readerUrl = "$baseUrl$chapterPath"
 
         // Chapter pages are immutable — serve the cached list instantly when
         // we already captured it once (covers re-opens and retries).
         val cached = readPageCache(chapter.url)
         if (cached != null) return cached.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
 
-        primeReaderPath(readerUrl)
-
         val imageUrls = try {
-            collectReaderPages(readerUrl)
+            collectReaderPages(chapterPath, readerUrl)
         } catch (e: WebViewTimeoutException) {
-            throw IOException(webViewHelpMessage, e)
+            throw IOException(readerHelpMessage, e)
         }
 
         if (imageUrls.isEmpty()) {
-            throw IOException(webViewHelpMessage)
+            throw IOException(readerHelpMessage)
         }
 
         writePageCache(chapter.url, imageUrls)
@@ -436,42 +437,15 @@ abstract class MKissa :
 
     /**
      * The user-facing guidance for every chapter-load failure. The site's
-     * CHALLENGE sits on the reader path (verified live, 2026-09: the
-     * homepage and manga pages answer a plain client with 200 while
-     * /manga/<id>/chapter-... answers a cf-mitigated challenge), so the
-     * advice must be to open and solve a CHAPTER in WebView — opening the
-     * homepage shows no check at all and fixes nothing.
+     * own security check (Turnstile) sits on the chapter API; the extension
+     * solves it automatically in a background WebView. Manual advice stays
+     * as the last resort for interactive-captcha days.
      */
-    private val webViewHelpMessage =
-        "MKissa's chapter page is behind a Cloudflare check that only a real WebView can solve. " +
-            "Open any chapter once in WebView (in the reader, tap the WebView icon in the top bar; " +
-            "or Browse → Sources → MKissa → ⋮ → Open in WebView and open a chapter there), " +
-            "solve the check, then reload the chapter here."
-
-    /**
-     * Prime the reader path with a plain okhttp GET before the off-screen
-     * WebView capture. When the clearance cookie is missing or stale, this
-     * is the request that lets the app-level CloudflareInterceptor solve
-     * the challenge in its OWN WebView (with UI) and store cf_clearance in
-     * the shared cookie jar — after which the off-screen WebView below
-     * loads the reader cleanly and the site's own pipeline (Turnstile +
-     * AA crypto + GraphQL) runs untouched. Without this priming the
-     * off-screen WebView is the first thing to hit the challenge — and an
-     * off-screen WebView can neither solve an interactive challenge nor
-     * show the user anything (the reported "chapter never loads; I check
-     * the website and nothing happens" deadlock).
-     */
-    private fun primeReaderPath(readerUrl: String) {
-        try {
-            client.newCall(Request.Builder().url(readerUrl).headers(headers).build())
-                .execute()
-                .close()
-        } catch (_: Exception) {
-            // Best-effort: no app-level solver, already solved, or the site
-            // simply isn't challenging right now — the capture below runs
-            // either way.
-        }
-    }
+    private val readerHelpMessage =
+        "MKissa's chapter reader is gated by the site's security check. This build solves it " +
+            "automatically in a background WebView — if you still see this, open the site in " +
+            "WebView (Browse → Sources → MKissa → ⋮ → Open in WebView), open any chapter there " +
+            "once, then reload the chapter here."
 
     // ----------------------------- page cache -----------------------------
 
@@ -506,25 +480,41 @@ abstract class MKissa :
     // --------------------------- WebView capture ---------------------------
 
     /**
-     * Loads the site's own reader page in an off-screen WebView and captures
-     * the chapter's page URLs. The fetch/XHR hook delivers the chapterPages
-     * GraphQL response through the jsBridge; request interception and DOM
-     * scraping run as fallbacks until then.
+     * Runs the whole reader pipeline in one off-screen WebView:
+     *
+     * 1. Loads the SERIES page (the reader document itself is CF-challenged;
+     *    the SPA route to it is not).
+     * 2. SPA-clicks the target chapter row (div.media-ep-item[data-href]).
+     * 3. Waits for the site's Security Check modal, helps the captcha finish
+     *    (auto-switch to reCAPTCHA, synthetic taps through the cross-origin
+     *    widget iframe) and watches for the token in the parent DOM.
+     * 4. The site re-runs its chapterPages query with the token; the fetch/
+     *    XHR hook tees the response (which carries the FULL page list per
+     *    source offering) and resolves.
+     * 5. If the site's retry doesn't land within a few seconds of the token,
+     *    replays token + harvested `aaReq` in our own POST as a safety net.
      */
-    private suspend fun collectReaderPages(readerUrl: String): List<String> = runWebView(timeout = 2.minutes) {
+    private suspend fun collectReaderPages(chapterPath: String, readerUrl: String): List<String> = runWebView(timeout = 3.minutes) {
         val collected = Collections.synchronizedSet(LinkedHashSet<String>())
         // Whether we saw at least one REAL page candidate (extension-based
-        // image URL or an extensionless non-site-host CDN URL). The v15
-        // build resolved its fallback with whatever was in the set — which,
-        // when the fetch hook never fired, was just the browser's favicon
-        // request — and every chapter ended up as a single page pointing at
-        // /favicon.ico. The fallback may now only resolve on real evidence.
+        // image URL or an extensionless non-site-host CDN URL). Fallback
+        // resolution may only fire on real evidence — never on UI assets
+        // like favicons (the v15 bug).
         val sawRealCandidate = java.util.concurrent.atomic.AtomicBoolean(false)
+        val captchaToken = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val aaReq = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val buildId = java.util.concurrent.atomic.AtomicReference<String?>(null)
+        val activePostFired = java.util.concurrent.atomic.AtomicBoolean(false)
+
         var lastCount = 0
         var stablePolls = 0
         var finished = false
         var challengePolls = 0
         var challengeReloaded = false
+        var modalPolls = 0
+        var tokenSeenAt = -1
+        var providerSwitched = false
+        var tapAttempts = 0
 
         fun consider(url: String) {
             val cleaned = url.trim().takeIf { it.startsWith("http") } ?: return
@@ -534,15 +524,78 @@ abstract class MKissa :
             }
         }
 
-        // Receives {url, req, res} envelopes from the injected fetch/XHR
-        // hook: the request body lets us verify the payload belongs to the
-        // chapter being opened (the reader can also fire chapterPages for
-        // other chapters), the response body carries the pages.
+        // Active safety net: POST chapterPages ourselves with the harvested
+        // token + aaReq when the site's own retry doesn't produce a payload.
+        fun fireActivePost() {
+            if (!activePostFired.compareAndSet(false, true)) return
+            val token = captchaToken.get() ?: return
+            val aa = aaReq.get() ?: return
+            val ref = chapterRefFromUrl(readerUrl) ?: return
+            val bid = buildId.get()
+            Thread({
+                runCatching {
+                    val body = buildJsonObject {
+                        putJsonObject("variables") {
+                            put("mangaId", ref.mangaId)
+                            put("translationType", ref.translation)
+                            put("chapterString", ref.chapterString)
+                            put("limit", 10)
+                            put("offset", 0)
+                        }
+                        putJsonObject("extensions") {
+                            putJsonObject("persistedQuery") {
+                                put("version", 1)
+                                put("sha256Hash", CHAPTER_PAGES_HASH)
+                            }
+                            put("k", CHAPTER_PAGES_LANE)
+                            put("aaReq", aa)
+                            put("captcha", token)
+                        }
+                    }.toString()
+
+                    val request = Request.Builder()
+                        .url(apiUrl)
+                        .post(body.toRequestBody("application/json".toMediaType()))
+                        .headers(headers)
+                        .apply { if (bid != null) header("x-build-id", bid) }
+                        .build()
+
+                    client.newCall(request).execute().use { resp ->
+                        val text = resp.body.string()
+                        if (text.isNullOrEmpty()) return@use
+                        val pages = extractPageUrls(text, body, readerUrl)
+                        if (pages.isNotEmpty()) resolve(pages)
+                    }
+                }
+            }, "MKissa-ActivePost").start()
+        }
+
+        // Receives our JSON envelopes from the injected hooks:
+        //  - {kind:"captcha"|"flutter", payload:…} → captcha token capture
+        //  - {kind:"aareq", url, req} → aaReq + buildId harvest
+        //  - {url, req, res} (default) → chapterPages payload from the
+        //    fetch/XHR hook (the primary capture path).
         jsBridge("mhbridge") { message ->
             runCatching {
-                val (reqBody, resBody) = parseBridgeEnvelope(message)
-                val pages = extractPageUrls(resBody, reqBody, readerUrl)
-                if (pages.isNotEmpty()) resolve(pages)
+                val root = runCatching { Json.parseToJsonElement(message) }.getOrNull() as? JsonObject
+                when ((root?.get("kind") as? JsonPrimitive)?.content) {
+                    "captcha", "flutter" -> {
+                        findTokenPayload(root)?.let { token ->
+                            if (token.length >= TOKEN_MIN_LENGTH) captchaToken.compareAndSet(null, token)
+                        }
+                    }
+                    "aareq" -> {
+                        val url = (root["url"] as? JsonPrimitive)?.content.orEmpty()
+                        val req = (root["req"] as? JsonPrimitive)?.content.orEmpty()
+                        harvestBuildId(url, buildId)
+                        harvestAaReq(url, req, aaReq)
+                    }
+                    else -> {
+                        val (reqBody, resBody) = parseBridgeEnvelope(message)
+                        val pages = extractPageUrls(resBody, reqBody, readerUrl)
+                        if (pages.isNotEmpty()) resolve(pages)
+                    }
+                }
             }
         }
 
@@ -560,9 +613,7 @@ abstract class MKissa :
                     // WebView "Accept: image/..." header is a solid image signal
                     // even when the CDN path has no file extension. STRICTLY
                     // GATED now: extensionless URLs only count on non-site
-                    // hosts (real page images come from the CDN) — this is the
-                    // exact path that let /favicon.ico (requested with an
-                    // image Accept) masquerade as "page 1" for every chapter.
+                    // hosts (real page images come from the CDN).
                     val accept = request.requestHeaders?.get("Accept")
                     if (accept?.contains("image/") == true &&
                         url.toHttpUrlOrNull()?.let { !isSiteHost(it.host) } == true
@@ -577,21 +628,88 @@ abstract class MKissa :
 
         onPageStarted { _ ->
             evaluateJs(FETCH_HOOK_JS)
+            evaluateJs(CAPTCHA_HOOK_JS)
         }
 
         onPageFinished { _ ->
             finished = true
             // Hedge: the reader can embed the chapterPages payload directly
-            // in the page (SSR state / inline JSON), especially now the site
-            // pins realm-isolated primitives specifically so extension hooks
-            // can't intercept its fetch calls. Scan inline scripts and push
-            // any embedded payload through the same bridge path.
+            // in the page (SSR state / inline JSON). Scan inline scripts and
+            // push any embedded payload through the same bridge path.
             evaluateJs(INLINE_PAYLOAD_JS)
         }
 
         poll(1.seconds) {
-            // Re-install the hook if the page re-navigated before it ran.
+            // Re-install the hooks if the page re-navigated before they ran.
             evaluateJs("window.__mhHookInstalled===true||(${FETCH_HOOK_JS})")
+            evaluateJs("window.__mhCaptchaHook===true||(${CAPTCHA_HOOK_JS})")
+
+            // ---- Phase 1: SPA-navigate to the chapter ----
+            evaluateJs(spaClickJs(chapterPath)) { value ->
+                // 'clicked' → the site fires its chapterPages query and
+                // (on NEED_CAPTCHA) opens the Security Check modal.
+            }
+
+            // ---- Phase 2: captcha pipeline ----
+            evaluateJs(CAPTCHA_STATE_JS) { value ->
+                runCatching {
+                    val inner = (Json.parseToJsonElement(value) as? JsonPrimitive)?.content ?: value
+                    val state = Json.parseToJsonElement(inner) as? JsonObject ?: return@runCatching
+                    val token = (state["token"] as? JsonPrimitive)?.content
+                    if (!token.isNullOrBlank() && token.length >= TOKEN_MIN_LENGTH) {
+                        if (captchaToken.compareAndSet(null, token)) {
+                            tokenSeenAt = modalPolls
+                        }
+                    }
+
+                    val overlayVisible = state["overlay"] == JsonPrimitive(true)
+                    if (overlayVisible) {
+                        modalPolls++
+
+                        // 12s without a token: switch the modal to the Google
+                        // reCAPTCHA provider (the site's own footer button —
+                        // plain DOM, fully scriptable).
+                        if (modalPolls == PROVIDER_SWITCH_POLL && !providerSwitched) {
+                            providerSwitched = true
+                            evaluateJs(SWITCH_RECAPTCHA_JS)
+                        }
+
+                        // 15s and still no token: tap the widget checkbox.
+                        // The checkbox lives inside a cross-origin iframe no
+                        // page script can click — the synthetic tap enters at
+                        // the platform input layer and reaches it anyway.
+                        if (modalPolls >= FIRST_TAP_POLL && tapAttempts < MAX_TAP_ATTEMPTS &&
+                            modalPolls % TAP_RETRY_POLL == 0
+                        ) {
+                            val rect = state["rect"] as? JsonObject ?: return@evaluateJs
+                            val x = (rect["x"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: return@evaluateJs
+                            val y = (rect["y"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: return@evaluateJs
+                            val h = (rect["h"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 65f
+                            // Checkbox sits at the widget's left edge, mid-height
+                            // (~28-30 CSS px in, for both Turnstile and reCAPTCHA).
+                            val density = android.content.res.Resources.getSystem().displayMetrics.density
+                            dispatchTap(
+                                (x + CHECKBOX_OFFSET_X) * density,
+                                (y + h / 2f) * density,
+                            )
+                            tapAttempts++
+                        }
+                    } else {
+                        modalPolls = 0
+                    }
+                }
+            }
+
+            // ---- Phase 3: active POST fallback ----
+            // Only when the site's own retry has had its grace period after
+            // the token appeared and still nothing resolved. The token is
+            // single-use, so this races the site's retry deliberately: whose
+            // POST verifies it first, that payload resolves the chapter.
+            if (tokenSeenAt >= 0 && aaReq.get() != null &&
+                modalPolls >= tokenSeenAt + ACTIVE_POST_GRACE
+            ) {
+                fireActivePost()
+            }
 
             // Nudge lazy loaders — jump to the bottom of the strip.
             evaluateJs(
@@ -610,12 +728,11 @@ abstract class MKissa :
 
             val count = collected.size
 
-            // Cloudflare check handling. A managed challenge often clears on
-            // a second load (and by then the priming GET above may already
-            // have landed cf_clearance in the shared cookie jar), so reload
-            // ONCE after ~25s of challenge title. If the check is still
-            // there 45s after that with zero candidates, fail fast with the
-            // actionable message instead of spinning for minutes.
+            // Cloudflare check handling (the SERIES page itself can in theory
+            // be challenged). A managed challenge often clears on a second
+            // load, so reload ONCE after ~25s of challenge title. If the
+            // check is still there 45s after that with zero candidates, fail
+            // fast with the actionable message instead of spinning.
             evaluateJs(DOM_TITLE_JS) { value ->
                 val title = value
                     ?.removeSurrounding("\"")
@@ -636,7 +753,7 @@ abstract class MKissa :
                 }
 
                 if (challengePolls >= 45 && count == 0 && challengeReloaded) {
-                    reject(IOException(webViewHelpMessage))
+                    reject(IOException(readerHelpMessage))
                 }
             }
 
@@ -653,7 +770,76 @@ abstract class MKissa :
             }
         }
 
-        loadUrl(readerUrl)
+        loadUrl("$baseUrl$chapterPath".substringBefore("/chapter-"))
+    }
+
+    /**
+     * Finds a captcha token inside the captcha/flutter bridge envelopes:
+     * `{kind:"captcha", payload:"{\"token\":…}"}` or the Flutter-bridge
+     * variant `{kind:"flutter", name:"rechapterReady", payload:"[{token:…}]"}`.
+     * Walks the decoded payload and returns the first "token" string long
+     * enough to be real (Turnstile/reCAPTCHA tokens are 100+ chars).
+     */
+    private fun findTokenPayload(root: JsonObject?): String? {
+        val payload = (root?.get("payload") as? JsonPrimitive)?.content ?: return null
+        val element = runCatching { Json.parseToJsonElement(payload) }.getOrNull() ?: return null
+        return findTokenIn(element)
+    }
+
+    private fun findTokenIn(element: JsonElement?): String? = when (element) {
+        is JsonObject -> element.entries.asSequence()
+            .mapNotNull { (key, value) ->
+                if (key == "token" && value is JsonPrimitive && value.isString) {
+                    value.content.takeIf { it.length >= TOKEN_MIN_LENGTH }
+                } else {
+                    findTokenIn(value)
+                }
+            }
+            .firstOrNull()
+        is JsonArray -> element.asSequence().mapNotNull(::findTokenIn).firstOrNull()
+        else -> null
+    }
+
+    /** Harvests the API build id from the site's own bootstrap/client URLs. */
+    private fun harvestBuildId(url: String, target: java.util.concurrent.atomic.AtomicReference<String?>) {
+        if (target.get() != null) return
+        Regex("""buildId=(\d+)""").find(url)?.groupValues?.get(1)?.let { target.compareAndSet(null, it) }
+    }
+
+    /**
+     * Harvests the site's own `aaReq` crypto proof (and the chapterPages
+     * hash) out of the requests our hooks teed — the proof is minted by
+     * obfuscated WebCrypto we deliberately do NOT reimplement. It travels
+     * either in the GET query (`extensions={"aaReq":…}`) or in a POST body.
+     */
+    private fun harvestAaReq(
+        url: String,
+        req: String,
+        target: java.util.concurrent.atomic.AtomicReference<String?>,
+    ) {
+        if (target.get() != null) return
+
+        val fromUrl = runCatching {
+            url.toHttpUrlOrNull()?.queryParameter("extensions")
+        }.getOrNull()
+        val fromBody = req.takeIf { it.trimStart().startsWith("{") }
+
+        for (candidate in listOf(fromUrl, fromBody)) {
+            val raw = candidate ?: continue
+            val extensions = runCatching {
+                val element = Json.parseToJsonElement(raw)
+                val obj = element as? JsonObject
+                // Envelope bodies: {"query":…, "variables":…} → extensions
+                (obj?.get("extensions") as? JsonObject) ?: (element as? JsonObject)
+                    ?.takeIf { it.containsKey("aaReq") }
+            }.getOrNull() ?: continue
+
+            val aa = (extensions["aaReq"] as? JsonPrimitive)?.content
+            if (!aa.isNullOrBlank()) {
+                target.compareAndSet(null, aa)
+                return
+            }
+        }
     }
 
     /**
@@ -1354,6 +1540,25 @@ abstract class MKissa :
         /** Reader URL translation suffixes ("chapter-<cs>-<tt>"). */
         private val TRANSLATION_TYPES = setOf("sub", "dub", "raw")
 
+        /** chapterPages persisted-query identity (captured live, 2026-09). */
+        private const val CHAPTER_PAGES_HASH = "d5de96b785ca8e8b94aaeec261a864ed5d58be45e671585dbc9a4421824d6d0d"
+        private const val CHAPTER_PAGES_LANE = "k9"
+
+        /** Minimum length for a plausible captcha token (real ones are 100+). */
+        private const val TOKEN_MIN_LENGTH = 40
+
+        /** Modal-watcher thresholds, in 1-second polls. */
+        private const val PROVIDER_SWITCH_POLL = 12
+        private const val FIRST_TAP_POLL = 15
+        private const val TAP_RETRY_POLL = 5
+        private const val MAX_TAP_ATTEMPTS = 3
+
+        /** Seconds to wait after a token appeared before the active POST fires. */
+        private const val ACTIVE_POST_GRACE = 6
+
+        /** Checkbox position inside the captcha widget (CSS px, both providers). */
+        private const val CHECKBOX_OFFSET_X = 30f
+
         /** Challenge-page title markers used by the stuck-detection poll. */
         private val CHALLENGE_TITLE_REGEX = Regex(
             "just a moment|attention required|security verification|verify you are human|checking your browser",
@@ -1362,17 +1567,26 @@ abstract class MKissa :
 
         /**
          * Injected at page start (and re-installed by the poll loop): wraps
-         * window.fetch and XMLHttpRequest so every response from the API host
-         * whose body carries the chapterPages payload is forwarded to the
-         * jsBridge together with the request body (so we can verify the
-         * payload belongs to the chapter being opened). Our .then handler is
-         * attached before the promise is handed back to the site, so the
-         * response body is teed before the site consumes it.
+         * window.fetch and XMLHttpRequest so every API call is reported:
+         *  - responses carrying the chapterPages payload → {url,req,res}
+         *    (the primary capture path — one response carries the FULL list),
+         *  - every request containing `aaReq` (or the client-crypto bootstrap)
+         *    → {kind:"aareq",url,req} so we can harvest the site's own crypto
+         *    proof + build id for the active fallback POST.
+         * Our .then handler is attached before the promise is handed back to
+         * the site, so the response body is teed before the site consumes it.
          */
         private val FETCH_HOOK_JS = """
             (function(){
               if(window.__mhHookInstalled) return;
               window.__mhHookInstalled=true;
+              function sendReq(url, req){
+                try{
+                  var u=String(url||''), r=String(req||'');
+                  if(u.indexOf('aaReq')===-1 && r.indexOf('aaReq')===-1 && u.indexOf('client-crypto')===-1) return;
+                  window.mhbridge.post(JSON.stringify({kind:'aareq',url:u.slice(0,4000),req:r.slice(0,4000)}));
+                }catch(e){}
+              }
               function sendPair(url, req, res){
                 try{
                   res=String(res||'');
@@ -1393,6 +1607,7 @@ abstract class MKissa :
                     var url=typeof a0==='string'?a0:(a0&&a0.url)||'';
                     var req=(a1&&a1.body!=null)?String(a1.body):'';
                     if(isApiUrl(url)){
+                      sendReq(url,req);
                       p.then(function(r){
                         try{ r.clone().text().then(function(txt){ sendPair(url,req,txt); }).catch(function(){}); }catch(e){}
                       }).catch(function(){});
@@ -1412,12 +1627,125 @@ abstract class MKissa :
                   x.addEventListener('load',function(){
                     try{
                       var u=String(x.__mhUrl||'');
-                      if(isApiUrl(u)) sendPair(u,req,x.responseText);
+                      if(isApiUrl(u)){ sendReq(u,req); sendPair(u,req,x.responseText); }
                     }catch(e){}
                   });
                 }catch(e){}
                 return os.apply(this,arguments);
               };
+            })();
+        """.trimIndent()
+
+        /**
+         * Injected at page start (and re-installed by the poll loop):
+         *  1. Shims window.flutter_inappwebview.callHandler so the site's
+         *     Flutter-bridge captcha handoff (dev-variant) reaches our bridge.
+         *  2. Listens for the sitea-captcha-ready postMessage the
+         *     iframe-provider variant emits, forwarding {token, provider}.
+         * (On production mkissa.to the token is read directly from the
+         * parent-DOM inputs — see CAPTCHA_STATE_JS; these hooks are the
+         * belt-and-braces for the other variants.)
+         */
+        private val CAPTCHA_HOOK_JS = """
+            (function(){
+              try{
+                if(window.__mhCaptchaHook) return;
+                window.__mhCaptchaHook=true;
+                if(!window.flutter_inappwebview){
+                  window.flutter_inappwebview={
+                    callHandler:function(name){
+                      try{
+                        var args=Array.prototype.slice.call(arguments,1);
+                        window.mhbridge.post(JSON.stringify({kind:'flutter',name:String(name||''),payload:JSON.stringify(args)}));
+                      }catch(e){}
+                      return Promise.resolve(null);
+                    }
+                  };
+                }
+                window.addEventListener('message',function(e){
+                  try{
+                    var d=e&&e.data;
+                    if(d&&typeof d==='object'&&(d.type==='sitea-captcha-ready'||(d.token&&d.provider))){
+                      window.mhbridge.post(JSON.stringify({kind:'captcha',payload:JSON.stringify(d)}));
+                    }
+                  }catch(err){}
+                });
+              }catch(e){}
+            })();
+        """.trimIndent()
+
+        /**
+         * Reads the captcha state from the PARENT document: the site renders
+         * Turnstile directly into #captcha-root and the token lands in
+         * input[name="cf-turnstile-response"] (or textarea#g-recaptcha-response
+         * after switching providers) — both readable cross-page without
+         * touching the cross-origin widget iframe. Also reports the widget
+         * iframe rect for the synthetic-tap fallback.
+         */
+        private val CAPTCHA_STATE_JS = """
+            (function(){
+              try{
+                var root=document.getElementById('captcha-root');
+                var token='';
+                if(root){
+                  var els=root.querySelectorAll('input[name="cf-turnstile-response"],input[id^="cf-chl-widget"][id$="_response"],textarea[name="g-recaptcha-response"],textarea#g-recaptcha-response');
+                  for(var i=0;i<els.length;i++){
+                    var v=String(els[i].value||'');
+                    if(v.length>token.length) token=v;
+                  }
+                }
+                var overlay=document.querySelector('.captcha-overlay--visible')!=null;
+                var rect=null;
+                if(root){
+                  var fr=root.querySelector('iframe');
+                  if(fr){ var r=fr.getBoundingClientRect(); if(r.width>10&&r.height>10){ rect={x:r.x,y:r.y,w:r.width,h:r.height}; } }
+                }
+                return JSON.stringify({token:token,overlay:overlay,rect:rect});
+              }catch(e){ return JSON.stringify({token:'',overlay:false,rect:null}); }
+            })();
+        """.trimIndent()
+
+        /**
+         * Clicks the modal's "Use Google reCAPTCHA" footer button — the
+         * site's own provider switch (plain DOM, scriptable) that re-renders
+         * the widget as a reCAPTCHA checkbox when Turnstile won't complete.
+         */
+        private val SWITCH_RECAPTCHA_JS = """
+            (function(){
+              try{
+                var btns=document.querySelectorAll('.captcha-footer button, button.captcha-btn--link');
+                for(var i=0;i<btns.length;i++){
+                  var t=(btns[i].textContent||'').toLowerCase();
+                  if(t.indexOf('recaptcha')!==-1){ btns[i].click(); return 'switched'; }
+                }
+                return 'nobutton';
+              }catch(e){ return 'err'; }
+            })();
+        """.trimIndent()
+
+        /**
+         * SPA-clicks the target chapter row on the series page. Reader rows
+         * are div.media-ep-item[data-href=…] (NOT links) handled by the
+         * site's client-side router — clicking one navigates to the reader
+         * WITHOUT fetching the Cloudflare-challenged reader document.
+         */
+        private fun spaClickJs(chapterPath: String) = """
+            (function(){
+              try{
+                if(window.__mhSpaDone) return 'done';
+                var target='$chapterPath';
+                var rows=document.querySelectorAll('div.media-ep-item[data-href], a.media-ep-item[href], .route-link[data-href]');
+                for(var i=0;i<rows.length;i++){
+                  var href=rows[i].getAttribute('data-href')||rows[i].getAttribute('href')||'';
+                  if(href===target){ rows[i].click(); window.__mhSpaDone=true; return 'clicked'; }
+                }
+                if(!window.__mhCollTried){
+                  window.__mhCollTried=true;
+                  var coll=document.querySelector('.collapser,[class*="collapser"]');
+                  if(coll){ coll.click(); return 'collapser'; }
+                }
+                return 'norows';
+              }catch(e){ return 'err'; }
             })();
         """.trimIndent()
 

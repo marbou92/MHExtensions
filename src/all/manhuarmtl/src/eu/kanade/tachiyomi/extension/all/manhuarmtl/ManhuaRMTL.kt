@@ -21,6 +21,7 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.get
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferences
@@ -66,30 +67,23 @@ abstract class ManhuaRMTL :
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // The Comix Cloudflare method (ported from our working comixto
-        // source): WebView-cookie sync + browser fingerprint (sec-ch-ua,
-        // sec-fetch-*) + smart retry on CF blocks. That trio is what keeps
-        // comix.to riding a single WebView solve instead of re-challenging
-        // every hour — CF's bot scoring checks header consistency beyond
-        // the clearance cookie, and the retry eats transient blocks that
-        // used to cost a manual WebView visit.
+        // The new Cloudflare method (v19): a headless challenge SOLVER
+        // (shared keiyoushi.cloudflare implementation — see the Kagane
+        // notes for the full rationale). Header hardening can never pass
+        // a managed challenge, so challenges are now solved silently in
+        // an off-screen WebView and the request retried on the fresh
+        // cf_clearance — no more manual WebView visits every hour.
         //
         // Kept from the 2026-09 audit: OriginSanitizer strips the "Origin:
         // <baseUrl>" header KeiSource stamps onto every request — real
         // browsers never send Origin on document navigations or <img>
         // loads, and that inconsistent Origin is exactly the kind of header
         // Cloudflare's bot scoring flags.
-        //
-        // The old one-shot priming + warm-up GETs are gone: they added a
-        // whole "fail -> warm-up -> retry" cycle to the first open without
-        // making the traffic itself any more browser-like. No rateLimit
-        // either — chapters pay a fixed 0.5s/image tax under it, which the
-        // user reads as "slow", and the comix build has none.
         connectTimeout(15, TimeUnit.SECONDS)
         readTimeout(30, TimeUnit.SECONDS)
         writeTimeout(15, TimeUnit.SECONDS)
 
-        CloudflareBypass(setOf(baseUrl.toHttpUrl().host)).install(this)
+        addInterceptor(CloudflareSolverInterceptor(setOf(baseUrl.toHttpUrl().host)))
 
         addInterceptor(::originSanitizerInterceptor)
 
@@ -118,13 +112,11 @@ abstract class ManhuaRMTL :
             .set("Referer", "$baseUrl/")
             .set("Connection", "keep-alive")
             .set("Accept-Language", "en-US,en-US;q=0.9,en;q=0.8")
-            .set("Accept-Encoding", "gzip, deflate, br, zstd")
             .set("Sec-Fetch-Dest", "image")
             .set("Sec-Fetch-Mode", "no-cors")
             .set("Sec-Fetch-Site", "cross-site")
             .set("Sec-Fetch-Storage-Access", "none")
             .set("Priority", "u=5, i")
-            .set("TE", "trailers")
             .build()
 
         return GET(page.imageUrl!!, imageHeaders)

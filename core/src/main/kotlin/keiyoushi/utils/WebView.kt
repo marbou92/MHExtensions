@@ -5,7 +5,9 @@ import android.content.res.Resources
 import android.graphics.Bitmap
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
+import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
 import android.webkit.ConsoleMessage
@@ -218,6 +220,32 @@ class WebViewScope<T> internal constructor(
         runOnMain {
             if (!destroyed) {
                 webView.stopLoading()
+            }
+        }
+    }
+
+    /**
+     * Dispatches a synthetic tap at ([x], [y]) in the WebView's own (physical)
+     * coordinate space — i.e. what a finger touching that point would produce.
+     *
+     * This reaches through cross-origin iframes (Cloudflare Turnstile and
+     * reCAPTCHA checkboxes) that page JavaScript can never click, because the
+     * events enter at the platform input layer instead of the DOM. Fire-and-
+     * forget: failures are logged, never fatal to the run.
+     */
+    fun dispatchTap(x: Float, y: Float) {
+        runOnMain {
+            if (destroyed) return@runOnMain
+            try {
+                val now = SystemClock.uptimeMillis()
+                val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0)
+                webView.dispatchTouchEvent(down)
+                down.recycle()
+                val up = MotionEvent.obtain(now, now + 60, MotionEvent.ACTION_UP, x, y, 0)
+                webView.dispatchTouchEvent(up)
+                up.recycle()
+            } catch (t: Throwable) {
+                Log.w("KeiyoushiWebView", "dispatchTap failed", t)
             }
         }
     }

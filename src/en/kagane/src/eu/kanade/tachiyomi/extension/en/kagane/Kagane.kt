@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
@@ -55,13 +56,19 @@ abstract class Kagane :
     private val prefs = getPreferences()
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // The Comix Cloudflare method (ported from our working comixto
-        // source): WebView-cookie sync + browser fingerprint (sec-ch-ua,
-        // sec-fetch-*) + smart retry on CF blocks. That trio is what keeps
-        // comix.to riding a single WebView solve instead of re-challenging
-        // every hour — CF's bot scoring checks header consistency beyond
-        // the clearance cookie, and the retry eats transient blocks that
-        // used to cost a manual WebView visit.
+        // The new Cloudflare method (v19): a headless challenge SOLVER.
+        // Research conclusion (2026-09): header hardening can never pass a
+        // managed challenge — `cf-mitigated: challenge` responses are full
+        // HTML pages that only a JS-executing browser environment can solve.
+        // So on a challenge this interceptor now solves it in an off-screen
+        // WebView (the same pattern Mihon's own app-level interceptor has
+        // shipped for years): UA/client-hint coherent, single-flight across
+        // parallel requests, interactive challenges abort fast, and the
+        // retried request rides the fresh cf_clearance — all without the
+        // user ever opening a WebView (the old "solve it manually every
+        // hour" loop is gone; clearance now re-mints itself silently).
+        // Fingerprint headers stay for the traffic BETWEEN solves (they
+        // keep CF's bot score of the cleared session healthy).
         //
         // Kept from the 2026-09 audit:
         // - originSanitizer: KeiSource stamps "Origin: <baseUrl>" onto every
@@ -71,7 +78,7 @@ abstract class Kagane :
         // - refreshTokenInterceptor: Kagane's own auth (token-bearing URLs)
         //   stays handled here; CF-challenge responses pass through it
         //   untouched (they can't be fixed by a token refresh).
-        CloudflareBypass(setOf(domain)).install(this)
+        addInterceptor(CloudflareSolverInterceptor(setOf(domain)))
 
         addInterceptor(::originSanitizerInterceptor)
         addInterceptor(::refreshTokenInterceptor)
