@@ -1934,22 +1934,51 @@ abstract class MKissa :
          * are div.media-ep-item[data-href=…] (NOT links) handled by the
          * site's client-side router — clicking one navigates to the reader
          * WITHOUT fetching the Cloudflare-challenged reader document.
+         *
+         * 2026 redesign (live-verified): the series page is tabbed and a
+         * FRESH load defaults to the Reviews tab — zero chapter rows exist
+         * until the "Chapters" tab (button.tab-item[aria-label=Chapters])
+         * is clicked. Older chapters additionally sit behind a
+         * button.showmore pagination (the list window starts at ~50 rows).
+         * The click therefore walks a phase ladder, one step per 1s poll:
+         *   1. target row in the DOM → click it, done
+         *   2. Chapters tab present but inactive → click the tab
+         *   3. tab active but target missing → expand the list (show-more /
+         *      legacy collapser) and retry on the next poll
          */
         private fun spaClickJs(chapterPath: String) = """
             (function(){
               try{
                 if(window.__mhSpaDone) return 'done';
                 var target='$chapterPath';
-                var rows=document.querySelectorAll('div.media-ep-item[data-href], a.media-ep-item[href], .route-link[data-href]');
-                for(var i=0;i<rows.length;i++){
-                  var href=rows[i].getAttribute('data-href')||rows[i].getAttribute('href')||'';
-                  if(href===target){ rows[i].click(); window.__mhSpaDone=true; return 'clicked'; }
+                function findRow(){
+                  var rows=document.querySelectorAll('div.media-ep-item[data-href], a.media-ep-item[href], .route-link[data-href]');
+                  for(var i=0;i<rows.length;i++){
+                    var href=rows[i].getAttribute('data-href')||rows[i].getAttribute('href')||'';
+                    if(href===target) return rows[i];
+                  }
+                  return null;
                 }
-                if(!window.__mhCollTried){
-                  window.__mhCollTried=true;
-                  var coll=document.querySelector('.collapser,[class*="collapser"]');
-                  if(coll){ coll.click(); return 'collapser'; }
+                var row=findRow();
+                if(row){ row.click(); window.__mhSpaDone=true; return 'clicked'; }
+                // Phase 2: open the tab the chapter list lives behind.
+                // NOTE: the aria-label/text carries the chapter count
+                // ("Chapters (56)" / "Chapters 56") on some loads — match by
+                // PREFIX, never exactly.
+                var tab=document.querySelector('button.tab-item[aria-label^="Chapters"], [role="tab"][aria-label^="Chapters"]');
+                if(!tab){
+                  var btns=document.querySelectorAll('button, [role="tab"]');
+                  for(var b=0;b<btns.length;b++){
+                    var t=String(btns[b].textContent||'').trim().toLowerCase();
+                    if(t==='chapters'||t.indexOf('chapters')===0||t.indexOf('chapters ')===0){ tab=btns[b]; break; }
+                  }
                 }
+                if(tab && tab.getAttribute('aria-selected')!=='true' && !/(^|\s)active(\s|$)/.test(String(tab.className))){
+                  tab.click(); return 'tab';
+                }
+                // Phase 3: widen the windowed list until the target renders.
+                var exp=document.querySelector('button.showmore, .showmore, [class*="show-more"], .collapser, [class*="collapser"]');
+                if(exp){ exp.click(); return 'more'; }
                 return 'norows';
               }catch(e){ return 'err'; }
             })();
