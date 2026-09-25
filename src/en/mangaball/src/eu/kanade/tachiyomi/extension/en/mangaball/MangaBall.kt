@@ -46,9 +46,11 @@ import java.util.TimeZone
  *  4. Chapter pages = GET /chapter-detail/{translationId}/ and read the
  *     inline `const chapterImages = JSON.parse(\`...\`)` array.
  *
- * Cloudflare is handled Comix-style: WebView cookie sync + coherent browser
- * fingerprint + smart retry (see CloudflareBypass), with real challenge
- * solving left to the app-level CloudflareInterceptor.
+ * Cloudflare is handled with Comix's EXACT method: the verbatim Comix
+ * CloudflareBypass (WebView cookie sync + UA-derived client hints + sec-fetch
+ * stamping + smart retry — see CloudflareBypass), installed before the source's
+ * own interceptors exactly like Comix does, with real challenge solving left to
+ * the app-level CloudflareInterceptor.
  */
 @Source
 abstract class MangaBall :
@@ -80,12 +82,13 @@ abstract class MangaBall :
         readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
 
+        // Comix's EXACT bypass (verbatim class), installed ahead of the
+        // source-specific interceptors — the same order Comix uses.
+        CloudflareBypass(setOf(domain)).install(this)
+
         // KeiSource stamps "Origin" on everything; browsers never send it on
         // document GETs. Drop it there (same reason as Kagane's sanitizer).
         addInterceptor(::originSanitizerInterceptor)
-
-        // Comix-style CF handling: cookie sync + fingerprint + smart retry.
-        CloudflareBypass(setOf(domain)).install(this)
     }
 
     private fun originSanitizerInterceptor(chain: okhttp3.Interceptor.Chain): Response {

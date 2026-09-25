@@ -8,29 +8,34 @@ import okhttp3.Response
 import java.io.IOException
 
 /**
- * Comix-style Cloudflare handling for MangaBall ("make it like Comix"):
+ * Modern Cloudflare bypass system for API-based extensions.
  *
- * 1. **Cookie sync** — explicitly attaches WebView cookies (`cf_clearance`,
- *    `__cf_bm`, PHPSESSID) to requests for the protected host, so clearance
- *    minted by any WebView visit flows into plain okhttp requests immediately.
- * 2. **Browser fingerprint** — `sec-ch-ua*` client hints derived from the
- *    request's own user agent (so they always match the WebView that solved
- *    the challenge) plus coherent `sec-fetch-*`. Unlike the older Comix
- *    version, document navigations (the homepage CSRF fetch, title-detail and
- *    chapter-detail pages) get `sec-fetch-mode: navigate` + `sec-fetch-dest:
- *    document` — stamping `cors`/`empty` onto a document GET is itself a bot
- *    signal (lesson from the 2026-09 Kagane/ManhuaRMTL audit).
+ * Hardens every request to look like a real browser XHR, which is what Cloudflare's
+ * bot scoring actually checks beyond the `cf_clearance` cookie:
+ *
+ * 1. **Browser fingerprint headers** — `sec-fetch-*`, `sec-ch-ua*` client hints
+ *    (derived from the request's own user agent, so the versions always match the
+ *    WebView that solved the challenge), `accept-language` and a proper `accept`.
+ * 2. **Cookie sync** — explicitly attaches WebView cookies (`cf_clearance`,
+ *    `__cf_bm`, session cookies) to requests for the protected hosts. Belt and
+ *    braces on top of the app's cookie jar; guarantees clearance cookies flow even
+ *    after a WebView solve mid-session.
  * 3. **Smart retry** — detects Cloudflare block responses (403/429/503 with
- *    `cf-mitigated` / `server: cloudflare`) and retries with backoff,
- *    honouring `Retry-After`. Actual challenge solving is left to the
- *    app-level CloudflareInterceptor (inherited from the app client), the
- *    same flow every "fast" keiyoushi source relies on.
+ *    `cf-mitigated` / `server: cloudflare` headers) and retries with backoff,
+ *    honouring `Retry-After`. Survives short rate-limit windows without failing
+ *    the whole refresh.
  *
- * The user agent is intentionally NOT overridden: `cf_clearance` is bound to
- * the WebView's user agent and the app already stamps a coherent one.
+ * The user agent is intentionally NOT overridden: `cf_clearance` is bound to the
+ * user agent of the WebView that solved the challenge, and the app's default agent
+ * always matches it (it is stamped onto every request by the app before this
+ * interceptor chain runs). A custom UA here would break the app's own
+ * challenge-solving flow.
+ *
+ * Requests that are still blocked after the retries throw an [IOException] with an
+ * actionable message, which Mihon surfaces to the user.
  */
 class CloudflareBypass(
-    /** Hosts that receive synced WebView cookies. */
+    /** Hosts that receive synced WebView cookies (site + API hosts). */
     private val cookieHosts: Set<String>,
 ) {
     fun install(builder: OkHttpClient.Builder): OkHttpClient.Builder = builder.apply {
@@ -40,7 +45,7 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 1. Cookie sync
+    // 1. Cookie sync — attach WebView cookies (cf_clearance, __cf_bm, ...)
     // ------------------------------------------------------------------------
 
     private fun cookieSyncInterceptor(chain: Interceptor.Chain): Response {
@@ -63,7 +68,7 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 2. Browser fingerprint — coherent sec-fetch-* per request type
+    // 2. Browser fingerprint — sec-fetch-* + client hints derived from the UA
     // ------------------------------------------------------------------------
 
     private fun fingerprintInterceptor(chain: Interceptor.Chain): Response {
@@ -73,6 +78,8 @@ class CloudflareBypass(
         val userAgent = request.header("User-Agent") ?: FALLBACK_UA
         val chromeMajor = CHROME_VERSION_REGEX.find(userAgent)?.groupValues?.get(1)
 
+        // Client hints must match the UA's Chrome version, otherwise the
+        // inconsistency itself becomes a bot signal.
         if (chromeMajor != null) {
             builder.header(
                 "sec-ch-ua",
@@ -85,37 +92,28 @@ class CloudflareBypass(
             builder.header("sec-ch-ua-platform", "\"Android\"")
         }
 
-        val isDocumentNavigation = request.header("Accept")?.startsWith("text/html") == true ||
-            request.header("Sec-Fetch-Dest") == "document"
-
+        val path = request.url.encodedPath
         if (request.header("Accept") == null) {
-            val accept = when {
-                isDocumentNavigation -> "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8"
-                request.url.encodedPath.substringAfterLast('.').lowercase() in IMAGE_EXTENSIONS ->
-                    "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
-                else -> "application/json, text/plain, */*"
+            val accept = if (path.substringAfterLast('.').lowercase() in IMAGE_EXTENSIONS) {
+                "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8"
+            } else {
+                "application/json, text/plain, */*"
             }
             builder.header("Accept", accept)
         }
 
         builder.header("accept-language", "en-US,en;q=0.9")
-        if (isDocumentNavigation) {
-            builder.header("sec-fetch-dest", "document")
-            builder.header("sec-fetch-mode", "navigate")
-            builder.header("sec-fetch-user", "?1")
-        } else {
-            builder.header("sec-fetch-dest", "empty")
-            builder.header("sec-fetch-mode", "cors")
-        }
+        builder.header("sec-fetch-dest", "empty")
+        builder.header("sec-fetch-mode", "cors")
 
         val refererHost = request.header("Referer")?.toHttpUrlOrNull()?.host
         builder.header(
             "sec-fetch-site",
             when {
                 refererHost == request.url.host -> "same-origin"
-                refererHost != null && refererHost == request.url.host -> "same-origin"
-                refererHost != null -> "same-site"
-                else -> "none"
+                refererHost != null && refererHost == request.url.host
+                    .substringBefore('.') -> "same-site"
+                else -> "cross-site"
             },
         )
 
@@ -123,7 +121,7 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 3. Smart retry on Cloudflare blocks
+    // 3. Smart retry on Cloudflare blocks (rate limits, transient challenges)
     // ------------------------------------------------------------------------
 
     private fun retryInterceptor(chain: Interceptor.Chain): Response {
@@ -151,8 +149,8 @@ class CloudflareBypass(
             response.close()
             throw IOException(
                 "Cloudflare is blocking requests to ${request.url.host} (HTTP $code). " +
-                    "Open the site in WebView (Browse → Sources → MangaBall → ⋮ → Open in WebView) " +
-                    "to solve the challenge, then try again.",
+                    "Open the site in WebView (Browse → Sources → the source → ⋮ → " +
+                    "Open in WebView) to solve the challenge, then try again.",
             )
         }
 

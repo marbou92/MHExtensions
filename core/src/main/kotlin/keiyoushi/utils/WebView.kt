@@ -1,6 +1,8 @@
 package keiyoushi.utils
 
 import android.annotation.SuppressLint
+import android.app.Activity
+import android.content.Context
 import android.content.res.Resources
 import android.graphics.Bitmap
 import android.os.Handler
@@ -20,6 +22,7 @@ import android.webkit.WebResourceResponse
 import android.webkit.WebSettings
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.FrameLayout
 import keiyoushi.webview.internal.WebViewGlueBridge
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CompletableDeferred
@@ -296,12 +299,35 @@ class WebViewScope<T> internal constructor(
     }
 }
 
+/**
+ * Patched as early as possible into every page (see [ScopeWebViewClient]): the
+ * DOM-level visibility signals report "visible" even when the WebView could not
+ * be attached to a real window (the fallback path of [attachOffscreen]). The
+ * engine-level visibility of the widget iframes (Cloudflare Turnstile) cannot be
+ * patched from page JS — only a real window attachment fixes those.
+ */
+private val VISIBILITY_PATCH_JS = """
+    (function(){
+      try{
+        if(window.__mhVisPatched) return; window.__mhVisPatched=true;
+        var def=function(o,p,v){try{Object.defineProperty(o,p,{get:function(){return v},configurable:true})}catch(e){}};
+        def(document,'visibilityState','visible');
+        def(document,'hidden',false);
+        def(document,'webkitVisibilityState','visible');
+        def(document,'webkitHidden',false);
+        try{document.hasFocus=function(){return true}}catch(e){}
+        try{document.dispatchEvent(new Event('visibilitychange'))}catch(e){}
+      }catch(e){}
+    })();
+""".trimIndent()
+
 private class ScopeWebViewClient(
     private val scope: WebViewScope<*>,
 ) : WebViewClient() {
 
     override fun onPageStarted(view: WebView?, url: String?, favicon: Bitmap?) {
         if (scope.destroyed) return
+        view?.evaluateJavascript(VISIBILITY_PATCH_JS, null)
         scope.pageStartedHooks.forEach { it(url.orEmpty()) }
     }
 
@@ -357,6 +383,92 @@ private class LoggingWebChromeClient : WebChromeClient() {
     }
 }
 
+/**
+ * A container that isolates the hidden WebView from the host activity: every
+ * touch that falls through the real app UI is swallowed here (the site must
+ * never receive the user's taps), and no child can steal window focus. The
+ * extension's own synthetic taps are unaffected — [WebViewScope.dispatchTap]
+ * calls [WebView.dispatchTouchEvent] directly, bypassing parent dispatch.
+ */
+private class IsolatingContainer(context: Context) : FrameLayout(context) {
+    override fun onInterceptTouchEvent(ev: MotionEvent?): Boolean = true
+    override fun onTouchEvent(ev: MotionEvent?): Boolean = true
+    override fun requestChildFocus(child: View?, focused: View?) {}
+}
+
+/**
+ * Best-effort lookup of the current foreground activity. Extension code only
+ * ever gets the Application context, so the activity has to be found through
+ * ActivityThread's activity record map (long-standing, greylisted reflection;
+ * every step is guarded and the whole probe returns null on failure).
+ */
+private fun findForegroundActivity(): Activity? = runCatching {
+    val threadClass = Class.forName("android.app.ActivityThread")
+    val thread = threadClass.getMethod("currentActivityThread").invoke(null) ?: return null
+    val activities = threadClass.getDeclaredField("mActivities")
+        .apply { isAccessible = true }
+        .get(thread) as? Map<*, *> ?: return null
+
+    var fallback: Activity? = null
+    for (record in activities.values) {
+        val activity = runCatching {
+            record?.javaClass?.getDeclaredField("activity")
+                ?.apply { isAccessible = true }
+                ?.get(record) as? Activity
+        }.getOrNull() ?: continue
+        if (activity.isFinishing || activity.isDestroyed) continue
+        if (activity.window == null) continue
+        // The focused activity is the one whose window is really showing.
+        if (activity.hasWindowFocus()) return activity
+        if (fallback == null) fallback = activity
+    }
+    fallback
+}.getOrNull()
+
+/**
+ * Attaches [webView] to a real window — fully laid out and drawn, but parked
+ * at index 0 of the activity's decor view (behind the app's own content), so
+ * the user never sees it.
+ *
+ * WHY THIS MATTERS: a WebView that is never attached to a window reports
+ * `document.visibilityState = "hidden"`. In that state every visibility-
+ * sensitive challenge silently stalls: Cloudflare Turnstile defers its widget
+ * until the page becomes visible and never issues a token (the v18-v22
+ * "off-screen" builds could never solve anything for this reason), and the
+ * managed-challenge loops forever. Once attached — even translated out of
+ * sight — Chromium marks the page visible, the widget actually renders, and
+ * the non-interactive branch auto-solves exactly like a real browser.
+ *
+ * Returns an [AutoCloseable] that removes the WebView again, or null when no
+ * usable activity was found (the WebView then stays unattached — the old
+ * behavior — and only the DOM-level VISIBILITY_PATCH_JS applies).
+ */
+private fun attachOffscreen(webView: WebView): AutoCloseable? = runCatching {
+    val activity = findForegroundActivity() ?: return null
+    val decor = activity.window?.decorView as? ViewGroup ?: return null
+    val metrics = Resources.getSystem().displayMetrics
+
+    webView.isFocusable = false
+    webView.isFocusableInTouchMode = false
+    webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+
+    val container = IsolatingContainer(webView.context).apply {
+        isFocusable = false
+        importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
+    }
+    container.addView(
+        webView,
+        ViewGroup.LayoutParams(metrics.widthPixels, metrics.heightPixels),
+    )
+    decor.addView(
+        container,
+        0,
+        ViewGroup.LayoutParams(metrics.widthPixels, metrics.heightPixels),
+    )
+
+    AutoCloseable { runCatching { decor.removeView(container) } }
+}.getOrNull()
+
 @SuppressLint("SetJavaScriptEnabled")
 private fun setupWebView(webView: WebView) {
     webView.settings.apply {
@@ -392,6 +504,10 @@ suspend fun <T> runWebView(
     val scope = WebViewScope(webView, deferred)
     webView.webViewClient = ScopeWebViewClient(scope)
     webView.webChromeClient = LoggingWebChromeClient()
+    // A never-attached WebView is "hidden" to Chromium — Turnstile and the
+    // managed-challenge widget stall forever. Attach it to the foreground
+    // activity's window (hidden behind the app UI) whenever possible.
+    val detach = attachOffscreen(webView)
     try {
         try {
             scope.configure()
@@ -408,6 +524,7 @@ suspend fun <T> runWebView(
     } finally {
         scope.destroyed = true
         webView.stopLoading()
+        detach?.close()
         webView.destroy()
     }
 }

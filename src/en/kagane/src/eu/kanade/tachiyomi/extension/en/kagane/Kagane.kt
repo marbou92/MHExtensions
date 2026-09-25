@@ -15,6 +15,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.cloudflare.CloudflareSolverInterceptor
+import keiyoushi.cloudflare.isCloudflareChallenge
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
@@ -56,17 +57,17 @@ abstract class Kagane :
     private val prefs = getPreferences()
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // The new Cloudflare method (v19): a headless challenge SOLVER.
-        // Research conclusion (2026-09): header hardening can never pass a
-        // managed challenge — `cf-mitigated: challenge` responses are full
-        // HTML pages that only a JS-executing browser environment can solve.
-        // So on a challenge this interceptor now solves it in an off-screen
-        // WebView (the same pattern Mihon's own app-level interceptor has
-        // shipped for years): UA/client-hint coherent, single-flight across
-        // parallel requests, interactive challenges abort fast, and the
-        // retried request rides the fresh cf_clearance — all without the
-        // user ever opening a WebView (the old "solve it manually every
-        // hour" loop is gone; clearance now re-mints itself silently).
+        // The Cloudflare method (v23): a challenge SOLVER in a window-attached
+        // WebView. Research conclusion (2026-09): header hardening can never
+        // pass a managed challenge — only a JS-executing browser environment
+        // solves them, and the WebView must be ATTACHED to a window: an
+        // unattached one reports document.visibilityState="hidden" and the
+        // Turnstile widget silently never renders (no token, no auto-solve).
+        // runWebView now parks its WebView behind the app's own UI, so the
+        // challenge auto-solves exactly like a real browser. Measured on this
+        // site: cf_clearance TTL is ONE YEAR — a single solve lasts, and the
+        // old "solve it manually every hour" loop was false-positive
+        // detection wiping valid clearance (see isCloudflareChallenge).
         // Fingerprint headers stay for the traffic BETWEEN solves (they
         // keep CF's bot score of the cleared session healthy).
         //
@@ -101,18 +102,13 @@ abstract class Kagane :
         return chain.proceed(request)
     }
 
-    /**
-     * True when the response is a Cloudflare challenge rather than a
-     * Kagane application error — those must NOT be consumed here (the
-     * token refresh can't fix them and the detour wastes seconds); they
-     * bubble up to the app-level CloudflareInterceptor, which solves them
-     * in the shared WebView and retries.
-     */
-    private fun Response.isCloudflareChallenge(): Boolean {
-        if (header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true) return true
-        if (header("server")?.contains("cloudflare", ignoreCase = true) == true && code in listOf(403, 429, 503)) return true
-        return false
-    }
+    // Cloudflare challenge detection uses the strict core implementation
+    // (keiyoushi.cloudflare.isCloudflareChallenge): cf-mitigated, or 403/503
+    // from Cloudflare with challenge-page BODY markers. Kagane's own API
+    // returns plain-JSON 401/403 auth errors from behind Cloudflare — the old
+    // header-only check misread those as challenges, skipped the token
+    // refresh and dumped the user into the app-level WebView prompt for a
+    // mere expired token.
 
     private fun refreshTokenInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()

@@ -67,12 +67,16 @@ abstract class ManhuaRMTL :
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // The new Cloudflare method (v19): a headless challenge SOLVER
-        // (shared keiyoushi.cloudflare implementation — see the Kagane
-        // notes for the full rationale). Header hardening can never pass
-        // a managed challenge, so challenges are now solved silently in
-        // an off-screen WebView and the request retried on the fresh
-        // cf_clearance — no more manual WebView visits every hour.
+        // The Cloudflare method (v23): a challenge SOLVER in a window-attached
+        // WebView (shared keiyoushi.cloudflare implementation — see the Kagane
+        // notes for the full rationale). Header hardening can never pass a
+        // managed challenge; the WebView must be ATTACHED to a window (an
+        // unattached one reports document.visibilityState="hidden" and the
+        // Turnstile widget silently never renders). Challenges now auto-solve
+        // like a real browser, and the strict challenge detection stops legit
+        // API 403s from wiping the (measured: one-year!) cf_clearance — the
+        // old "manual WebView visits every hour" loop was false-positive
+        // detection, not expiry.
         //
         // Kept from the 2026-09 audit: OriginSanitizer strips the "Origin:
         // <baseUrl>" header KeiSource stamps onto every request — real

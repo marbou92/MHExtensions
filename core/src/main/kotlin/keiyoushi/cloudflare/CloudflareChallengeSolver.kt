@@ -27,31 +27,43 @@ import kotlin.time.Duration.Companion.seconds
  * - Header hardening of plain OkHttp traffic can NEVER pass a managed challenge.
  *   `cf-mitigated: challenge` responses are full HTML challenge pages that only a
  *   JS-executing browser environment can solve.
- * - An off-screen (never-attached) Android WebView DOES pass the auto-solvable
- *   branch of managed challenges — this is exactly what Mihon's own app-level
- *   interceptor has shipped for years, and what keiyoushi's `runWebView`
- *   institutionalizes (WebView laid out at real screen size, never attached).
- * - `cf_clearance` is issued for ~30 min (site-configurable) and is bound to the
- *   user agent of the solving browser — so the WebView MUST present exactly the
- *   UA the retried request will send, and the UA must never be overridden later.
+ * - The solving WebView MUST be attached to a real window: a never-attached
+ *   WebView reports `document.visibilityState = "hidden"` and Turnstile (both
+ *   the managed-challenge widget and the site's own security checks) silently
+ *   stalls forever — no token, no auto-solve, no interactive branch (measured
+ *   live, 2026-09: the widget iframe never even renders). runWebView therefore
+ *   attaches its WebViews to the foreground activity's window, hidden behind
+ *   the app's own content.
+ * - `cf_clearance` is bound to the user agent of the solving browser — so the
+ *   WebView MUST present exactly the UA the retried request will send, and the
+ *   UA must never be overridden later. On both kagane.to and manhuarmtl.com the
+ *   measured TTL is ONE YEAR (365 d), so a single solve lasts: what used to
+ *   look like hourly expiry was the clearance being wiped by false-positive
+ *   challenge detection — hence the strict isCloudflareChallenge below.
  *
  * What this interceptor does on a challenge response:
- *  1. Single-flight: parallel requests (image loads!) wait on one solve.
- *  2. Deletes the stale `cf_clearance` cookie (a stale cookie only feeds CF's
+ *  1. Strict detection: only `cf-mitigated: challenge`, or 403/503 from
+ *     Cloudflare whose BODY carries challenge-page markers. A plain JSON 403
+ *     from the site's own API behind Cloudflare is NOT a challenge — treating
+ *     it as one used to purge a perfectly valid clearance and force the user
+ *     through pointless WebView solves.
+ *  2. Single-flight: parallel requests (image loads!) wait on one solve.
+ *  3. Deletes the stale `cf_clearance` cookie (a stale cookie only feeds CF's
  *     bot score — Mihon deletes it before solving too).
- *  3. Solves headless in a `runWebViewBlocking` session: loads the challenged
- *     URL (GETs) or the site root (non-GETs), spoofs `Sec-CH-UA` client hints
- *     from the request UA, and — when the challenge escalates to the
- *     interactive Turnstile checkbox — TAPS it: synthetic MotionEvents enter
- *     at the platform input layer and reach through the cross-origin widget
- *     iframe that page JavaScript can never click (the same mechanism MKissa
- *     uses to click its captcha widgets). This turns the once-aborted
- *     interactive branch into a completed solve instead of a user prompt.
- *  4. Retries the original request once with the fresh clearance; if the
+ *  4. Solves in a `runWebViewBlocking` session (now window-attached, so the
+ *     widget really renders): loads the challenged URL (GETs) or the site root
+ *     (non-GETs), spoofs `Sec-CH-UA` client hints from the request UA, and —
+ *     when the challenge escalates to the interactive Turnstile checkbox —
+ *     TAPS it: synthetic MotionEvents enter at the platform input layer and
+ *     reach through the cross-origin widget iframe that page JavaScript can
+ *     never click (the same mechanism MKissa uses to click its captcha
+ *     widgets). This turns the once-aborted interactive branch into a
+ *     completed solve instead of a user prompt.
+ *  5. Retries the original request once with the fresh clearance; if the
  *     retry is challenged AGAIN, one more full solve round runs before the
  *     challenge is handed back (second loads clear far more often than
  *     first loads).
- *  5. Last resort: hands the challenge response back so the app-level
+ *  6. Last resort: hands the challenge response back so the app-level
  *     CloudflareInterceptor (or a manual "Open in WebView") can still solve it.
  *
  * 429s without a challenge marker are retried with backoff (rate-limit windows).
@@ -59,10 +71,31 @@ import kotlin.time.Duration.Companion.seconds
 
 /** True when [response] is a Cloudflare managed challenge (official detection). */
 fun Response.isCloudflareChallenge(): Boolean {
+    // The authoritative marker — Cloudflare sets it on every managed challenge.
     if (header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true) return true
-    if (header("server")?.contains("cloudflare", ignoreCase = true) == true && code in listOf(403, 503)) return true
+
+    if (header("server")?.contains("cloudflare", ignoreCase = true) == true && code in listOf(403, 503)) {
+        // 403/503 from a site's own API behind Cloudflare (JSON errors, rate
+        // limits) are header-identical to a challenge page. Require the
+        // challenge-page body markers before treating it as one — a false
+        // positive here purges a perfectly valid (365-day!) cf_clearance and
+        // pushes the user through pointless WebView solves.
+        val body = runCatching { peekBody(4096).string() }.getOrNull().orEmpty()
+        return CHALLENGE_BODY_MARKERS.any { marker -> body.contains(marker, ignoreCase = true) }
+    }
     return false
 }
+
+private val CHALLENGE_BODY_MARKERS = listOf(
+    "Just a moment",
+    "challenge-platform",
+    "_cf_chl_opt",
+    "cf-chl",
+    "Attention Required",
+    "cf-browser-verification",
+    "cf-error-details",
+    "cf-turnstile",
+)
 
 /** Thrown when Cloudflare escalates to an interactive challenge (unsolvable headless). */
 class InteractiveChallengeException : IOException("The Cloudflare challenge requires interaction")
