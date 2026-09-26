@@ -5,18 +5,19 @@ plugins {
 }
 
 keiyoushi {
-    name = "MKissa"
-    versionCode = 21
+    name = "MangaBall"
+    versionCode = 3
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
     source {
-        lang = "en"
-        baseUrl = "https://mkissa.to"
+        lang = "all"
+        baseUrl = "https://mangaball.net"
     }
 
     deeplink {
-        host("mkissa.to")
+        host("mangaball.net")
         path("/manga/..*")
+        path("/title-detail/..*")
     }
 }

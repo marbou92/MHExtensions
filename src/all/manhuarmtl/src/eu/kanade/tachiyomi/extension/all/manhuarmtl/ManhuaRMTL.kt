@@ -223,6 +223,40 @@ abstract class ManhuaRMTL :
         return MangasPage(mangas, hasNextPageSelector(document))
     }
 
+    // ============================== Related manga ==============================
+    //
+    // The site does not answer the madara_load_more AJAX endpoint (the
+    // multisrc's default related route) and its MRM skin has no
+    // server-rendered related block — so the default recommendations always
+    // came back EMPTY. Route related manga through the site's own search
+    // page instead: the same ?post_type=wp-manga&genre[]=<slug>&sort=trending
+    // parameters the search flow uses (verified live 2026-09), parsed with
+    // the same li.mrm-r-item card parser.
+
+    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
+        val genreSlugs = relatedGenres(manga).map { it.slug }
+        if (genreSlugs.isEmpty()) return emptyList()
+
+        return genreSlugs
+            .flatMap { genre ->
+                val url = "$baseUrl/".toHttpUrl().newBuilder().apply {
+                    addQueryParameter("post_type", "wp-manga")
+                    addQueryParameter("s", "")
+                    addQueryParameter("genre[]", genre)
+                    addQueryParameter("sort", "trending")
+                }.build()
+
+                runCatching {
+                    client.get(url.toString()).asJsoup()
+                        .select("li.mrm-r-item")
+                        .mapNotNull(::mrmCardToSManga)
+                }.getOrDefault(emptyList())
+            }
+            .filter { it.url != manga.url }
+            .distinctBy { it.url }
+            .take(24)
+    }
+
     // ============================== Genres ==============================
     //
     // The site sits behind an intermittent Cloudflare challenge; genre chips

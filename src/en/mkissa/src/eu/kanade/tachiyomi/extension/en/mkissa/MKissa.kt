@@ -655,7 +655,20 @@ abstract class MKissa :
         }
 
         interceptRequest { request ->
-            if (!request.isForMainFrame) {
+            // ---- Promo-redirect hijack guard (v24) ----
+            // The site's ad layer top-level-navigates the first chapter
+            // click to a sister site (kagane.to, "Just a moment..."), which
+            // killed the whole off-screen pipeline and produced the
+            // misleading "open the site in WebView" advice. Block any
+            // main-frame navigation away from mkissa.to.
+            if (request.isForMainFrame) {
+                val uri = request.url
+                val scheme = uri.scheme
+                val host = uri.host
+                if ((scheme == "http" || scheme == "https") && !isSiteHost(host ?: "")) {
+                    return@interceptRequest emptyResponse()
+                }
+            } else {
                 val url = request.url
                 val urlString = url.toString()
 
@@ -678,25 +691,16 @@ abstract class MKissa :
                     }
                 }
 
-                // ---- DOM-harvest path (last resort) ----
-                // NEVER harvest the reader page itself: that single URL serves
-                // the entire chapter, and treating it as "page 1" is exactly
-                // the older reported bug. Site chrome and captcha traffic are
-                // excluded by isHarvestablePageUrl; series-page recommendation
-                // covers are excluded by the readerActive gate in consider().
-                if (isHarvestablePageUrl(urlString)) {
-                    consider(urlString)
-                    // WebView "Accept: image/..." header is a solid image signal
-                    // even when the CDN path has no file extension. STRICTLY
-                    // GATED: extensionless URLs only count on non-site hosts
-                    // (real page images come from the CDN).
-                    val accept = request.requestHeaders?.get("Accept")
-                    if (accept?.contains("image/") == true &&
-                        urlString.toHttpUrlOrNull()?.let { !isSiteHost(it.host) } == true
-                    ) {
-                        consider(urlString)
-                    }
-                }
+                // ---- DOM-harvest path (RETIRED in v24) ----
+                // The old image-sniff ("Accept: image/... on a non-site host
+                // is a page image") was the root cause of the "chapter shows
+                // recommended manhuas" bug: the reader route itself renders
+                // recommendation rails whose covers come from CDN hosts and
+                // were swept into the harvest, then baked into the page cache
+                // by the DOM fallback resolution. Resolution now comes ONLY
+                // from structured chapterPages payloads (MITM tee / fetch
+                // hook / active replay) or the strictly-scoped
+                // img.reader-page__img strip poll — never from request sniffing.
             }
             null
         }
@@ -993,6 +997,17 @@ abstract class MKissa :
             }
         }.getOrNull()
     }
+
+    /**
+     * A 204-style empty response used to block a navigation outright (the
+     * v24 promo-redirect hijack guard). Cheaper and safer than letting a
+     * sister-site challenge page consume the WebView's time budget.
+     */
+    private fun emptyResponse(): android.webkit.WebResourceResponse = android.webkit.WebResourceResponse(
+        "text/plain",
+        "utf-8",
+        java.io.ByteArrayInputStream(ByteArray(0)),
+    )
 
     /**
      * Re-issues the site's captured chapterPages GET with the captcha token
@@ -1314,7 +1329,24 @@ abstract class MKissa :
         if (host == "challenges.cloudflare.com" || host == apiHost) return false
         val path = url.substringBefore('?').substringBefore('#').lowercase()
         if (isSiteUiAssetPath(path)) return false
+        // Recommendation-rail covers (the "chapter shows recommended manhuas"
+        // bug): the site's cover CDN paths are unmistakable — reject them
+        // before any other check can admit them.
+        if (isCoverAssetPath(path)) return false
         return path.substringAfterLast('.').substringBefore('%') in PAGE_IMAGE_EXTENSIONS
+    }
+
+    /**
+     * The site's recommendation rails / cards serve covers from paths like
+     * `/mcovers/...` and `.../m_tbs...`, `ms_tbs`, `usr_tbs`, `a_tbs`
+     * (aln.youtube-anime.com, live-verified 2026-09). None of those can be
+     * a reader page.
+     */
+    private fun isCoverAssetPath(path: String): Boolean {
+        if (path.contains("/mcovers/")) return true
+        return path.substringAfterLast('/').let { name ->
+            COVER_TOKEN_REGEX.containsMatchIn(name)
+        }
     }
 
     /**
@@ -1356,6 +1388,7 @@ abstract class MKissa :
         if (httpUrl.host == apiHost || httpUrl.host.endsWith(".$apiHost")) return false
         if (isSiteUiAssetPath(httpUrl.encodedPath.lowercase())) return false
         val path = httpUrl.encodedPath.lowercase()
+        if (isCoverAssetPath(path)) return false
         if (path == "/" || path.startsWith("/manga/") || path.startsWith("/api")) return false
         return true
     }
@@ -1716,7 +1749,7 @@ abstract class MKissa :
         // v20: prefix bumped again so page lists captured by older builds
         // are never served — v19/v18 lists were DOM-harvest fallbacks whose
         // first ~40 entries were recommendation covers from the series page.
-        private const val PAGE_CACHE_PREFIX = "mkissa_pages_v5_"
+        private const val PAGE_CACHE_PREFIX = "mkissa_pages_v6_"
         private const val LEGACY_PAGE_CACHE_PREFIX = "mkissa_pages_"
         private const val PAGE_CACHE_MAX_ENTRIES = 60
 
@@ -1997,17 +2030,16 @@ abstract class MKissa :
 
         /**
          * Collects the reader's own page-image strip: the reader renders
-         * each page as img.reader-page__img (site bundle, 2026-09). Scoped
-         * to the strip first so recommendation covers and site chrome can
-         * never enter the harvest; the whole-document scan is the defensive
-         * fallback (the caller additionally gates on the reader route).
+         * each page as img.reader-page__img (site bundle, 2026-09). STRICTLY
+         * scoped to that selector since v24 — the old whole-document fallback
+         * swept the recommendation-rail covers that the reader route itself
+         * renders, which is how "recommended manhuas" became "chapter pages".
          */
         private val READER_STRIP_JS = """
             (function () {
               try {
                 var out = [];
                 var imgs = document.querySelectorAll('img.reader-page__img');
-                if (!imgs.length) { imgs = document.images; }
                 for (var i = 0; i < imgs.length; i++) {
                   var im = imgs[i];
                   var s = im.currentSrc || im.src || im.getAttribute('data-src') || '';
@@ -2048,5 +2080,8 @@ abstract class MKissa :
 
         /** File extensions the chapter-page image harvester accepts. */
         private val PAGE_IMAGE_EXTENSIONS = setOf("webp", "jpg", "jpeg", "png", "avif", "gif", "jfif")
+
+        /** Recommendation-rail cover file names: m_tbs / ms_tbs / usr_tbs / a_tbs. */
+        private val COVER_TOKEN_REGEX = Regex("(?:^|_)(m_tbs|ms_tbs|usr_tbs|a_tbs)(?:_|\\.|\\b)")
     }
 }

@@ -32,10 +32,14 @@ import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.put
 import kotlinx.serialization.json.putJsonArray
+import kotlinx.serialization.json.putJsonObject
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -266,8 +270,10 @@ abstract class Kagane :
         val segments = url.pathSegments
         if (segments.size < 2) return null
         val seriesId = segments[1]
-        return parseMangaDetails(getMangaById(seriesId)).apply {
+        val dto = getMangaById(seriesId)
+        return parseMangaDetails(dto).apply {
             this.url = seriesId
+            memo = buildMemo(dto)
             initialized = true
         }
     }
@@ -291,16 +297,35 @@ abstract class Kagane :
         val dto = getMangaById(seriesId)
 
         val updatedManga = parseMangaDetails(dto).apply {
-            if (!dto.trackerId.isNullOrEmpty()) {
-                memo = buildJsonObject {
-                    put("trackerId", dto.trackerId)
-                }
-            }
+            memo = buildMemo(dto)
         }
         val updatedChapters = parseChapterList(dto, seriesId)
 
         return SMangaUpdate(updatedManga, updatedChapters)
     }
+
+    /**
+     * Identity data the related-manga route needs later: the tracker id
+     * (alternate editions) plus the series' genre/tag ids (client-side
+     * similar search — the API has no suggestions endpoint).
+     */
+    private fun buildMemo(dto: DetailsDto): JsonObject = buildJsonObject {
+        if (!dto.trackerId.isNullOrEmpty()) {
+            put("trackerId", dto.trackerId)
+        }
+        val genreIds = dto.genres.mapNotNull { it.genreId }
+        val tagIds = dto.tags.mapNotNull { it.tagId }
+        if (genreIds.isNotEmpty()) {
+            putJsonArray("genreIds") { genreIds.forEach { add(it) } }
+        }
+        if (tagIds.isNotEmpty()) {
+            putJsonArray("tagIds") { tagIds.forEach { add(it) } }
+        }
+    }
+
+    private fun memoStringList(manga: SManga, key: String): List<String> = manga.memo[key]?.jsonArray
+        ?.mapNotNull { (it as? JsonPrimitive)?.content }
+        .orEmpty()
 
     private fun parseChapterList(details: DetailsDto, seriesId: String): List<SChapter> {
         val useSourceChapterNumber = details.format in setOf(
@@ -320,14 +345,80 @@ abstract class Kagane :
     // =========================== Related Manga ============================
     override val supportsRelatedMangas = true
 
+    /**
+     * Related manga = tracker siblings + client-side "similar".
+     *
+     * The API has NO suggestions/similar endpoint (route surface verified
+     * 2026-09), and the old implementation only ever returned same-tracker
+     * siblings (alternate editions of the SAME work — often just itself).
+     * The similar list is built by searching with this series' own genres
+     * and tags (match ANY), most-viewed first, excluding self and siblings.
+     */
     override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
-        val trackerId = manga.memo["trackerId"]?.string ?: return emptyList()
+        val selfId = manga.url
+        val results = LinkedHashMap<String, SManga>()
+        val siblings = mutableSetOf<String>()
 
-        val series = client.get("$apiUrl/trackers/$trackerId/series")
-            .parseAs<TrackerDto>()
-            .bookSeries
-        return series
-            .map { it.toSManga(apiUrl, showSource, sources, cleanTitle) }
+        // 1) Tracker siblings — alternate editions/translations of the work.
+        manga.memo["trackerId"]?.string?.let { trackerId ->
+            runCatching {
+                client.get("$apiUrl/trackers/$trackerId/series")
+                    .parseAs<TrackerDto>()
+                    .bookSeries
+            }.getOrNull()?.forEach { book ->
+                siblings += book.id
+                if (book.id != selfId) {
+                    results.putIfAbsent(book.id, book.toSManga(apiUrl, showSource, sources, cleanTitle))
+                }
+            }
+        }
+
+        // 2) Similar via genre/tag search, sorted by total views.
+        val genreIds = memoStringList(manga, "genreIds")
+        val tagIds = memoStringList(manga, "tagIds")
+        if (genreIds.isNotEmpty() || tagIds.isNotEmpty()) {
+            runCatching {
+                val body = buildJsonObject {
+                    if (genreIds.isNotEmpty()) {
+                        putJsonObject("genres") {
+                            putJsonArray("values") { genreIds.forEach { add(it) } }
+                            put("match_all", false)
+                        }
+                    }
+                    if (tagIds.isNotEmpty()) {
+                        putJsonObject("tags") {
+                            putJsonArray("values") { tagIds.forEach { add(it) } }
+                            put("match_all", false)
+                        }
+                    }
+
+                    val sourceTypes = if (sourceDisplayMode == "official") {
+                        listOf("Official")
+                    } else {
+                        listOf("Official", "Unofficial", "Mixed")
+                    }
+                    putJsonArray("source_type") { sourceTypes.forEach { add(it) } }
+                    putJsonArray("content_lang") { kaganeLangs.forEach { add(it) } }
+                }.toJsonRequestBody()
+
+                val url = "$apiUrl/search/series".toHttpUrl().newBuilder()
+                    .addQueryParameter("page", "0")
+                    .addQueryParameter("size", "35")
+                    .addQueryParameter("sort", "total_views,desc")
+                    .build()
+
+                client.post(url, body)
+                    .parseAs<SearchDto>()
+                    .content
+                    .forEach { book ->
+                        if (book.id != selfId && book.id !in siblings) {
+                            results.putIfAbsent(book.id, book.toSManga(apiUrl, showSource, sources, cleanTitle))
+                        }
+                    }
+            }
+        }
+
+        return results.values.toList().take(25)
     }
 
     // =============================== Pages ================================

@@ -142,12 +142,16 @@ class DetailsDto(
 
     @Serializable
     class Genre(
+        @SerialName("genre_id")
+        val genreId: String? = null,
         @SerialName("genre_name")
         val genreName: String,
     )
 
     @Serializable
     class Tag(
+        @SerialName("tag_id")
+        val tagId: String? = null,
         @SerialName("tag_name")
         val tagName: String,
     )
