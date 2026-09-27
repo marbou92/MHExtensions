@@ -74,7 +74,9 @@ fun Response.isCloudflareChallenge(): Boolean {
     // The authoritative marker — Cloudflare sets it on every managed challenge.
     if (header("cf-mitigated")?.contains("challenge", ignoreCase = true) == true) return true
 
-    if (header("server")?.contains("cloudflare", ignoreCase = true) == true && code in listOf(403, 503)) {
+    if (header("server")?.contains("cloudflare", ignoreCase = true) != true) return false
+
+    if (code in listOf(403, 503)) {
         // 403/503 from a site's own API behind Cloudflare (JSON errors, rate
         // limits) are header-identical to a challenge page. Require the
         // challenge-page body markers before treating it as one — a false
@@ -83,6 +85,20 @@ fun Response.isCloudflareChallenge(): Boolean {
         val body = runCatching { peekBody(4096).string() }.getOrNull().orEmpty()
         return CHALLENGE_BODY_MARKERS.any { marker -> body.contains(marker, ignoreCase = true) }
     }
+
+    if (code == 200 && header("Content-Type")?.contains("text/html", ignoreCase = true) == true) {
+        // Challenges are occasionally served with HTTP 200 (custom challenge
+        // pages, cached interstitials). They used to sail through detection
+        // and crash into source-side parsing — MangaBall read such a page as
+        // the site homepage and failed with "couldn't read the CSRF token".
+        // Peek is cheap (does not consume the body) and HTML-only. Only
+        // Cloudflare-PROPRIETARY markers count here: a real page that merely
+        // mentions "Just a moment" must never trigger a solve.
+        val body = runCatching { peekBody(8192).string() }.getOrNull().orEmpty()
+        return body.contains("_cf_chl_opt", ignoreCase = true) ||
+            (body.contains("challenge-platform", ignoreCase = true) && body.contains("cf-chl", ignoreCase = true))
+    }
+
     return false
 }
 
@@ -357,25 +373,28 @@ class CloudflareSolverInterceptor(
     }
 
     private companion object {
-        val SOLVE_TIMEOUT = 45.seconds
+        // 75s: interactive Turnstile has to render, run and pass — and with
+        // the window-attached WebView that now actually happens. 45s cut
+        // real solves off mid-run.
+        val SOLVE_TIMEOUT = 75.seconds
 
         /** Queued requests within this window after a solve skip re-solving. */
         const val SOLVE_DEDUPE_MS = 20_000L
 
         /** Solve rounds per challenge before handing it to the app flow. */
-        const val SOLVE_ROUNDS = 2
+        const val SOLVE_ROUNDS = 3
 
         /** Start probing for the widget after this many ms even without an interactive signal. */
-        const val TAP_AFTER_MS = 8_000L
+        const val TAP_AFTER_MS = 6_000L
 
         /** Spacing between synthetic widget taps. */
-        const val TAP_SPACING_MS = 2_500L
+        const val TAP_SPACING_MS = 2_000L
 
         /** Checkbox position inside the captcha widget (CSS dp, both providers). */
         const val CHECKBOX_OFFSET_X_DP = 30f
 
         /** Cap for the widget taps within one solve round. */
-        const val MAX_TAP_ATTEMPTS = 8
+        const val MAX_TAP_ATTEMPTS = 12
 
         const val CLEARANCE_COOKIE = "cf_clearance="
         const val BRIDGE_NAME = "mhcfbridge"

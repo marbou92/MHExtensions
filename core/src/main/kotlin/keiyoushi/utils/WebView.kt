@@ -52,6 +52,12 @@ class RenderProcessGoneException internal constructor(
     if (didCrash) "WebView render process crashed" else "WebView render process was killed",
 )
 
+/** How long [runWebView] waits for an activity to resume before attaching. */
+private val ACTIVITY_WAIT_MS = 4_000L
+
+/** Poll interval while waiting for an activity to resume. */
+private val ACTIVITY_POLL_INTERVAL = 250.milliseconds
+
 /**
  * Thrown by [runWebView] on timeout. Deliberately a plain [Exception] rather than a
  * [kotlinx.coroutines.CancellationException], so callers see a failure instead of a
@@ -398,11 +404,22 @@ private class IsolatingContainer(context: Context) : FrameLayout(context) {
 
 /**
  * Best-effort lookup of the current foreground activity. Extension code only
- * ever gets the Application context, so the activity has to be found through
- * ActivityThread's activity record map (long-standing, greylisted reflection;
- * every step is guarded and the whole probe returns null on failure).
+ * ever gets the Application context, so the activity has to be found somehow.
+ *
+ * FIRST choice: the public-API [ForegroundActivityTracker] (lifecycle
+ * callbacks — cannot be blocked by hidden-API enforcement and reliable on
+ * every Android version). FALLBACK: ActivityThread's activity record map
+ * (long-standing, greylisted reflection; blocked on newer targets — every
+ * step is guarded and the whole probe returns null on failure). The fallback
+ * also covers the only tracker blind spot: an activity resumed BEFORE the
+ * tracker was registered.
  */
-private fun findForegroundActivity(): Activity? = runCatching {
+private fun findForegroundActivity(): Activity? {
+    ForegroundActivityTracker.peek()?.let { return it }
+    return findForegroundActivityReflective()
+}
+
+private fun findForegroundActivityReflective(): Activity? = runCatching {
     val threadClass = Class.forName("android.app.ActivityThread")
     val thread = threadClass.getMethod("currentActivityThread").invoke(null) ?: return null
     val activities = threadClass.getDeclaredField("mActivities")
@@ -507,7 +524,18 @@ suspend fun <T> runWebView(
     // A never-attached WebView is "hidden" to Chromium — Turnstile and the
     // managed-challenge widget stall forever. Attach it to the foreground
     // activity's window (hidden behind the app UI) whenever possible.
-    val detach = attachOffscreen(webView)
+    var detach = attachOffscreen(webView)
+    if (detach == null && ForegroundActivityTracker.everResumed) {
+        // No usable activity RIGHT NOW, but this process has had one. The
+        // fetch probably raced a navigation or the app was just backgrounded
+        // — give the tracker a moment to see the next resume before giving
+        // up and running unattached (where challenges cannot solve).
+        val deadline = SystemClock.uptimeMillis() + ACTIVITY_WAIT_MS
+        while (detach == null && SystemClock.uptimeMillis() < deadline && !deferred.isCompleted) {
+            delay(ACTIVITY_POLL_INTERVAL)
+            detach = attachOffscreen(webView)
+        }
+    }
     try {
         try {
             scope.configure()

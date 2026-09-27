@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.all.mangaball
 
+import android.webkit.CookieManager
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -13,6 +14,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.source.KeiSource
@@ -30,6 +32,7 @@ import okhttp3.OkHttpClient
 import okhttp3.Response
 import org.jsoup.Jsoup
 import java.io.IOException
+import java.net.URLDecoder
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -55,12 +58,13 @@ import java.util.TimeZone
  *  4. Chapter pages = GET /chapter-detail/{translationId}/ and read the
  *     inline `const chapterImages = JSON.parse(`...`)` array.
  *
- * Cloudflare is handled with Comix's EXACT method: the verbatim Comix
- * CloudflareBypass (WebView cookie sync + UA-derived client hints + sec-fetch
- * stamping + smart retry — see CloudflareBypass), installed before the source's
- * own interceptors exactly like Comix does, with real challenge solving done by
- * the app-level CloudflareInterceptor (window-attached WebView since core v23,
- * which auto-solves the managed challenge mangaball.net serves).
+ * Cloudflare is handled with the core CloudflareSolverInterceptor (the v23+
+ * method shared with Kagane and ManhuaRMTL): window-attached WebView solves
+ * (with Turnstile tapping) plus strict challenge detection, so Laravel's own
+ * 403/419 answers reach apiPost's CSRF refresh instead of being mistaken for
+ * Cloudflare blocks. The v24 Comix-style header bypass could only harden
+ * headers and RETRY — it can never pass a managed challenge, which is why
+ * browsing failed until a manual WebView visit.
  */
 @Source
 abstract class MangaBall :
@@ -84,7 +88,7 @@ abstract class MangaBall :
 
     /** Client for the CSRF bootstrap homepage (no csrf logic → no recursion). */
     private val csrfClient: OkHttpClient = network.client.newBuilder()
-        .apply { CloudflareBypass(setOf(domain)).install(this) }
+        .apply { addInterceptor(CloudflareSolverInterceptor(setOf(domain))) }
         .build()
 
     override fun OkHttpClient.Builder.configureClient() = apply {
@@ -92,9 +96,9 @@ abstract class MangaBall :
         readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
 
-        // Comix's EXACT bypass (verbatim class), installed ahead of the
-        // source-specific interceptors — the same order Comix uses.
-        CloudflareBypass(setOf(domain)).install(this)
+        // The real challenge solver (window-attached WebView + strict
+        // detection), same as Kagane/ManhuaRMTL.
+        addInterceptor(CloudflareSolverInterceptor(setOf(domain)))
 
         // KeiSource stamps "Origin" on everything; browsers never send it on
         // document GETs. Drop it there (same reason as Kagane's sanitizer).
@@ -138,6 +142,10 @@ abstract class MangaBall :
     @Volatile
     private var csrfToken: String? = null
 
+    /** Which header the current [csrfToken] must be sent in. */
+    @Volatile
+    private var csrfHeaderName: String = HEADER_CSRF_TOKEN
+
     private val csrfMutex = Mutex()
 
     private suspend fun ensureCsrf(force: Boolean = false): String? {
@@ -148,36 +156,64 @@ abstract class MangaBall :
             val response = csrfClient.get("$baseUrl/", htmlHeaders)
             val body = response.body.string()
 
-            val token = Jsoup.parse(body, baseUrl)
+            val meta = Jsoup.parse(body, baseUrl)
                 .selectFirst("meta[name=csrf-token]")?.attr("content")
                 ?.takeIf { it.isNotBlank() }
 
-            if (token == null) {
-                // Site layout change or a challenge page leaked through.
-                throw IOException(
-                    "MangaBall: couldn't read the site's CSRF token. " +
-                        "Open the site in WebView once, then retry.",
-                )
+            if (meta != null) {
+                csrfHeaderName = HEADER_CSRF_TOKEN
+                csrfToken = meta
+                return@withLock meta
             }
 
-            csrfToken = token
-            token
+            // Fallback: Laravel sets the XSRF-TOKEN cookie on EVERY real page
+            // response with the same (URL-encoded) token the meta tag carries
+            // — the site's own axios client reads exactly this cookie and
+            // sends it as X-XSRF-TOKEN. When a layout change or a non-standard
+            // page hides the meta tag, the cookie still authenticates POSTs.
+            val cookieToken = xsrfCookieToken()
+            if (cookieToken != null) {
+                csrfHeaderName = HEADER_XSRF_TOKEN
+                csrfToken = cookieToken
+                return@withLock cookieToken
+            }
+
+            // Site layout change or a challenge page leaked through.
+            throw IOException(
+                "MangaBall: couldn't read the site's CSRF token (a Cloudflare challenge " +
+                    "page came through instead of the site). Open the site in WebView once, " +
+                    "then retry.",
+            )
         }
     }
 
+    /** Reads and URL-decodes the Laravel `XSRF-TOKEN` cookie, or null. */
+    private fun xsrfCookieToken(): String? = runCatching {
+        CookieManager.getInstance()
+            .getCookie("$baseUrl/")
+            ?.split(";")
+            ?.map(String::trim)
+            ?.firstOrNull { it.startsWith("XSRF-TOKEN=", ignoreCase = true) }
+            ?.substringAfter('=')
+            ?.takeIf { it.isNotBlank() }
+            ?.let { URLDecoder.decode(it, "UTF-8") }
+    }.getOrNull()
+
     private fun invalidateCsrf() {
         csrfToken = null
+        csrfHeaderName = HEADER_CSRF_TOKEN
     }
 
     /**
      * POSTs a form to an /api/v1 endpoint with CSRF + XHR headers, refreshing
      * the CSRF token once on Laravel's 419 (Page Expired) or a non-CF 403.
-     * (CF blocks never reach here: CloudflareBypass retries and throws first.)
+     * (Cloudflare challenges never reach here: the solver interceptor solves
+     * and retries them first; Laravel's own 403/419 JSON answers DO arrive.)
      */
     private suspend fun apiPost(url: String, form: FormBody): Response {
         val token = ensureCsrf()
         val headers = apiHeaders.newBuilder()
-            .apply { token?.let { set("X-CSRF-Token", it) } }
+            .apply { token?.let { set(csrfHeaderName, it) } }
             .build()
 
         val response = client.post(url, headers, form)
@@ -188,7 +224,7 @@ abstract class MangaBall :
         invalidateCsrf()
         val fresh = ensureCsrf(force = true)
         val retryHeaders = apiHeaders.newBuilder()
-            .apply { fresh?.let { set("X-CSRF-Token", it) } }
+            .apply { fresh?.let { set(csrfHeaderName, it) } }
             .build()
         return client.post(url, retryHeaders, form)
     }
@@ -985,6 +1021,11 @@ abstract class MangaBall :
         private const val SORT_CREATED_ASC = "created_at_asc"
         private const val SORT_NAME_ASC = "name_asc"
         private const val SORT_NAME_DESC = "name_desc"
+
+        // Laravel accepts the raw token in X-CSRF-Token (meta tag path) or the
+        // decoded XSRF-TOKEN cookie value in X-XSRF-TOKEN (axios path).
+        private const val HEADER_CSRF_TOKEN = "X-CSRF-Token"
+        private const val HEADER_XSRF_TOKEN = "X-XSRF-TOKEN"
 
         private const val PREF_CHAPTER_LANGUAGE = "pref_chapter_language"
         private const val PREF_FALLBACK_LANGUAGE = "pref_fallback_language"
