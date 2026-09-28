@@ -37,11 +37,13 @@ import java.util.Locale
  *    search = the query. The `sortby` query param IS honored server-side
  *    (verified: field_update / field_name_* reorder the SSR cards); the
  *    type / demographic / content-rating panel controls are client-side only.
- *  - Latest         GET /rss/latest.xml — 100 newest chapter releases with
- *    series title, cover enclosure and chapter id. The feed is CHAPTER-level
- *    (a series that released 5 chapters shows 5x), so entries are deduped by
- *    series title. Series URLs resolve on details open (the reader payload
- *    carries `title_id`).
+ *  - Latest         GET /latest — NOW server-rendered series cards (24 per
+ *    page; the v1 recon's "client-side only" no longer holds, and the old
+ *    /rss/latest.xml feed was chapter-level and capped at 100 entries).
+ *    Pagination follows the page's own "Older →" link: /latest?before={the
+ *    oldest release timestamp on the page}. Cards carry the REAL title slug,
+ *    so the RSS-era two-hop details resolution is no longer needed on the
+ *    browse path (kept for old library entries).
  *  - Details        GET /title/{id6}; selectors below. The header stats row
  *    carries the star rating (+ user count), follows, reviews, comments.
  *  - Chapters       TWO-STEP: the title page renders ONE box per source
@@ -49,7 +51,9 @@ import java.util.Locale
  *    /source/{id} link) — the v1 build mistook those for the full list. The
  *    FULL chapter list of a group lives on its /source/{id} page
  *    (`a[href^=/chapter/]` rows + `time[data-time]` epoch millis), so we
- *    fetch one /source/{id} per language-matching group.
+ *    fetch one /source/{id} per language-matching group. The same chapter
+ *    number is frequently uploaded by several groups — the "Deduplicate
+ *    chapters" setting keeps one per number × language.
  *  - Pages          GET /chapter/{id} — the reader has no <img> tags; the
  *    page URLs are absolute (`https://iXX.imgXX.org/_f/...`) inside the
  *    `"imageUrls"` qwik/json state. Parsed positionally with a URL regex;
@@ -80,17 +84,41 @@ abstract class XComic :
         .set("User-Agent", CHROME_UA)
         .set("Referer", "$mirror/")
 
+    /** Latest pagination state: the site paginates /latest with a `before`
+     * cursor (oldest release timestamp of the page), so the cursor handed
+     * back by page N's parse is stored for page N+1. Mihon calls browse
+     * requests strictly sequentially, so a small map is sufficient.
+     */
+    private var latestRequestedPage = 1
+    private val latestCursors = HashMap<Int, String>()
+
     // ========================================================================
     // Browse / search
     // ========================================================================
 
     override fun popularMangaRequest(page: Int): Request = GET("$mirror/search?word=&page=$page", headers)
 
-    override fun popularMangaParse(response: Response): MangasPage = searchCardParse(response)
+    override fun popularMangaParse(response: Response): MangasPage = popularParse(response)
 
-    override fun latestUpdatesRequest(page: Int): Request = GET("$mirror/rss/latest.xml", headers)
+    override fun latestUpdatesRequest(page: Int): Request {
+        latestRequestedPage = page
+        val cursor = latestCursors[page]
+        return GET(if (cursor.isNullOrBlank()) "$mirror/latest" else "$mirror/latest?before=$cursor", headers)
+    }
 
-    override fun latestUpdatesParse(response: Response): MangasPage = rssLatestParse(response)
+    override fun latestUpdatesParse(response: Response): MangasPage {
+        val document = response.asJsoup()
+
+        // The page's own "Older →" link carries the next cursor: the oldest
+        // release timestamp on this page. No link = last page.
+        document.selectFirst("a[href^=/latest?before=]")?.attr("href")
+            ?.substringAfter("before=")?.substringBefore("&")
+            ?.takeIf { it.isNotBlank() }
+            ?.let { latestCursors[latestRequestedPage + 1] = it }
+
+        val mangas = parseTitleCards(document)
+        return MangasPage(mangas, latestCursors.containsKey(latestRequestedPage + 1))
+    }
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val encoded = java.net.URLEncoder.encode(query, "UTF-8")
@@ -102,14 +130,24 @@ abstract class XComic :
         return GET("$mirror/search?word=$encoded&page=$page&sortby=$sortValue", headers)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = searchCardParse(response)
+    override fun searchMangaParse(response: Response): MangasPage = popularParse(response)
 
-    /** Server-rendered search cards: cover link `a[href^="/title/"]:has(img)`. */
-    private fun searchCardParse(response: Response): MangasPage {
-        val document = response.asJsoup()
+    /** Search/popular listings: 48 cards per page; the size threshold doubles
+     * as the hasNext heuristic (the pages have no server-side next link).
+     */
+    private fun popularParse(response: Response): MangasPage {
+        val mangas = parseTitleCards(response.asJsoup())
+        return MangasPage(mangas, mangas.size >= 40)
+    }
+
+    /** Server-rendered cards (shared by search and latest): cover link
+     * `a[href^="/title/"]:has(img)` — each series card renders the link
+     * twice (cover + heading), so dedupe by href.
+     */
+    private fun parseTitleCards(document: Document): List<SManga> {
         val coverLinks = document.select("a[href^=/title/]").filter { it.selectFirst("img") != null }
         val seen = mutableSetOf<String>()
-        val mangas = coverLinks.mapNotNull { coverLink ->
+        return coverLinks.mapNotNull { coverLink ->
             val href = coverLink.attr("href").substringBefore("?")
             if (!seen.add(href)) return@mapNotNull null
             val title = coverLink.selectFirst("img")?.attr("alt")?.trim().takeUnless { it.isNullOrBlank() }
@@ -127,44 +165,6 @@ abstract class XComic :
                     }
             }
         }
-        // 48 cards per page; size threshold doubles as the hasNext heuristic.
-        return MangasPage(mangas, mangas.size >= 40)
-    }
-
-    /** Chapter-level RSS → series cards (cover from the enclosure).
-     * The feed is chapter-level: a series with several releases in the window
-     * repeats once per chapter. Keep the FIRST (newest — the feed is
-     * release-ordered) entry per series so "Latest" shows each series once.
-     */
-    private fun rssLatestParse(response: Response): MangasPage {
-        val xml = response.body.string()
-        val seen = mutableSetOf<String>()
-        val mangas = ITEM_REGEX.findAll(xml).mapNotNull { match ->
-            val item = match.value
-            val chapterId = GUID_REGEX.find(item)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
-                ?: return@mapNotNull null
-            val rawTitle = XML_TITLE_REGEX.find(item)?.groupValues?.get(1)?.trim() ?: return@mapNotNull null
-
-            // "🇬🇧 Series Name - Volume 1 Chapter 2" → "Series Name"
-            val seriesTitle = rawTitle
-                .replace(FLAG_REGEX, "")
-                .trim()
-                .replace(Regex("""\s*-\s*(Volume\s*\d+\s*)?[Cc]h(apter)?\.?\s*[\dvolVOL.\s]*$"""), "")
-                .trim()
-                .ifBlank { rawTitle }
-
-            val cover = ENCLOSURE_REGEX.find(item)?.groupValues?.get(1)
-
-            if (!seen.add(seriesTitle.lowercase())) return@mapNotNull null
-
-            SManga.create().apply {
-                // Resolved to the real title slug when details are fetched.
-                url = "c/$chapterId"
-                title = seriesTitle
-                thumbnail_url = cover
-            }
-        }.toList()
-        return MangasPage(mangas, false)
     }
 
     // ========================================================================
@@ -307,6 +307,22 @@ abstract class XComic :
             ?.let { segment -> STRING_REGEX.findAll(segment).map { it.groupValues[1] }.toList() }
             .orEmpty()
 
+        // Comix-style score stars: "★★★★☆ 6.9 (by 41 users)". The site's
+        // score is 10-point, so half of it is the number of full stars out of
+        // 5 (same math as the Comix extension).
+        val scoreLine = rating?.trim()?.let { ratingText ->
+            val score = ratingText.toFloatOrNull() ?: return@let null
+            val fullStars = (score / 2f).toInt().coerceIn(0, 5)
+            buildString {
+                append("★".repeat(fullStars))
+                append("☆".repeat(5 - fullStars))
+                append(' ').append(ratingText)
+                if (!ratingUsers.isNullOrBlank()) {
+                    append(" (by ").append(ratingUsers).append(" users)")
+                }
+            }
+        }
+
         val infoLine = if (showExtraInfo) {
             buildString {
                 if (!statusText.isNullOrBlank()) {
@@ -319,11 +335,6 @@ abstract class XComic :
                 if (type != null) {
                     if (isNotEmpty()) append(" · ")
                     append("**Type:** ").append(type)
-                }
-                if (rating != null) {
-                    if (isNotEmpty()) append(" · ")
-                    append("**Rating:** ").append(rating)
-                    if (!ratingUsers.isNullOrBlank()) append(" (by ").append(ratingUsers).append(" users)")
                 }
                 if (follows != null) {
                     if (isNotEmpty()) append(" · ")
@@ -339,6 +350,12 @@ abstract class XComic :
         }
 
         val desc = buildString {
+            // Score stars first (Comix-style), then the info line, then the
+            // description body.
+            if (scoreLine != null) {
+                append(scoreLine)
+                append("\n\n")
+            }
             if (infoLine != null) {
                 append(infoLine)
                 append("\n\n")
@@ -424,9 +441,19 @@ abstract class XComic :
                 groups
             }
 
+        val dedupe = preferences.deduplicateChapters()
+
         val chapters = mutableListOf<SChapter>()
+        val seenNumbers = mutableSetOf<Pair<String, Float>>()
         for (group in selected) {
             for ((chapterId, name, dateMs) in fetchSourceChapterRows(group.sourceId)) {
+                val number = chapterNumberOf(name)
+                // The same chapter number is often uploaded by several
+                // groups; keep the first row per number × language (the site
+                // lists the primary groups first). Rows with an unparseable
+                // number are never treated as duplicates of each other.
+                if (dedupe && number > 0f && !seenNumbers.add(group.lang to number)) continue
+
                 chapters += SChapter.create().apply {
                     url = "$chapterId|$titleSlug"
                     this.name = buildString {
@@ -437,8 +464,7 @@ abstract class XComic :
                             append("]")
                         }
                     }
-                    chapter_number = CHAPTER_NUMBER_REGEX.findAll(name)
-                        .lastOrNull()?.value?.toFloatOrNull() ?: -1f
+                    chapter_number = number
                     date_upload = dateMs
                     scanlator = group.sourceName.ifBlank { null }
                 }
@@ -457,6 +483,9 @@ abstract class XComic :
             compareByDescending<SChapter> { it.chapter_number }.thenByDescending { it.date_upload },
         )
     }
+
+    /** Last number token in a chapter label ("Volume 9 Chapter 9.2" → 9.2). */
+    private fun chapterNumberOf(label: String): Float = CHAPTER_NUMBER_REGEX.findAll(label).lastOrNull()?.value?.toFloatOrNull() ?: -1f
 
     /**
      * Fetches (and caches) one source group's full chapter list from
@@ -600,6 +629,14 @@ abstract class XComic :
         }.let(screen::addPreference)
 
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_DEDUPLICATE_CHAPTERS
+            title = "Deduplicate chapters"
+            summary = "Keep one chapter per number and language — the same " +
+                "chapter is often uploaded by several groups"
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_ALT_NAMES
             title = "Show alternative names"
             summary = "Display alternative titles in the description"
@@ -616,7 +653,7 @@ abstract class XComic :
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_EXTRA_INFO
             title = "Show extra info in description"
-            summary = "Display status, year, type, rating and follows above the description"
+            summary = "Display status, year, type and follows above the description"
             setDefaultValue(true)
         }.let(screen::addPreference)
     }
@@ -626,6 +663,8 @@ abstract class XComic :
     private fun android.content.SharedPreferences.customMirror(): String? = getString(PREF_CUSTOM_MIRROR, "")?.takeIf { it.isNotBlank() }
 
     private fun android.content.SharedPreferences.chapterLanguage(): String = getString(PREF_CHAPTER_LANGUAGE, "all") ?: "all"
+
+    private fun android.content.SharedPreferences.deduplicateChapters(): Boolean = getBoolean(PREF_DEDUPLICATE_CHAPTERS, true)
 
     private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
@@ -654,6 +693,7 @@ abstract class XComic :
         private const val PREF_MIRROR = "pref_mirror"
         private const val PREF_CUSTOM_MIRROR = "pref_custom_mirror"
         private const val PREF_CHAPTER_LANGUAGE = "pref_chapter_language"
+        private const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
         private const val PREF_SHOW_ALT_NAMES = "pref_show_alt_names"
         private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
@@ -720,16 +760,6 @@ abstract class XComic :
         private val ALT_TITLES_REGEX = Regex(""""alt_titles",4,\[(.*?)\]""")
 
         private val STRING_REGEX = Regex(""""((?:[^"\\]|\\.)*)"""")
-
-        private val ITEM_REGEX = Regex("""<item>[\s\S]*?</item>""")
-
-        private val XML_TITLE_REGEX = Regex("""<title>(?:<!\[CDATA\[)?([\s\S]*?)(?:\]\]>)?</title>""")
-
-        private val GUID_REGEX = Regex("""<guid[^>]*>([^<]+)</guid>""")
-
-        private val ENCLOSURE_REGEX = Regex("""<enclosure[^>]*url="([^"]+)"""")
-
-        private val FLAG_REGEX = Regex("""[\uD83C][\uDDE6-\uDDFF][\uD83C][\uDDE6-\uDDFF]""")
 
         private val CHAPTER_NUMBER_REGEX = Regex("""\d+(?:\.\d+)?""")
 

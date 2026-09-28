@@ -60,6 +60,11 @@ import java.util.concurrent.ConcurrentHashMap
  * Chapter urls carry "id|number|slug" so the page-list fallback can rebuild
  * the reader page without extra state.
  *
+ * NSFW: search/latest are filtered server-side; popular has no server-side
+ * nsfw parameter, so flagged rows are dropped client-side (see cardListParse).
+ * Chapters are STRICTLY language-filtered — a series without chapters in the
+ * preferred language gets an empty list, never a mixed-language dump.
+ *
  * Caveats inherited from the recon: `order=created` 500s server-side (never
  * used here); listing `total` is flaky under filters (hasNext uses the row
  * count); covers on cum.swarm.ws 404 directly and are rewritten to
@@ -160,13 +165,23 @@ abstract class Swarm :
 
     private fun cardListParse(response: Response): MangasPage {
         val body = response.body.string()
-        val cards = runCatching { body.parseAs<SwarmCardListDto>(json).data }
+        var cards = runCatching { body.parseAs<SwarmCardListDto>(json).data }
             .getOrElse {
                 runCatching {
                     json.decodeFromString(JsonArray.serializer(), body)
                         .map { json.decodeFromJsonElement(SwarmCardDto.serializer(), it) }
                 }.getOrDefault(emptyList())
             }
+
+        // NSFW: search and latest are filtered server-side, but the popular
+        // listing has NO server-side nsfw parameter at all — and the app's
+        // browse suggestions are drawn from it, so NSFW titles kept showing
+        // up even with the setting off. Popular rows carry a reliable `nsfw`
+        // flag, so drop flagged rows client-side (rows from the other
+        // listings carry a null flag and are unaffected by this no-op).
+        if (!preferences.showNsfw()) {
+            cards = cards.filter { it.nsfw != true }
+        }
 
         // The aggregator indexes the same series once per upstream source, so
         // listings (and therefore the app's search suggestions) can repeat a
@@ -241,6 +256,45 @@ abstract class Swarm :
         } ?: throw IOException("Swarm: couldn't read the series page (layout change?).")
 
         return mangaDto.toSManga(slug)
+    }
+
+    /**
+     * Komikku's "Related mangas" (the suggestions rail on the details screen)
+     * used to fall back to the app's own implementation: it keyword-searches
+     * the title — every word of the title fires a broad search, and plenty of
+     * NSFW records on this aggregator carry no nsfw flag at all, so NSFW
+     * manhua dominated the rail no matter what. Disabled, and replaced with
+     * the aggregator's honest answer: the OTHER records of the same series
+     * (and its direct sequels/spin-offs) from the light backend title search,
+     * NSFW-flag-filtered client-side.
+     */
+    override val disableRelatedMangasBySearch: Boolean
+        get() = true
+
+    override val supportsRelatedMangas: Boolean
+        get() = true
+
+    override suspend fun fetchRelatedMangaList(manga: SManga): List<SManga> {
+        val title = manga.title.trim()
+        if (title.isBlank()) return emptyList()
+
+        val searchUrl = "$backendApi/manga".toHttpUrl().newBuilder()
+            .addQueryParameter("title", title)
+            .addQueryParameter("limit", "10")
+            .build()
+
+        val cards = runCatching {
+            client.newCall(GET(searchUrl, headers)).execute().use { response ->
+                response.body.string().parseAs<SwarmCardListDto>(json).data
+            }
+        }.getOrDefault(emptyList())
+
+        val selfUrl = manga.url.trim()
+        return cards
+            .filter { preferences.showNsfw() || it.nsfw != true }
+            .filterNot { it.url.orEmpty().trim() == selfUrl }
+            .distinctBy { it.title?.trim()?.lowercase() }
+            .map { it.toSManga() }
     }
 
     /** Resolves a slug to the backend id via the LIGHT backend title search
@@ -421,9 +475,13 @@ abstract class Swarm :
         val preferredLang = preferences.chapterLanguage().lowercase()
         val dedupe = preferences.deduplicateChapters()
 
-        val preferredRows = rows.filter { it.lang?.lowercase() == preferredLang }
-        val candidates = preferredRows.ifEmpty { rows }
-        val fellBack = preferredRows.isEmpty()
+        // Strict language filter: the aggregator indexes the same series once
+        // per upstream source, and a record that only exists in, say, Spanish
+        // has nothing to show an English reader. The previous fallback
+        // ("preferred language empty → show ALL languages") drowned those
+        // series in unreadable chapters; now the list is simply empty.
+        val candidates = rows.filter { it.lang?.lowercase() == preferredLang }
+        if (candidates.isEmpty()) return emptyList()
 
         val chosen: List<SwarmChapterDto> = if (dedupe) {
             candidates
@@ -441,22 +499,14 @@ abstract class Swarm :
             candidates.toList()
         }
 
-        val showLangTags = !dedupe && candidates.any { it.lang?.lowercase() != preferredLang }
-
         return chosen
             .sortedByDescending { it.number.asFloatOrNull() ?: 0f }
-            .map { it.toSChapter(manga.url, preferredLang, showLangTags, fellBack) }
+            .map { it.toSChapter(manga.url) }
     }
 
-    private fun SwarmChapterDto.toSChapter(
-        mangaSlug: String,
-        preferredLang: String,
-        showLangTag: Boolean,
-        fellBack: Boolean,
-    ): SChapter {
+    private fun SwarmChapterDto.toSChapter(mangaSlug: String): SChapter {
         val num = number.asFloatOrNull() ?: -1f
-        val lang = lang.orEmpty().lowercase()
-        val rawTitle = title.orEmpty().trim()
+        val rawTitle = cleanupChapterTitle(title, scan_group, source)
 
         return SChapter.create().apply {
             // Keep everything the page-list fallback needs: id, number, slug.
@@ -470,21 +520,40 @@ abstract class Swarm :
                     append("Ch. ")
                     append(formatChapterNumber(num))
                 }
-                if (rawTitle.isNotBlank() && !rawTitle.equals("chapter", ignoreCase = true)) {
+                if (rawTitle.isNotBlank()) {
                     if (isNotEmpty()) append(" - ")
                     append(rawTitle)
                 }
                 if (isEmpty()) append(if (num <= 0) "Oneshot" else "Chapter ${formatChapterNumber(num)}")
-                if ((showLangTag || fellBack) && lang.isNotBlank() && lang != preferredLang) {
-                    append(" [")
-                    append(lang)
-                    append("]")
-                }
             }
             chapter_number = num
             date_upload = parseDate(published_date)
             scanlator = scan_group?.takeIf { it.isNotBlank() } ?: source?.takeIf { it.isNotBlank() }
         }
+    }
+
+    /**
+     * Chapter `title` values on the aggregator are notoriously noisy. Real
+     * titles are kept; everything that would duplicate the number or read as
+     * site branding is dropped:
+     *  - "Chapter 202" (restates the number → names like "Ch. 202 - Chapter 202")
+     *  - the scanlation group / upstream source name itself
+     *  - ALL-CAPS branding rows ("ANIME-SAMA", "OFFICIAL TRANSLATION",
+     *    "LEERCAPITULO", …) — the largest non-title noise source in the data
+     *  - stray newlines/whitespace inside otherwise usable titles
+     */
+    private fun cleanupChapterTitle(raw: String?, scanGroup: String?, source: String?): String {
+        val normalized = raw.orEmpty().replace(Regex("""\s+"""), " ").trim()
+        if (normalized.isBlank()) return ""
+        if (normalized.equals("chapter", ignoreCase = true)) return ""
+        if (CHAPTER_ONLY_TITLE_REGEX.matches(normalized)) return ""
+        val group = scanGroup?.trim()
+        val src = source?.trim()
+        if (!group.isNullOrBlank() && normalized.equals(group, ignoreCase = true)) return ""
+        if (!src.isNullOrBlank() && normalized.equals(src, ignoreCase = true)) return ""
+        val hasLowercase = normalized.any { it.isLetter() && it.isLowerCase() }
+        if (!hasLowercase) return ""
+        return normalized
     }
 
     // ========================================================================
@@ -626,19 +695,21 @@ abstract class Swarm :
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_NSFW
             title = "Show NSFW content"
-            summary = "Off = only safe titles (site-side filter)"
+            summary = "Off = only safe titles in every listing"
             setDefaultValue(false)
         }.let(screen::addPreference)
 
         androidx.preference.ListPreference(screen.context).apply {
             key = PREF_CHAPTER_LANGUAGE
             title = "Chapter language"
-            summary = "Preferred chapter language (%s)"
+            summary = "Preferred chapter language (%s) — series without " +
+                "chapters in this language show an empty list"
             setDefaultValue("en")
             entries = CHAPTER_LANGUAGES.map { it.second }.toTypedArray()
             entryValues = CHAPTER_LANGUAGES.map { it.first }.toTypedArray()
             setOnPreferenceChangeListener { _, newValue ->
-                summary = "Preferred chapter language ($newValue)"
+                summary = "Preferred chapter language ($newValue) — series without " +
+                    "chapters in this language show an empty list"
                 true
             }
         }.let(screen::addPreference)
@@ -738,6 +809,12 @@ abstract class Swarm :
         /** Matches the {"baseUrl","paths":[...]} blob embedded in the reader SSR page. */
         private val READER_PATHS_REGEX = Regex(
             """"baseUrl"\s*:\s*"([^"]*)"\s*,\s*"paths"\s*:\s*(\[[^\]]*\])""",
+        )
+
+        /** Chapter titles that only restate the number ("Chapter 202", "ch. 5"…). */
+        private val CHAPTER_ONLY_TITLE_REGEX = Regex(
+            "^(?:chapter|chap|ch\\.?|episode|ep|глава)\\s*[0-9.]*$",
+            RegexOption.IGNORE_CASE,
         )
 
         private const val PREF_SHOW_NSFW = "pref_show_nsfw"

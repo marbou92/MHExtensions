@@ -134,18 +134,24 @@ abstract class MangaBall :
 
     /**
      * Latest = the site's DEDICATED recently-updated endpoint (the same one the
-     * "Latest Updates" page calls). The previous implementation used
-     * search-advanced?sort=updated_chapters_desc — a sort value the API does
-     * not know, silently falling back to its default order, which made Popular
-     * and Latest render the SAME list. The dedicated endpoint returns titles
-     * ordered by latest_chapter_at and carries the same row shape, so the
-     * shared parse keeps working.
+     * "Latest Updates" page calls). Two live-verified quirks make this the only
+     * correct way to call it:
+     *  1. search-advanced?sort=updated_chapters_desc is silently IGNORED by the
+     *     API (it falls back to its default = views order) → Popular == Latest.
+     *  2. BARE recently-updated is ordered by the TITLE-record update time
+     *     (crawl recency) — its top rows are the same popular titles again,
+     *     plus a stream of just-crawled zero-chapter records.
+     * The site's own Latest page sends `chapterLanguage` (verified against its
+     * JS chunk) — with it the endpoint returns real chapter-update ordering
+     * filtered to titles that actually HAVE chapters in that language. So the
+     * chapter-language preference is forwarded here.
      */
     override suspend fun getLatestUpdates(page: Int): MangasPage {
         val url = "$apiBase/title/recently-updated".toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
             addQueryParameter("limit", "24")
             addQueryParameter("adult_mode", if (preferences.showNsfw()) "all" else "no_18")
+            addQueryParameter("chapterLanguage", preferences.preferredLanguage())
         }.build()
 
         val response = client.get(url, apiHeaders)
