@@ -564,12 +564,20 @@ abstract class MKissa :
         // aaReq); falls back to a constructed APQ GET from the harvested
         // identity pieces (the pinned hash verified live against the API,
         // 2026-09: it answers NEED_CAPTCHA, i.e. registered).
+        //
+        // v26: the replayed GET also carries the FRESHEST harvested aaReq.
+        // The site's own captcha-retry mints a new one per attempt (per-request,
+        // epoch-bound) — replaying with the ORIGINAL captured aaReq is what
+        // made the server answer "Error Re-captcha!"/AA-mismatch even with a
+        // valid token. Every teed "aareq" envelope re-arms the replay so a
+        // failed attempt retries itself with the newer aaReq (bounded below).
         fun fireActiveReplay() {
             if (replayAttempts.incrementAndGet() > MAX_ACTIVE_REPLAYS) return
             val token = captchaToken.get() ?: return
+            val freshAaReq = aaReq.get()
             val capturedUrl = chapterPagesGetUrl.get()
             val url = when {
-                capturedUrl != null -> withCaptchaInjected(capturedUrl, token, captchaProvider.get())
+                capturedUrl != null -> withCaptchaInjected(capturedUrl, token, captchaProvider.get(), freshAaReq)
                 else -> {
                     val ref = chapterRefFromUrl(readerUrl) ?: return
                     val extensions = buildJsonObject {
@@ -636,6 +644,7 @@ abstract class MKissa :
                     "aareq" -> {
                         val url = (root["url"] as? JsonPrimitive)?.content.orEmpty()
                         val req = (root["req"] as? JsonPrimitive)?.content.orEmpty()
+                        val previousAaReq = aaReq.get()
                         harvestBuildId(url, buildId)
                         harvestAaReq(url, req, aaReq)
                         // A teed chapterPages GET (fetch-hook path) is just as
@@ -643,6 +652,15 @@ abstract class MKissa :
                         if (isChapterPagesApqUrl(url)) {
                             chapterPagesGetUrl.compareAndSet(null, url)
                             harvestApqIdentity(url, harvestedHash, harvestedLane, aaReq, buildId)
+                        }
+                        // v26: a NEWLY minted aaReq means the site just ran its
+                        // own (captcha-gated) query again — the perfect moment
+                        // to replay with the token + fresh aaReq (bounded by
+                        // MAX_ACTIVE_REPLAYS; also covers the case where an
+                        // earlier replay failed with a stale aaReq).
+                        val updatedAaReq = aaReq.get()
+                        if (updatedAaReq != null && updatedAaReq != previousAaReq && captchaToken.get() != null) {
+                            fireActiveReplay()
                         }
                     }
                     else -> {
@@ -1013,11 +1031,15 @@ abstract class MKissa :
      * Re-issues the site's captured chapterPages GET with the captcha token
      * injected as `extensions.captcha = {token, provider}` — the exact
      * envelope the site's own retry uses (verified in the site bundle).
-     * Everything else (variables, persistedQuery, fresh aaReq, lane) rides
-     * along byte-identical. Returns null when the URL carries no parsable
-     * extensions (then the caller uses its constructed fallback).
+     * Everything else (variables, persistedQuery, lane) rides along
+     * byte-identical. v26: when a fresher aaReq has been harvested (the
+     * site's own retry mints one per attempt), the stale captured one is
+     * REPLACED — the server validates aaReq per request, so replaying with
+     * the original aaReq + new token fails with an AA/captcha error. Returns
+     * null when the URL carries no parsable extensions (then the caller uses
+     * its constructed fallback).
      */
-    private fun withCaptchaInjected(url: String, token: String, provider: String?): String? {
+    private fun withCaptchaInjected(url: String, token: String, provider: String?, freshAaReq: String?): String? {
         return runCatching {
             val httpUrl = url.toHttpUrlOrNull() ?: return null
             val rawExtensions = httpUrl.queryParameter("extensions") ?: return null
@@ -1031,6 +1053,9 @@ abstract class MKissa :
                             put("provider", provider ?: "turnstile1")
                         },
                     )
+                    if (!freshAaReq.isNullOrBlank()) {
+                        put("aaReq", JsonPrimitive(freshAaReq))
+                    }
                 },
             )
             httpUrl.newBuilder()

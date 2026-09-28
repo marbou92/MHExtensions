@@ -5,18 +5,18 @@ plugins {
 }
 
 keiyoushi {
-    name = "Kagane"
-    versionCode = 49
+    name = "WeebCentral"
+    versionCode = 1
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.6"
+    libVersion = "1.4"
 
     source {
         lang = "en"
-        baseUrl = "https://kagane.to"
+        baseUrl = "https://weebcentral.com"
     }
 
     deeplink {
-        host("kagane.to")
+        host("weebcentral.com")
         path("/series/..*")
     }
 }

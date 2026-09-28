@@ -38,10 +38,13 @@ rootProject.name = "Keiyoushi"
 // or switch back to loadAllIndividualExtensions() to auto-discover everything under src/.
 loadIndividualExtension("all", "comixto")
 loadIndividualExtension("all", "manhuarmtl")
+loadIndividualExtension("all", "swarm")
 loadIndividualExtension("en", "kagane")
 loadIndividualExtension("en", "atsumaru")
 loadIndividualExtension("en", "mkissa")
 loadIndividualExtension("all", "mangaball")
+loadIndividualExtension("en", "weebcentral")
+loadIndividualExtension("all", "xcomic")
 // loadAllIndividualExtensions()
 
 /**

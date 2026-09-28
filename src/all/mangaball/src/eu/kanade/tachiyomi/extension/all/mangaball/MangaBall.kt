@@ -1,9 +1,5 @@
 package eu.kanade.tachiyomi.extension.all.mangaball
 
-import android.webkit.CookieManager
-import androidx.preference.ListPreference
-import androidx.preference.PreferenceScreen
-import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
@@ -20,51 +16,50 @@ import keiyoushi.network.post
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
-import kotlinx.coroutines.sync.Mutex
-import kotlinx.coroutines.sync.withLock
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.JsonArray
-import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonObject
-import okhttp3.FormBody
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.put
 import okhttp3.HttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
-import org.jsoup.Jsoup
 import java.io.IOException
-import java.net.URLDecoder
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 
 /**
- * MangaBall (mangaball.net) — Laravel app with a JSON API under /api/v1.
+ * MangaBall (mangaball.com — the old mangaball.net Laravel site is gone and
+ * 301-redirects here; the front-end was rebuilt on Next.js with a dedicated
+ * JSON API at api.mangaball.com/api/v1).
  *
- * Flow (mirrors the site's own front-end and the Yui007/mangaball-downloader,
- * apiku and Aidoku reference clients):
- *  1. GET the homepage once and read the Laravel CSRF token from
- *     `meta[name="csrf-token"]` (also establishes the PHPSESSID session).
- *  2. Browse/search = POST /api/v1/title/search-advanced/ (form-encoded,
- *     `X-Requested-With: XMLHttpRequest`, `X-CSRF-Token: ...`).
- *     - `filters[sort]` takes STRING values (Aidoku v11 maps its dropdown 1:1):
- *       views_desc / views_asc / updated_chapters_desc / updated_chapters_asc /
- *       created_at_desc / created_at_asc / name_asc / name_desc.
- *     - Popular = views_desc, Latest = updated_chapters_desc — the old
- *       `search_type=popular|latest` pair is NOT what the site uses and both
- *       values fell back to the same default list (the v23 "Popular == Latest" bug).
- *  3. Chapter list = POST /api/v1/chapter/chapter-listing-by-title-id/
- *     with `title_id` (+ `userSettingsEnabled=true`, as the site's own client sends).
- *  4. Chapter pages = GET /chapter-detail/{translationId}/ and read the
- *     inline `const chapterImages = JSON.parse(`...`)` array.
+ * THE CSRF ERA IS OVER: the new stack has no CSRF tokens, no XSRF cookies and
+ * no meta tags. v25's "couldn't read the site CSRF token" failures came from
+ * bootstrapping a token system that no longer exists, and from the API calls
+ * hitting mangaball.net whose 301 redirect silently converted every POST into
+ * a GET. Everything below talks to api.mangaball.com directly with the exact
+ * calls the site's own client makes — all verified live (2026-09), anonymous,
+ * cookie-free and challenge-free:
  *
- * Cloudflare is handled with the core CloudflareSolverInterceptor (the v23+
- * method shared with Kagane and ManhuaRMTL): window-attached WebView solves
- * (with Turnstile tapping) plus strict challenge detection, so Laravel's own
- * 403/419 answers reach apiPost's CSRF refresh instead of being mistaken for
- * Cloudflare blocks. The v24 Comix-style header bypass could only harden
- * headers and RETRY — it can never pass a managed challenge, which is why
- * browsing failed until a manual WebView visit.
+ *  1. Browse/search  GET /title/search-advanced?sort=&page=&limit=24&adult_mode=
+ *                    &keyword=&status=&demographic=&original_language=
+ *                    &publication_year=&included_tags=&tag_mode=&excluded_tags=
+ *                    (Popular = sort=views_desc, Latest = updated_chapters_desc)
+ *  2. Details        POST /title/detail            {"title_id": "..."}
+ *  3. Chapters       POST /chapter/chapter-listing-by-title-id
+ *                    {"title_id": "...", "user_id": "demo_user"} → FLAT rows
+ *  4. Pages          GET  /chapter-detail?chapter_id=…&user_id=demo_user
+ *                    → data.chapter.pages[] = absolute image URLs
+ *  5. Filter tags    GET  /tag/get-grouped → {format, genre, theme, content}
+ *
+ * "demo_user" is exactly what the site's own client sends for logged-out
+ * visitors. The NSFW toggle maps to the server's adult_mode filter (all /
+ * no_18) instead of client-side hiding. Manga URLs are the numeric title ids
+ * the site now links with (/title-detail/{id}); old v24 slug urls resolve via
+ * the same /title/search lookup the site's own code uses as its fallback.
  */
 @Source
 abstract class MangaBall :
@@ -79,26 +74,28 @@ abstract class MangaBall :
 
     private val domain = baseUrl.removePrefix("https://")
 
-    /** Lenient JSON — the API shape is verified but types of some fields are not. */
+    /** The site's dedicated JSON API host. */
+    private val apiBase = "https://api.mangaball.com/api/v1"
+
+    /** Cover/page CDN (the site's BASE_DOMAIN_STORAGE_COVER constant). */
+    private val coverCdn = "https://bulbasaur.poke-black-and-white.net/covers/"
+
+    /** Lenient JSON — shapes verified live but some fields are unions. */
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
         coerceInputValues = true
     }
 
-    /** Client for the CSRF bootstrap homepage (no csrf logic → no recursion). */
-    private val csrfClient: OkHttpClient = network.client.newBuilder()
-        .apply { addInterceptor(CloudflareSolverInterceptor(setOf(domain))) }
-        .build()
-
     override fun OkHttpClient.Builder.configureClient() = apply {
         connectTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
 
-        // The real challenge solver (window-attached WebView + strict
-        // detection), same as Kagane/ManhuaRMTL.
-        addInterceptor(CloudflareSolverInterceptor(setOf(domain)))
+        // Insurance: Cloudflare still fronts both hosts (a per-endpoint WAF
+        // rule used to challenge /tag/search and friends; the solver heals
+        // any challenge that appears without a manual WebView visit).
+        addInterceptor(CloudflareSolverInterceptor(setOf(domain, "api.mangaball.com")))
 
         // KeiSource stamps "Origin" on everything; browsers never send it on
         // document GETs. Drop it there (same reason as Kagane's sanitizer).
@@ -117,117 +114,17 @@ abstract class MangaBall :
     // Headers
     // ------------------------------------------------------------------
 
-    /** Headers for document page GETs (homepage, title-detail, chapter-detail). */
-    private val htmlHeaders by lazy {
-        headers.newBuilder()
-            .set(
-                "Accept",
-                "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
-            )
-            .build()
-    }
-
-    /** Headers for the JSON API (XHR). */
     private val apiHeaders by lazy {
         headers.newBuilder()
             .set("Accept", "application/json, text/plain, */*")
-            .set("X-Requested-With", "XMLHttpRequest")
+            .set("Origin", "https://mangaball.com")
+            .set("Referer", "https://mangaball.com/")
             .build()
     }
 
-    // ------------------------------------------------------------------
-    // CSRF token lifecycle
-    // ------------------------------------------------------------------
+    private val jsonBody = "application/json; charset=utf-8".toMediaType()
 
-    @Volatile
-    private var csrfToken: String? = null
-
-    /** Which header the current [csrfToken] must be sent in. */
-    @Volatile
-    private var csrfHeaderName: String = HEADER_CSRF_TOKEN
-
-    private val csrfMutex = Mutex()
-
-    private suspend fun ensureCsrf(force: Boolean = false): String? {
-        if (!force) csrfToken?.let { return it }
-        return csrfMutex.withLock {
-            if (!force) csrfToken?.let { return it }
-
-            val response = csrfClient.get("$baseUrl/", htmlHeaders)
-            val body = response.body.string()
-
-            val meta = Jsoup.parse(body, baseUrl)
-                .selectFirst("meta[name=csrf-token]")?.attr("content")
-                ?.takeIf { it.isNotBlank() }
-
-            if (meta != null) {
-                csrfHeaderName = HEADER_CSRF_TOKEN
-                csrfToken = meta
-                return@withLock meta
-            }
-
-            // Fallback: Laravel sets the XSRF-TOKEN cookie on EVERY real page
-            // response with the same (URL-encoded) token the meta tag carries
-            // — the site's own axios client reads exactly this cookie and
-            // sends it as X-XSRF-TOKEN. When a layout change or a non-standard
-            // page hides the meta tag, the cookie still authenticates POSTs.
-            val cookieToken = xsrfCookieToken()
-            if (cookieToken != null) {
-                csrfHeaderName = HEADER_XSRF_TOKEN
-                csrfToken = cookieToken
-                return@withLock cookieToken
-            }
-
-            // Site layout change or a challenge page leaked through.
-            throw IOException(
-                "MangaBall: couldn't read the site's CSRF token (a Cloudflare challenge " +
-                    "page came through instead of the site). Open the site in WebView once, " +
-                    "then retry.",
-            )
-        }
-    }
-
-    /** Reads and URL-decodes the Laravel `XSRF-TOKEN` cookie, or null. */
-    private fun xsrfCookieToken(): String? = runCatching {
-        CookieManager.getInstance()
-            .getCookie("$baseUrl/")
-            ?.split(";")
-            ?.map(String::trim)
-            ?.firstOrNull { it.startsWith("XSRF-TOKEN=", ignoreCase = true) }
-            ?.substringAfter('=')
-            ?.takeIf { it.isNotBlank() }
-            ?.let { URLDecoder.decode(it, "UTF-8") }
-    }.getOrNull()
-
-    private fun invalidateCsrf() {
-        csrfToken = null
-        csrfHeaderName = HEADER_CSRF_TOKEN
-    }
-
-    /**
-     * POSTs a form to an /api/v1 endpoint with CSRF + XHR headers, refreshing
-     * the CSRF token once on Laravel's 419 (Page Expired) or a non-CF 403.
-     * (Cloudflare challenges never reach here: the solver interceptor solves
-     * and retries them first; Laravel's own 403/419 JSON answers DO arrive.)
-     */
-    private suspend fun apiPost(url: String, form: FormBody): Response {
-        val token = ensureCsrf()
-        val headers = apiHeaders.newBuilder()
-            .apply { token?.let { set(csrfHeaderName, it) } }
-            .build()
-
-        val response = client.post(url, headers, form)
-        if (response.code != 419 && response.code != 403) return response
-
-        // Possibly expired session/token: re-bootstrap and retry once.
-        response.close()
-        invalidateCsrf()
-        val fresh = ensureCsrf(force = true)
-        val retryHeaders = apiHeaders.newBuilder()
-            .apply { fresh?.let { set(csrfHeaderName, it) } }
-            .build()
-        return client.post(url, retryHeaders, form)
-    }
+    private fun jsonRequestBody(json: String) = json.toRequestBody(jsonBody)
 
     // ------------------------------------------------------------------
     // Browse + search
@@ -255,6 +152,9 @@ abstract class MangaBall :
                 is OriginalLanguageFilter -> originalLanguage = languageValues[filter.state].takeIf { it.isNotBlank() }
                 is YearFilter -> year = filter.state.trim().takeIf { it.isNotBlank() }
                 is GenreMatchModeFilter -> tagMatchAll = filter.state == 1
+                // Format tags live in the same tag taxonomy — they filter via
+                // the exact same included_tags parameter.
+                is FormatFilter -> includedTags += filter.selectedIds()
                 is GenreFilter -> {
                     includedTags += filter.includedIds()
                     excludedTags += filter.excludedIds()
@@ -266,7 +166,7 @@ abstract class MangaBall :
         return mangaList(
             page = page,
             sort = sort,
-            query = query,
+            keyword = query,
             status = status,
             demographic = demographic,
             originalLanguage = originalLanguage,
@@ -280,7 +180,7 @@ abstract class MangaBall :
     private suspend fun mangaList(
         page: Int,
         sort: String,
-        query: String = "",
+        keyword: String = "",
         status: String? = null,
         demographic: String? = null,
         originalLanguage: String? = null,
@@ -289,73 +189,203 @@ abstract class MangaBall :
         excludedTags: List<String> = emptyList(),
         tagMatchAll: Boolean = false,
     ): MangasPage {
-        val form = FormBody.Builder().apply {
-            if (query.isNotBlank()) {
-                // Verified working minimal search (Yui007/mangaball-downloader):
-                // search_input + numeric sort + page.
-                add("search_input", query)
-                add("filters[sort]", "6")
-            } else {
-                // Aidoku-style browse: string sort over search-advanced.
-                add("filters[sort]", sort)
+        val url = "$apiBase/title/search-advanced".toHttpUrl().newBuilder().apply {
+            addQueryParameter("sort", sort)
+            addQueryParameter("page", page.toString())
+            addQueryParameter("limit", "24")
+            // Server-side NSFW filter — the exact vocabulary the site uses.
+            addQueryParameter("adult_mode", if (preferences.showNsfw()) "all" else "no_18")
+            if (keyword.isNotBlank()) addQueryParameter("keyword", keyword)
+            status?.let { addQueryParameter("status", it) }
+            demographic?.let { addQueryParameter("demographic", it) }
+            originalLanguage?.let { addQueryParameter("original_language", it) }
+            year?.let { addQueryParameter("publication_year", it) }
+            if (includedTags.isNotEmpty()) {
+                addQueryParameter("included_tags", includedTags.joinToString(","))
+                addQueryParameter("tag_mode", if (tagMatchAll) "and" else "any")
             }
-            add("filters[page]", page.toString())
-
-            status?.let { add("filters[publicationStatus]", it) }
-            demographic?.let { add("filters[demographic]", it) }
-            originalLanguage?.let { add("filters[originalLanguages]", it) }
-            year?.let { add("filters[publicationYear]", it) }
-            includedTags.forEach { add("filters[tag_included_ids][]", it) }
-            if (includedTags.isNotEmpty()) add("filters[tag_included_mode]", if (tagMatchAll) "and" else "or")
-            excludedTags.forEach { add("filters[tag_excluded_ids][]", it) }
-            if (excludedTags.isNotEmpty()) add("filters[tag_excluded_mode]", "any")
+            if (excludedTags.isNotEmpty()) addQueryParameter("excluded_tags", excludedTags.joinToString(","))
         }.build()
 
-        val response = apiPost("$baseUrl/api/v1/title/search-advanced/", form)
+        val response = client.get(url, apiHeaders)
         val result = response.parseAs<MbSearchResponse>(json)
-
-        val showNsfw = preferences.showNsfw()
-        val mangas = result.data
-            .filter { showNsfw || it.isAdult != true }
-            .map { it.toSManga() }
-        return MangasPage(mangas, result.hasNextPage())
+        return MangasPage(result.data.map { it.toSManga() }, result.hasNextPage())
     }
 
     private fun MbTitleDto.toSManga(): SManga = SManga.create().apply {
-        val slug = titleSlug()
-        url = slug
-        title = name.orEmpty().ifBlank { slug }
-        thumbnail_url = coverUrl()?.toAbsoluteUrl()
+        val id = idOrNull().orEmpty()
+        url = id.ifBlank { slug.orEmpty() }
+        title = name.orEmpty().ifBlank { slug.orEmpty() }
+        thumbnail_url = coverUrl()
         status = statusStringToSManga(this@toSManga.status)
     }
 
-    private fun String.toAbsoluteUrl(): String = when {
-        startsWith("http://") || startsWith("https://") -> this
-        startsWith("//") -> "https:$this"
-        startsWith("/") -> baseUrl + this
-        isNotBlank() -> "$baseUrl/$this"
-        else -> this
+    /** coverUrl from the shared image object (search rows + detail DTOs). */
+    private fun coverUrlOf(image: MbImageDto?): String? {
+        val path = image?.cover?.path
+        if (!path.isNullOrBlank()) {
+            return if (path.startsWith("http")) path else coverCdn + path
+        }
+        image?.file?.let { file ->
+            val asString = JsonElements.asStringOrNull(file)
+            if (!asString.isNullOrBlank()) return asString
+        }
+        return image?.cdn_mangadex?.takeIf { it.isNotBlank() }
     }
 
+    private fun MbTitleDto.coverUrl(): String? = coverUrlOf(image)
+
     // ------------------------------------------------------------------
-    // Details + chapters
+    // Details
     // ------------------------------------------------------------------
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (!url.host.endsWith(domain)) return null
+        if (!url.host.endsWith(domain) && !url.host.endsWith("mangaball.net")) return null
         val segments = url.pathSegments.filter { it.isNotBlank() }
         if (segments.isEmpty()) return null
+        if (segments.first() !in TITLE_PATHS) return null
 
-        val slug = segments.last()
-        return if (segments.first() in TITLE_PATHS) fetchMangaDetailsBySlug(slug) else null
-    }
-
-    private suspend fun fetchMangaDetailsBySlug(slug: String): SManga {
-        val response = client.get("$baseUrl/title-detail/$slug/", htmlHeaders)
-        return parseMangaDetails(response).apply { url = slug }
+        val key = segments.last()
+        return fetchMangaDetailsByKey(key)
     }
 
     override fun getMangaUrl(manga: SManga): String = "$baseUrl/title-detail/${manga.url}/"
+
+    private suspend fun fetchMangaDetailsByKey(key: String): SManga {
+        val titleId = resolveTitleId(key)
+        val response = client.post(
+            "$apiBase/title/detail",
+            apiHeaders,
+            jsonRequestBody(buildJsonObject { put("title_id", titleId) }.toString()),
+        )
+        val detail = response.parseAs<MbDetailResponse>(json).data
+            ?: throw IOException("MangaBall: no details returned for this title")
+
+        return detail.toSManga().apply { url = titleId }
+    }
+
+    /**
+     * Accepts both url shapes:
+     *  - current site links: the numeric title id (/title-detail/{24-hex id})
+     *  - v24-era slugs (/title-detail/{slug}): resolved with the same
+     *    /title/search lookup the site's own code uses as its fallback,
+     *    exact-slug match preferred.
+     */
+    private suspend fun resolveTitleId(key: String): String {
+        val trimmed = key.trim().trim('/')
+        if (trimmed.matches(TITLE_ID_REGEX)) return trimmed
+
+        val candidates = try {
+            client.post(
+                "$apiBase/title/search/",
+                apiHeaders,
+                jsonRequestBody(
+                    buildJsonObject {
+                        put("keyword", trimmed)
+                        put("limit", 20)
+                    }.toString(),
+                ),
+            ).parseAs<MbSearchResponse>(json).data
+        } catch (_: Exception) {
+            emptyList()
+        }
+
+        candidates.firstOrNull { it.slug == trimmed || it.slug.orEmpty() == trimmed }?.idOrNull()
+            ?.let { return it }
+        candidates.firstOrNull()?.idOrNull()?.let { return it }
+
+        throw IOException(
+            "MangaBall: couldn't find this title on the new site (it may have been renamed " +
+                "or removed). Search for it by name instead.",
+        )
+    }
+
+    private fun MbDetailDto.toSManga(): SManga {
+        val showAltNames = preferences.showAltNames()
+        val showExtraInfo = preferences.showExtraInfo()
+
+        val synopsis = description
+            .map { it.trim() }
+            .filter { it.isNotEmpty() }
+            .distinct()
+            .joinToString("\n\n")
+
+        // Info line (Comix-style, bold labels) — status, original language,
+        // publication year, chapter/views/likes counters.
+        val infoLine = if (showExtraInfo) {
+            buildString {
+                if (!status.isNullOrBlank()) {
+                    append("**Status:** ").append(formatStatus(status))
+                }
+                if (!originalLanguage.isNullOrBlank()) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Original:** ").append(formatOriginalLanguage(originalLanguage))
+                }
+                val year = JsonElements.asStringOrNull(date_published)?.takeIf { it.isNotBlank() }
+                if (year != null) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Year:** ").append(year)
+                }
+                val chapterCount = JsonElements.asLongOrNull(chapters_count)
+                if (chapterCount != null && chapterCount > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Chapters:** ").append(chapterCount)
+                }
+                val views = JsonElements.asLongOrNull(views_count)
+                if (views != null && views > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Views:** ").append(views)
+                }
+                val likes = JsonElements.asLongOrNull(likes_count)
+                if (likes != null && likes > 0) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Likes:** ").append(likes)
+                }
+            }.ifBlank { null }
+        } else {
+            null
+        }
+
+        val desc = buildString {
+            if (infoLine != null) {
+                append(infoLine)
+                append("\n\n")
+            }
+            append(synopsis)
+            if (showAltNames && alternateName.isNotEmpty()) {
+                if (isNotEmpty()) append("\n\n")
+                append("Alternative names:\n")
+                append(alternateName.map { it.trim() }.filter { it.isNotEmpty() }.distinct().joinToString("\n") { "• $it" })
+            }
+        }.trim()
+
+        return SManga.create().apply {
+            url = idOrNull().orEmpty()
+            title = name.orEmpty()
+            author = (authors.ifEmpty { this@toSManga.author }).mapNotNull { it.name }.distinct().joinToString(", ").ifBlank { null }
+            genre = tags.mapNotNull { it.name }.distinct().joinToString(", ").ifBlank { null }
+            description = desc.ifBlank { synopsis.ifBlank { null } }
+            thumbnail_url = coverUrlOf(image)
+            status = statusStringToSManga(this@toSManga.status)
+            initialized = true
+        }
+    }
+
+    private fun formatStatus(status: String?): String = when (status?.lowercase()) {
+        "ongoing", "releasing", "updating" -> "Ongoing"
+        "completed", "finished", "end" -> "Completed"
+        "on_hold", "on hold", "hiatus" -> "On hiatus"
+        "cancelled", "canceled", "dropped", "discontinued" -> "Cancelled"
+        else -> status?.replaceFirstChar { it.uppercase(Locale.ROOT) } ?: "Unknown"
+    }
+
+    private fun formatOriginalLanguage(lang: String?): String = when (lang?.lowercase()) {
+        "en" -> "English"
+        "ja", "jp" -> "Japanese"
+        "ko", "kr" -> "Korean"
+        "cn", "zh" -> "Chinese"
+        else -> lang ?: "Unknown"
+    }
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -363,111 +393,21 @@ abstract class MangaBall :
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val slug = manga.url
+        val titleId = resolveTitleId(manga.url)
 
         val updatedManga = if (fetchDetails) {
-            fetchMangaDetailsBySlug(slug)
+            fetchMangaDetailsByKey(titleId)
         } else {
             manga
         }
 
         val updatedChapters = if (fetchChapters) {
-            chapterList(slug)
+            chapterList(titleId)
         } else {
             chapters
         }
 
         return SMangaUpdate(updatedManga, updatedChapters)
-    }
-
-    private fun parseMangaDetails(response: Response): SManga {
-        val body = response.body.string()
-        val document = Jsoup.parse(body, baseUrl)
-        val showAltNames = preferences.showAltNames()
-        val showExtraInfo = preferences.showExtraInfo()
-
-        val rawTitle = document.selectFirst("#comicDetail h6")?.text()
-            ?: document.selectFirst("meta[property=og:title]")?.attr("content")
-        val title = rawTitle.orEmpty()
-            .replace(TITLE_SUFFIX_REGEX, "")
-            .trim()
-
-        // Synopsis: the description block holds MULTIPLE <p> paragraphs —
-        // keep them as separate paragraphs instead of concatenating into
-        // one wall of text.
-        val synopsis = document.select(DESCRIPTION_PARAGRAPH_SELECTORS)
-            .eachText()
-            .map { it.trim() }
-            .filter { it.isNotEmpty() }
-            .distinct()
-            .joinToString("\n\n")
-            .takeIf { it.isNotBlank() }
-            // Layout fallback: plain text of the whole block.
-            ?: document.selectFirst("#descriptionContent")?.text()?.trim()?.takeIf { it.isNotBlank() }
-
-        val cover = document.selectFirst("meta[property=og:image]")?.attr("content")
-            ?: document.selectFirst("#comicDetail img[src*=\"/storage/\"]")?.attr("src")
-
-        val statusText = document.selectFirst("#comicDetail .badge-status")?.text()?.trim()
-
-        // People ([data-person-id]) are the site's author/artist entries.
-        val authors = document.select("#comicDetail [data-person-id]")
-            .eachText()
-            .map { it.trim() }
-            .filter { it.isNotBlank() && !it.equals("Free", ignoreCase = true) }
-            .distinct()
-
-        // Genre/tags stay the genre field.
-        val genres = document.select("#comicDetail [data-tag-id]")
-            .eachText()
-            .map { it.trim() }
-            .filter { it.isNotBlank() && !it.equals("Free", ignoreCase = true) }
-            .distinct()
-
-        // Alternative titles (the keywords container — per the Aidoku source
-        // selector map these are keywords/alt names, NOT genres).
-        val altNames = document.select(KEYWORD_SELECTORS)
-            .eachText()
-            .map { it.trim() }
-            .filter { it.isNotBlank() && !it.equals("Free", ignoreCase = true) }
-            .distinct()
-
-        // Original language flag (best effort — the site shows flag icons).
-        val originalLanguage = document.selectFirst("#comicDetail img[src*=\"/storage/flags/\"]")
-            ?.attr("alt")?.trim()?.takeIf { it.isNotBlank() }
-
-        val infoLine = buildString {
-            statusText?.takeIf { it.isNotBlank() }?.let { append("Status: ").append(it.replaceFirstChar { c -> c.uppercase(Locale.ROOT) }) }
-            originalLanguage?.let {
-                if (isNotEmpty()) append(" · ")
-                append("Original: ").append(it)
-            }
-        }.ifBlank { null }
-
-        val desc = buildString {
-            if (showExtraInfo && infoLine != null) {
-                append(infoLine)
-                append("\n\n")
-            }
-
-            append(synopsis.orEmpty())
-
-            if (showAltNames && altNames.isNotEmpty()) {
-                if (isNotEmpty()) append("\n\n")
-                append("Alternative names:\n")
-                append(altNames.joinToString("\n") { "• $it" })
-            }
-        }.trim()
-
-        return SManga.create().apply {
-            this.title = title
-            this.description = desc.ifBlank { null }
-            this.thumbnail_url = cover?.toAbsoluteUrl()?.takeIf { it.isNotBlank() }
-            this.status = statusTextToSManga(statusText)
-            this.author = authors.takeIf { it.isNotEmpty() }?.joinToString(", ")
-            this.genre = genres.takeIf { it.isNotEmpty() }?.joinToString(", ")
-            this.initialized = true
-        }
     }
 
     private fun statusStringToSManga(status: String?): Int = when (status?.lowercase()) {
@@ -478,131 +418,93 @@ abstract class MangaBall :
         else -> SManga.UNKNOWN
     }
 
-    private fun statusTextToSManga(text: String?): Int = when (text?.lowercase()) {
-        "ongoing", "releasing", "updating" -> SManga.ONGOING
-        "completed", "finished", "end" -> SManga.COMPLETED
-        "on hold", "hiatus" -> SManga.ON_HIATUS
-        "cancelled", "canceled", "dropped", "discontinued" -> SManga.CANCELLED
-        else -> SManga.UNKNOWN
-    }
-
     // ------------------------------------------------------------------
     // Chapter list
     // ------------------------------------------------------------------
 
-    private suspend fun chapterList(slug: String): List<SChapter> {
-        val titleId = slug.substringAfterLast('-')
+    private suspend fun chapterList(titleId: String): List<SChapter> {
+        val body = jsonRequestBody(
+            buildJsonObject {
+                put("title_id", titleId)
+                put("user_id", USER_ID_DEMO)
+            }.toString(),
+        )
 
-        val form = FormBody.Builder()
-            .add("title_id", titleId)
-            // The site's own client sends this (apiku reference); it routes
-            // the listing through the user's language settings server-side.
-            .add("userSettingsEnabled", "true")
-            .build()
-
-        val response = apiPost("$baseUrl/api/v1/chapter/chapter-listing-by-title-id/", form)
+        val response = client.post("$apiBase/chapter/chapter-listing-by-title-id", apiHeaders, body)
         val listing = response.parseAs<MbChapterListingResponse>(json)
 
         val preferredLang = preferences.preferredLanguage().lowercase()
         val fallback = preferences.fallbackLanguage()
         val dedupe = preferences.deduplicateUploads()
-        val showUploads = preferences.showAllUploads()
+        val showLangTags = preferences.showAllUploads()
 
-        val groups = listing.allChapters
+        val rows = listing.data
+            .filter { it.idOrNull() != null }
             .sortedByDescending { it.chapterNumber() }
 
-        val chapters = mutableListOf<SChapter>()
-
-        for (group in groups) {
-            val uploads = group.translations
-            if (uploads.isEmpty()) continue
-
-            var candidates = uploads.filter {
-                it.language?.lowercase() == preferredLang
-            }
-            if (candidates.isEmpty() && fallback) candidates = uploads
-            if (candidates.isEmpty()) continue
-
-            val chosen = if (dedupe) {
-                listOf(bestUpload(candidates))
-            } else {
-                candidates
-            }
-
-            for (tr in chosen) {
-                val id = tr.idOrNull() ?: continue
-                val lang = tr.language?.lowercase().orEmpty()
-                chapters += tr.toSChapter(group, id, preferredLang, lang, showUploads)
-            }
-        }
-
-        if (chapters.isEmpty()) {
+        var candidates = rows.filter { it.lang?.lowercase() == preferredLang }
+        if (candidates.isEmpty() && fallback) candidates = rows
+        if (candidates.isEmpty()) {
             throw IOException(
-                "MangaBall returned no chapters for this title. " +
-                    "If the title opens on the website, refresh this screen; " +
-                    "if it keeps failing, the chapter language settings may exclude every upload " +
-                    "(Settings → MangaBall → Fallback to any language).",
+                "MangaBall returned no chapters in \"$preferredLang\" for this title. " +
+                    "Enable \"Fallback to any language\" in MangaBall settings to see the " +
+                    "other translations.",
             )
         }
 
-        return chapters
-    }
-
-    /**
-     * Picks the "best" upload — the Aidoku source's dedupe order:
-     * official first, then most likes, most views, newest date.
-     */
-    private fun bestUpload(candidates: List<MbChapterTranslationDto>): MbChapterTranslationDto = candidates.maxWithOrNull(
-        compareBy(
-            { it.officialOrNull() },
-            { it.likesOrNull() },
-            { it.viewsOrNull() },
-            { parseDate(it.date) },
-        ),
-    ) ?: candidates.first()
-
-    private fun MbChapterTranslationDto.toSChapter(
-        group: MbChapterGroupDto,
-        id: String,
-        preferredLang: String,
-        lang: String,
-        showLangTag: Boolean,
-    ): SChapter = SChapter.create().apply {
-        url = id
-        val num = group.chapterNumber()
-        val rawTitle = group.title?.trim().orEmpty()
-            // The API's `title` sometimes duplicates the site's own
-            // "Ch. N" prefix — strip it so names read "Ch. N - Real Title".
-            .replace(CHAPTER_PREFIX_REGEX, "")
-        val vol = volumeOrNull()
-
-        name = buildString {
-            if (vol != null && vol > 0) {
-                append("Vol. ")
-                append(formatNumber(vol))
-                append(" ")
-            }
-            if (num > 0) {
-                append("Ch. ")
-                append(formatNumber(num))
-            }
-            if (rawTitle.isNotBlank()) {
-                if (isNotEmpty()) append(" - ")
-                append(rawTitle)
-            }
-            if (isEmpty()) append(if (num <= 0) "Oneshot" else "Chapter ${formatNumber(num)}")
-            if (showLangTag && lang.isNotBlank() && lang != preferredLang) {
-                append(" [")
-                append(lang)
-                append("]")
-            }
+        // One row per (chapter number, volume) when deduplicating: the site
+        // itself aggregates multiple group uploads per chapter; keep the most
+        // viewed, then the freshest upload.
+        val chosen: List<MbChapterDto> = if (dedupe) {
+            candidates
+                .groupBy { Pair(it.volumeNumber() ?: 0.0, it.chapterNumber()) }
+                .map { (_, uploadsForNumber) ->
+                    uploadsForNumber.maxWithOrNull(
+                        compareBy({ it.viewsCount() }, { parseDate(it.created_at) }),
+                    ) ?: uploadsForNumber.first()
+                }
+                .sortedByDescending { it.chapterNumber() }
+        } else {
+            candidates
         }
 
-        chapter_number = num.toFloat().takeIf { num > 0 } ?: -1f
-        date_upload = parseDate(date)
-        scanlator = groupNameOrNull()
-            ?.takeIf { it.isNotBlank() }
-            ?: language?.replaceFirstChar { it.uppercase(Locale.ROOT) }
+        return chosen.map { it.toSChapter(preferredLang, showLangTags) }
+    }
+
+    private fun MbChapterDto.toSChapter(preferredLang: String, showLangTag: Boolean): SChapter {
+        val id = idOrNull().orEmpty()
+        val num = chapterNumber()
+        val vol = volumeNumber()
+        val lang = lang.orEmpty().lowercase()
+        val rawTitle = name.orEmpty().trim().replace(CHAPTER_PREFIX_REGEX, "")
+
+        return SChapter.create().apply {
+            url = id
+            name = buildString {
+                if (vol != null && vol > 0) {
+                    append("Vol. ")
+                    append(formatNumber(vol))
+                    append(" ")
+                }
+                if (num > 0) {
+                    append("Ch. ")
+                    append(formatNumber(num))
+                }
+                if (rawTitle.isNotBlank() && !rawTitle.equals("chapter", ignoreCase = true)) {
+                    if (isNotEmpty()) append(" - ")
+                    append(rawTitle)
+                }
+                if (isEmpty()) append(if (num <= 0) "Oneshot" else "Chapter ${formatNumber(num)}")
+                if (showLangTag && lang.isNotBlank() && lang != preferredLang) {
+                    append(" [")
+                    append(lang)
+                    append("]")
+                }
+            }
+            chapter_number = num.toFloat().takeIf { num > 0 } ?: -1f
+            date_upload = parseDate(created_at ?: updated_at)
+            scanlator = groupName().ifBlank { null }
+        }
     }
 
     private fun formatNumber(value: Double): String {
@@ -615,80 +517,43 @@ abstract class MangaBall :
     // ------------------------------------------------------------------
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val id = chapter.url.trim().trim('/').substringAfterLast('/')
-        val response = client.get("$baseUrl/chapter-detail/$id/", htmlHeaders)
-        val body = response.body.string()
+        val chapterId = chapter.url.trim().trim('/').substringAfterLast('/')
+        val url = "$apiBase/chapter-detail".toHttpUrl().newBuilder()
+            .addQueryParameter("chapter_id", chapterId)
+            .addQueryParameter("user_id", USER_ID_DEMO)
+            .build()
 
-        if (response.code == 403 || body.contains("Just a moment", ignoreCase = true)) {
+        val response = client.get(url, apiHeaders)
+        val pages = response.parseAs<MbChapterDetailResponse>(json).data?.chapter?.pages.orEmpty()
+
+        if (pages.isEmpty()) {
             throw IOException(
-                "MangaBall's Cloudflare check didn't clear. Open the chapter in WebView once, " +
-                    "then retry.",
+                "MangaBall: no pages returned for this chapter. Refresh the chapter list " +
+                    "and try again (the chapter may have been removed from the site).",
             )
         }
 
-        val pageUrls = extractChapterImages(body)
-            .ifEmpty { extractChapterImagesFallback(body) }
-
-        if (pageUrls.isEmpty()) {
-            throw IOException(
-                "MangaBall: couldn't read this chapter's pages (site layout changed or " +
-                    "Cloudflare blocked the request). Refresh the chapter list and try again, " +
-                    "or open the chapter in WebView.",
-            )
-        }
-
-        return pageUrls.mapIndexed { index, url ->
-            Page(index, imageUrl = url.toAbsoluteUrl())
+        return pages.mapIndexed { index, imageUrl ->
+            Page(index, imageUrl = imageUrl)
         }
     }
 
-    /**
-     * The chapter-detail page embeds the page list as
-     * `const chapterImages = JSON.parse(`[...]`)` — the same inline JS the
-     * site's own reader consumes.
-     */
-    private fun extractChapterImages(body: String): List<String> {
-        val match = CHAPTER_IMAGES_REGEX.find(body) ?: return emptyList()
-        val rawJson = match.groupValues[1].trim()
-        if (rawJson.isEmpty()) return emptyList()
-
-        return runCatching {
-            val element = json.decodeFromString(
-                kotlinx.serialization.json.JsonElement.serializer(),
-                rawJson,
-            )
-            when (element) {
-                is JsonArray ->
-                    element.mapNotNull { it.asStringOrNull() }
-                is JsonObject ->
-                    element["images"]?.let { el ->
-                        (el as? JsonArray)?.mapNotNull { it.asStringOrNull() }
-                    } ?: emptyList()
-                else -> emptyList()
-            }
-        }.getOrDefault(emptyList())
+    override fun getChapterUrl(chapter: SChapter): String {
+        val id = chapter.url.trim('/').substringAfterLast('/')
+        val num = chapter.chapter_number
+        val query = if (num > 0f) "?chapter=${formatNumber(num.toDouble())}" else ""
+        return "$baseUrl/chapter-detail/$id$query"
     }
 
-    /** Fallbacks for layout variations of the inline page list. */
-    private fun extractChapterImagesFallback(body: String): List<String> {
-        for (regex in FALLBACK_IMAGE_REGEXES) {
-            val match = regex.find(body) ?: continue
-            val rawJson = match.groupValues[1].trim()
-            val urls = runCatching {
-                val element = json.decodeFromString(
-                    kotlinx.serialization.json.JsonElement.serializer(),
-                    rawJson,
-                )
-                (element as? JsonArray)?.mapNotNull { it.asStringOrNull() }
-            }.getOrNull() ?: emptyList()
-            if (urls.isNotEmpty()) return urls
-        }
-        return emptyList()
-    }
-
-    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl/chapter-detail/${chapter.url.trim('/').substringAfterLast('/')}/"
-
-    override fun imageRequest(page: Page) = GET(page.imageUrl!!, headers)
+    // Page images live on the site's own CDN and reject requests without a
+    // browser-like Referer — send one (the site's own <img> requests do).
+    override fun imageRequest(page: Page) = GET(
+        page.imageUrl!!,
+        headers.newBuilder()
+            .set("Referer", "$baseUrl/")
+            .set("Accept", "image/avif,image/webp,image/apng,image/*,*/*;q=0.8")
+            .build(),
+    )
 
     // ------------------------------------------------------------------
     // Dates
@@ -763,49 +628,23 @@ abstract class MangaBall :
     // ------------------------------------------------------------------
 
     /**
-     * Dynamic taxonomy: the site exposes its genres/tags (with filterable
-     * ids) via GET /api/v1/tag/search/. Parsed tolerantly — the exact
-     * envelope could not be verified from this environment, so any array
-     * of objects carrying an id-ish + name-ish pair is accepted.
+     * Live taxonomy from GET /tag/get-grouped — four groups (format / genre /
+     * theme / content), each an array of {id, name} rows used verbatim as the
+     * search-advanced tag ids. The response is wrapped in a {"data": …}
+     * envelope, so the inner object is what gets cached for getFilterList.
      */
-    override suspend fun fetchFilterData(): JsonElement {
-        val response = client.get("$baseUrl/api/v1/tag/search/", apiHeaders)
-        val root = json.decodeFromString(JsonElement.serializer(), response.body.string())
-        val tags = collectTagOptions(root)
-            .distinctBy { it.id }
-            .takeIf { it.isNotEmpty() }
-            ?: throw IOException("MangaBall: no genres in tag search response")
+    override val supportsFilterFetching = true
 
-        return MbFilterTaxonomy(tags = tags).toJsonElement()
+    override suspend fun fetchFilterData(): kotlinx.serialization.json.JsonElement {
+        val response = client.get("$apiBase/tag/get-grouped", apiHeaders)
+        val root = json.decodeFromString(
+            kotlinx.serialization.json.JsonElement.serializer(),
+            response.body.string(),
+        )
+        return (root as? kotlinx.serialization.json.JsonObject)?.get("data") ?: root
     }
 
-    /** Walks any JSON shape and pulls out {id/name} option objects. */
-    private fun collectTagOptions(element: JsonElement?): List<MbFilterTag> {
-        if (element == null) return emptyList()
-        val out = mutableListOf<MbFilterTag>()
-
-        fun walk(node: JsonElement?) {
-            when (node) {
-                is JsonArray -> node.forEach { walk(it) }
-                is JsonObject -> {
-                    val id = (node["id"] ?: node["_id"] ?: node["tag_id"] ?: node["genre_id"])
-                        .asStringOrNull()
-                    val name = (node["name"] ?: node["title"] ?: node["tag_name"] ?: node["genre_name"])
-                        .asStringOrNull()
-                    if (id != null && name != null) {
-                        out += MbFilterTag(id, name)
-                    } else {
-                        node.values.forEach { walk(it) }
-                    }
-                }
-                else -> {}
-            }
-        }
-        walk(element)
-        return out
-    }
-
-    override fun getFilterList(data: JsonElement?): FilterList = FilterList(
+    override fun getFilterList(data: kotlinx.serialization.json.JsonElement?): FilterList = FilterList(
         buildList {
             add(Filter.Header("MangaBall filters"))
             add(Filter.Separator())
@@ -816,15 +655,27 @@ abstract class MangaBall :
             add(YearFilter())
             add(Filter.Separator())
 
-            val taxonomy = runCatching { data?.parseAs<MbFilterTaxonomy>(json) }.getOrNull()
-            val tags = taxonomy?.tags.orEmpty()
-            if (tags.isNotEmpty()) {
+            val groups = runCatching { data?.parseAs<MbTagGroupsDto>(json) }.getOrNull()
+            val genres = buildList {
+                addAll(groups?.genre.orEmpty())
+                addAll(groups?.theme.orEmpty())
+            }.filter { it.idOrNull() != null && !it.name.isNullOrBlank() }
+                .distinctBy { it.idOrNull() ?: it.slug }
+            val formats = groups?.format.orEmpty()
+                .filter { it.idOrNull() != null && !it.name.isNullOrBlank() }
+                .distinctBy { it.idOrNull() ?: it.slug }
+
+            if (genres.isNotEmpty()) {
                 add(Filter.Header("Genres (live list from the site)"))
                 add(GenreMatchModeFilter())
-                add(GenreFilter("Genres", tags, excludeMode = false))
-                add(GenreFilter("Exclude genres", tags, excludeMode = true))
+                add(GenreFilter("Genres", genres, excludeMode = false))
+                add(GenreFilter("Exclude genres", genres, excludeMode = true))
             } else {
                 add(Filter.Header("Genres are loading — press 'Reset' to retry"))
+            }
+            if (formats.isNotEmpty()) {
+                add(Filter.Header("Format"))
+                add(FormatFilter(formats))
             }
         },
     )
@@ -842,7 +693,7 @@ abstract class MangaBall :
 
     private val statusValues = arrayOf("", "ongoing", "completed", "on_hold", "cancelled", "hiatus")
     private val demographicValues = arrayOf("", "shounen", "shoujo", "seinen", "josei", "yuri", "yaoi")
-    private val languageValues = arrayOf("", "en", "jp", "kr", "zh")
+    private val languageValues = arrayOf("", "en", "jp", "kr", "cn", "zh", "manga", "comics", "manhua", "manhwa")
 
     private class SortFilter :
         Filter.Select<String>(
@@ -874,7 +725,7 @@ abstract class MangaBall :
     private class OriginalLanguageFilter :
         Filter.Select<String>(
             "Original language",
-            arrayOf("Any", "English", "Japanese", "Korean", "Chinese"),
+            arrayOf("Any", "English (Comics)", "Japanese (Manga)", "Korean (Manhwa)", "Chinese (Manhua)"),
         )
 
     private class YearFilter : Filter.Text("Publication year", "")
@@ -892,7 +743,7 @@ abstract class MangaBall :
         private val excludeMode: Boolean,
     ) : Filter.Group<GenreFilter.CheckBox>(
         title,
-        tags.map { CheckBox(it.name, it.id) },
+        tags.map { CheckBox(it.name.orEmpty(), it.idOrNull().orEmpty()) },
     ) {
         class CheckBox(name: String, val id: String) : Filter.CheckBox(name, false)
 
@@ -903,19 +754,31 @@ abstract class MangaBall :
         fun excludedIds(): List<String> = if (excludeMode) selectedIds() else emptyList()
     }
 
+    /** Checkbox filter over the site's "format" tag group (Long Strip etc.). */
+    private class FormatFilter(
+        tags: List<MbFilterTag>,
+    ) : Filter.Group<FormatFilter.CheckBox>(
+        "Format",
+        tags.map { CheckBox(it.name.orEmpty(), it.idOrNull().orEmpty()) },
+    ) {
+        class CheckBox(name: String, val id: String) : Filter.CheckBox(name, false)
+
+        fun selectedIds(): List<String> = state.filter { it.state }.map { it.id }
+    }
+
     // ------------------------------------------------------------------
     // Settings
     // ------------------------------------------------------------------
 
-    override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        SwitchPreferenceCompat(screen.context).apply {
+    override fun setupPreferenceScreen(screen: androidx.preference.PreferenceScreen) {
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_NSFW
             title = "Show NSFW content"
-            summary = "Show adult (NSFW) titles in browse and search"
+            summary = "Off = only safe titles (filtered server-side, exact site behavior)"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
-        ListPreference(screen.context).apply {
+        androidx.preference.ListPreference(screen.context).apply {
             key = PREF_CHAPTER_LANGUAGE
             title = "Chapter language"
             summary = "Preferred translation language for chapters (%s)"
@@ -928,22 +791,22 @@ abstract class MangaBall :
             }
         }.let(screen::addPreference)
 
-        SwitchPreferenceCompat(screen.context).apply {
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_FALLBACK_LANGUAGE
             title = "Fallback to any language"
             summary = "Show chapters even when no translation in the preferred language exists"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
-        SwitchPreferenceCompat(screen.context).apply {
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_DEDUPLICATE_UPLOADS
             title = "Deduplicate chapter uploads"
             summary = "Keep only one upload per chapter (useful when multiple groups upload the " +
-                "same chapter) — prefers official uploads, then most liked, most viewed, newest"
+                "same chapter) — prefers the most viewed, then the freshest upload"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
-        SwitchPreferenceCompat(screen.context).apply {
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_ALL_UPLOADS
             title = "Show upload language tags"
             summary = "Append the translation language to chapter names when it differs from " +
@@ -951,17 +814,18 @@ abstract class MangaBall :
             setDefaultValue(true)
         }.let(screen::addPreference)
 
-        SwitchPreferenceCompat(screen.context).apply {
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_ALT_NAMES
             title = "Show alternative names"
             summary = "Display alternative titles in the description"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
-        SwitchPreferenceCompat(screen.context).apply {
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_EXTRA_INFO
             title = "Show extra info in description"
-            summary = "Display status and original language above the description"
+            summary = "Display status, original language, year, chapters, views and likes " +
+                "above the description"
             setDefaultValue(true)
         }.let(screen::addPreference)
     }
@@ -983,23 +847,10 @@ abstract class MangaBall :
     companion object {
         private val TITLE_PATHS = setOf("manga", "title-detail")
 
-        private val CHAPTER_IMAGES_REGEX = Regex(
-            """const\s+chapterImages\s*=\s*JSON\.parse\(`([^`]+)`\)""",
-        )
-
-        private val FALLBACK_IMAGE_REGEXES = arrayOf(
-            Regex("""chapterImages\s*=\s*(\[[\s\S]*?\])\s*;"""),
-            Regex("""chapterImages\s*=\s*JSON\.parse\('([^']+)'\)"""),
-            Regex("""chapterImages\s*=\s*JSON\.parse\("([^"]+)"\)"""),
-        )
+        /** The site's own title-id shape: 24 hex chars (Mongo ObjectId). */
+        private val TITLE_ID_REGEX = Regex("""^[0-9a-f]{24}$""", RegexOption.IGNORE_CASE)
 
         private val RELATIVE_DATE_REGEX = Regex("""(\d+)\s*(s|sec|m|min|h|hr|d|day|w|wk|mo|mos|y|yr)s?\s*ago""")
-
-        /** Site title suffixes (apiku reference client). */
-        private val TITLE_SUFFIX_REGEX = Regex(
-            """\s*[-|]\s*(Manga\s*Ball|MangaBall)(\s*Online\s*Free)?\s*$""",
-            RegexOption.IGNORE_CASE,
-        )
 
         /** Strips the site's own "Ch. N" / "Chapter N" prefix from chapter titles. */
         private val CHAPTER_PREFIX_REGEX = Regex(
@@ -1007,12 +858,7 @@ abstract class MangaBall :
             RegexOption.IGNORE_CASE,
         )
 
-        private val DESCRIPTION_PARAGRAPH_SELECTORS = "#descriptionContent .description-text > p, #descriptionContent p"
-
-        private val KEYWORD_SELECTORS = ".keywords-container [data-keyword-id]"
-        // (keywords-container doubles as the site's alt-titles row — Aidoku selector map)
-
-        // filters[sort] string values (Aidoku v11 maps its dropdown 1:1).
+        // search-advanced string sorts (verified live against the new API).
         private const val SORT_VIEWS_DESC = "views_desc"
         private const val SORT_VIEWS_ASC = "views_asc"
         private const val SORT_UPDATED_DESC = "updated_chapters_desc"
@@ -1022,10 +868,8 @@ abstract class MangaBall :
         private const val SORT_NAME_ASC = "name_asc"
         private const val SORT_NAME_DESC = "name_desc"
 
-        // Laravel accepts the raw token in X-CSRF-Token (meta tag path) or the
-        // decoded XSRF-TOKEN cookie value in X-XSRF-TOKEN (axios path).
-        private const val HEADER_CSRF_TOKEN = "X-CSRF-Token"
-        private const val HEADER_XSRF_TOKEN = "X-XSRF-TOKEN"
+        /** What the site's own client sends as user_id for logged-out visitors. */
+        private const val USER_ID_DEMO = "demo_user"
 
         private const val PREF_CHAPTER_LANGUAGE = "pref_chapter_language"
         private const val PREF_FALLBACK_LANGUAGE = "pref_fallback_language"

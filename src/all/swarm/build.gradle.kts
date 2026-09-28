@@ -5,18 +5,18 @@ plugins {
 }
 
 keiyoushi {
-    name = "Kagane"
-    versionCode = 49
+    name = "Swarm"
+    versionCode = 1
     contentWarning = ContentWarning.MIXED
-    libVersion = "1.6"
+    libVersion = "1.4"
 
     source {
-        lang = "en"
-        baseUrl = "https://kagane.to"
+        lang = "all"
+        baseUrl = "https://swarm.ws"
     }
 
     deeplink {
-        host("kagane.to")
-        path("/series/..*")
+        host("swarm.ws")
+        path("/comic/..*")
     }
 }

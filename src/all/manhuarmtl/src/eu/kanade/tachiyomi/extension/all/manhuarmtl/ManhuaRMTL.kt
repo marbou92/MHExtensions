@@ -726,6 +726,19 @@ abstract class ManhuaRMTL :
             }
         }
 
+        // OCR render fingerprint (v26): encode the overlay settings into the
+        // page URL fragment. Mihon's page caches key on the URL string, so
+        // CHANGING any overlay setting (text mode, size, grouping) changes the
+        // identity of every page — previously loaded, stale-rendered chapters
+        // are instantly refetched and re-rendered with the new setting. The
+        // fragment never reaches the wire (okhttp strips it from requests)
+        // and the interceptor's OCR lookup strips it before matching.
+        val fingerprint = "#ocrv=$mode-${overlayTextScale()}-$grouping"
+        for (page in pages) {
+            val url = page.imageUrl ?: continue
+            if (!url.contains("#ocrv=")) page.imageUrl = url + fingerprint
+        }
+
         return pages
     }
 
@@ -931,7 +944,7 @@ abstract class ManhuaRMTL :
         if (mode == MODE_RAW) return response
         if (!response.isSuccessful) return response
 
-        val url = request.url.toString()
+        val url = request.url.newBuilder().fragment(null).build().toString()
 
         // Only process images from the site hosts (covers cdn.manhuarmtl.com)
         if (!url.contains("manhuarmtl.com")) return response

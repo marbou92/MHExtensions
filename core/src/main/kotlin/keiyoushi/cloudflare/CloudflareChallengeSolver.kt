@@ -1,8 +1,10 @@
 package keiyoushi.cloudflare
 
 import android.annotation.SuppressLint
+import android.content.Context
 import android.content.res.Resources
 import android.webkit.CookieManager
+import keiyoushi.utils.applicationContext
 import keiyoushi.utils.runWebViewBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -16,6 +18,7 @@ import okhttp3.Response
 import java.io.IOException
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
+import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
@@ -65,6 +68,17 @@ import kotlin.time.Duration.Companion.seconds
  *     first loads).
  *  6. Last resort: hands the challenge response back so the app-level
  *     CloudflareInterceptor (or a manual "Open in WebView") can still solve it.
+ *
+ *  7. SELF-HEALING (v26): sites rotate their clearance lifetimes (measured:
+ *     365 d once, but users report a few hours on kagane.to/manhuarmtl.com
+ *     today — Cloudflare lets site owners tune it). The interceptor therefore
+ *     persists the time of the last successful solve per host and, when the
+ *     first request of a session carries a clearance OLDER than ~3.5 h, runs
+ *     a SILENT VERIFY pass: the site root loads in the window-attached
+ *     WebView; if a challenge appears it is solved (same as below), if the
+ *     page loads clean the existing clearance was still valid. Either way the
+ *     user never sees an error — the "come back after 5 hours, open WebView"
+ *     loop becomes a 5-15 s transparent pause on the first request.
  *
  * 429s without a challenge marker are retried with backoff (rate-limit windows).
  */
@@ -133,6 +147,11 @@ class CloudflareSolverInterceptor(
         if (!isProtectedHost(request.url.host)) return chain.proceed(request)
 
         val request1 = fingerprint(request)
+
+        // Self-heal: a stale-but-present clearance gets a silent verify solve
+        // BEFORE the request, so expiry never surfaces as a failed fetch.
+        maybeWarmUpClearance(request1, chain.call())
+
         var response = chain.proceed(request1)
 
         // Rate-limit windows (no challenge marker): brief backoff retries.
@@ -193,7 +212,7 @@ class CloudflareSolverInterceptor(
     // ------------------------------------------------------------------
 
     @SuppressLint("SetJavaScriptEnabled")
-    private fun solveInWebView(request: Request, call: Call) {
+    private fun solveInWebView(request: Request, call: Call, verifyOnly: Boolean = false) {
         val host = request.url.host
         val scheme = request.url.scheme
         val oldCookie = currentClearance(host, scheme)
@@ -218,8 +237,19 @@ class CloudflareSolverInterceptor(
                     evaluateJs(INTERACTIVE_HOOK_JS)
                 }
 
+                // VERIFY mode: when the root page finishes WITHOUT a challenge
+                // the current clearance is still valid — resolve immediately
+                // instead of spinning to the timeout waiting for a cookie
+                // that will never change. Also rescues the solve path whenever
+                // the page navigates to real content.
+                var pageLoaded = false
+                onPageFinished { _ ->
+                    pageLoaded = true
+                }
+
                 var tapAttempts = 0
                 var lastTapAt = 0L
+                var lastCleanCheckAt = 0L
                 val startedAt = System.currentTimeMillis()
                 poll(500.milliseconds) {
                     val clearance = currentClearance(host, scheme)
@@ -228,12 +258,25 @@ class CloudflareSolverInterceptor(
                         return@poll
                     }
 
+                    val now = System.currentTimeMillis()
+
+                    // Clean-load probe: check at most twice a second, from the
+                    // first finished load. Challenge pages keep rendering the
+                    // widget, so "clean" can only mean we are through.
+                    if (pageLoaded && now - lastCleanCheckAt >= 1000) {
+                        lastCleanCheckAt = now
+                        evaluateJs(CLEAN_PAGE_JS) { result ->
+                            if (result?.contains("clean") == true) {
+                                resolve(Unit)
+                            }
+                        }
+                    }
+
                     // Tap the Turnstile checkbox when the challenge is (or
                     // might be) interactive. The widget lives in a
                     // cross-origin iframe; the synthetic tap enters at the
                     // platform input layer and reaches it anyway. A few
                     // spaced attempts, then give up for this round.
-                    val now = System.currentTimeMillis()
                     val shouldTap = interactive || now - startedAt > TAP_AFTER_MS
                     if (shouldTap && tapAttempts < MAX_TAP_ATTEMPTS && now - lastTapAt >= TAP_SPACING_MS) {
                         lastTapAt = now
@@ -286,6 +329,63 @@ class CloudflareSolverInterceptor(
             ?.map(String::trim)
             ?.firstOrNull { it.startsWith(CLEARANCE_COOKIE) }
     }.getOrNull()
+
+    // ------------------------------------------------------------------
+    // Self-heal (v26): silent clearance verification
+    // ------------------------------------------------------------------
+
+    /**
+     * Runs a silent verify solve when the stored clearance predates
+     * [WARMUP_AFTER_MS] — the first request of a session after the user has
+     * been away for a few hours. The verify pass either re-mints a rotated
+     * clearance or confirms the old one still works; the request then just
+     * proceeds. Single-flight via the same solve lock as real challenges.
+     */
+    private fun maybeWarmUpClearance(request: Request, call: Call) {
+        val host = request.url.host
+        val scheme = request.url.scheme
+
+        val clearance = currentClearance(host, scheme) ?: return
+        if (clearance.isEmpty()) return
+
+        val solvedAt = persistedSolveAt(host)
+        if (solvedAt == 0L) {
+            // No solve history (fresh install or pre-v26): record now and let
+            // the normal flow handle anything that comes up.
+            recordSolveAt(host)
+            return
+        }
+        if (System.currentTimeMillis() - solvedAt < WARMUP_AFTER_MS) return
+
+        solveLock.withLock {
+            // Re-check inside the lock — a parallel thread may have warmed up.
+            if (System.currentTimeMillis() - persistedSolveAt(host) < WARMUP_AFTER_MS) return
+            if (call.isCanceled()) return
+
+            // Verify-only: never wipe the cookie first (if the clearance is
+            // still valid, wiping it would CONVERT a working session into a
+            // challenge for no reason).
+            solveInWebView(request, call, verifyOnly = true)
+            recordSolveAt(host)
+            lastSolveAt = System.currentTimeMillis()
+        }
+    }
+
+    private fun persistedSolveAt(host: String): Long = runCatching {
+        solveStore().getLong(keyFor(host), 0L)
+    }.getOrDefault(0L)
+
+    private fun recordSolveAt(host: String) {
+        runCatching {
+            solveStore().edit().putLong(keyFor(host), System.currentTimeMillis()).apply()
+        }
+    }
+
+    /** Tiny app-level prefs file shared by every source's solver instance. */
+    private fun solveStore() = applicationContext
+        .getSharedPreferences("keiyoushi_cf_solver", Context.MODE_PRIVATE)
+
+    private fun keyFor(host: String) = "last_solve_$host"
 
     /** Deletes the stale clearance cookie so the solve mints a fresh one. */
     private fun clearStaleClearance(url: HttpUrl) {
@@ -378,6 +478,13 @@ class CloudflareSolverInterceptor(
         // real solves off mid-run.
         val SOLVE_TIMEOUT = 75.seconds
 
+        /**
+         * Clearances older than this get a silent verify pass on the first
+         * request of a session. Users reported needing a manual WebView after
+         * ~5 h away, so 3.5 h re-mints/validates BEFORE expiry can bite.
+         */
+        val WARMUP_AFTER_MS = 3.5.hours.inWholeMilliseconds
+
         /** Queued requests within this window after a solve skip re-solving. */
         const val SOLVE_DEDUPE_MS = 20_000L
 
@@ -424,6 +531,22 @@ class CloudflareSolverInterceptor(
                   }catch(err){}
                 });
               }catch(e){}
+            })();
+        """.trimIndent()
+
+        /**
+         * Clean-load probe for the verify pass: "clean" only when the document
+         * is real site content (challenge pages carry a challenge title and a
+         * challenge/widget DOM that never goes away until solved).
+         */
+        private val CLEAN_PAGE_JS = """
+            (function(){
+              try{
+                var t=document.title||'';
+                if(/just a moment|attention required|checking your browser|access denied/i.test(t)) return 'challenge';
+                if(document.querySelector('#challenge-form,#challenge-running,#cf-challenge-running,#cf-turnstile,[class*="cf-turnstile"],#challenge-error-text,#cf-wrapper--challenge')) return 'challenge';
+                return 'clean';
+              }catch(e){ return 'unknown'; }
             })();
         """.trimIndent()
 

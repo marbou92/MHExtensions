@@ -2,195 +2,248 @@ package eu.kanade.tachiyomi.extension.all.mangaball
 
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
-import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
-import kotlinx.serialization.json.JsonNull
-import kotlinx.serialization.json.JsonObject
-import kotlinx.serialization.json.JsonPrimitive
 
 /**
- * Defensive DTOs for the mangaball.net API. Field shapes were mapped from the
- * live API (Yui007/mangaball-downloader) and the Aidoku source's serde struct
- * names, but the exact types of some fields (ids, covers, groups) could not be
- * verified from this environment — so anything non-critical is a JsonElement
- * parsed with tolerant helpers instead of a hard type.
+ * DTOs for the new MangaBall stack (mangaball.com + api.mangaball.com/api/v1).
+ * Every endpoint used here was captured live from the real site's own client
+ * (the Next.js app on mangaball.com, 2026-09) and the exact field shapes below
+ * come from real response bodies. Types that looked unstable across endpoints
+ * (ids, covers, stats) stay JsonElement and are read with tolerant helpers.
  */
+
+// ---------------------------------------------------------------------------
+// Browse / search
+// ---------------------------------------------------------------------------
 
 @Serializable
 data class MbSearchResponse(
     val data: List<MbTitleDto> = emptyList(),
     val pagination: MbPaginationDto? = null,
-    @SerialName("current_page") val currentPage: JsonElement? = null,
-    @SerialName("last_page") val lastPage: JsonElement? = null,
 ) {
     fun hasNextPage(): Boolean {
-        val cur = pagination?.currentPage?.toIntOrNull()
-            ?: currentPage.toIntOrNull()
-            ?: return data.isNotEmpty()
-        val last = pagination?.lastPage?.toIntOrNull()
-            ?: lastPage.toIntOrNull()
-            ?: return data.isNotEmpty()
-        return cur < last
+        val page = JsonElements.asLongOrNull(pagination?.page) ?: return data.isNotEmpty()
+        val total = JsonElements.asLongOrNull(pagination?.totalPages) ?: return data.isNotEmpty()
+        return page < total
     }
 }
 
 @Serializable
 data class MbPaginationDto(
-    @SerialName("current_page") val currentPage: JsonElement? = null,
-    @SerialName("last_page") val lastPage: JsonElement? = null,
+    val page: JsonElement? = null,
+    @SerialName("total_pages") val totalPages: JsonElement? = null,
     val total: JsonElement? = null,
+    val limit: JsonElement? = null,
 )
 
 @Serializable
 data class MbTitleDto(
-    @SerialName("_id") val id: JsonElement? = null,
+    val id: JsonElement? = null,
+    @SerialName("_id") val idAlt: JsonElement? = null,
     val name: String? = null,
-    val url: String? = null,
     val slug: String? = null,
-    val thumbnail: JsonElement? = null,
-    val cover: JsonElement? = null,
-    val background: JsonElement? = null,
-    val image: JsonElement? = null,
-    val type: String? = null,
-    val format: String? = null,
+    val image: MbImageDto? = null,
     val status: String? = null,
-    val isAdult: Boolean? = null,
-    val languageFlag: String? = null,
-    @SerialName("last_chapter") val lastChapter: JsonElement? = null,
-    @SerialName("updated_at") val updatedAt: String? = null,
-    val description: JsonElement? = null,
+    val is18plus: JsonElement? = null,
 ) {
-    /** Best display cover: thumbnail → cover → background → image. */
-    fun coverUrl(): String? = thumbnail.asStringOrNull()
-        ?: cover.asStringOrNull()
-        ?: background.asStringOrNull()
-        ?: image.asStringOrNull()
-
-    /** Path slug like "nano-machine-12345" (title id is the trailing number). */
-    fun titleSlug(): String {
-        val raw = url.orEmpty().trim().trim('/')
-        val lastSegment = raw.substringAfterLast('/').takeIf { it.isNotBlank() }
-        return slug?.takeIf { it.isNotBlank() }
-            ?: lastSegment
-            ?: id.asStringOrNull()?.let { "title-$it" }
-            ?: ""
-    }
+    fun idOrNull(): String? = JsonElements.asStringOrNull(id) ?: JsonElements.asStringOrNull(idAlt)
+    fun isAdult(): Boolean = JsonElements.asBoolOrNull(is18plus) ?: false
 }
 
+// ---------------------------------------------------------------------------
+// Details
+// ---------------------------------------------------------------------------
+
 @Serializable
-data class MbChapterListingResponse(
-    @SerialName("ALL_CHAPTERS") val allChapters: List<MbChapterGroupDto> = emptyList(),
-    val data: JsonElement? = null,
-    val pagination: MbPaginationDto? = null,
+data class MbDetailResponse(
+    val data: MbDetailDto? = null,
 )
 
 @Serializable
-data class MbChapterGroupDto(
-    val number: JsonElement? = null,
-    @SerialName("number_float") val numberFloat: JsonElement? = null,
-    val title: String? = null,
-    val translations: List<MbChapterTranslationDto> = emptyList(),
-) {
-    fun chapterNumber(): Double = numberFloat.asDoubleOrNull()
-        ?: number.asDoubleOrNull()
-        ?: -1.0
-}
-
-@Serializable
-data class MbChapterTranslationDto(
+data class MbDetailDto(
     val id: JsonElement? = null,
-    val language: String? = null,
-    val group: JsonElement? = null,
-    val date: String? = null,
-    val pages: JsonElement? = null,
-    val views: JsonElement? = null,
-    val likes: JsonElement? = null,
-    val volume: JsonElement? = null,
-    val url: String? = null,
-    val official: JsonElement? = null,
-    @SerialName("is_official") val isOfficial: JsonElement? = null,
+    @SerialName("_id") val idAlt: JsonElement? = null,
+    val name: String? = null,
+    val slug: String? = null,
+    val description: List<String> = emptyList(),
+    val alternateName: List<String> = emptyList(),
+    val authors: List<MbPersonDto> = emptyList(),
+    val author: List<MbPersonDto> = emptyList(),
+    val tags: List<MbTagDto> = emptyList(),
+    val image: MbImageDto? = null,
+    val status: String? = null,
+    val originalLanguage: String? = null,
+    val publicationDemographic: String? = null,
+    val date_published: JsonElement? = null,
+    val is18plus: JsonElement? = null,
+    val availableTranslatedLanguages: List<String> = emptyList(),
+    val links: MbLinksDto? = null,
+    val stats: MbStatsDto? = null,
+    val chapters_count: JsonElement? = null,
+    val likes_count: JsonElement? = null,
+    val views_count: JsonElement? = null,
 ) {
-    fun idOrNull(): String? = id.asStringOrNull() ?: url?.trim('/')?.substringAfterLast('/')
-
-    fun groupNameOrNull(): String? = group.asStringOrNull()
-
-    fun pageCountOrNull(): Int? = pages.toIntOrNull()
-
-    fun viewsOrNull(): Long = views.asLongOrNull() ?: 0L
-
-    fun likesOrNull(): Long = likes.asLongOrNull() ?: 0L
-
-    fun volumeOrNull(): Double? = volume.asDoubleOrNull()?.takeIf { it > 0.0 }
-
-    /** Aidoku's dedupe prefers official uploads first. */
-    fun officialOrNull(): Boolean = official.asBooleanOrNull() == true ||
-        isOfficial.asBooleanOrNull() == true ||
-        groupNameOrNull()?.contains("official", ignoreCase = true) == true
+    fun idOrNull(): String? = JsonElements.asStringOrNull(id) ?: JsonElements.asStringOrNull(idAlt)
+    fun isAdult(): Boolean = JsonElements.asBoolOrNull(is18plus) ?: false
 }
 
-// ----------------------------------------------------------------------------
-// Dynamic filter taxonomy (GET /api/v1/tag/search/)
-// ----------------------------------------------------------------------------
+@Serializable
+data class MbPersonDto(
+    val name: String? = null,
+)
 
 @Serializable
-data class MbFilterTaxonomy(
-    val tags: List<MbFilterTag> = emptyList(),
+data class MbTagDto(
+    val id: JsonElement? = null,
+    @SerialName("_id") val idAlt: JsonElement? = null,
+    val name: String? = null,
+    val slug: String? = null,
+    val group: String? = null,
+) {
+    fun idOrNull(): String? = JsonElements.asStringOrNull(id) ?: JsonElements.asStringOrNull(idAlt)
+}
+
+@Serializable
+data class MbLinksDto(
+    val mangadex: String? = null,
+    val mangaUpdate: String? = null,
+    val myanimelist: String? = null,
+    val animePlanet: String? = null,
+    val kitsu: String? = null,
+)
+
+@Serializable
+data class MbStatsDto(
+    val views: JsonElement? = null,
+    val followers: JsonElement? = null,
+)
+
+// ---------------------------------------------------------------------------
+// Chapter listing (flat chapter rows, one per (chapter, group, lang))
+// ---------------------------------------------------------------------------
+
+@Serializable
+data class MbChapterListingResponse(
+    val data: List<MbChapterDto> = emptyList(),
+)
+
+@Serializable
+data class MbChapterDto(
+    val id: JsonElement? = null,
+    @SerialName("_id") val idAlt: JsonElement? = null,
+    val title_id: JsonElement? = null,
+    val name: String? = null,
+    val number: JsonElement? = null,
+    val chapter_number: JsonElement? = null,
+    val volume: JsonElement? = null,
+    val lang: String? = null,
+    val site: String? = null,
+    val status: String? = null,
+    val created_at: String? = null,
+    val updated_at: String? = null,
+    val views: JsonElement? = null,
+    val group: MbGroupDto? = null,
+    val group_name: String? = null,
+) {
+    fun idOrNull(): String? = JsonElements.asStringOrNull(id) ?: JsonElements.asStringOrNull(idAlt)
+    fun chapterNumber(): Double = JsonElements.asDoubleOrNull(chapter_number) ?: JsonElements.asDoubleOrNull(number) ?: 0.0
+    fun volumeNumber(): Double? = JsonElements.asDoubleOrNull(volume)
+    fun viewsCount(): Long = JsonElements.asLongOrNull(views) ?: 0L
+    fun groupName(): String = group_name ?: group?.name.orEmpty()
+}
+
+@Serializable
+data class MbGroupDto(
+    val name: String? = null,
+    val slug: String? = null,
+)
+
+// ---------------------------------------------------------------------------
+// Chapter pages
+// ---------------------------------------------------------------------------
+
+@Serializable
+data class MbChapterDetailResponse(
+    val data: MbChapterDetailData? = null,
+)
+
+@Serializable
+data class MbChapterDetailData(
+    val chapter: MbChapterDetailChapter? = null,
+)
+
+@Serializable
+data class MbChapterDetailChapter(
+    val id: JsonElement? = null,
+    val pages: List<String> = emptyList(),
+    val title_id: JsonElement? = null,
+    val chapter_number: JsonElement? = null,
+    val lang: String? = null,
+)
+
+// ---------------------------------------------------------------------------
+// Filter taxonomy (GET /tag/get-grouped → {"data": {group: [tag,...]}})
+// ---------------------------------------------------------------------------
+
+@Serializable
+data class MbTagGroupsDto(
+    val format: List<MbFilterTag> = emptyList(),
+    val genre: List<MbFilterTag> = emptyList(),
+    val theme: List<MbFilterTag> = emptyList(),
+    val content: List<MbFilterTag> = emptyList(),
 )
 
 @Serializable
 data class MbFilterTag(
-    val id: String,
-    val name: String,
+    val id: JsonElement? = null,
+    @SerialName("_id") val idAlt: JsonElement? = null,
+    val name: String? = null,
+    val slug: String? = null,
+) {
+    fun idOrNull(): String? = JsonElements.asStringOrNull(id) ?: JsonElements.asStringOrNull(idAlt)
+}
+
+// ---------------------------------------------------------------------------
+// Shared helpers
+// ---------------------------------------------------------------------------
+
+@Serializable
+data class MbImageDto(
+    val file: JsonElement? = null,
+    val cover: MbCoverDto? = null,
+    val cdn_mangadex: String? = null,
 )
 
-fun MbFilterTaxonomy.toJsonElement(): JsonElement = Json.encodeToJsonElement(MbFilterTaxonomy.serializer(), this)
+@Serializable
+data class MbCoverDto(
+    val name: String? = null,
+    val path: String? = null,
+)
 
-// ----------------------------------------------------------------------------
-// Tolerant JsonElement helpers (the API may return ids/covers/groups as plain
-// strings, numbers, objects or null depending on endpoint and row state).
-// ----------------------------------------------------------------------------
-
-internal fun JsonElement?.asStringOrNull(): String? = when (this) {
-    null, is JsonNull -> null
-    is JsonPrimitive -> content.takeUnless { it.isEmpty() || it == "null" }
-    is JsonObject -> (this["url"] ?: this["src"] ?: this["name"]).asStringOrNull()
-    else -> null
-}
-
-internal fun JsonElement?.asDoubleOrNull(): Double? = when (this) {
-    null, is JsonNull -> null
-    is JsonPrimitive -> content.toDoubleOrNull() ?: content.trim().removeSuffix(".0").toDoubleOrNull()
-    is JsonObject -> this["number_float"].asDoubleOrNull() ?: this["number"].asDoubleOrNull()
-    else -> null
-}
-
-internal fun JsonElement?.asBooleanOrNull(): Boolean? = when (this) {
-    null, is JsonNull -> null
-    is JsonPrimitive -> content.lowercase().let { it == "true" || it == "1" }.takeIf { content.isNotEmpty() && content != "null" }
-    is JsonObject -> null
-    else -> null
-}
-
-internal fun JsonElement?.toIntOrNull(): Int? = asDoubleOrNull()?.toInt()
-
-internal fun JsonElement?.asLongOrNull(): Long? = when (this) {
-    null, is JsonNull -> null
-    is JsonPrimitive -> {
-        val raw = content.trim()
-        raw.toLongOrNull()
-            ?: raw.toDoubleOrNull()?.toLong()
-            ?: parseKFormat(raw)
+/** Tolerant JsonElement readers shared by every DTO above. */
+internal object JsonElements {
+    fun asStringOrNull(element: JsonElement?): String? {
+        val primitive = element as? kotlinx.serialization.json.JsonPrimitive ?: return null
+        if (primitive.isString) return primitive.content
+        return primitive.content.takeIf { it.isNotBlank() && it != "null" }
     }
-    else -> null
-}
 
-/** "1.2k" → 1200, "3.4m" → 3_400_000 (defensive, some fields may be display-formatted). */
-private fun parseKFormat(raw: String): Long? {
-    val m = Regex("""^([\d.]+)\s*([kKmM])\??$""").find(raw) ?: return null
-    val num = m.groupValues[1].toDoubleOrNull() ?: return null
-    return when (m.groupValues[2].lowercase()) {
-        "k" -> (num * 1_000).toLong()
-        "m" -> (num * 1_000_000).toLong()
+    fun asDoubleOrNull(element: JsonElement?): Double? = when (element) {
+        null -> null
+        is kotlinx.serialization.json.JsonPrimitive ->
+            element.content.toDoubleOrNull() ?: element.content.removeSuffix(".0").toDoubleOrNull()
+        else -> null
+    }
+
+    fun asLongOrNull(element: JsonElement?): Long? = asDoubleOrNull(element)?.toLong()
+
+    fun asBoolOrNull(element: JsonElement?): Boolean? = when (element) {
+        null -> null
+        is kotlinx.serialization.json.JsonPrimitive -> when (element.content.lowercase()) {
+            "true", "1", "yes" -> true
+            "false", "0", "no" -> false
+            else -> null
+        }
         else -> null
     }
 }
