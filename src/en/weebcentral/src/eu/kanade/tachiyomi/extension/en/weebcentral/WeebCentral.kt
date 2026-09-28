@@ -266,8 +266,12 @@ abstract class WeebCentral :
             author = authors.joinToString(", ").ifBlank { null }
             genre = genreChips
             description = buildString {
+                if (infoLine != null && preferences.extraInfoAtTop()) {
+                    append(infoLine)
+                    if (parsedDescription != null) append("\n\n")
+                }
                 parsedDescription?.let { append(it) }
-                if (infoLine != null) {
+                if (infoLine != null && !preferences.extraInfoAtTop()) {
                     if (isNotEmpty()) append("\n\n")
                     append(infoLine)
                 }
@@ -446,8 +450,21 @@ abstract class WeebCentral :
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_EXTRA_INFO
             title = "Show extra info in description"
-            summary = "Display type, year, status and official translation below the description"
+            summary = "Display type, year, status and official translation in the description"
             setDefaultValue(true)
+        }.let(screen::addPreference)
+
+        androidx.preference.ListPreference(screen.context).apply {
+            key = PREF_EXTRA_INFO_POSITION
+            title = "Extra info position"
+            summary = "Where the extra info line appears (%s)"
+            entries = arrayOf("Above the description", "Below the description")
+            entryValues = arrayOf("top", "below")
+            setDefaultValue("below")
+            setOnPreferenceChangeListener { _, newValue ->
+                summary = "Where the extra info line appears ($newValue)"
+                true
+            }
         }.let(screen::addPreference)
 
         SwitchPreferenceCompat(screen.context).apply {
@@ -468,6 +485,8 @@ abstract class WeebCentral :
     private fun android.content.SharedPreferences.showNsfw(): Boolean = getBoolean(PREF_SHOW_NSFW, false)
 
     private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
+
+    private fun android.content.SharedPreferences.extraInfoAtTop(): Boolean = getString(PREF_EXTRA_INFO_POSITION, "below") == "top"
 
     private fun android.content.SharedPreferences.showTagsInGenre(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
@@ -494,6 +513,7 @@ abstract class WeebCentral :
 
         private const val PREF_SHOW_NSFW = "pref_show_nsfw"
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
+        private const val PREF_EXTRA_INFO_POSITION = "pref_extra_info_position"
         private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
         private const val PREF_BLOCKED_GENRES = "pref_blocked_genres"
 

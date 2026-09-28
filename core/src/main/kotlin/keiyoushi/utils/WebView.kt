@@ -419,6 +419,16 @@ private fun findForegroundActivity(): Activity? {
     return findForegroundActivityReflective()
 }
 
+/**
+ * Cheap probe for callers that only need a yes/no answer: is there a resumed,
+ * usable activity RIGHT NOW? Background-triggered fetches (library updates,
+ * downloads) must not run WebView solves — without a foreground activity the
+ * WebView stays unattached and every visibility-gated challenge would spin
+ * until timeout (and, in the challenge path, a valid clearance would be wiped
+ * for nothing).
+ */
+fun hasForegroundActivity(): Boolean = findForegroundActivity() != null
+
 private fun findForegroundActivityReflective(): Activity? = runCatching {
     val threadClass = Class.forName("android.app.ActivityThread")
     val thread = threadClass.getMethod("currentActivityThread").invoke(null) ?: return null

@@ -5,6 +5,7 @@ import android.content.Context
 import android.content.res.Resources
 import android.webkit.CookieManager
 import keiyoushi.utils.applicationContext
+import keiyoushi.utils.hasForegroundActivity
 import keiyoushi.utils.runWebViewBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonObject
@@ -148,9 +149,18 @@ class CloudflareSolverInterceptor(
 
         val request1 = fingerprint(request)
 
+        // WebView solves can only ever succeed with a foreground activity to
+        // attach to (visibilityState=hidden pages can never pass Turnstile).
+        // Background-triggered fetches (library updates, downloads) therefore
+        // skip BOTH the self-heal and the challenge solve: without the gate a
+        // background challenge would wipe a still-valid clearance and spin
+        // 3 × 75 s for nothing before failing. The next foreground request
+        // picks the solve up instead.
+        val canSolve = hasForegroundActivity()
+
         // Self-heal: a stale-but-present clearance gets a silent verify solve
         // BEFORE the request, so expiry never surfaces as a failed fetch.
-        maybeWarmUpClearance(request1, chain.call())
+        if (canSolve) maybeWarmUpClearance(request1, chain.call())
 
         var response = chain.proceed(request1)
 
@@ -167,6 +177,13 @@ class CloudflareSolverInterceptor(
 
         // ---- Cloudflare challenge: solve headless, then retry. ----
         response.close()
+
+        if (!canSolve) {
+            // Hand the challenge back untouched — do NOT wipe the clearance:
+            // it may still be valid, and an unattached WebView can never
+            // re-mint it.
+            return chain.proceed(request1)
+        }
 
         var solvedRecently = false
         solveLock.withLock {
@@ -185,7 +202,13 @@ class CloudflareSolverInterceptor(
                     lastSolveAt = System.currentTimeMillis()
 
                     response = chain.proceed(request1)
-                    if (!response.isCloudflareChallenge()) return@withLock
+                    if (!response.isCloudflareChallenge()) {
+                        // The solve produced a working clearance — remember
+                        // WHEN, or the self-heal would fire a pointless verify
+                        // pass 3.5 h after this moment on every later session.
+                        recordSolveAt(request1.url.host)
+                        return@withLock
+                    }
                     // Keep the LAST response open — it is what we return.
                     if (round < SOLVE_ROUNDS) response.close()
                 }
@@ -361,6 +384,9 @@ class CloudflareSolverInterceptor(
             // Re-check inside the lock — a parallel thread may have warmed up.
             if (System.currentTimeMillis() - persistedSolveAt(host) < WARMUP_AFTER_MS) return
             if (call.isCanceled()) return
+            // Re-check the activity inside the lock — the app could have been
+            // backgrounded since canSolve was sampled.
+            if (!hasForegroundActivity()) return
 
             // Verify-only: never wipe the cookie first (if the clearance is
             // still valid, wiping it would CONVERT a working session into a

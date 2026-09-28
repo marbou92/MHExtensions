@@ -132,7 +132,26 @@ abstract class MangaBall :
 
     override suspend fun getPopularManga(page: Int): MangasPage = mangaList(page, sort = SORT_VIEWS_DESC)
 
-    override suspend fun getLatestUpdates(page: Int): MangasPage = mangaList(page, sort = SORT_UPDATED_DESC)
+    /**
+     * Latest = the site's DEDICATED recently-updated endpoint (the same one the
+     * "Latest Updates" page calls). The previous implementation used
+     * search-advanced?sort=updated_chapters_desc — a sort value the API does
+     * not know, silently falling back to its default order, which made Popular
+     * and Latest render the SAME list. The dedicated endpoint returns titles
+     * ordered by latest_chapter_at and carries the same row shape, so the
+     * shared parse keeps working.
+     */
+    override suspend fun getLatestUpdates(page: Int): MangasPage {
+        val url = "$apiBase/title/recently-updated".toHttpUrl().newBuilder().apply {
+            addQueryParameter("page", page.toString())
+            addQueryParameter("limit", "24")
+            addQueryParameter("adult_mode", if (preferences.showNsfw()) "all" else "no_18")
+        }.build()
+
+        val response = client.get(url, apiHeaders)
+        val result = response.parseAs<MbSearchResponse>(json)
+        return MangasPage(result.data.map { it.toSManga() }, result.hasNextPage())
+    }
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         var sort: String = SORT_VIEWS_DESC

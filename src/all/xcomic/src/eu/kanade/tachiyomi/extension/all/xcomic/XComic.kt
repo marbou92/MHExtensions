@@ -17,9 +17,7 @@ import okhttp3.Request
 import okhttp3.Response
 import org.jsoup.nodes.Document
 import java.io.IOException
-import java.text.SimpleDateFormat
 import java.util.Locale
-import java.util.TimeZone
 
 /**
  * XComic (xcomic.me) — Qwik City SSR site. FOUR mirrors share one backend and
@@ -36,15 +34,22 @@ import java.util.TimeZone
  * Endpoints (live-verified 2026-09, desktop Chrome UA, no CF challenges):
  *  - Browse/search  GET /search?word={query}&page={N} — the ONLY server-side
  *    paginated listing (48 cards/page). Popular = empty word (site order),
- *    search = the query. The site's sort/filter tabs are client-side only.
+ *    search = the query. The `sortby` query param IS honored server-side
+ *    (verified: field_update / field_name_* reorder the SSR cards); the
+ *    type / demographic / content-rating panel controls are client-side only.
  *  - Latest         GET /rss/latest.xml — 100 newest chapter releases with
- *    series title, cover enclosure and chapter id. Series URLs resolve on
- *    details open (the reader payload carries `title_id`).
- *  - Details        GET /title/{id6}; selectors below.
- *  - Chapters       embedded in the title page: group boxes
- *    (`div.border.border-base-300`) each with a flag-emoji span
- *    (`span.font-family-NotoColorEmoji`), a `/source/{id}` group link and
- *    rows `a[href^="/chapter/"]` + `time[data-time]` (epoch millis).
+ *    series title, cover enclosure and chapter id. The feed is CHAPTER-level
+ *    (a series that released 5 chapters shows 5x), so entries are deduped by
+ *    series title. Series URLs resolve on details open (the reader payload
+ *    carries `title_id`).
+ *  - Details        GET /title/{id6}; selectors below. The header stats row
+ *    carries the star rating (+ user count), follows, reviews, comments.
+ *  - Chapters       TWO-STEP: the title page renders ONE box per source
+ *    group, each showing only that group's LATEST chapter (plus flag +
+ *    /source/{id} link) — the v1 build mistook those for the full list. The
+ *    FULL chapter list of a group lives on its /source/{id} page
+ *    (`a[href^=/chapter/]` rows + `time[data-time]` epoch millis), so we
+ *    fetch one /source/{id} per language-matching group.
  *  - Pages          GET /chapter/{id} — the reader has no <img> tags; the
  *    page URLs are absolute (`https://iXX.imgXX.org/_f/...`) inside the
  *    `"imageUrls"` qwik/json state. Parsed positionally with a URL regex;
@@ -87,7 +92,15 @@ abstract class XComic :
 
     override fun latestUpdatesParse(response: Response): MangasPage = rssLatestParse(response)
 
-    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = GET("$mirror/search?word=${java.net.URLEncoder.encode(query, "UTF-8")}&page=$page", headers)
+    override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
+        val encoded = java.net.URLEncoder.encode(query, "UTF-8")
+        // The site's ONLY server-side search lever (verified live: field_update
+        // and field_name_* reorder the SSR cards; everything else in the
+        // filter panel is client-side-only).
+        val sortFilter = filters.firstOrNull { it is SortByFilter } as? SortByFilter
+        val sortValue = SORT_VALUES.getOrElse(sortFilter?.state ?: 0) { SORT_VALUES.first() }
+        return GET("$mirror/search?word=$encoded&page=$page&sortby=$sortValue", headers)
+    }
 
     override fun searchMangaParse(response: Response): MangasPage = searchCardParse(response)
 
@@ -118,9 +131,14 @@ abstract class XComic :
         return MangasPage(mangas, mangas.size >= 40)
     }
 
-    /** Chapter-level RSS → series cards (cover from the enclosure). */
+    /** Chapter-level RSS → series cards (cover from the enclosure).
+     * The feed is chapter-level: a series with several releases in the window
+     * repeats once per chapter. Keep the FIRST (newest — the feed is
+     * release-ordered) entry per series so "Latest" shows each series once.
+     */
     private fun rssLatestParse(response: Response): MangasPage {
         val xml = response.body.string()
+        val seen = mutableSetOf<String>()
         val mangas = ITEM_REGEX.findAll(xml).mapNotNull { match ->
             val item = match.value
             val chapterId = GUID_REGEX.find(item)?.groupValues?.get(1)?.takeIf { it.isNotBlank() }
@@ -136,6 +154,8 @@ abstract class XComic :
                 .ifBlank { rawTitle }
 
             val cover = ENCLOSURE_REGEX.find(item)?.groupValues?.get(1)
+
+            if (!seen.add(seriesTitle.lowercase())) return@mapNotNull null
 
             SManga.create().apply {
                 // Resolved to the real title slug when details are fetched.
@@ -219,11 +239,14 @@ abstract class XComic :
             ?.takeIf { it.length > 40 }
             ?: document.selectFirst("meta[name=description]")?.attr("content")?.trim()
 
-        // Header info line: type / rating / year / status / genres.
+        // Header info row: flag (original language) / type / content rating /
+        // year / status / genre+tag chips. Stats row separately: star rating
+        // (+ user count) and follows.
         var type: String? = null
         var year: String? = null
         var statusText: String? = null
-        val genres = mutableListOf<String>()
+        val contentRatings = mutableListOf<String>()
+        val chips = mutableListOf<String>()
         document.selectFirst("div.space-y-3")?.let { infoBlock ->
             var statusSeen = false
             for (span in infoBlock.select("span")) {
@@ -232,18 +255,52 @@ abstract class XComic :
                     text.isEmpty() -> {}
                     span.hasClass("font-family-NotoColorEmoji") -> {}
                     type == null && text in TYPE_WORDS -> type = text
-                    text.toDoubleOrNull() != null -> {} // rating
                     text.matches(Regex("""\d{4}""")) && year == null -> year = text
+                    text.lowercase() in CONTENT_RATINGS -> {
+                        contentRatings += text.replaceFirstChar { it.uppercase(Locale.ROOT) }
+                    }
                     !statusSeen && text.lowercase() in STATUS_WORDS -> {
                         statusText = text
                         statusSeen = true
                     }
                     text in TYPE_WORDS -> {}
-                    text.lowercase() in CONTENT_RATINGS -> {}
-                    statusSeen && span.hasClass("whitespace-nowrap") -> genres += text
+                    statusSeen && span.hasClass("whitespace-nowrap") -> chips += text
                 }
             }
         }
+
+        // Rating: the span right after the star icon span ("6.9"), with the
+        // "by N users" count following it. Follows: span whose NEXT sibling
+        // label reads "follows".
+        var rating: String? = null
+        var ratingUsers: String? = null
+        var follows: String? = null
+        for (span in document.select("span")) {
+            if (span.selectFirst("i[name=star]") != null) {
+                val value = span.nextElementSibling()?.text()?.trim()
+                if (!value.isNullOrBlank()) {
+                    rating = value
+                    ratingUsers = span.nextElementSibling()
+                        ?.nextElementSibling()?.text()?.trim()
+                        ?.substringAfter("by ")?.substringBefore(" ")
+                }
+                break
+            }
+        }
+        for (span in document.select("span")) {
+            if (span.nextElementSibling()?.ownText() == "follows") {
+                follows = span.text().trim().takeIf { it.isNotBlank() }
+                break
+            }
+        }
+
+        // Genres vs tags: the site mixes MangaUpdates-style genres and format
+        // tags in one chip row. Known format/tag words can be hidden behind
+        // the "Show tags in genres" setting.
+        val showTags = preferences.showTagsInGenres()
+        val genreChips = chips
+            .filter { showTags || it !in TAG_WORDS }
+            .distinct()
 
         // Alt titles live in the qwik state: "alt_titles",4,[0,"a",0,"b",…]
         val altTitles = ALT_TITLES_REGEX.find(html)?.groupValues?.get(1)
@@ -262,6 +319,19 @@ abstract class XComic :
                 if (type != null) {
                     if (isNotEmpty()) append(" · ")
                     append("**Type:** ").append(type)
+                }
+                if (rating != null) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Rating:** ").append(rating)
+                    if (!ratingUsers.isNullOrBlank()) append(" (by ").append(ratingUsers).append(" users)")
+                }
+                if (follows != null) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Follows:** ").append(follows)
+                }
+                if (contentRatings.isNotEmpty() && contentRatings.singleOrNull() != "Safe") {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Content:** ").append(contentRatings.joinToString("/"))
                 }
             }.ifBlank { null }
         } else {
@@ -287,7 +357,7 @@ abstract class XComic :
             this.author = authors
             this.artist = artists
             this.description = desc.ifBlank { null }
-            this.genre = genres.distinct().joinToString(", ").ifBlank { null }
+            this.genre = genreChips.joinToString(", ").ifBlank { null }
             this.thumbnail_url = cover
             this.status = statusStringToSManga(statusText)
             this.initialized = true
@@ -327,36 +397,50 @@ abstract class XComic :
         val document = response.asJsoup()
         val preferredLang = preferences.chapterLanguage()
 
-        val chapters = mutableListOf<SChapter>()
-        for (groupBox in document.select("div.border.border-base-300")) {
+        // The title page renders ONE box per source group, each with only that
+        // group's LATEST chapter. Collect (language, source id, source name)
+        // and fetch each group's FULL list from its /source/{id} page.
+        data class Group(val lang: String, val sourceId: String, val sourceName: String)
+
+        val groups = document.select("div.border.border-base-300").mapNotNull { groupBox ->
             val flag = groupBox.selectFirst("span.font-family-NotoColorEmoji")?.text()?.trim().orEmpty()
             val lang = flagToLanguage(flag)
-            if (preferredLang != "all" && lang != preferredLang) continue
+            val sourceId = groupBox.selectFirst("a[href^=/source/]")?.attr("href")
+                ?.trim('/')?.removePrefix("source/")?.substringBefore('?')
+                ?.takeIf { it.isNotBlank() } ?: return@mapNotNull null
+            val sourceName = groupBox.selectFirst("a[href^=/source/]")?.text()?.trim().orEmpty()
+            Group(lang, sourceId, sourceName)
+        }
 
-            val groupName = groupBox.selectFirst("a[href^=/source/]")?.text()?.trim()?.takeIf { it.isNotBlank() }
+        if (groups.isEmpty()) {
+            throw IOException("XComic: couldn't read the source groups on this series page (layout change?).")
+        }
 
-            for (row in groupBox.select("a[href^=/chapter/]")) {
-                val chapterId = row.attr("href").trim('/').removePrefix("chapter/").substringBefore('?')
-                if (chapterId.isBlank()) continue
+        val selected = groups
+            .filter { preferredLang == "all" || it.lang == preferredLang }
+            .ifEmpty {
+                // The requested language has no group on this series — fall
+                // back to everything rather than returning an empty list.
+                groups
+            }
 
-                val label = row.text().trim()
-                val timeEl = row.parent()?.selectFirst("time[data-time]")
-                val dateMs = timeEl?.attr("data-time")?.toLongOrNull() ?: parseDate(timeEl?.text())
-
+        val chapters = mutableListOf<SChapter>()
+        for (group in selected) {
+            for ((chapterId, name, dateMs) in fetchSourceChapterRows(group.sourceId)) {
                 chapters += SChapter.create().apply {
                     url = "$chapterId|$titleSlug"
-                    name = buildString {
-                        append(label.ifBlank { "Chapter" })
-                        if (preferredLang == "all" && lang.isNotBlank()) {
+                    this.name = buildString {
+                        append(name.ifBlank { "Chapter" })
+                        if (preferredLang == "all" && group.lang.isNotBlank()) {
                             append(" [")
-                            append(lang)
+                            append(group.lang)
                             append("]")
                         }
                     }
-                    chapter_number = CHAPTER_NUMBER_REGEX.findAll(label)
+                    chapter_number = CHAPTER_NUMBER_REGEX.findAll(name)
                         .lastOrNull()?.value?.toFloatOrNull() ?: -1f
                     date_upload = dateMs
-                    scanlator = resolveScanlator(groupName, lang)
+                    scanlator = group.sourceName.ifBlank { null }
                 }
             }
         }
@@ -369,10 +453,50 @@ abstract class XComic :
             )
         }
 
-        return chapters.sortedByDescending { it.chapter_number }
+        return chapters.sortedWith(
+            compareByDescending<SChapter> { it.chapter_number }.thenByDescending { it.date_upload },
+        )
     }
 
-    private fun resolveScanlator(group: String?, lang: String): String? = group?.takeIf { it.isNotBlank() } ?: lang.takeIf { it.isNotBlank() }?.uppercase(Locale.ROOT)
+    /**
+     * Fetches (and caches) one source group's full chapter list from
+     * /source/{id} as (chapter id, label, epoch millis) triples.
+     */
+    private fun fetchSourceChapterRows(sourceId: String): List<Triple<String, String, Long>> {
+        sourceChapterCache[sourceId]?.let { return it }
+
+        val rows = runCatching {
+            client.newCall(GET("$mirror/source/$sourceId", headers)).execute().use { response ->
+                val document = response.asJsoup()
+                document.select("a[href^=/chapter/]").map { row ->
+                    val href = row.attr("href").trim('/').removePrefix("chapter/").substringBefore('?')
+                    // Chapter title suffix lives in a sibling span (": Extra").
+                    val suffix = row.nextElementSibling()
+                        ?.takeIf { it.tagName() == "span" && !it.hasClass("font-variant-small-caps") }
+                        ?.text()?.trim().orEmpty()
+                    val name = buildString {
+                        append(row.text().trim())
+                        if (suffix.isNotEmpty() && !name.endsWith(suffix)) append(suffix)
+                    }
+                        .replace(Regex("""\s+"""), " ")
+                        .trim()
+                    // The timestamp lives in a sibling cell of the row container.
+                    val dateMs = row.parents()
+                        .firstOrNull { it.selectFirst("time[data-time]") != null }
+                        ?.selectFirst("time[data-time]")?.attr("data-time")?.toLongOrNull() ?: 0L
+                    Triple(href, name, dateMs)
+                }
+            }
+        }.getOrDefault(emptyList())
+
+        sourceChapterCache[sourceId] = rows
+        return rows
+    }
+
+    /** Bounded per-session cache of source-group chapter rows (refresh speed). */
+    private val sourceChapterCache = object : LinkedHashMap<String, List<Triple<String, String, Long>>>(8, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<Triple<String, String, Long>>>): Boolean = size > 8
+    }
 
     /** 🇬🇧 → "gb" → "en". Regional-indicator pair → country code → language. */
     private fun flagToLanguage(flag: String): String {
@@ -425,10 +549,17 @@ abstract class XComic :
     // ========================================================================
 
     override fun getFilterList(): FilterList = FilterList(
-        Filter.Header("The site's filters (sort, type, genre, language)"),
-        Filter.Header("are client-side only — no server support."),
+        Filter.Header("Sort is applied by the site (server-side)."),
+        Filter.Header("The site's other panels are client-side only."),
         Filter.Separator(),
+        SortByFilter(),
     )
+
+    private class SortByFilter :
+        Filter.Select<String>(
+            "Sort by",
+            arrayOf("Rating Score", "Last Update", "Date Added", "Name A-Z", "Name Z-A"),
+        )
 
     // ========================================================================
     // Settings
@@ -476,9 +607,16 @@ abstract class XComic :
         }.let(screen::addPreference)
 
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SHOW_TAGS_IN_GENRE
+            title = "Show tags in genres"
+            summary = "Include format tags (Long Strip, Full Color…) in the genre field"
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_EXTRA_INFO
             title = "Show extra info in description"
-            summary = "Display status, year and type above the description"
+            summary = "Display status, year, type, rating and follows above the description"
             setDefaultValue(true)
         }.let(screen::addPreference)
     }
@@ -491,28 +629,9 @@ abstract class XComic :
 
     private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
+    private fun android.content.SharedPreferences.showTagsInGenres(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
+
     private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
-
-    // ========================================================================
-    // Helpers
-    // ========================================================================
-
-    private val rssDateFormats = arrayOf(
-        "EEE, dd MMM yyyy HH:mm:ss z",
-        "EEE, dd MMM yyyy HH:mm:ss Z",
-    ).map { SimpleDateFormat(it, Locale.US).apply { timeZone = TimeZone.getTimeZone("UTC") } }
-
-    private fun parseDate(raw: String?): Long {
-        if (raw.isNullOrBlank()) return 0L
-        for (format in rssDateFormats) {
-            try {
-                @Suppress("DEPRECATION")
-                return format.parse(raw.trim())?.time ?: continue
-            } catch (_: Exception) {
-            }
-        }
-        return 0L
-    }
 
     companion object {
         private const val CHROME_UA =
@@ -536,7 +655,17 @@ abstract class XComic :
         private const val PREF_CUSTOM_MIRROR = "pref_custom_mirror"
         private const val PREF_CHAPTER_LANGUAGE = "pref_chapter_language"
         private const val PREF_SHOW_ALT_NAMES = "pref_show_alt_names"
+        private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
+
+        /** Server-side `sortby` values, in the order the site offers them. */
+        private val SORT_VALUES = arrayOf(
+            "field_score",
+            "field_update",
+            "field_create",
+            "field_name_asc",
+            "field_name_desc",
+        )
 
         private val CHAPTER_LANGUAGES = listOf(
             "all" to "All languages",
@@ -570,6 +699,18 @@ abstract class XComic :
         private val STATUS_WORDS = setOf("ongoing", "hiatus", "completed", "cancelled", "canceled", "dropped")
 
         private val CONTENT_RATINGS = setOf("safe", "suggestive", "erotica", "pornographic")
+
+        /**
+         * MangaUpdates-style format/tag words the site mixes into the genre
+         * chip row — hiding them (settings) leaves the actual genres.
+         */
+        private val TAG_WORDS = setOf(
+            "Long Strip", "Full Color", "Web Comic", "Webtoon", "1-Koma", "4-Koma",
+            "Oneshot", "One-shot", "Doujinshi", "Colored", "Official Colored",
+            "Fan Colored", "Self-Published", "Series", "Adaptation", "Anthology",
+            "Award Winning", "High Quality", "Gore", "Smut", "Video Game",
+            "Time Loop", "Nitro+", "Harmony", "Ironic", "Broadcast", "Hardcore",
+        )
 
         /** `"title_id",0,"{slug}"` in the reader qwik/json state. */
         private val TITLE_ID_REGEX = Regex(""""title_id",0,"([a-z0-9]+)"""")

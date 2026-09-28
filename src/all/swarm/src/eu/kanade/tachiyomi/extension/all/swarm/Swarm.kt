@@ -25,12 +25,14 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
+import org.jsoup.Jsoup
 import rx.Observable
 import java.io.IOException
 import java.text.ParseException
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
+import java.util.concurrent.ConcurrentHashMap
 
 /**
  * Swarm (swarm.ws) — Next.js front-end over a MongoDB-backed aggregator API
@@ -44,9 +46,11 @@ import java.util.TimeZone
  *  - Search     GET /api/comic/search?title=&limit=50&offset=&nsfw=&suggestive=
  *               (+genres=&types=&yearStartMin/Max=&minChapters= — exact case)
  *  - Details    SSR page /comic/{slug} → Next.js flight payload {manga, chapters}
- *               (fallback: /api/comic/search → api.swarm.ws/api/manga/{id})
- *  - Chapters   same RSC payload, or GET api.swarm.ws/api/chapter?manga={id}&limit=9999
- *               (fixed sort: number desc → rank asc; hard cap ~10k rows)
+ *               (fallback: light backend search → api.swarm.ws/api/manga/{id})
+ *  - Chapters   api.swarm.ws/api/chapter?manga={id}&limit=9999 as PLAIN JSON
+ *               (slug → id resolved via the light backend search and cached;
+ *               fixed sort: number desc → rank asc; hard cap ~10k rows).
+ *               SSR flight payload stays as the last-resort fallback.
  *  - Pages      POST /api/sp  body {"payload":"<hex iv>:<hex ct>"} — AES-256-CBC
  *               over {"chapterId":…}, key = SHA-256(SECRET) (see SwarmCrypto);
  *               answer {baseUrl, chapter:{data:[urls]}} → MangaDex@Home shape.
@@ -164,7 +168,14 @@ abstract class Swarm :
                 }.getOrDefault(emptyList())
             }
 
-        return MangasPage(cards.map { it.toSManga() }, cards.size >= 50)
+        // The aggregator indexes the same series once per upstream source, so
+        // listings (and therefore the app's search suggestions) can repeat a
+        // title many times under different ids. Keep the first occurrence of
+        // each distinct title — listings are relevance-ordered, so the first
+        // row is the most complete record.
+        val deduped = cards.distinctBy { it.title?.trim()?.lowercase() ?: it.url ?: it.id }
+
+        return MangasPage(deduped.map { it.toSManga() }, cards.size >= 50)
     }
 
     private fun SwarmCardDto.toSManga(): SManga = SManga.create().apply {
@@ -211,10 +222,16 @@ abstract class Swarm :
             element is JsonObject && element.containsKey("manga") && element.containsKey("chapters")
         }
 
+        // Free id for the chapter fast path — saves the resolver round-trip.
+        series?.manga?.id?.takeIf { it.isNotBlank() }?.let { id ->
+            if (mangaIdCache.size > 30) mangaIdCache.clear()
+            mangaIdCache[slug] = id
+        }
+
         val mangaDto = series?.manga ?: run {
-            // Fallback: resolve the slug through the search API and fetch the
-            // backend detail record.
-            resolveSlugViaSearch(slug)?.let { id ->
+            // Fallback: resolve the slug through the light backend search and
+            // fetch the backend detail record.
+            resolveMangaId(slug)?.let { id ->
                 runCatching {
                     client.newCall(GET("$backendApi/manga/$id", headers)).execute().use { detail ->
                         detail.body.string().parseAs<SwarmMangaEnvelopeDto>(json).data
@@ -226,23 +243,34 @@ abstract class Swarm :
         return mangaDto.toSManga(slug)
     }
 
-    /** Resolves a slug to the backend id via the search API (exact url match preferred). */
-    private fun resolveSlugViaSearch(slug: String): String? {
+    /** Resolves a slug to the backend id via the LIGHT backend title search
+     * (exact url match preferred). The old resolver hit the 600 KB+ web search
+     * on every fallback; this one is a ~5 KB JSON call.
+     */
+    private fun resolveMangaId(slug: String): String? {
         if (slug.isBlank()) return null
+        mangaIdCache[slug]?.let { return it }
+
         val keyword = slug.replace('-', ' ').replace('_', ' ')
-        val searchUrl = "$webApi/comic/search".toHttpUrl().newBuilder()
+        val searchUrl = "$backendApi/manga".toHttpUrl().newBuilder()
             .addQueryParameter("title", keyword)
-            .addQueryParameter("limit", "20")
+            .addQueryParameter("limit", "10")
             .build()
 
-        return runCatching {
+        val id = runCatching {
             client.newCall(GET(searchUrl, headers)).execute().use { response ->
                 response.body.string().parseAs<SwarmCardListDto>(json).data
             }.let { cards ->
                 cards.firstOrNull { it.url == slug }?.id
-                    ?: cards.firstOrNull()?.id
+                    ?: cards.singleOrNull()?.id
             }
         }.getOrNull()
+
+        if (id != null) {
+            if (mangaIdCache.size > 30) mangaIdCache.clear()
+            mangaIdCache[slug] = id
+        }
+        return id
     }
 
     private fun SwarmMangaFullDto.toSManga(fallbackSlug: String): SManga {
@@ -280,7 +308,10 @@ abstract class Swarm :
             null
         }
 
-        val genreList = (genres.orEmpty() + tags.orEmpty())
+        val genreList = buildList {
+            addAll(genres.orEmpty())
+            if (preferences.showTagsInGenres()) addAll(tags.orEmpty())
+        }
             .map { it.trim() }
             .filter { it.isNotEmpty() }
             .distinct()
@@ -331,7 +362,25 @@ abstract class Swarm :
     // Chapters
     // ========================================================================
 
-    override fun chapterListRequest(manga: SManga): Request = mangaDetailsRequest(manga)
+    /**
+     * The slug → backend-id cache, filled by [mangaDetailsParse] (the RSC
+     * payload carries the id) and by [resolveMangaId]. Makes the chapter list
+     * a single straight JSON call instead of "download the 2 MB series page
+     * again and re-parse the whole flight payload".
+     */
+    private val mangaIdCache = ConcurrentHashMap<String, String>()
+
+    override fun chapterListRequest(manga: SManga): Request {
+        // Fast path: the backend chapter API as plain JSON. Slower path (SSR
+        // series page + flight-payload parse) only when the id can't be
+        // resolved at all.
+        val id = resolveMangaId(manga.url)
+        return if (id != null) {
+            GET("$backendApi/chapter?manga=$id&limit=9999", headers)
+        } else {
+            mangaDetailsRequest(manga)
+        }
+    }
 
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = client.newCall(chapterListRequest(manga)).asObservableSuccess().map { response ->
         chapterListParse(response, manga)
@@ -340,26 +389,29 @@ abstract class Swarm :
     override fun chapterListParse(response: Response): List<SChapter> = chapterListParse(response, SManga.create().apply { url = response.request.url.pathSegments.lastOrNull().orEmpty() })
 
     /**
-     * Reuses the details response (the RSC payload carries the chapter rows);
-     * falls back to the backend chapter API when the payload had none.
+     * Accepts both transports: the plain JSON chapter API (fast path) and the
+     * SSR series page whose flight payload embeds the chapter rows (fallback).
      */
     private fun chapterListParse(response: Response, manga: SManga): List<SChapter> {
-        val document = response.asJsoup()
+        val body = response.body.string()
 
-        val series = document.extractNextJs<SwarmRscSeriesDto> { element: JsonElement ->
-            element is JsonObject && element.containsKey("manga") && element.containsKey("chapters")
-        }
-        var rows = series?.chapters.orEmpty()
-
-        if (rows.isEmpty()) {
-            // Fallback: resolve the id, then the backend chapter API.
-            rows = resolveSlugViaSearch(manga.url)?.let { id ->
-                runCatching {
-                    client.newCall(GET("$backendApi/chapter?manga=$id&limit=9999", headers)).execute().use { chResponse ->
-                        chResponse.body.string().parseAs<SwarmChapterListDto>(json).data
-                    }
-                }.getOrDefault(emptyList())
-            } ?: emptyList()
+        val rows: List<SwarmChapterDto> = if (body.trimStart().startsWith("{")) {
+            runCatching {
+                body.parseAs<SwarmChapterListDto>(json).data
+            }.getOrElse { emptyList<SwarmChapterDto>() }
+        } else {
+            val series = Jsoup.parse(body).extractNextJs<SwarmRscSeriesDto> { element: JsonElement ->
+                element is JsonObject && element.containsKey("manga") && element.containsKey("chapters")
+            }
+            series?.chapters.orEmpty().ifEmpty {
+                resolveMangaId(manga.url)?.let { id ->
+                    runCatching {
+                        client.newCall(GET("$backendApi/chapter?manga=$id&limit=9999", headers)).execute().use { chResponse ->
+                            chResponse.body.string().parseAs<SwarmChapterListDto>(json).data
+                        }
+                    }.getOrDefault(emptyList())
+                }.orEmpty()
+            }
         }
 
         if (rows.isEmpty()) {
@@ -600,6 +652,13 @@ abstract class Swarm :
         }.let(screen::addPreference)
 
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SHOW_TAGS_IN_GENRE
+            title = "Show tags in genres"
+            summary = "Include the tag list next to the genres in the genre field"
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+
+        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_ALT_NAMES
             title = "Show alternative names"
             summary = "Display alternative titles in the description"
@@ -619,6 +678,8 @@ abstract class Swarm :
     private fun android.content.SharedPreferences.chapterLanguage(): String = getString(PREF_CHAPTER_LANGUAGE, "en") ?: "en"
 
     private fun android.content.SharedPreferences.deduplicateChapters(): Boolean = getBoolean(PREF_DEDUPLICATE_CHAPTERS, true)
+
+    private fun android.content.SharedPreferences.showTagsInGenres(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
     private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
@@ -682,6 +743,7 @@ abstract class Swarm :
         private const val PREF_SHOW_NSFW = "pref_show_nsfw"
         private const val PREF_CHAPTER_LANGUAGE = "pref_chapter_language"
         private const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
+        private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
         private const val PREF_SHOW_ALT_NAMES = "pref_show_alt_names"
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
 
