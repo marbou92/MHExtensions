@@ -197,7 +197,15 @@ class CloudflareSolverInterceptor(
                 var round = 0
                 while (round < SOLVE_ROUNDS) {
                     round++
-                    clearStaleClearance(request1.url)
+                    // Round 1 KEEPS the existing clearance: a transient/edge
+                    // challenge (a rate-limit blip, a per-CDN rule) must not
+                    // destroy a still-valid cookie — wiping it first converted
+                    // working sessions into full re-solve loops (the reported
+                    // "CF issue is still there"). The VERIFY pass proves a
+                    // solve works without wiping; from round 2 on (the
+                    // previous round's solve+retry already failed) the wipe
+                    // is the fresh-cookie-state attempt it always was.
+                    if (round > 1) clearStaleClearance(request1.url)
                     solveInWebView(request1, chain.call())
                     lastSolveAt = System.currentTimeMillis()
 

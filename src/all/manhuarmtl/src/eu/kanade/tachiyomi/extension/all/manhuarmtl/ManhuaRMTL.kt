@@ -31,7 +31,9 @@ import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.add
 import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.jsonArray
@@ -47,9 +49,14 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.toResponseBody
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
+import java.util.concurrent.CompletableFuture
 import java.util.concurrent.ConcurrentHashMap
+import java.util.concurrent.ConcurrentLinkedQueue
 import java.util.concurrent.Executors
+import java.util.concurrent.ScheduledExecutorService
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
+import java.util.concurrent.atomic.AtomicInteger
 import kotlin.math.min
 import kotlin.math.roundToInt
 
@@ -96,6 +103,20 @@ abstract class ManhuaRMTL :
         // API 403s from wiping the (measured: one-year!) cf_clearance — the
         // old "manual WebView visits every hour" loop was false-positive
         // detection, not expiry.
+        //
+        // v32: the app-level CloudflareInterceptor is REMOVED from this
+        // client (newBuilder() copies it in from the base network client).
+        // When the keiyoushi solver hands back a challenge after its rounds,
+        // that app-level interceptor used to wipe cookies and run yet another
+        // WebView solve — no single-flight, no tap mode, no clean-load probe
+        // — so heavy sessions still collapsed into the "WebView every 30
+        // minutes" loop. The keiyoushi solver below is the SINGLE Cloudflare
+        // authority for this source: strict detection, one solve at a time,
+        // interactive-Turnstile tap mode, and (with the core round-1 no-wipe
+        // change) it never destroys a valid clearance on a transient
+        // challenge — a failed request just retries on the next load.
+        val appCloudflare = interceptors().filter { it.javaClass.simpleName == "CloudflareInterceptor" }
+        interceptors().removeAll(appCloudflare)
         //
         // Kept from the 2026-09 audit: OriginSanitizer strips the "Origin:
         // <baseUrl>" header KeiSource stamps onto every request — real
@@ -831,10 +852,15 @@ abstract class ManhuaRMTL :
         // fragment never reaches the wire (okhttp strips it from requests)
         // and the interceptor's OCR lookup strips it before matching.
         //
-        // The "3-" prefix bumps the cache identity once so pages burned by
-        // the buggy pipeline (missing overlays, half-English renders) are
-        // refetched instead of served from Mihon's cache.
-        val fingerprint = "#ocrv=3-$mode-${overlayTextScale()}-$grouping"
+        // The "4-" prefix re-bumps the cache identity (v32) so pages burned
+        // with English fallbacks by the dead gtx backend are refetched, and
+        // the "-e<epoch>" tail keeps bumping it whenever a render had to burn
+        // fallback text while other translations succeeded (see
+        // getTranslation / overlayEpoch) — previously such pages stayed
+        // English in Mihon's disk cache FOREVER, because the fingerprint only
+        // changed when a setting changed.
+        val epoch = overlayEpoch()
+        val fingerprint = "#ocrv=4-$mode-${overlayTextScale()}-$grouping-e$epoch"
         for (page in pages) {
             val url = page.imageUrl ?: continue
             if (!url.contains("#ocrv=")) page.imageUrl = url + fingerprint
@@ -1026,31 +1052,57 @@ abstract class ManhuaRMTL :
 
     // ============================== Translation ==============================
     // The OCR gate only carries English text. For the other overlay languages
-    // we translate each text box (Google's public gtx endpoint) and cache the
-    // result, so each string is translated at most once. Failed strings are
-    // NOT cached — they retry on the next chapter load.
+    // we translate each text box and cache the result, so each string is
+    // translated at most once. Failed strings are NOT cached — they retry on
+    // the next chapter load.
+    //
+    // Backend history: Google's public gtx endpoint (translate_a/single,
+    // client=gtx) — the v31 backend — is DEAD as of 2026-09: every request,
+    // even a first one, answers the "Sorry..." 429 block page, so every
+    // non-English overlay degraded to its English fallback (the reported
+    // "only English is working"). The endpoint Chrome extensions use
+    // (clients5.google.com/translate_a/t, client=dict-chrome-ex) still
+    // works — and, unlike gtx, accepts MANY strings per request via
+    // repeated q params (verified live: a 10-string batch returns 10
+    // in-order translations in ~1 s). All traffic runs as micro-batches
+    // through a minimum gap plus a shared escalating backoff, and failed
+    // strings are never cached.
 
     // In-flight translation requests, deduplicated so the image interceptor
     // can piggyback on the background prefetch instead of doing its own
     // serial network calls (which used to hold every page response hostage
     // for one RTT PER TEXT BOX — the real "chapter loading is slow").
-    private val translationsInFlight = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<String?>>()
+    private val translationsInFlight = ConcurrentHashMap<String, CompletableFuture<String?>>()
 
-    // ---- gtx throttle ------------------------------------------------------
-    // Google's public gtx endpoint rate-limits bursts. The old pipeline fired
-    // one request per unique text box through a 6-thread pool, ate a 429
-    // storm after a few chapters, and CACHED THE FAILURES AS ENGLISH — pages
+    // Queued "<target>|<text>" keys waiting to be packed into a batch.
+    private val pendingTranslations = ConcurrentLinkedQueue<String>()
+
+    // Micro-batching scheduler: collects queued strings for a moment, then
+    // fires whole batches instead of one request per box.
+    private val batchScheduler: ScheduledExecutorService = Executors.newSingleThreadScheduledExecutor { runnable ->
+        Thread(runnable, "ManhuaRMTL-TrBatch").apply { isDaemon = true }
+    }
+    private val flushQueued = AtomicBoolean(false)
+
+    // Successful translations since the last fingerprint-epoch bump — the
+    // "partial render" signal for the fallback self-heal (see overlayEpoch).
+    private val translationsSinceEpoch = AtomicInteger(0)
+
+    // ---- translation throttle ---------------------------------------------
+    // The translation endpoint rate-limits bursts. The old pipeline fired one
+    // request per unique text box through a 6-thread pool, ate a 429 storm
+    // after a few chapters, and CACHED THE FAILURES AS ENGLISH — pages
     // rendered half-Arabic/half-English (the reported "combined text"), and
-    // the poison stuck for the whole session. All gtx traffic now runs
-    // through a minimum gap plus a shared escalating backoff, and failed
-    // strings are never cached.
+    // the poison stuck for the whole session. All traffic still runs through
+    // a minimum gap plus a shared escalating backoff, and failed strings are
+    // never cached.
 
     private val throttleLock = Any()
     private var lastTranslateStart = 0L
     private var translatePauseUntil = 0L
     private var translateBackoffMs = TRANSLATE_BACKOFF_START_MS
 
-    /** Blocks until the caller may start one gtx request (worker thread only). */
+    /** Blocks until the caller may start one translation request (worker thread only). */
     private fun acquireTranslateSlot() {
         while (true) {
             val waitMs: Long
@@ -1086,12 +1138,15 @@ abstract class ManhuaRMTL :
     }
 
     /**
-     * Submits a background translation and registers the shared future so
-     * [getTranslation] can await it (bounded) instead of re-requesting.
-     * Completed futures (including failures) are reaped here so the next
-     * chapter load retries any string that failed.
+     * Queues one string for background translation and registers the shared
+     * future so [getTranslation] can await it (bounded) instead of
+     * re-requesting. Queued strings are packed into batches by the
+     * scheduler — a whole chapter costs a handful of round-trips instead of
+     * one request per box. Completed futures (including failures) are
+     * reaped here so the next chapter load retries any string that failed.
      */
     private fun prefetchTranslation(text: String, target: String) {
+        if (text.isBlank()) return
         val key = "$target|$text"
         if (translationCache.containsKey(key)) return
         translationsInFlight[key]?.let { existing ->
@@ -1099,14 +1154,80 @@ abstract class ManhuaRMTL :
             translationsInFlight.remove(key, existing)
         }
 
-        val future = java.util.concurrent.CompletableFuture.supplyAsync({
-            try {
-                translateText(text, target)
-            } catch (_: Exception) {
-                null
+        val future = CompletableFuture<String?>()
+        if (translationsInFlight.putIfAbsent(key, future) != null) return
+        pendingTranslations.add(key)
+        scheduleFlush()
+    }
+
+    private fun scheduleFlush() {
+        if (flushQueued.compareAndSet(false, true)) {
+            batchScheduler.schedule({
+                flushQueued.set(false)
+                flushTranslations()
+            }, TRANSLATE_BATCH_DELAY_MS, TimeUnit.MILLISECONDS)
+        }
+    }
+
+    /** Drains the queue, groups it by target language and fires batch jobs. */
+    private fun flushTranslations() {
+        val groups = linkedMapOf<String, MutableList<String>>()
+        var drained = 0
+        while (drained < TRANSLATE_BATCH_DRAIN_MAX) {
+            val key = pendingTranslations.poll() ?: break
+            drained++
+            groups.getOrPut(key.substringBefore('|')) { mutableListOf() }.add(key)
+        }
+
+        for ((target, keys) in groups) {
+            // Split into bounded batches: cap strings per request and the
+            // total encoded length (URL limits; merged-paragraph mode can
+            // produce long strings).
+            var batch = mutableListOf<String>()
+            var batchChars = 0
+            val batches = mutableListOf<List<String>>()
+            for (key in keys) {
+                val textLen = key.length - target.length - 1
+                if (batch.isNotEmpty() && (batch.size >= TRANSLATE_BATCH_MAX_STRINGS || batchChars + textLen > TRANSLATE_BATCH_MAX_CHARS)) {
+                    batches.add(batch)
+                    batch = mutableListOf()
+                    batchChars = 0
+                }
+                batch.add(key)
+                batchChars += textLen
             }
-        }, translateExecutor)
-        translationsInFlight.putIfAbsent(key, future)
+            if (batch.isNotEmpty()) batches.add(batch)
+
+            for (b in batches) {
+                translateExecutor.execute { translateBatchAndComplete(b, target) }
+            }
+        }
+
+        if (pendingTranslations.isNotEmpty()) scheduleFlush()
+    }
+
+    /** Runs one batch and completes every string's future with its result. */
+    private fun translateBatchAndComplete(keys: List<String>, target: String) {
+        val results = translateBatch(keys.map { it.substringAfter('|') }, target)
+        var anySuccess = false
+        for (index in keys.indices) {
+            val key = keys[index]
+            val future = translationsInFlight[key] ?: continue
+            val translated = results.getOrNull(index)
+            if (translated.isNullOrBlank()) {
+                // Complete with null — deliberately NOT cached, so the next
+                // chapter load retries (the v31 "poison cache" lesson).
+                future.complete(null)
+            } else {
+                anySuccess = true
+                if (translationCache.size > MAX_TRANSLATION_CACHE) translationCache.clear()
+                translationCache[key] = translated
+                translationsSinceEpoch.incrementAndGet()
+                future.complete(translated)
+            }
+            translationsInFlight.remove(key, future)
+        }
+        if (anySuccess) reportTranslateSuccess()
     }
 
     /**
@@ -1114,9 +1235,15 @@ abstract class ManhuaRMTL :
      * NEVER performs its own network call: the image response must not be
      * held hostage for translation round-trips. Order of preference:
      * 1. translated value already cached,
-     * 2. a translation that is already in flight (awaited up to 3s),
-     * 3. the original English text (drawn as-is — never cached, so the
-     *    next render of this page picks up the real translation).
+     * 2. a translation that is already in flight (awaited briefly — batches
+     *    usually land well inside the window; a page only ever waits for its
+     *    own boxes' batches, never for its own download),
+     * 3. the original English text (drawn as-is — never cached). A fallback
+     *    burn is MARKED: the next getPageList bumps the page-cache fingerprint
+     *    epoch so Mihon refetches those pages and re-renders them with the
+     *    real translation. (The v31 fingerprint was static per settings, so
+     *    pages burned with a fallback stayed English in Mihon's disk cache
+     *    forever — the other half of the "only English works" report.)
      */
     private fun getTranslation(text: String, target: String): String {
         val key = "$target|$text"
@@ -1126,46 +1253,69 @@ abstract class ManhuaRMTL :
         if (future != null) {
             var stillRunning = false
             try {
-                future.get(3, TimeUnit.SECONDS)?.let { return it }
+                future.get(TRANSLATE_RENDER_WAIT_MS, TimeUnit.MILLISECONDS)?.let { return it }
             } catch (_: Exception) {
                 stillRunning = true // keep it around for the next box to await
             }
             if (!stillRunning) translationsInFlight.remove(key, future)
         }
 
+        markFallbackBurn()
         return text
     }
 
+    /** Flags that a fallback render happened (see [overlayEpoch]). */
+    private fun markFallbackBurn() {
+        if (!preferences.getBoolean(PREF_FALLBACK_DIRTY, false)) {
+            preferences.edit().putBoolean(PREF_FALLBACK_DIRTY, true).apply()
+        }
+    }
+
     /**
-     * One throttled, retried gtx round-trip. Returns null on failure —
+     * The cache-identity epoch of the overlay fingerprint. Bumps exactly when
+     * a previous render had to burn fallback text while OTHER translations
+     * succeeded — a partial render worth re-burning with the now-cached
+     * translations. A fully dead backend bumps nothing (pages stay on their
+     * English fallback without refetch storms); the bump happens
+     * automatically on the first chapter load where translations flow again.
+     */
+    private fun overlayEpoch(): Int {
+        val current = preferences.getInt(PREF_RENDER_EPOCH, 0)
+        if (!preferences.getBoolean(PREF_FALLBACK_DIRTY, false)) return current
+        if (translationsSinceEpoch.get() == 0) return current
+
+        translationsSinceEpoch.set(0)
+        val next = current + 1
+        preferences.edit()
+            .putInt(PREF_RENDER_EPOCH, next)
+            .putBoolean(PREF_FALLBACK_DIRTY, false)
+            .apply()
+        return next
+    }
+
+    /**
+     * One throttled, retried batch round-trip to the dict-chrome-ex endpoint.
+     * Returns one result per input (null where a string failed) —
      * deliberately NOT caching a fallback, which used to permanently render
      * English over a chapter the user asked for in Arabic.
      */
-    private fun translateText(text: String, target: String): String? {
-        val key = "$target|$text"
-        translationCache[key]?.let { return it }
-
+    private fun translateBatch(texts: List<String>, target: String): List<String?> {
         var attempt = 0
         while (attempt < TRANSLATE_ATTEMPTS) {
             attempt++
             acquireTranslateSlot()
 
-            val translated = try {
-                val url = "https://translate.googleapis.com/translate_a/single".toHttpUrl().newBuilder()
-                    .addQueryParameter("client", "gtx")
+            val results = try {
+                val urlBuilder = "https://clients5.google.com/translate_a/t".toHttpUrl().newBuilder()
+                    .addQueryParameter("client", "dict-chrome-ex")
                     .addQueryParameter("sl", "en")
                     .addQueryParameter("tl", target)
-                    .addQueryParameter("dt", "t")
-                    .addQueryParameter("q", text)
-                    .build()
+                for (text in texts) urlBuilder.addQueryParameter("q", text)
 
                 val request = Request.Builder()
-                    .url(url)
+                    .url(urlBuilder.build())
                     .get()
-                    .header(
-                        "User-Agent",
-                        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                    )
+                    .header("User-Agent", TRANSLATE_UA)
                     .header("Accept", "*/*")
                     .header("Accept-Language", "en-US,en;q=0.9")
                     .build()
@@ -1177,39 +1327,47 @@ abstract class ManhuaRMTL :
                             null
                         }
                         !resp.isSuccessful -> null
-                        else -> resp.body.string().takeIf(String::isNotBlank)?.let(::parseGtxResponse)
+                        else -> resp.body.string().takeIf(String::isNotBlank)?.let { parseBatchResponse(it, texts.size) }
                     }
                 }
             } catch (_: Exception) {
                 null
             }
 
-            if (!translated.isNullOrBlank()) {
-                reportTranslateSuccess()
-                if (translationCache.size > MAX_TRANSLATION_CACHE) translationCache.clear()
-                translationCache[key] = translated
-                return translated
-            }
-
+            if (results != null) return results
             if (attempt < TRANSLATE_ATTEMPTS) Thread.sleep(500L * attempt)
         }
 
-        return null
+        return List(texts.size) { null }
     }
 
-    private fun parseGtxResponse(body: String): String? {
-        val segments = Json.parseToJsonElement(body).jsonArray
-            .firstOrNull()?.jsonArray ?: return null
+    /**
+     * dict-chrome-ex answers with a flat JSON array of translated strings,
+     * one per q param, in request order (verified live with 10-string
+     * batches). The legacy gtx nested shape is tolerated in case the
+     * endpoint ever morphs. A count mismatch means the order cannot be
+     * trusted — return null and let the retry attempt handle it.
+     */
+    private fun parseBatchResponse(body: String, expected: Int): List<String?>? {
+        val array = runCatching { Json.parseToJsonElement(body).jsonArray }.getOrNull() ?: return null
 
-        return buildString {
-            segments.forEach { segment ->
-                try {
-                    append(segment.jsonArray[0].jsonPrimitive.content)
-                } catch (_: Exception) {
-                    // Skip malformed segments
-                }
+        val out = ArrayList<String?>(array.size)
+        for (element in array) {
+            when (element) {
+                is JsonPrimitive -> out.add(element.content.trim().takeIf(String::isNotEmpty))
+                is JsonArray -> out.add(
+                    element.firstOrNull()
+                        ?.let { segment ->
+                            runCatching { segment.jsonArray.firstOrNull()?.jsonPrimitive?.content }.getOrNull()
+                        }
+                        ?.trim()
+                        ?.takeIf(String::isNotEmpty),
+                )
+                else -> out.add(null)
             }
-        }.trim().takeIf { it.isNotEmpty() }
+        }
+
+        return out.takeIf { it.size == expected }
     }
 
     /**
@@ -1606,6 +1764,15 @@ abstract class ManhuaRMTL :
         private const val TRANSLATE_BACKOFF_START_MS = 20_000L
         private const val TRANSLATE_BACKOFF_MAX_MS = 180_000L
         private const val TRANSLATE_ATTEMPTS = 3
+        private const val TRANSLATE_UA =
+            "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
+        private const val TRANSLATE_BATCH_DELAY_MS = 120L
+        private const val TRANSLATE_BATCH_MAX_STRINGS = 8
+        private const val TRANSLATE_BATCH_MAX_CHARS = 3600
+        private const val TRANSLATE_BATCH_DRAIN_MAX = 600
+        private const val TRANSLATE_RENDER_WAIT_MS = 6000L
+        private const val PREF_FALLBACK_DIRTY = "pref_ocr_fallback_dirty"
+        private const val PREF_RENDER_EPOCH = "pref_ocr_render_epoch"
         private const val OCR_MEMORY_TTL_MS = 90 * 60_000L
         private const val OCR_DISK_TTL_MS = 24 * 60 * 60_000L
         private const val OCR_DISK_MAX_ENTRIES = 160
