@@ -1,5 +1,7 @@
 package eu.kanade.tachiyomi.extension.all.manhuarmtl
 
+import android.content.Context
+import android.content.SharedPreferences
 import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
@@ -23,14 +25,18 @@ import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
 import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.get
+import keiyoushi.utils.applicationContext
 import keiyoushi.utils.asJsoup
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonElement
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.add
+import kotlinx.serialization.json.buildJsonArray
 import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
+import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -57,12 +63,25 @@ abstract class ManhuaRMTL :
     /**
      * Short-timeout client for the auxiliary OCR/translation calls — a hung
      * gate used to stall the whole chapter open path for up to a minute.
+     *
+     * The Cloudflare interceptor is deliberately STRIPPED here: the OCR gate
+     * answers heavy use with 403 block pages whose HTML is full of Cloudflare
+     * markers, and a challenge interceptor that mistakes a block page for a
+     * challenge WIPES the still-valid site cf_clearance and forces a WebView
+     * re-solve of a session that was never actually expired — the reported
+     * "I have to open the WebView every ~30 minutes". A challenged gate here
+     * simply yields "no OCR for this chapter" until the next load retries;
+     * the main client keeps its full solver.
      */
     private val auxClient: OkHttpClient by lazy {
         network.client.newBuilder()
             .connectTimeout(8, TimeUnit.SECONDS)
             .readTimeout(12, TimeUnit.SECONDS)
             .writeTimeout(8, TimeUnit.SECONDS)
+            .apply {
+                val cf = interceptors().filter { it.javaClass.simpleName == "CloudflareInterceptor" }
+                interceptors().removeAll(cf)
+            }
             .build()
     }
 
@@ -109,8 +128,29 @@ abstract class ManhuaRMTL :
         return chain.proceed(request)
     }
 
+    /**
+     * Document-shaped fingerprint for every HTML page request. The CF solver
+     * only fills in sec-fetch-* headers that are MISSING (and its defaults —
+     * dest=empty / mode=cors — describe an XHR, not a navigation), so a page
+     * fetch without these read as a script making CORS calls to document
+     * URLs: a strong bot signal that kept the site challenge-prone.
+     */
+    override fun Headers.Builder.configureHeaders(): Headers.Builder = this
+        .set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/png,*/*;q=0.8")
+        .set("Accept-Language", "en-US,en;q=0.9")
+        .set("Sec-Fetch-Dest", "document")
+        .set("Sec-Fetch-Mode", "navigate")
+        .set("Sec-Fetch-Site", "none")
+        .set("Upgrade-Insecure-Requests", "1")
+
+    // The only non-document request the base class issues is the per-chapter
+    // view-count POST — document headers on an XHR POST read as a bot signal,
+    // and it buys the reader nothing. Off.
+    override val sendViewCount get() = false
+
     /** Browser-like image headers for the CDN (chapter pages + covers). */
     override fun imageRequest(page: Page): Request {
+        val target = runCatching { page.imageUrl!!.toHttpUrl() }.getOrNull()
         val imageHeaders = headersBuilder()
             .set("Accept", "image/avif,image/webp,image/png,image/svg+xml,image/*;q=0.8,*/*;q=0.5")
             .set("Referer", "$baseUrl/")
@@ -118,29 +158,70 @@ abstract class ManhuaRMTL :
             .set("Accept-Language", "en-US,en-US;q=0.9,en;q=0.8")
             .set("Sec-Fetch-Dest", "image")
             .set("Sec-Fetch-Mode", "no-cors")
-            .set("Sec-Fetch-Site", "cross-site")
+            .set("Sec-Fetch-Site", target?.let { secFetchSite(it.host) } ?: "cross-site")
             .set("Sec-Fetch-Storage-Access", "none")
             .set("Priority", "u=5, i")
+            .removeAll("Upgrade-Insecure-Requests")
             .build()
 
         return GET(page.imageUrl!!, imageHeaders)
     }
 
-    // Thread-safe storage for OCR text boxes, keyed by full image URL
-    private val ocrData = ConcurrentHashMap<String, List<OcrTextBox>>()
+    /**
+     * A real <img> tag is same-origin when the image lives on the site host
+     * and same-site on its CDN subdomain — the blanket "cross-site" this used
+     * to send is a bot score penalty on the busiest request class of all.
+     */
+    private fun secFetchSite(host: String): String {
+        val base = baseUrl.toHttpUrl().host.removePrefix("www.")
+        val target = host.removePrefix("www.")
+        return when {
+            target == base -> "same-origin"
+            target.endsWith(".$base") -> "same-site"
+            else -> "cross-site"
+        }
+    }
+
+    /**
+     * OCR text boxes keyed by the FULL page image URL, kept for several
+     * chapters at once. The old single map wiped on every chapter open was
+     * the "OCR stops showing after a few chapters" bug: reader preloads and
+     * the download queue open the NEXT chapter while the CURRENT one's
+     * images are still downloading, and the clear() erased the boxes those
+     * in-flight images were waiting for (they rendered raw — empty bubbles).
+     */
+    private val ocrData = ConcurrentHashMap<String, OcrEntry>()
+
+    private class OcrEntry(val boxes: List<OcrTextBox>, val savedAt: Long)
+
+    /**
+     * Chapter page HTML keyed by the chapter URL it belongs to. A single
+     * volatile slot went stale the moment two chapters were processed in
+     * parallel — the second fetch overwrote the first one's credentials and
+     * the first chapter matched its filenames against the WRONG chapter's
+     * OCR payload (again: no overlay).
+     */
+    private val pendingChapterHtml = ConcurrentHashMap<String, String>()
+
+    /**
+     * Persistent mirror of the OCR boxes, keyed by full page image URL.
+     * Mihon restores re-opened chapters from its database WITHOUT calling
+     * getPageList again; when a burned image was evicted from the disk
+     * cache, the re-download used to hit an EMPTY in-memory map (fresh
+     * process after "leave the app and come back") and rendered raw. Boxes
+     * are tiny, so the last few chapters live in a private prefs file.
+     */
+    private val ocrStore by lazy {
+        applicationContext.getSharedPreferences("manhuarmtl_ocr", Context.MODE_PRIVATE)
+    }
 
     // Translation cache: "<lang>|<text>" -> translated text
     private val translationCache = ConcurrentHashMap<String, String>()
 
     // Background pool that pre-translates chapter text while images download
-    private val translateExecutor = Executors.newFixedThreadPool(6) { runnable ->
+    private val translateExecutor = Executors.newFixedThreadPool(4) { runnable ->
         Thread(runnable, "ManhuaRMTL-Translate").apply { isDaemon = true }
     }
-
-    // Raw HTML of the chapter page last fetched via fetchChapterDocument —
-    // carries the OCR gate credentials for the overlay.
-    @Volatile
-    private var lastChapterHtml: String? = null
 
     private val preferences = getPreferences()
 
@@ -645,25 +726,29 @@ abstract class ManhuaRMTL :
     override suspend fun fetchChapterDocument(chapterUrl: String): Document {
         val response = client.get(chapterUrl)
         val html = response.use { it.body.string() }
-        lastChapterHtml = html
+        // Keyed by chapter URL — a single slot was overwritten by whichever
+        // chapter fetched last whenever two loaded in parallel (reader
+        // preload / download queue), and the loser matched its pages against
+        // the WRONG chapter's OCR credentials → overlay silently missing.
+        if (pendingChapterHtml.size > 12) pendingChapterHtml.clear()
+        pendingChapterHtml[chapterUrl] = html
         return html.asJsoup(chapterUrl)
     }
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val pages = super.getPageList(chapter)
 
-        val html = lastChapterHtml
-        lastChapterHtml = null
+        // Drain THIS chapter's HTML only — never borrow another chapter's
+        // (that borrowing was the wrong-credentials bug).
+        val chapterUrl = runCatching { getChapterUrl(chapter) }.getOrNull()
+        val html = chapterUrl?.let { pendingChapterHtml.remove(it) }
 
         val mode = chapterTextMode()
-        if (mode != MODE_RAW && !html.isNullOrBlank()) {
-            // Clear previous chapter's OCR data
-            ocrData.clear()
-
+        if (mode != MODE_RAW && !html.isNullOrBlank() && chapterUrl != null) {
             try {
                 val credentials = parseOcrCredentials(html)
                 if (credentials != null) {
-                    val ocrPages = fetchOcrData(credentials, getChapterUrl(chapter))
+                    val ocrPages = fetchOcrData(credentials, chapterUrl)
                     if (ocrPages != null && ocrPages.isNotEmpty()) {
                         // Build filename → text boxes map (try multiple key formats for robust matching)
                         val ocrByFilename = mutableMapOf<String, List<OcrTextBox>>()
@@ -692,7 +777,11 @@ abstract class ManhuaRMTL :
                             }
                         }
 
-                        // Match OCR data to pages by filename (try multiple formats)
+                        // Match OCR data to pages by filename (try multiple formats).
+                        // Boxes are MERGED into the map, not replacing it: images of
+                        // earlier chapters may still be in flight (preload/download).
+                        val now = System.currentTimeMillis()
+                        val fresh = mutableMapOf<String, List<OcrTextBox>>()
                         for (page in pages) {
                             val imageUrl = page.imageUrl ?: continue
                             // Strip leading spaces (site has src=" https://..."), get filename, strip query
@@ -704,9 +793,12 @@ abstract class ManhuaRMTL :
                                 ?: ocrByFilename[decodedFilename]
                                 ?: ocrByFilename[decodedFilename.replace(" ", "_")]
                             if (textBoxes != null && textBoxes.isNotEmpty()) {
-                                ocrData[imageUrl.trim()] = textBoxes
+                                val key = imageUrl.trim()
+                                ocrData[key] = OcrEntry(textBoxes, now)
+                                fresh[key] = textBoxes
                             }
                         }
+                        persistOcr(fresh)
 
                         // Pre-translate all text boxes in the background so the
                         // overlay is ready by the time images arrive (non-English modes).
@@ -714,7 +806,8 @@ abstract class ManhuaRMTL :
                         // request instead of issuing its own serial network calls.
                         if (mode != MODE_EN) {
                             ocrData.values
-                                .flatMap { boxes -> boxes.map { it.text } }
+                                .flatMap { it.boxes }
+                                .map { it.text }
                                 .filter { it.isNotBlank() }
                                 .distinct()
                                 .forEach { text -> prefetchTranslation(text, mode) }
@@ -726,6 +819,10 @@ abstract class ManhuaRMTL :
             }
         }
 
+        // Drop boxes of chapters nobody has touched in a while — bounds the
+        // map without ever erasing in-flight chapters.
+        pruneOcrMemory()
+
         // OCR render fingerprint (v26): encode the overlay settings into the
         // page URL fragment. Mihon's page caches key on the URL string, so
         // CHANGING any overlay setting (text mode, size, grouping) changes the
@@ -733,7 +830,11 @@ abstract class ManhuaRMTL :
         // are instantly refetched and re-rendered with the new setting. The
         // fragment never reaches the wire (okhttp strips it from requests)
         // and the interceptor's OCR lookup strips it before matching.
-        val fingerprint = "#ocrv=$mode-${overlayTextScale()}-$grouping"
+        //
+        // The "3-" prefix bumps the cache identity once so pages burned by
+        // the buggy pipeline (missing overlays, half-English renders) are
+        // refetched instead of served from Mihon's cache.
+        val fingerprint = "#ocrv=3-$mode-${overlayTextScale()}-$grouping"
         for (page in pages) {
             val url = page.imageUrl ?: continue
             if (!url.contains("#ocrv=")) page.imageUrl = url + fingerprint
@@ -775,16 +876,30 @@ abstract class ManhuaRMTL :
      * - Origin and Referer headers are REQUIRED (site returns 403 without them)
      */
     private fun fetchOcrData(credentials: OcrCredentials, readingPageUrl: String): List<OcrPage>? {
+        val first = fetchOcrDataOnce(credentials, readingPageUrl)
+        if (first != null) return first
+
+        // The gate answers short bursts with transient 403/429s — one quiet
+        // retry rescues those without meaningfully delaying the chapter.
+        Thread.sleep(900)
+        return fetchOcrDataOnce(credentials, readingPageUrl)
+    }
+
+    private fun fetchOcrDataOnce(credentials: OcrCredentials, readingPageUrl: String): List<OcrPage>? {
         // Body: cid stays base64, ref is hex — both as-is from _0xvault
         val jsonBody = """{"cid":"${credentials.cid}","ref":"${credentials.ref}"}"""
         val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
 
         // Use the source's default headers (includes User-Agent) as a base,
-        // then set all required OCR headers
+        // then set all required OCR headers. The Accept/sec-fetch-* overrides
+        // make this read as exactly what it is on the site: a same-origin
+        // jQuery AJAX POST — the document-shaped defaults from
+        // configureHeaders would be a bot signal on an XHR.
         val request = Request.Builder()
             .url(credentials.gateUrl)
             .post(requestBody)
             .headers(headers)
+            .header("Accept", "application/json, text/javascript, */*; q=0.01")
             .header("Content-Type", "application/json")
             .header("X-Requested-With", "XMLHttpRequest")
             .header("Cache-Control", "no-cache")
@@ -793,6 +908,10 @@ abstract class ManhuaRMTL :
             .header("X-Gate-Timestamp", credentials.timestamp.toString())
             .header("Referer", readingPageUrl)
             .header("Origin", baseUrl)
+            .header("Sec-Fetch-Dest", "empty")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Site", secFetchSite(credentials.gateUrl.toHttpUrl().host))
+            .removeHeader("Upgrade-Insecure-Requests")
             .build()
 
         return try {
@@ -802,8 +921,18 @@ abstract class ManhuaRMTL :
 
             if (body.isNullOrBlank()) return null
 
-            // Detect Cloudflare challenge page
-            if (body.contains("Just a moment") || body.contains("cf-challenge") || body.contains("cf-mitigated")) {
+            // Detect Cloudflare challenge / block pages. These are NOT
+            // solvable here (and must never touch the cookie store — the aux
+            // client ships without Cloudflare interceptors for exactly that
+            // reason); report "no data" and let the next load retry.
+            if (
+                body.contains("Just a moment") ||
+                body.contains("cf-challenge") ||
+                body.contains("cf-mitigated") ||
+                body.contains("Attention Required", ignoreCase = true) ||
+                body.contains("cf-error-details", ignoreCase = true) ||
+                body.contains("cf-turnstile", ignoreCase = true)
+            ) {
                 return null
             }
 
@@ -822,31 +951,159 @@ abstract class ManhuaRMTL :
         }
     }
 
+    // ============================== OCR box storage ==============================
+
+    private fun pruneOcrMemory() {
+        val cutoff = System.currentTimeMillis() - OCR_MEMORY_TTL_MS
+        val iterator = ocrData.entries.iterator()
+        while (iterator.hasNext()) {
+            if (iterator.next().value.savedAt < cutoff) iterator.remove()
+        }
+    }
+
+    /**
+     * Persists a chapter's boxes. Value layout: "<savedAt>|<json>", json =
+     * [[x, y, w, h, "text"], …]. The store is pruned to the newest
+     * [OCR_DISK_MAX_ENTRIES] pages whenever it outgrows the cap.
+     */
+    private fun persistOcr(entries: Map<String, List<OcrTextBox>>) {
+        if (entries.isEmpty()) return
+        runCatching {
+            val now = System.currentTimeMillis()
+            val editor = ocrStore.edit()
+            for ((url, boxes) in entries) {
+                val json = buildJsonArray {
+                    for (b in boxes) {
+                        add(
+                            buildJsonArray {
+                                add(b.box.getOrElse(0) { 0f }.toDouble())
+                                add(b.box.getOrElse(1) { 0f }.toDouble())
+                                add(b.box.getOrElse(2) { 0f }.toDouble())
+                                add(b.box.getOrElse(3) { 0f }.toDouble())
+                                add(b.text)
+                            },
+                        )
+                    }
+                }
+                editor.putString("p|$url", "$now|$json")
+            }
+            pruneOcrStore(editor, entries.size)
+            editor.apply()
+        }
+    }
+
+    private fun loadOcrBoxes(url: String): List<OcrTextBox>? {
+        val raw = ocrStore.getString("p|$url", null) ?: return null
+        val at = raw.substringBefore('|').toLongOrNull() ?: return null
+        if (System.currentTimeMillis() - at > OCR_DISK_TTL_MS) return null
+
+        return runCatching {
+            Json.parseToJsonElement(raw.substringAfter('|')).jsonArray.mapNotNull { box ->
+                val f = box.jsonArray
+                val x = f.getOrNull(0)?.jsonPrimitive?.content?.toFloatOrNull() ?: return@mapNotNull null
+                val y = f.getOrNull(1)?.jsonPrimitive?.content?.toFloatOrNull() ?: return@mapNotNull null
+                val w = f.getOrNull(2)?.jsonPrimitive?.content?.toFloatOrNull() ?: return@mapNotNull null
+                val h = f.getOrNull(3)?.jsonPrimitive?.content?.toFloatOrNull() ?: return@mapNotNull null
+                val text = f.getOrNull(4)?.jsonPrimitive?.content ?: return@mapNotNull null
+                if (text.isBlank()) return@mapNotNull null
+                OcrTextBox(floatArrayOf(x, y, w, h), text)
+            }.takeIf { it.isNotEmpty() }
+        }.getOrNull()
+    }
+
+    /** Deletes the oldest stored pages once the store outgrows its cap. */
+    private fun pruneOcrStore(editor: SharedPreferences.Editor, inserted: Int) {
+        val keys = ocrStore.all.keys.filter { it.startsWith("p|") }
+        val excess = keys.size + inserted - OCR_DISK_MAX_ENTRIES
+        if (excess <= 0) return
+
+        keys.asSequence()
+            .map { key -> key to (ocrStore.getString(key, null)?.substringBefore('|')?.toLongOrNull() ?: 0L) }
+            .sortedBy { it.second }
+            .take(excess + OCR_DISK_PRUNE_SLACK)
+            .forEach { (key, _) -> editor.remove(key) }
+    }
+
     // ============================== Translation ==============================
     // The OCR gate only carries English text. For the other overlay languages
     // we translate each text box (Google's public gtx endpoint) and cache the
-    // result, so each string is translated at most once.
+    // result, so each string is translated at most once. Failed strings are
+    // NOT cached — they retry on the next chapter load.
 
     // In-flight translation requests, deduplicated so the image interceptor
     // can piggyback on the background prefetch instead of doing its own
     // serial network calls (which used to hold every page response hostage
     // for one RTT PER TEXT BOX — the real "chapter loading is slow").
-    private val translationsInFlight = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<String>>()
+    private val translationsInFlight = ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<String?>>()
+
+    // ---- gtx throttle ------------------------------------------------------
+    // Google's public gtx endpoint rate-limits bursts. The old pipeline fired
+    // one request per unique text box through a 6-thread pool, ate a 429
+    // storm after a few chapters, and CACHED THE FAILURES AS ENGLISH — pages
+    // rendered half-Arabic/half-English (the reported "combined text"), and
+    // the poison stuck for the whole session. All gtx traffic now runs
+    // through a minimum gap plus a shared escalating backoff, and failed
+    // strings are never cached.
+
+    private val throttleLock = Any()
+    private var lastTranslateStart = 0L
+    private var translatePauseUntil = 0L
+    private var translateBackoffMs = TRANSLATE_BACKOFF_START_MS
+
+    /** Blocks until the caller may start one gtx request (worker thread only). */
+    private fun acquireTranslateSlot() {
+        while (true) {
+            val waitMs: Long
+            synchronized(throttleLock) {
+                val now = System.currentTimeMillis()
+                waitMs = maxOf(
+                    translatePauseUntil - now,
+                    lastTranslateStart + TRANSLATE_MIN_GAP_MS - now,
+                    0L,
+                )
+                if (waitMs <= 0L) lastTranslateStart = now
+            }
+            if (waitMs <= 0L) return
+            Thread.sleep(minOf(waitMs, 400L))
+        }
+    }
+
+    private fun reportTranslateSuccess() {
+        synchronized(throttleLock) {
+            translatePauseUntil = 0L
+            translateBackoffMs = TRANSLATE_BACKOFF_START_MS
+        }
+    }
+
+    private fun reportTranslateRateLimited() {
+        synchronized(throttleLock) {
+            val now = System.currentTimeMillis()
+            if (translatePauseUntil < now) {
+                translatePauseUntil = now + translateBackoffMs
+                translateBackoffMs = (translateBackoffMs * 2).coerceAtMost(TRANSLATE_BACKOFF_MAX_MS)
+            }
+        }
+    }
 
     /**
      * Submits a background translation and registers the shared future so
      * [getTranslation] can await it (bounded) instead of re-requesting.
+     * Completed futures (including failures) are reaped here so the next
+     * chapter load retries any string that failed.
      */
     private fun prefetchTranslation(text: String, target: String) {
         val key = "$target|$text"
         if (translationCache.containsKey(key)) return
-        if (translationsInFlight.containsKey(key)) return
+        translationsInFlight[key]?.let { existing ->
+            if (!existing.isDone) return
+            translationsInFlight.remove(key, existing)
+        }
 
         val future = java.util.concurrent.CompletableFuture.supplyAsync({
             try {
                 translateText(text, target)
             } catch (_: Exception) {
-                text
+                null
             }
         }, translateExecutor)
         translationsInFlight.putIfAbsent(key, future)
@@ -858,7 +1115,8 @@ abstract class ManhuaRMTL :
      * held hostage for translation round-trips. Order of preference:
      * 1. translated value already cached,
      * 2. a translation that is already in flight (awaited up to 3s),
-     * 3. the original English text (drawn as-is).
+     * 3. the original English text (drawn as-is — never cached, so the
+     *    next render of this page picks up the real translation).
      */
     private fun getTranslation(text: String, target: String): String {
         val key = "$target|$text"
@@ -866,55 +1124,77 @@ abstract class ManhuaRMTL :
 
         val future = translationsInFlight[key]
         if (future != null) {
+            var stillRunning = false
             try {
-                return future.get(3, TimeUnit.SECONDS)
+                future.get(3, TimeUnit.SECONDS)?.let { return it }
             } catch (_: Exception) {
-                // Timeout/cancel/interrupt — fall through to English text
+                stillRunning = true // keep it around for the next box to await
             }
+            if (!stillRunning) translationsInFlight.remove(key, future)
         }
 
         return text
     }
 
-    private fun translateText(text: String, target: String): String {
+    /**
+     * One throttled, retried gtx round-trip. Returns null on failure —
+     * deliberately NOT caching a fallback, which used to permanently render
+     * English over a chapter the user asked for in Arabic.
+     */
+    private fun translateText(text: String, target: String): String? {
         val key = "$target|$text"
         translationCache[key]?.let { return it }
 
-        val translated = try {
-            val url = "https://translate.googleapis.com/translate_a/single".toHttpUrl().newBuilder()
-                .addQueryParameter("client", "gtx")
-                .addQueryParameter("sl", "en")
-                .addQueryParameter("tl", target)
-                .addQueryParameter("dt", "t")
-                .addQueryParameter("q", text)
-                .build()
+        var attempt = 0
+        while (attempt < TRANSLATE_ATTEMPTS) {
+            attempt++
+            acquireTranslateSlot()
 
-            val request = Request.Builder()
-                .url(url)
-                .get()
-                .header(
-                    "User-Agent",
-                    "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
-                )
-                .build()
+            val translated = try {
+                val url = "https://translate.googleapis.com/translate_a/single".toHttpUrl().newBuilder()
+                    .addQueryParameter("client", "gtx")
+                    .addQueryParameter("sl", "en")
+                    .addQueryParameter("tl", target)
+                    .addQueryParameter("dt", "t")
+                    .addQueryParameter("q", text)
+                    .build()
 
-            auxClient.newCall(request).execute().use { resp ->
-                if (!resp.isSuccessful) return@use null
-                val body = resp.body.string()
-                if (body.isBlank()) return@use null
-                parseGtxResponse(body)
+                val request = Request.Builder()
+                    .url(url)
+                    .get()
+                    .header(
+                        "User-Agent",
+                        "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36",
+                    )
+                    .header("Accept", "*/*")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .build()
+
+                auxClient.newCall(request).execute().use { resp ->
+                    when {
+                        resp.code == 429 -> {
+                            reportTranslateRateLimited()
+                            null
+                        }
+                        !resp.isSuccessful -> null
+                        else -> resp.body.string().takeIf(String::isNotBlank)?.let(::parseGtxResponse)
+                    }
+                }
+            } catch (_: Exception) {
+                null
             }
-        } catch (_: Exception) {
-            null
+
+            if (!translated.isNullOrBlank()) {
+                reportTranslateSuccess()
+                if (translationCache.size > MAX_TRANSLATION_CACHE) translationCache.clear()
+                translationCache[key] = translated
+                return translated
+            }
+
+            if (attempt < TRANSLATE_ATTEMPTS) Thread.sleep(500L * attempt)
         }
 
-        // Fall back to the English text when translation fails
-        val result = translated?.takeIf { it.isNotBlank() } ?: text
-
-        if (translationCache.size > MAX_TRANSLATION_CACHE) translationCache.clear()
-        translationCache[key] = result
-        translationsInFlight.remove(key)
-        return result
+        return null
     }
 
     private fun parseGtxResponse(body: String): String? {
@@ -949,9 +1229,17 @@ abstract class ManhuaRMTL :
         // Only process images from the site hosts (covers cdn.manhuarmtl.com)
         if (!url.contains("manhuarmtl.com")) return response
 
-        // Look up OCR text boxes for this image URL (try both raw and trimmed)
-        val textBoxes = ocrData[url] ?: ocrData[url.trim()] ?: return response
-        if (textBoxes.isEmpty()) return response
+        // Look up OCR text boxes for this image URL — memory first, then the
+        // persistent store (covers chapters the reader restored from its DB
+        // after an app restart, whose re-downloads never saw getPageList).
+        var textBoxes = ocrData[url]?.boxes ?: ocrData[url.trim()]?.boxes
+        if (textBoxes == null) {
+            textBoxes = loadOcrBoxes(url) ?: loadOcrBoxes(url.trim())
+            if (textBoxes != null) {
+                ocrData[url.trim()] = OcrEntry(textBoxes, System.currentTimeMillis())
+            }
+        }
+        if (textBoxes.isNullOrEmpty()) return response
 
         // Read the image bytes
         val imageBytes = response.body.bytes()
@@ -1314,6 +1602,14 @@ abstract class ManhuaRMTL :
         private const val GROUP_PARAGRAPH = "paragraph"
         private const val GROUP_LINE = "line"
         private const val MAX_TRANSLATION_CACHE = 3000
+        private const val TRANSLATE_MIN_GAP_MS = 140L
+        private const val TRANSLATE_BACKOFF_START_MS = 20_000L
+        private const val TRANSLATE_BACKOFF_MAX_MS = 180_000L
+        private const val TRANSLATE_ATTEMPTS = 3
+        private const val OCR_MEMORY_TTL_MS = 90 * 60_000L
+        private const val OCR_DISK_TTL_MS = 24 * 60 * 60_000L
+        private const val OCR_DISK_MAX_ENTRIES = 160
+        private const val OCR_DISK_PRUNE_SLACK = 20
         private const val TEXT_TOP_PADDING = 2f
         private const val OVERLAY_JPEG_QUALITY = 85
         private const val PREF_CHAPTER_TEXT_MODE = "pref_chapter_text_mode"
