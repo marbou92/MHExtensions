@@ -44,10 +44,15 @@ import java.util.TimeZone
  * calls the site's own client makes — all verified live (2026-09), anonymous,
  * cookie-free and challenge-free:
  *
- *  1. Browse/search  GET /title/search-advanced?sort=&page=&limit=24&adult_mode=
- *                    &keyword=&status=&demographic=&original_language=
- *                    &publication_year=&included_tags=&tag_mode=&excluded_tags=
- *                    (Popular = sort=views_desc, Latest = updated_chapters_desc)
+ *  1. Browse/search  GET /title/search-advanced?sort_by=&sort_order=&page=
+ *                    &limit=24&adult_mode=&keyword=&status=&demographic=
+ *                    &original_language=&publication_year=&included_tags=
+ *                    &tag_mode=&excluded_tags=
+ *                    (valid sort_by values = the site's own dropdown:
+ *                     views / lastupdate / rating / created_at / name)
+ *  1b. Latest        GET /title/recently-added?page=&limit=24&adult_mode=
+ *                    (the dedicated endpoint behind the site's
+ *                     /recently-added page — titles ordered by creation)
  *  2. Details        POST /title/detail            {"title_id": "..."}
  *  3. Chapters       POST /chapter/chapter-listing-by-title-id
  *                    {"title_id": "...", "user_id": "demo_user"} → FLAT rows
@@ -133,25 +138,19 @@ abstract class MangaBall :
     override suspend fun getPopularManga(page: Int): MangasPage = mangaList(page, sort = SORT_VIEWS_DESC)
 
     /**
-     * Latest = the site's DEDICATED recently-updated endpoint (the same one the
-     * "Latest Updates" page calls). Two live-verified quirks make this the only
-     * correct way to call it:
-     *  1. search-advanced?sort=updated_chapters_desc is silently IGNORED by the
-     *     API (it falls back to its default = views order) → Popular == Latest.
-     *  2. BARE recently-updated is ordered by the TITLE-record update time
-     *     (crawl recency) — its top rows are the same popular titles again,
-     *     plus a stream of just-crawled zero-chapter records.
-     * The site's own Latest page sends `chapterLanguage` (verified against its
-     * JS chunk) — with it the endpoint returns real chapter-update ordering
-     * filtered to titles that actually HAVE chapters in that language. So the
-     * chapter-language preference is forwarded here.
+     * Latest = the dedicated endpoint behind the site's /recently-added page
+     * (user-reported and verified against the site's JS client):
+     * GET /title/recently-added?page=&limit=24&adult_mode= — titles ordered by
+     * creation time. This is a DIFFERENT endpoint from everything Popular
+     * uses, so the two browse feeds can never collapse into the same list
+     * again (the previous /title/recently-updated attempt still mirrored
+     * popular's crawl order too closely).
      */
     override suspend fun getLatestUpdates(page: Int): MangasPage {
-        val url = "$apiBase/title/recently-updated".toHttpUrl().newBuilder().apply {
+        val url = "$apiBase/title/recently-added".toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
             addQueryParameter("limit", "24")
             addQueryParameter("adult_mode", if (preferences.showNsfw()) "all" else "no_18")
-            addQueryParameter("chapterLanguage", preferences.preferredLanguage())
         }.build()
 
         val response = client.get(url, apiHeaders)
@@ -215,7 +214,14 @@ abstract class MangaBall :
         tagMatchAll: Boolean = false,
     ): MangasPage {
         val url = "$apiBase/title/search-advanced".toHttpUrl().newBuilder().apply {
-            addQueryParameter("sort", sort)
+            // The API expects TWO parameters: sort_by (views / lastupdate /
+            // rating / created_at / name) and sort_order (asc / desc) — the
+            // site's advanced-search page forwards exactly these. The old
+            // single `sort=views_desc` parameter was silently IGNORED (every
+            // browse list fell back to the server's default crawl order —
+            // which is why Popular and Latest looked identical for months).
+            addQueryParameter("sort_by", sort.substringBefore(':'))
+            addQueryParameter("sort_order", sort.substringAfter(':', "desc"))
             addQueryParameter("page", page.toString())
             addQueryParameter("limit", "24")
             // Server-side NSFW filter — the exact vocabulary the site uses.
@@ -227,7 +233,7 @@ abstract class MangaBall :
             year?.let { addQueryParameter("publication_year", it) }
             if (includedTags.isNotEmpty()) {
                 addQueryParameter("included_tags", includedTags.joinToString(","))
-                addQueryParameter("tag_mode", if (tagMatchAll) "and" else "any")
+                addQueryParameter("tag_mode", if (tagMatchAll) "AND" else "OR")
             }
             if (excludedTags.isNotEmpty()) addQueryParameter("excluded_tags", excludedTags.joinToString(","))
         }.build()
@@ -883,15 +889,20 @@ abstract class MangaBall :
             RegexOption.IGNORE_CASE,
         )
 
-        // search-advanced string sorts (verified live against the new API).
-        private const val SORT_VIEWS_DESC = "views_desc"
-        private const val SORT_VIEWS_ASC = "views_asc"
-        private const val SORT_UPDATED_DESC = "updated_chapters_desc"
-        private const val SORT_UPDATED_ASC = "updated_chapters_asc"
-        private const val SORT_CREATED_DESC = "created_at_desc"
-        private const val SORT_CREATED_ASC = "created_at_asc"
-        private const val SORT_NAME_ASC = "name_asc"
-        private const val SORT_NAME_DESC = "name_desc"
+        /**
+         * Sort options as "sort_by:sort_order" pairs — the exact vocabulary
+         * the site's advanced-search page sends to the API (verified against
+         * its JS: `sort_by` ∈ views / lastupdate / rating / created_at / name,
+         * `sort_order` ∈ asc / desc; anything else is silently ignored).
+         */
+        private const val SORT_VIEWS_DESC = "views:desc"
+        private const val SORT_VIEWS_ASC = "views:asc"
+        private const val SORT_UPDATED_DESC = "lastupdate:desc"
+        private const val SORT_UPDATED_ASC = "lastupdate:asc"
+        private const val SORT_CREATED_DESC = "created_at:desc"
+        private const val SORT_CREATED_ASC = "created_at:asc"
+        private const val SORT_NAME_ASC = "name:asc"
+        private const val SORT_NAME_DESC = "name:desc"
 
         /** What the site's own client sends as user_id for logged-out visitors. */
         private const val USER_ID_DEMO = "demo_user"

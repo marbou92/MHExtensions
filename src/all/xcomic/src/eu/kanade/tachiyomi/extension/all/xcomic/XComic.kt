@@ -444,15 +444,17 @@ abstract class XComic :
         val dedupe = preferences.deduplicateChapters()
 
         val chapters = mutableListOf<SChapter>()
-        val seenNumbers = mutableSetOf<Pair<String, Float>>()
+        val seenNumbers = mutableSetOf<Float>()
         for (group in selected) {
             for ((chapterId, name, dateMs) in fetchSourceChapterRows(group.sourceId)) {
                 val number = chapterNumberOf(name)
-                // The same chapter number is often uploaded by several
-                // groups; keep the first row per number × language (the site
-                // lists the primary groups first). Rows with an unparseable
-                // number are never treated as duplicates of each other.
-                if (dedupe && number > 0f && !seenNumbers.add(group.lang to number)) continue
+                // The same chapter number is often uploaded by several groups
+                // AND several languages; with "Deduplicate chapters" on, each
+                // number is counted ONCE across all selected groups (the site
+                // lists the primary group first, and that upload wins). Rows
+                // with an unparseable number are never deduped against each
+                // other.
+                if (dedupe && number > 0f && !seenNumbers.add(number)) continue
 
                 chapters += SChapter.create().apply {
                     url = "$chapterId|$titleSlug"
@@ -484,8 +486,23 @@ abstract class XComic :
         )
     }
 
-    /** Last number token in a chapter label ("Volume 9 Chapter 9.2" → 9.2). */
-    private fun chapterNumberOf(label: String): Float = CHAPTER_NUMBER_REGEX.findAll(label).lastOrNull()?.value?.toFloatOrNull() ?: -1f
+    /**
+     * The chapter number inside a label. The number that follows a chapter
+     * word ("Chapter 12", "Ch.12", "Episode 7", "Cap. 5") always wins —
+     * labels like "Chapter 48 - S2 START" used to parse as chapter 2 (the
+     * last number token) and land between chapters 2 and 3. Without a
+     * chapter word, the last number NOT glued to a letter is taken
+     * ("One Punch 98" → 98; "S2" alone → no number).
+     */
+    private fun chapterNumberOf(label: String): Float {
+        CHAPTER_WORD_NUMBER_REGEX.find(label)?.groupValues?.get(1)?.let { token ->
+            return token.replace(',', '.').toFloatOrNull() ?: -1f
+        }
+        return NUMBER_TOKEN_REGEX.findAll(label)
+            .lastOrNull()?.value
+            ?.replace(',', '.')?.toFloatOrNull()
+            ?: -1f
+    }
 
     /**
      * Fetches (and caches) one source group's full chapter list from
@@ -631,8 +648,8 @@ abstract class XComic :
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_DEDUPLICATE_CHAPTERS
             title = "Deduplicate chapters"
-            summary = "Keep one chapter per number and language — the same " +
-                "chapter is often uploaded by several groups"
+            summary = "Keep one chapter per number — the same chapter is " +
+                "often uploaded by several groups and languages"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
@@ -761,7 +778,15 @@ abstract class XComic :
 
         private val STRING_REGEX = Regex(""""((?:[^"\\]|\\.)*)"""")
 
-        private val CHAPTER_NUMBER_REGEX = Regex("""\d+(?:\.\d+)?""")
+        /** The number right after a chapter word ("Chapter 12", "Ch.12",
+         * "Episode 7", "Cap. 5", "Capítulo 3,5"). */
+        private val CHAPTER_WORD_NUMBER_REGEX = Regex(
+            """(?:chapter|chap|ch|episode|ep|capítulo|capitulo|cap)\s*\.?\s*(\d+(?:[.,]\d+)?)""",
+            RegexOption.IGNORE_CASE,
+        )
+
+        /** Numbers NOT glued to a letter ("S2" is excluded, "#98" isn't). */
+        private val NUMBER_TOKEN_REGEX = Regex("""(?<![A-Za-z])\d+(?:[.,]\d+)?""")
 
         /** Absolute page URLs in the reader's qwik state (iXX.imgXX.org and friends). */
         private val IMAGE_URL_REGEX = Regex("""(https://[a-zA-Z0-9.\-]+/_f/[a-zA-Z0-9./_\-]+)""")
