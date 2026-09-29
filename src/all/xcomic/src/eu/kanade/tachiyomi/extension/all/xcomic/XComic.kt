@@ -12,6 +12,10 @@ import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
 import keiyoushi.utils.getPreferences
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.runBlocking
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Request
 import okhttp3.Response
@@ -36,7 +40,9 @@ import java.util.Locale
  *    paginated listing (48 cards/page). Popular = empty word (site order),
  *    search = the query. The `sortby` query param IS honored server-side
  *    (verified: field_update / field_name_* reorder the SSR cards); the
- *    type / demographic / content-rating panel controls are client-side only.
+ *    type / demographic / content-rating / status panel controls are
+ *    client-side only on the site — this source reads those exact panels from
+ *    the card chips and applies them in searchMangaParse (v1.4.5).
  *  - Latest         GET /latest — NOW server-rendered series cards (24 per
  *    page; the v1 recon's "client-side only" no longer holds, and the old
  *    /rss/latest.xml feed was chapter-level and capped at 100 entries).
@@ -92,6 +98,13 @@ abstract class XComic :
     private var latestRequestedPage = 1
     private val latestCursors = HashMap<Int, String>()
 
+    /** Client-side search selections, stashed by [searchMangaRequest] and
+     * consumed by [searchMangaParse] (the site applies these panels in JS). */
+    private var activeTypes: Set<String> = emptySet()
+    private var activeContents: Set<String> = emptySet()
+    private var activeStatuses: Set<String> = emptySet()
+    private var activeDemographics: Set<String> = emptySet()
+
     // ========================================================================
     // Browse / search
     // ========================================================================
@@ -127,10 +140,39 @@ abstract class XComic :
         // filter panel is client-side-only).
         val sortFilter = filters.firstOrNull { it is SortByFilter } as? SortByFilter
         val sortValue = SORT_VALUES.getOrElse(sortFilter?.state ?: 0) { SORT_VALUES.first() }
+
+        // The remaining panels are applied client-side in [searchMangaParse]
+        // over the same chip data the site's own JS reads.
+        activeTypes = filters.firstInstance<TypeFilter>()?.state
+            ?.filter { it.state }?.mapTo(mutableSetOf()) { it.value.lowercase(Locale.ROOT) } ?: emptySet()
+        activeContents = filters.firstInstance<ContentRatingFilter>()?.state
+            ?.filter { it.state }?.mapTo(mutableSetOf()) { it.value.lowercase(Locale.ROOT) } ?: emptySet()
+        activeStatuses = filters.firstInstance<StatusFilter>()?.state
+            ?.filter { it.state }?.mapTo(mutableSetOf()) { it.value.lowercase(Locale.ROOT) } ?: emptySet()
+        activeDemographics = filters.firstInstance<DemographicFilter>()?.state
+            ?.filter { it.state }?.mapTo(mutableSetOf()) { it.value } ?: emptySet()
+
         return GET("$mirror/search?word=$encoded&page=$page&sortby=$sortValue", headers)
     }
 
-    override fun searchMangaParse(response: Response): MangasPage = popularParse(response)
+    override fun searchMangaParse(response: Response): MangasPage {
+        val cards = parseCards(response.asJsoup())
+        val hasNext = cards.size >= 40
+
+        val mangas = cards
+            .filter { card ->
+                (activeTypes.isEmpty() || card.type.lowercase(Locale.ROOT) in activeTypes) &&
+                    (activeContents.isEmpty() || card.contentRating.lowercase(Locale.ROOT) in activeContents) &&
+                    (activeStatuses.isEmpty() || card.status.lowercase(Locale.ROOT) in activeStatuses) &&
+                    (activeDemographics.isEmpty() || card.demographics.any { it in activeDemographics })
+            }
+            .map { it.manga }
+
+        return MangasPage(mangas, hasNext)
+    }
+
+    /** First filter of a type in the list. */
+    private inline fun <reified T : Filter<*>> FilterList.firstInstance(): T? = filterIsInstance<T>().firstOrNull()
 
     /** Search/popular listings: 48 cards per page; the size threshold doubles
      * as the hasNext heuristic (the pages have no server-side next link).
@@ -144,7 +186,20 @@ abstract class XComic :
      * `a[href^="/title/"]:has(img)` — each series card renders the link
      * twice (cover + heading), so dedupe by href.
      */
-    private fun parseTitleCards(document: Document): List<SManga> {
+    private fun parseTitleCards(document: Document): List<SManga> = parseCards(document).map { it.manga }
+
+    /** One listing card plus the chip metadata the site's own filter panels
+     * read (type · content rating · year · status · genre/tag chips).
+     */
+    private class CardData(
+        val manga: SManga,
+        val type: String,
+        val contentRating: String,
+        val status: String,
+        val demographics: Set<String>,
+    )
+
+    private fun parseCards(document: Document): List<CardData> {
         val coverLinks = document.select("a[href^=/title/]").filter { it.selectFirst("img") != null }
         val seen = mutableSetOf<String>()
         return coverLinks.mapNotNull { coverLink ->
@@ -153,7 +208,7 @@ abstract class XComic :
             val title = coverLink.selectFirst("img")?.attr("alt")?.trim().takeUnless { it.isNullOrBlank() }
                 ?: coverLink.parent()?.selectFirst("a.link-pri")?.text()?.trim()
                 ?: href.substringAfterLast('/')
-            SManga.create().apply {
+            val manga = SManga.create().apply {
                 url = href.removePrefix("/title/").trim('/')
                 this.title = title
                 thumbnail_url = coverLink.selectFirst("img")?.attr("abs:src")?.takeIf { it.isNotBlank() }
@@ -164,6 +219,20 @@ abstract class XComic :
                         }
                     }
             }
+
+            // Chip row: 🇨🇳 Manhua · Safe · 2017 · completed · tags… — the
+            // type span directly follows the flag emoji span; the content
+            // rating and status are small-caps spans (the rating one lives in
+            // a text-success wrapper, the status one after the circle icon).
+            val cardRoot = coverLink.parents().firstOrNull { it.hasClass("border-b") }
+            val type = cardRoot?.selectFirst("span.font-family-NotoColorEmoji + span")?.text()?.trim().orEmpty()
+            val smallCaps = cardRoot?.select("span.font-variant-small-caps")?.map { it.text().trim() }.orEmpty()
+            val contentRating = smallCaps.firstOrNull { it.lowercase(Locale.ROOT) in CONTENT_RATINGS }.orEmpty()
+            val status = smallCaps.firstOrNull { it.lowercase(Locale.ROOT) in STATUS_WORDS }.orEmpty()
+            val cardText = cardRoot?.text()?.lowercase(Locale.ROOT).orEmpty()
+            val demographics = DEMOGRAPHIC_TAGS.filterTo(mutableSetOf()) { it.lowercase(Locale.ROOT) in cardText }
+
+            CardData(manga, type, contentRating, status, demographics)
         }
     }
 
@@ -443,16 +512,40 @@ abstract class XComic :
 
         val dedupe = preferences.deduplicateChapters()
 
+        // Deduplicate ON = the site's own default view: the FIRST group the
+        // series page renders for the language, nothing else. v1.4.4 instead
+        // merged every group and kept one row per number — but a number that
+        // exists ONLY in a secondary group still surfaced, and secondary
+        // groups often number differently (a lone "Chapter 33" upload next
+        // to the primary's 31 real chapters). That mismatch was the
+        // "sometimes a chapter appears that doesn't exist" report. OFF =
+        // every selected group's list, downloaded in parallel.
+        val selectedGroups = if (dedupe) selected.take(1) else selected
+
         val chapters = mutableListOf<SChapter>()
         val seenNumbers = mutableSetOf<Float>()
-        for (group in selected) {
-            for ((chapterId, name, dateMs) in fetchSourceChapterRows(group.sourceId)) {
+
+        val rowsPerGroup: List<Pair<Group, List<Triple<String, String, Long>>>> = if (selectedGroups.size == 1) {
+            selectedGroups.map { it to fetchSourceChapterRows(it.sourceId) }
+        } else {
+            // Overlap the ~0.5-1 s per-group page latency instead of stacking
+            // it (language "all" on a multi-group series used to serialize up
+            // to ten sequential fetches).
+            runBlocking {
+                selectedGroups
+                    .map { group -> async(Dispatchers.IO) { group to fetchSourceChapterRows(group.sourceId) } }
+                    .awaitAll()
+            }
+        }
+
+        for ((group, rows) in rowsPerGroup) {
+            for ((chapterId, name, dateMs) in rows) {
                 val number = chapterNumberOf(name)
-                // The same chapter number is often uploaded by several groups
-                // AND several languages; with "Deduplicate chapters" on, each
-                // number is counted ONCE across all selected groups (the site
-                // lists the primary group first, and that upload wins). Rows
-                // with an unparseable number are never deduped against each
+                // With "Deduplicate chapters" on, the list is a single group
+                // (see above); seenNumbers still collapses the duplicate
+                // uploads WITHIN that group (aggregators list the same
+                // number twice when two upstream sites carry it). Rows with
+                // an unparseable number are never deduped against each
                 // other.
                 if (dedupe && number > 0f && !seenNumbers.add(number)) continue
 
@@ -596,9 +689,13 @@ abstract class XComic :
 
     override fun getFilterList(): FilterList = FilterList(
         Filter.Header("Sort is applied by the site (server-side)."),
-        Filter.Header("The site's other panels are client-side only."),
+        Filter.Header("The other panels match the site's filters (applied by the extension)."),
         Filter.Separator(),
         SortByFilter(),
+        TypeFilter(),
+        ContentRatingFilter(),
+        StatusFilter(),
+        DemographicFilter(),
     )
 
     private class SortByFilter :
@@ -606,6 +703,16 @@ abstract class XComic :
             "Sort by",
             arrayOf("Rating Score", "Last Update", "Date Added", "Name A-Z", "Name Z-A"),
         )
+
+    private class CheckBoxFilter(name: String, val value: String, default: Boolean = false) : Filter.CheckBox(name, default)
+
+    private class TypeFilter : Filter.Group<CheckBoxFilter>("Type", TYPE_FILTER_VALUES.map { CheckBoxFilter(it, it) })
+
+    private class ContentRatingFilter : Filter.Group<CheckBoxFilter>("Content rating", CONTENT_FILTER_VALUES.map { CheckBoxFilter(it, it) })
+
+    private class StatusFilter : Filter.Group<CheckBoxFilter>("Status", STATUS_FILTER_VALUES.map { CheckBoxFilter(it, it) })
+
+    private class DemographicFilter : Filter.Group<CheckBoxFilter>("Demographic", DEMOGRAPHIC_TAGS.map { CheckBoxFilter(it, it) })
 
     // ========================================================================
     // Settings
@@ -648,8 +755,9 @@ abstract class XComic :
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_DEDUPLICATE_CHAPTERS
             title = "Deduplicate chapters"
-            summary = "Keep one chapter per number — the same chapter is " +
-                "often uploaded by several groups and languages"
+            summary = "ON: show the series' primary group only (what the site " +
+                "shows first — no phantom numbers from other groups). OFF: " +
+                "merge every group's list"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
@@ -753,9 +861,38 @@ abstract class XComic :
 
         private val TYPE_WORDS = setOf("Manga", "Manhwa", "Manhua", "Comic", "Webtoon", "OEL", "One-shot")
 
-        private val STATUS_WORDS = setOf("ongoing", "hiatus", "completed", "cancelled", "canceled", "dropped")
+        private val STATUS_WORDS = setOf("ongoing", "releasing", "hiatus", "completed", "cancelled", "canceled", "dropped", "upcoming", "unknown")
 
         private val CONTENT_RATINGS = setOf("safe", "suggestive", "erotica", "pornographic")
+
+        /** Search-filter panel values (chip vocabulary on the site's cards). */
+        private val TYPE_FILTER_VALUES = listOf(
+            "Manga",
+            "Manhua",
+            "Manhwa",
+            "Cartoon",
+            "Imageset",
+            "OEL",
+            "Other",
+            "Western",
+        )
+
+        private val CONTENT_FILTER_VALUES = listOf("Safe", "Suggestive", "Erotica", "Pornographic")
+
+        private val STATUS_FILTER_VALUES = listOf(
+            "Releasing",
+            "Completed",
+            "Hiatus",
+            "Cancelled",
+            "Upcoming",
+            "Unknown",
+        )
+
+        /** MangaUpdates-style demographic chips the cards carry as tags. */
+        private val DEMOGRAPHIC_TAGS = listOf(
+            "Shounen(B)", "Shoujo(G)", "Seinen(M)", "Josei(W)", "Kodomo(Kid)",
+            "Silver & Golden", "Non-human", "Male Oriented", "Female Oriented",
+        )
 
         /**
          * MangaUpdates-style format/tag words the site mixes into the genre

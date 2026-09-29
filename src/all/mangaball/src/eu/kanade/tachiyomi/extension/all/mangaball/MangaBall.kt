@@ -12,18 +12,13 @@ import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.get
-import keiyoushi.network.post
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.buildJsonObject
-import kotlinx.serialization.json.put
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 import java.text.ParseException
@@ -53,18 +48,26 @@ import java.util.TimeZone
  *  1b. Latest        GET /title/recently-added?page=&limit=24&adult_mode=
  *                    (the dedicated endpoint behind the site's
  *                     /recently-added page — titles ordered by creation)
- *  2. Details        POST /title/detail            {"title_id": "..."}
- *  3. Chapters       POST /chapter/chapter-listing-by-title-id
- *                    {"title_id": "...", "user_id": "demo_user"} → FLAT rows
- *  4. Pages          GET  /chapter-detail?chapter_id=…&user_id=demo_user
+ *  2. Details        GET  /title/detail/{title_id}
+ *                    (v1.6.8's POST /title/detail was removed server-side in
+ *                     late Sep 2026 — the chapter list broke with it)
+ *  3. Chapters       GET  /title/chapter-listing?title_id=&page=&limit=
+ *                    &sort_order=desc&language=&search=&user_id=
+ *                    → FLAT rows (same shape as before), `total` on the
+ *                    wrapper; limit=2000 returns a whole series in one call
+ *                    (verified live: 1004-row series, page 2 empty). The old
+ *                    POST /chapter/chapter-listing-by-title-id is gone.
+ *  4. Pages          GET  /chapter-detail?chapter_id=…&user_id=
  *                    → data.chapter.pages[] = absolute image URLs
  *  5. Filter tags    GET  /tag/get-grouped → {format, genre, theme, content}
  *
- * "demo_user" is exactly what the site's own client sends for logged-out
- * visitors. The NSFW toggle maps to the server's adult_mode filter (all /
- * no_18) instead of client-side hiding. Manga URLs are the numeric title ids
- * the site now links with (/title-detail/{id}); old v24 slug urls resolve via
- * the same /title/search lookup the site's own code uses as its fallback.
+ * "demo_user" is what the site's own client used to send for logged-out
+ * visitors (the 2026-09-29 traffic capture sends an EMPTY user_id instead —
+ * this source follows that). The NSFW toggle maps to the server's adult_mode
+ * filter (all / no_18) instead of client-side hiding. Manga URLs are the
+ * numeric title ids the site now links with (/title-detail/{id}); old v24
+ * slug urls resolve via the same /title/search lookup the site's own code
+ * uses as its fallback.
  */
 @Source
 abstract class MangaBall :
@@ -126,10 +129,6 @@ abstract class MangaBall :
             .set("Referer", "https://mangaball.com/")
             .build()
     }
-
-    private val jsonBody = "application/json; charset=utf-8".toMediaType()
-
-    private fun jsonRequestBody(json: String) = json.toRequestBody(jsonBody)
 
     // ------------------------------------------------------------------
     // Browse + search
@@ -284,11 +283,7 @@ abstract class MangaBall :
 
     private suspend fun fetchMangaDetailsByKey(key: String): SManga {
         val titleId = resolveTitleId(key)
-        val response = client.post(
-            "$apiBase/title/detail",
-            apiHeaders,
-            jsonRequestBody(buildJsonObject { put("title_id", titleId) }.toString()),
-        )
+        val response = client.get("$apiBase/title/detail/$titleId", apiHeaders)
         val detail = response.parseAs<MbDetailResponse>(json).data
             ?: throw IOException("MangaBall: no details returned for this title")
 
@@ -306,16 +301,15 @@ abstract class MangaBall :
         val trimmed = key.trim().trim('/')
         if (trimmed.matches(TITLE_ID_REGEX)) return trimmed
 
+        // v1.6.9: the old POST /title/search/ went away with the other POST
+        // endpoints; the site's search page itself is a GET on search-advanced.
         val candidates = try {
-            client.post(
-                "$apiBase/title/search/",
+            client.get(
+                "$apiBase/title/search-advanced".toHttpUrl().newBuilder()
+                    .addQueryParameter("keyword", trimmed)
+                    .addQueryParameter("limit", "20")
+                    .build(),
                 apiHeaders,
-                jsonRequestBody(
-                    buildJsonObject {
-                        put("keyword", trimmed)
-                        put("limit", 20)
-                    }.toString(),
-                ),
             ).parseAs<MbSearchResponse>(json).data
         } catch (_: Exception) {
             emptyList()
@@ -454,22 +448,40 @@ abstract class MangaBall :
     // ------------------------------------------------------------------
 
     private suspend fun chapterList(titleId: String): List<SChapter> {
-        val body = jsonRequestBody(
-            buildJsonObject {
-                put("title_id", titleId)
-                put("user_id", USER_ID_DEMO)
-            }.toString(),
-        )
+        // v1.6.9: the POST /chapter/chapter-listing-by-title-id endpoint was
+        // removed server-side (every POST on the API was, actually — the site's
+        // own title page now reads chapters from this GET endpoint, captured
+        // live from its traffic). Flat rows, same field shape as before;
+        // `limit=2000` returns a whole series in one call and the wrapper's
+        // `total` allows a safety loop for bigger ones.
+        val fetchedRows = buildList {
+            var page = 1
+            while (page <= 10) {
+                val url = "$apiBase/title/chapter-listing".toHttpUrl().newBuilder()
+                    .addQueryParameter("title_id", titleId)
+                    .addQueryParameter("page", page.toString())
+                    .addQueryParameter("limit", "2000")
+                    .addQueryParameter("sort_order", "desc")
+                    .addQueryParameter("language", "")
+                    .addQueryParameter("search", "")
+                    .addQueryParameter("user_id", "")
+                    .build()
 
-        val response = client.post("$apiBase/chapter/chapter-listing-by-title-id", apiHeaders, body)
-        val listing = response.parseAs<MbChapterListingResponse>(json)
+                val listing = client.get(url, apiHeaders).parseAs<MbChapterListingResponse>(json)
+                addAll(listing.data)
+
+                val total = JsonElements.asLongOrNull(listing.total) ?: Long.MAX_VALUE
+                if (size >= total || listing.data.isEmpty()) break
+                page++
+            }
+        }
 
         val preferredLang = preferences.preferredLanguage().lowercase()
         val fallback = preferences.fallbackLanguage()
         val dedupe = preferences.deduplicateUploads()
         val showLangTags = preferences.showAllUploads()
 
-        val rows = listing.data
+        val rows = fetchedRows
             .filter { it.idOrNull() != null }
             .sortedByDescending { it.chapterNumber() }
 
@@ -551,7 +563,7 @@ abstract class MangaBall :
         val chapterId = chapter.url.trim().trim('/').substringAfterLast('/')
         val url = "$apiBase/chapter-detail".toHttpUrl().newBuilder()
             .addQueryParameter("chapter_id", chapterId)
-            .addQueryParameter("user_id", USER_ID_DEMO)
+            .addQueryParameter("user_id", "")
             .build()
 
         val response = client.get(url, apiHeaders)
@@ -905,7 +917,6 @@ abstract class MangaBall :
         private const val SORT_NAME_DESC = "name:desc"
 
         /** What the site's own client sends as user_id for logged-out visitors. */
-        private const val USER_ID_DEMO = "demo_user"
 
         private const val PREF_CHAPTER_LANGUAGE = "pref_chapter_language"
         private const val PREF_FALLBACK_LANGUAGE = "pref_fallback_language"

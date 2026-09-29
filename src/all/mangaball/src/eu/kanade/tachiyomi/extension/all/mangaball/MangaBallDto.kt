@@ -125,6 +125,8 @@ data class MbStatsDto(
 @Serializable
 data class MbChapterListingResponse(
     val data: List<MbChapterDto> = emptyList(),
+    /** Row total across pages (the /title/chapter-listing wrapper carries it). */
+    val total: JsonElement? = null,
 )
 
 @Serializable

@@ -16,10 +16,6 @@ import keiyoushi.annotation.Source
 import keiyoushi.utils.extractNextJs
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
-import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.async
-import kotlinx.coroutines.awaitAll
-import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -467,16 +463,20 @@ abstract class Swarm :
     /**
      * Chapter list, speed-tuned. The backend chapter API has no server-side
      * language or field filter, and the biggest series index ~4.7k rows
-     * (~1.2 MB, ~1.7 s). Three things make this feel much faster:
+     * (~1.2 MB, ~1.9 s for one full request). Two things keep this fast AND
+     * complete:
      *
      *  1. The slug→id resolver result is LRU-cached (see [mangaIdCache]),
      *     so repeated refreshes stop paying an extra round-trip per series.
-     *  2. Rows are downloaded in PARALLEL batches of 2000-row pages (three
-     *     offsets at a time) — the server's ~0.8 s query latency overlaps
-     *     with the transfer instead of stacking. Typical series (≤2000
-     *     rows) are still a single request.
-     *  3. The SSR series page (2 MB, full flight-payload parse) is only
-     *     touched when the id can't be resolved at all.
+     *  2. ONE request with limit=9999 covers every series that exists today.
+     *     v1.4.4 downloaded rows in parallel 2000-row windows instead — and
+     *     silently DROPPED any window whose two attempts failed while a
+     *     sibling window signalled the end (offsets advanced 3×2000 whether
+     *     or not every page had succeeded). That race was the recurring
+     *     "sometimes the chapter list is incomplete" report. A single request
+     *     cannot skip a window; the sequential overflow path below only runs
+     *     for future monster series (>9999 rows) and never advances past a
+     *     page that didn't succeed.
      */
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable
         .defer {
@@ -518,39 +518,42 @@ abstract class Swarm :
     }
 
     /**
-     * Downloads ALL chapter rows for a manga id. Page size 2000 keeps typical
-     * series a single request; bigger ones add rounds of three concurrent
-     * requests until a short page signals the end (a failed page retries
-     * once and is neither treated as the end nor silently skipped — the next
-     * round's window overlap plus the id-dedupe keeps the merge safe).
+     * Downloads ALL chapter rows for a manga id. One `limit=9999` request
+     * covers the largest known series; only a hypothetical bigger index
+     * falls through to sequential paging, which NEVER skips a failed window
+     * (the v1.4.4 parallel windows did — that was the truncated-list bug).
      */
     private fun fetchAllChapterRows(id: String): List<SwarmChapterDto> {
-        val pageSize = 2000
         val rows = LinkedHashMap<String, SwarmChapterDto>()
-        var offset = 0
-        while (true) {
-            val pages = runBlocking {
-                List(3) { index -> offset + index * pageSize }
-                    .map { off -> async(Dispatchers.IO) { fetchChapterPage(id, off, pageSize) } }
-                    .awaitAll()
-            }
 
-            var endReached = false
-            var fresh = 0
-            for (page in pages) {
-                if (page == null) continue
-                if (page.size < pageSize) endReached = true
-                for (row in page) {
-                    val key = row.id.orEmpty().ifEmpty { "${row.number}-${row.lang}-${row.source}-${row.published_date}" }
-                    if (rows.put(key, row) == null) fresh++
-                }
-            }
+        val first = fetchPageUntilSuccess(id, 0, SINGLE_REQUEST_LIMIT)
+            ?: throw IOException("Swarm: the chapter API keeps failing — check your connection and refresh.")
+        for (row in first) rows.put(row.key(), row)
 
-            if (endReached || fresh == 0 || offset > 100_000) break
-            offset += 3 * pageSize
+        var offset = SINGLE_REQUEST_LIMIT
+        while (first.size >= SINGLE_REQUEST_LIMIT && offset <= 100_000) {
+            val next = fetchPageUntilSuccess(id, offset, SINGLE_REQUEST_LIMIT)
+                ?: throw IOException("Swarm: the chapter API keeps failing — check your connection and refresh.")
+            val fresh = next.count { row -> rows.put(row.key(), row) == null }
+            if (next.size < SINGLE_REQUEST_LIMIT || fresh == 0) break
+            offset += SINGLE_REQUEST_LIMIT
         }
+
         return rows.values.toList()
     }
+
+    /** Up to three rounds (with a pause between) — throws nothing, returns
+     * null only when every attempt failed, so the caller can surface an
+     * honest error instead of silently missing rows. */
+    private fun fetchPageUntilSuccess(id: String, offset: Int, limit: Int): List<SwarmChapterDto>? {
+        repeat(3) { round ->
+            fetchChapterPage(id, offset, limit)?.let { return it }
+            if (round < 2) Thread.sleep(1_200L * (round + 1))
+        }
+        return null
+    }
+
+    private fun SwarmChapterDto.key(): String = id.orEmpty().ifEmpty { "$number-$lang-$source-${published_date}" }
 
     /** One chapter page from the backend; null after two failed attempts. */
     private fun fetchChapterPage(id: String, offset: Int, pageSize: Int): List<SwarmChapterDto>? = runCatching {
@@ -903,6 +906,10 @@ abstract class Swarm :
     }
 
     companion object {
+        /** One full-request page size: the largest known series index is
+         * ~4.7k rows, 9999 covers everything that exists today. */
+        private const val SINGLE_REQUEST_LIMIT = 9999
+
         private const val CHROME_UA =
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 
