@@ -77,8 +77,9 @@ abstract class ManhuaRMTL :
      * challenge WIPES the still-valid site cf_clearance and forces a WebView
      * re-solve of a session that was never actually expired — the reported
      * "I have to open the WebView every ~30 minutes". A challenged gate here
-     * simply yields "no OCR for this chapter" until the next load retries;
-     * the main client keeps its full solver.
+     * simply yields "no OCR for this chapter" — a patient in-line retry plus
+     * the background self-heal (scheduleOcrHeal) take it from there; the main
+     * client keeps its full solver.
      */
     private val auxClient: OkHttpClient by lazy {
         network.client.newBuilder()
@@ -784,68 +785,33 @@ abstract class ManhuaRMTL :
                 val credentials = parseOcrCredentials(html)
                 if (credentials != null) {
                     val ocrPages = fetchOcrData(credentials, chapterUrl)
-                    if (ocrPages != null && ocrPages.isNotEmpty()) {
-                        // Build filename → text boxes map (try multiple key formats for robust matching)
-                        val ocrByFilename = mutableMapOf<String, List<OcrTextBox>>()
-                        for (ocrPage in ocrPages) {
-                            val filename = ocrPage.image ?: continue
-                            val rawBoxes = ocrPage.normalisedTexts()
-                            if (rawBoxes.isEmpty()) continue
-                            // Rendering modes: the SITE renders each OCR entry as
-                            // its own overlay box (it cuts text into many small
-                            // blocks); paragraph merging is an optional mode.
-                            val textBoxes = when (grouping) {
-                                GROUP_PARAGRAPH -> groupIntoParagraphs(
-                                    rawBoxes.distinctBy { b ->
-                                        "${b.text}|${b.box.map { (it * 10).toInt() }}"
-                                    },
-                                )
-                                else -> rawBoxes.distinctBy { b ->
-                                    "${b.text}|${b.box.map { (it * 10).toInt() }}"
-                                }
-                            }
-                            if (textBoxes.isNotEmpty()) {
-                                // Store under original name AND URL-decoded name
-                                ocrByFilename[filename] = textBoxes
-                                ocrByFilename[filename.replace("%20", " ")] = textBoxes
-                                ocrByFilename[filename.replace(" ", "_")] = textBoxes
-                            }
-                        }
+                    when {
+                        // Gate refused (rate-limit block / challenge). Instead
+                        // of letting the chapter render raw forever, schedule
+                        // the background heal that re-fetches everything once
+                        // the block window passes.
+                        ocrPages == null -> scheduleOcrHeal(chapterUrl, pages, mode)
 
-                        // Match OCR data to pages by filename (try multiple formats).
-                        // Boxes are MERGED into the map, not replacing it: images of
-                        // earlier chapters may still be in flight (preload/download).
-                        val now = System.currentTimeMillis()
-                        val fresh = mutableMapOf<String, List<OcrTextBox>>()
-                        for (page in pages) {
-                            val imageUrl = page.imageUrl ?: continue
-                            // Strip leading spaces (site has src=" https://..."), get filename, strip query
-                            val filename = imageUrl.trim().substringAfterLast("/").substringBefore("?")
-                            // Also try URL-decoded version
-                            val decodedFilename = java.net.URLDecoder.decode(filename, "UTF-8")
+                        // Gate answered but the chapter simply has no OCR
+                        // text (art-only pages) — nothing to store, nothing
+                        // to heal.
+                        ocrPages.isEmpty() -> {}
 
-                            val textBoxes = ocrByFilename[filename]
-                                ?: ocrByFilename[decodedFilename]
-                                ?: ocrByFilename[decodedFilename.replace(" ", "_")]
-                            if (textBoxes != null && textBoxes.isNotEmpty()) {
-                                val key = imageUrl.trim()
-                                ocrData[key] = OcrEntry(textBoxes, now)
-                                fresh[key] = textBoxes
+                        else -> {
+                            val fresh = storeOcrBoxes(pages.mapNotNull { it.imageUrl }, ocrPages)
+                            if (fresh.isNotEmpty()) {
+                                noteOcrLanded()
+
+                                // Pre-translate THIS chapter's text boxes in
+                                // the background so the overlay is ready by the
+                                // time images arrive (non-English modes). Used
+                                // to walk EVERY stored chapter: strings whose
+                                // translation once failed are never cached, so
+                                // they re-queued on every single chapter open
+                                // and the queue grew into a 429 storm over a
+                                // long session.
+                                if (mode != MODE_EN) prefetchTranslations(fresh.values, mode)
                             }
-                        }
-                        persistOcr(fresh)
-
-                        // Pre-translate all text boxes in the background so the
-                        // overlay is ready by the time images arrive (non-English modes).
-                        // The futures are shared: the image interceptor awaits the SAME
-                        // request instead of issuing its own serial network calls.
-                        if (mode != MODE_EN) {
-                            ocrData.values
-                                .flatMap { it.boxes }
-                                .map { it.text }
-                                .filter { it.isNotBlank() }
-                                .distinct()
-                                .forEach { text -> prefetchTranslation(text, mode) }
                         }
                     }
                 }
@@ -873,8 +839,16 @@ abstract class ManhuaRMTL :
         // getTranslation / overlayEpoch) — previously such pages stayed
         // English in Mihon's disk cache FOREVER, because the fingerprint only
         // changed when a setting changed.
+        //
+        // The "5-" prefix and the "-r<epoch>" tail are v34: when a gate block
+        // burned a chapter RAW (every fetch attempt gave up), the first later
+        // OCR landing bumps the raw epoch (see noteOcrLanded / scheduleOcrHeal)
+        // — the burned chapter is then refetched WITH its overlay on the next
+        // open instead of showing raw pages forever. The "5-" prefix also
+        // re-baselines every page once for this release.
         val epoch = overlayEpoch()
-        val fingerprint = "#ocrv=4-$mode-${overlayTextScale()}-$grouping-e$epoch"
+        val rawEpoch = preferences.getInt(PREF_RAW_EPOCH, 0)
+        val fingerprint = "#ocrv=5-$mode-${overlayTextScale()}-$grouping-e$epoch-r$rawEpoch"
         for (page in pages) {
             val url = page.imageUrl ?: continue
             if (!url.contains("#ocrv=")) page.imageUrl = url + fingerprint
@@ -916,13 +890,22 @@ abstract class ManhuaRMTL :
      * - Origin and Referer headers are REQUIRED (site returns 403 without them)
      */
     private fun fetchOcrData(credentials: OcrCredentials, readingPageUrl: String): List<OcrPage>? {
-        val first = fetchOcrDataOnce(credentials, readingPageUrl)
-        if (first != null) return first
+        var result = fetchOcrDataOnce(credentials, readingPageUrl)
+        for (gapMs in OCR_FETCH_RETRY_GAPS_MS) {
+            if (result != null) return result
 
-        // The gate answers short bursts with transient 403/429s — one quiet
-        // retry rescues those without meaningfully delaying the chapter.
-        Thread.sleep(900)
-        return fetchOcrDataOnce(credentials, readingPageUrl)
+            // The gate rate-limits heavy use (several chapters read back to
+            // back) with short 403/429 windows. The old single 900 ms retry
+            // gave up while the window was still open — the WHOLE chapter
+            // silently rendered raw ("after ~5 chapters the OCR disappears,
+            // the next chapter is fine again"). Escalating gaps ride out the
+            // short windows right at chapter open; a failure that survives
+            // them hands over to the background self-heal (scheduleOcrHeal)
+            // instead of burning raw pages forever.
+            Thread.sleep(gapMs)
+            result = fetchOcrDataOnce(credentials, readingPageUrl)
+        }
+        return result
     }
 
     private fun fetchOcrDataOnce(credentials: OcrCredentials, readingPageUrl: String): List<OcrPage>? {
@@ -989,6 +972,153 @@ abstract class ManhuaRMTL :
         } catch (_: Exception) {
             null
         }
+    }
+
+    // ============================== OCR self-heal ==============================
+    //
+    // When even the patient in-line schedule cannot get past a gate block,
+    // the chapter is burned RAW into Mihon's page cache (the raw images are
+    // already downloaded and cached under the current fingerprint). The heal
+    // job keeps retrying in the background — re-reading the chapter page for
+    // FRESH credentials each round, because the block can outlive the
+    // credential set parsed at chapter open — and when it finally lands, the
+    // boxes are stored and the page-cache fingerprint epoch bumps, so the
+    // burned chapter is refetched WITH the overlay on its next open instead
+    // of showing raw pages forever.
+
+    private val healScheduler = Executors.newSingleThreadExecutor { runnable ->
+        Thread(runnable, "ManhuaRMTL-OcrHeal").apply { isDaemon = true }
+    }
+
+    // One heal job per chapter even when getPageList re-runs it (re-opens,
+    // restarts) while an earlier job is still retrying.
+    private val healingChapters = ConcurrentHashMap<String, Boolean>()
+
+    private fun scheduleOcrHeal(chapterUrl: String, pages: List<Page>, mode: String) {
+        preferences.edit().putBoolean(PREF_RAW_PENDING, true).apply()
+        if (healingChapters.putIfAbsent(chapterUrl, true) != null) return
+
+        // Captured BEFORE the fingerprint fragments are appended (this runs
+        // inside getPageList, ahead of the fragment pass) — bare URLs are
+        // exactly what the image interceptor looks up after stripping "#ocrv=".
+        val imageUrls = pages.mapNotNull { it.imageUrl }
+
+        healScheduler.execute {
+            try {
+                for (attempt in 1..OCR_HEAL_ATTEMPTS) {
+                    Thread.sleep(if (attempt == 1) OCR_HEAL_FIRST_DELAY_MS else OCR_HEAL_RETRY_GAP_MS)
+                    try {
+                        val html = client.newCall(GET(chapterUrl, headers)).execute().use { it.body.string() }
+                        val credentials = parseOcrCredentials(html) ?: continue
+                        val ocrPages = fetchOcrDataOnce(credentials, chapterUrl) ?: continue
+                        if (ocrPages.isEmpty()) break // gate answered: chapter simply has no OCR text
+
+                        val fresh = storeOcrBoxes(imageUrls, ocrPages)
+                        if (fresh.isNotEmpty()) {
+                            if (mode != MODE_EN) prefetchTranslations(fresh.values, mode)
+                            noteOcrLanded()
+                        }
+                        break
+                    } catch (_: Exception) {
+                        // Transient (gate still blocking, page fetch choked) —
+                        // the next spaced attempt takes over.
+                    }
+                }
+            } finally {
+                healingChapters.remove(chapterUrl)
+            }
+        }
+    }
+
+    /**
+     * After raw pages were burned, the FIRST successful OCR landing — this
+     * chapter's heal, or simply the next chapter fetching fine — bumps the
+     * raw-epoch part of the page-cache fingerprint. Every getPageList after
+     * that moment issues fresh page identities, so re-opening the burned
+     * chapter refetches its images (and now finds boxes in [ocrData]) instead
+     * of hitting Mihon's raw disk cache forever. Mirrors the translation
+     * fallback epoch (overlayEpoch), which never fires in English mode — the
+     * mode where raw burns are the only failure there is.
+     */
+    private fun noteOcrLanded() {
+        if (!preferences.getBoolean(PREF_RAW_PENDING, false)) return
+        preferences.edit()
+            .putBoolean(PREF_RAW_PENDING, false)
+            .putInt(PREF_RAW_EPOCH, preferences.getInt(PREF_RAW_EPOCH, 0) + 1)
+            .apply()
+    }
+
+    /**
+     * Queues background pre-translation for a batch of text boxes (shared
+     * futures: the image interceptor awaits the SAME request instead of
+     * issuing its own serial network calls).
+     */
+    private fun prefetchTranslations(boxesByPage: Collection<List<OcrTextBox>>, target: String) {
+        boxesByPage
+            .flatten()
+            .map { it.text }
+            .filter { it.isNotBlank() }
+            .distinct()
+            .forEach { text -> prefetchTranslation(text, target) }
+    }
+
+    /**
+     * Matches OCR pages against image URLs (several filename spellings) and
+     * MERGES the boxes into [ocrData] — images of earlier chapters may still
+     * be in flight (preload/download), so nothing is ever replaced or erased.
+     * Returns the boxes stored THIS call, keyed by image URL (empty when
+     * nothing matched).
+     */
+    private fun storeOcrBoxes(pageUrls: List<String>, ocrPages: List<OcrPage>): Map<String, List<OcrTextBox>> {
+        // Build filename → text boxes map (try multiple key formats for robust matching)
+        val ocrByFilename = mutableMapOf<String, List<OcrTextBox>>()
+        for (ocrPage in ocrPages) {
+            val filename = ocrPage.image ?: continue
+            val rawBoxes = ocrPage.normalisedTexts()
+            if (rawBoxes.isEmpty()) continue
+            // Rendering modes: the SITE renders each OCR entry as its own
+            // overlay box (it cuts text into many small blocks); paragraph
+            // merging is an optional mode.
+            val textBoxes = when (grouping) {
+                GROUP_PARAGRAPH -> groupIntoParagraphs(
+                    rawBoxes.distinctBy { b ->
+                        "${b.text}|${b.box.map { (it * 10).toInt() }}"
+                    },
+                )
+                else -> rawBoxes.distinctBy { b ->
+                    "${b.text}|${b.box.map { (it * 10).toInt() }}"
+                }
+            }
+            if (textBoxes.isNotEmpty()) {
+                // Store under original name AND URL-decoded name
+                ocrByFilename[filename] = textBoxes
+                ocrByFilename[filename.replace("%20", " ")] = textBoxes
+                ocrByFilename[filename.replace(" ", "_")] = textBoxes
+            }
+        }
+
+        val now = System.currentTimeMillis()
+        val fresh = mutableMapOf<String, List<OcrTextBox>>()
+        for (imageUrl in pageUrls) {
+            // Strip leading spaces (site has src=" https://..."), get filename, strip query
+            val filename = imageUrl.trim().substringAfterLast("/").substringBefore("?")
+            // Also try URL-decoded version — decode is guarded: a stray '%'
+            // in a filename used to throw and kill the WHOLE chapter's
+            // matching via the outer catch (one more silent-raw source).
+            val decodedFilename = runCatching { java.net.URLDecoder.decode(filename, "UTF-8") }
+                .getOrDefault(filename)
+
+            val textBoxes = ocrByFilename[filename]
+                ?: ocrByFilename[decodedFilename]
+                ?: ocrByFilename[decodedFilename.replace(" ", "_")]
+            if (textBoxes != null && textBoxes.isNotEmpty()) {
+                val key = imageUrl.trim()
+                ocrData[key] = OcrEntry(textBoxes, now)
+                fresh[key] = textBoxes
+            }
+        }
+        if (fresh.isNotEmpty()) persistOcr(fresh)
+        return fresh
     }
 
     // ============================== OCR box storage ==============================
@@ -1787,6 +1917,20 @@ abstract class ManhuaRMTL :
         private const val TRANSLATE_RENDER_WAIT_MS = 6000L
         private const val PREF_FALLBACK_DIRTY = "pref_ocr_fallback_dirty"
         private const val PREF_RENDER_EPOCH = "pref_ocr_render_epoch"
+        private const val PREF_RAW_PENDING = "pref_ocr_raw_pending"
+        private const val PREF_RAW_EPOCH = "pref_ocr_raw_epoch"
+
+        // In-line gate patience: 4 attempts with escalating gaps (~12 s total
+        // including request time — invisible while the gate is healthy, the
+        // first attempt answers immediately).
+        private val OCR_FETCH_RETRY_GAPS_MS = longArrayOf(1_200L, 2_500L, 5_000L)
+
+        // Background self-heal patience: first attempt after 20 s, then every
+        // 30 s — roughly 4 minutes of riding out a rate-limit window.
+        private const val OCR_HEAL_ATTEMPTS = 8
+        private const val OCR_HEAL_FIRST_DELAY_MS = 20_000L
+        private const val OCR_HEAL_RETRY_GAP_MS = 30_000L
+
         private const val OCR_MEMORY_TTL_MS = 90 * 60_000L
         private const val OCR_DISK_TTL_MS = 24 * 60 * 60_000L
         private const val OCR_DISK_MAX_ENTRIES = 160
