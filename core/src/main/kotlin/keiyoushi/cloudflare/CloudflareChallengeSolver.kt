@@ -14,9 +14,11 @@ import okhttp3.Call
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
+import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.time.Duration.Companion.milliseconds
@@ -94,6 +96,22 @@ import kotlin.time.Duration.Companion.seconds
  *     manual WebView the user is pushed to is focused and visible, so it
  *     always passed). The WebView now takes real view focus on attach, and
  *     the wipe deletes every attribute variant of the cookie.
+ *
+ *  9. v35 (bypass-tool research round — FlareSolverr, CF-Clearance-Scraper,
+ *     Pydoll, NoCaptcha AI + Cloudflare's own docs): (a) the verify pass is
+ *     PRECEDED by a cheap XmlHTTP-shaped probe — GET site root with the
+ *     current clearance set as an explicit Cookie header on a bare client —
+ *     so a healthy session confirms with one small request instead of a 60 s
+ *     WebView load, and XmlHTTP traffic earns Cloudflare's documented +1 h
+ *     validation grace, which is what keeps a long reading session past the
+ *     default 30-min Challenge Passage from ever surfacing a challenge;
+ *     (b) the warmup threshold drops 45 → 25 min to sit UNDER that default
+ *     TTL (v33's 45 min straddled a 30-min passage and expired 15 min before
+ *     every verify). Verified live on manhuarmtl.com: a stale cf_clearance
+ *     sent probe-shaped still answers 403 + cf-mitigated: challenge, so a
+ *     dead clearance can never be confirmed healthy; a network-failed probe
+ *     is "inconclusive" and defers to the next request instead of burning a
+ *     WebView round on a dead connection.
  *
  * 429s without a challenge marker are retried with backoff (rate-limit windows).
  */
@@ -393,6 +411,56 @@ class CloudflareSolverInterceptor(
             ?.firstOrNull { it.startsWith(CLEARANCE_COOKIE) }
     }.getOrNull()
 
+    /**
+     * v35: XmlHTTP-shaped clearance probe — GET the site root carrying the
+     * current cf_clearance. Returns:
+     *  - true  → the clearance VALIDATES (record it; no WebView verify needed)
+     *  - false → the answer is a challenge (stale/absent clearance; caller
+     *            re-mints via the WebView verify)
+     *  - null  → transport error (inconclusive; caller skips this round —
+     *            burning a WebView solve on a dead connection helps nobody)
+     *
+     * The probe rides a bare cookie-less OkHttpClient with the clearance set
+     * as an explicit Cookie header, so neither an app-level Cloudflare
+     * interceptor nor this interceptor itself can react to (or wipe anything
+     * over) the probe's own response. XmlHTTP-shaped requests also earn
+     * Cloudflare's documented +1 h validation grace on the clearance — the
+     * cheap way to keep a multi-hour session past the 30-min Challenge
+     * Passage without a single visible solve.
+     */
+    private fun probeClearanceByXmlHttp(host: String, scheme: String, userAgent: String): Boolean? {
+        val cookie = currentClearance(host, scheme)
+        if (cookie.isNullOrEmpty()) return false
+
+        return try {
+            probeClient.newCall(
+                Request.Builder()
+                    .url("$scheme://$host/")
+                    .header("User-Agent", userAgent)
+                    .header("Cookie", cookie)
+                    .header("X-Requested-With", "XMLHttpRequest")
+                    .header("Accept", "*/*")
+                    .header("Accept-Language", "en-US,en;q=0.9")
+                    .header("Sec-Fetch-Dest", "empty")
+                    .header("Sec-Fetch-Mode", "cors")
+                    .header("Sec-Fetch-Site", "same-origin")
+                    .build(),
+            ).execute().use { response ->
+                response.isSuccessful && !response.isCloudflareChallenge()
+            }
+        } catch (_: Exception) {
+            null
+        }
+    }
+
+    /** Bare client for the XmlHTTP clearance probe (never solves, never wipes). */
+    private val probeClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(10, TimeUnit.SECONDS)
+            .readTimeout(15, TimeUnit.SECONDS)
+            .build()
+    }
+
     // ------------------------------------------------------------------
     // Self-heal (v26): silent clearance verification
     // ------------------------------------------------------------------
@@ -419,6 +487,20 @@ class CloudflareSolverInterceptor(
             return
         }
         if (System.currentTimeMillis() - solvedAt < WARMUP_AFTER_MS) return
+
+        // v35: cheap XmlHTTP probe first. Healthy clearance → confirmed with
+        // one small request (and CF's +1 h XmlHTTP validation grace earned);
+        // challenged clearance → fall through to the WebView verify; network
+        // error → inconclusive, skip this round (the next request re-probes).
+        when (probeClearanceByXmlHttp(host, scheme, request.header("User-Agent") ?: FALLBACK_UA)) {
+            true -> {
+                recordSolveAt(host)
+                lastSolveAt = System.currentTimeMillis()
+                return
+            }
+            null -> return
+            false -> Unit
+        }
 
         solveLock.withLock {
             // Re-check inside the lock — a parallel thread may have warmed up.
@@ -601,14 +683,16 @@ class CloudflareSolverInterceptor(
         val SOLVE_TIMEOUT = 60.seconds
 
         /**
-         * Clearances older than this get a silent verify pass. Users measure
-         * the manhuarmtl.com clearance TTL at ~1 h today (Cloudflare lets
-         * site owners tune it; it once measured a year). The threshold must
-         * sit UNDER the real TTL — at 3.5 h the verify pass never fired
-         * before a 1 h expiry, so every session past an hour opened with a
-         * hard challenge instead of a silent re-mint.
+         * Clearances older than this get a silent verify pass. Cloudflare's
+         * Challenge Passage defaults to 30 min (site-tunable; users measure
+         * ~1 h on manhuarmtl.com today, 365 d once). The threshold must sit
+         * UNDER the real TTL — at 3.5 h the verify never fired before a 1 h
+         * expiry, and at 45 min it straddles the 30-min default, so a
+         * 30-min-passage session expired 15 min BEFORE every verify. 25 min
+         * stays under both; the v35 XmlHTTP probe makes each pass cheap
+         * enough to afford the tighter cadence.
          */
-        val WARMUP_AFTER_MS = 45.minutes.inWholeMilliseconds
+        val WARMUP_AFTER_MS = 25.minutes.inWholeMilliseconds
 
         /** A clearance minted/confirmed within this window survives a solve (transient blip). */
         val SOLVE_FRESH_MS = 15.minutes.inWholeMilliseconds

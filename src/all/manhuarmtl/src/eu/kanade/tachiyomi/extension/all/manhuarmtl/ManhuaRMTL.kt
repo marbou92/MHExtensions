@@ -814,9 +814,19 @@ abstract class ManhuaRMTL :
                             }
                         }
                     }
+                } else {
+                    // v35: no vault in the served page — most likely a stale
+                    // page-cache render whose credentials were stripped or
+                    // expired. The heal's cache-busted re-reads mint fresh
+                    // ones; without this the chapter burned raw with NO
+                    // recovery path at all.
+                    scheduleOcrHeal(chapterUrl, pages, mode)
                 }
             } catch (_: Exception) {
-                // Fall back to raw images silently
+                // v35: an unexpected throw used to skip BOTH the overlay and
+                // every recovery path silently — schedule the heal so the
+                // background ladder still gets its chance.
+                scheduleOcrHeal(chapterUrl, pages, mode)
             }
         }
 
@@ -891,6 +901,7 @@ abstract class ManhuaRMTL :
      */
     private fun fetchOcrData(credentials: OcrCredentials, readingPageUrl: String): List<OcrPage>? {
         var result = fetchOcrDataOnce(credentials, readingPageUrl)
+        var creds = credentials
         for (gapMs in OCR_FETCH_RETRY_GAPS_MS) {
             if (result != null) return result
 
@@ -903,9 +914,36 @@ abstract class ManhuaRMTL :
             // them hands over to the background self-heal (scheduleOcrHeal)
             // instead of burning raw pages forever.
             Thread.sleep(gapMs)
-            result = fetchOcrDataOnce(credentials, readingPageUrl)
+
+            // v35 (the "first chapter of a session has no OCR" report): every
+            // retry rides FRESH credentials from a cache-busted re-read of the
+            // chapter page. The gate binds its blocks to the presented
+            // credential set, so replaying the SAME vault — what the v34
+            // ladder did — can never recover from a per-credential block or a
+            // stale page-cache vault; a fresh render mints a new vault. The
+            // re-read goes through the MAIN client, so a challenge on it is
+            // auto-solved by the core solver before the next gate attempt.
+            refreshOcrCredentials(readingPageUrl)?.let { creds = it }
+            result = fetchOcrDataOnce(creds, readingPageUrl)
         }
         return result
+    }
+
+    /**
+     * Re-reads the chapter page for a FRESH _0xvault credential set, with a
+     * throwaway query parameter so neither Cloudflare's cache nor the site's
+     * own page cache can answer with the (possibly blocked or expired) vault
+     * from the original load. Returns null when the page can't be fetched or
+     * parsed; callers keep their previous credentials in that case.
+     */
+    private fun refreshOcrCredentials(chapterUrl: String): OcrCredentials? = try {
+        val busted = chapterUrl.toHttpUrl().newBuilder()
+            .addQueryParameter("ocrts", System.currentTimeMillis().toString())
+            .build()
+        val html = client.newCall(GET(busted.toString(), headers)).execute().use { it.body.string() }
+        parseOcrCredentials(html)
+    } catch (_: Exception) {
+        null
     }
 
     private fun fetchOcrDataOnce(credentials: OcrCredentials, readingPageUrl: String): List<OcrPage>? {
@@ -940,6 +978,7 @@ abstract class ManhuaRMTL :
         return try {
             val response = auxClient.newCall(request).execute()
             val body = response.body.string()
+            val cfMitigated = response.header("cf-mitigated")
             response.close()
 
             if (body.isNullOrBlank()) return null
@@ -947,8 +986,12 @@ abstract class ManhuaRMTL :
             // Detect Cloudflare challenge / block pages. These are NOT
             // solvable here (and must never touch the cookie store — the aux
             // client ships without Cloudflare interceptors for exactly that
-            // reason); report "no data" and let the next load retry.
+            // reason); report "no data" and let the retry ladder (fresh
+            // credentials via the main client's solver) recover. v35: the
+            // cf-mitigated response HEADER is checked too — it is Cloudflare's
+            // documented reliable marker and is invisible to a body-only scan.
             if (
+                cfMitigated?.contains("challenge", ignoreCase = true) == true ||
                 body.contains("Just a moment") ||
                 body.contains("cf-challenge") ||
                 body.contains("cf-mitigated") ||
@@ -1005,11 +1048,16 @@ abstract class ManhuaRMTL :
 
         healScheduler.execute {
             try {
-                for (attempt in 1..OCR_HEAL_ATTEMPTS) {
-                    Thread.sleep(if (attempt == 1) OCR_HEAL_FIRST_DELAY_MS else OCR_HEAL_RETRY_GAP_MS)
+                for (gapMs in OCR_HEAL_GAPS_MS) {
+                    Thread.sleep(gapMs)
                     try {
-                        val html = client.newCall(GET(chapterUrl, headers)).execute().use { it.body.string() }
-                        val credentials = parseOcrCredentials(html) ?: continue
+                        // v35: fresh credentials EVERY round, from a
+                        // cache-busted page re-read — the plain re-read used
+                        // to hit the cached page and replay the same blocked
+                        // vault until the ~4 min heal ran out, while the
+                        // block window outlived it (the un-healed "first
+                        // chapter of a session").
+                        val credentials = refreshOcrCredentials(chapterUrl) ?: continue
                         val ocrPages = fetchOcrDataOnce(credentials, chapterUrl) ?: continue
                         if (ocrPages.isEmpty()) break // gate answered: chapter simply has no OCR text
 
@@ -1920,16 +1968,19 @@ abstract class ManhuaRMTL :
         private const val PREF_RAW_PENDING = "pref_ocr_raw_pending"
         private const val PREF_RAW_EPOCH = "pref_ocr_raw_epoch"
 
-        // In-line gate patience: 4 attempts with escalating gaps (~12 s total
-        // including request time — invisible while the gate is healthy, the
-        // first attempt answers immediately).
+        // In-line gate patience: 4 attempts with escalating gaps (~12 s of
+        // waiting — invisible while the gate is healthy, the first attempt
+        // answers immediately). Every retry rides FRESH credentials from a
+        // cache-busted chapter re-read (v35).
         private val OCR_FETCH_RETRY_GAPS_MS = longArrayOf(1_200L, 2_500L, 5_000L)
 
-        // Background self-heal patience: first attempt after 20 s, then every
-        // 30 s — roughly 4 minutes of riding out a rate-limit window.
-        private const val OCR_HEAL_ATTEMPTS = 8
-        private const val OCR_HEAL_FIRST_DELAY_MS = 20_000L
-        private const val OCR_HEAL_RETRY_GAP_MS = 30_000L
+        // Background self-heal patience (v35): ~12.75 min of escalating gaps.
+        // The old 8 × 30 s (~4 min) window regularly closed before the gate's
+        // block did — and a block window outlives the app restart that makes
+        // the user's FIRST chapter of a session the raw one.
+        private val OCR_HEAL_GAPS_MS = longArrayOf(
+            20_000L, 30_000L, 45_000L, 60_000L, 90_000L, 90_000L, 120_000L, 120_000L, 180_000L,
+        )
 
         private const val OCR_MEMORY_TTL_MS = 90 * 60_000L
         private const val OCR_DISK_TTL_MS = 24 * 60 * 60_000L
