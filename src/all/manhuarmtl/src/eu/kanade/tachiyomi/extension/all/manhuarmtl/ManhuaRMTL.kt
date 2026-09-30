@@ -86,8 +86,11 @@ abstract class ManhuaRMTL :
             .readTimeout(12, TimeUnit.SECONDS)
             .writeTimeout(8, TimeUnit.SECONDS)
             .apply {
-                val cf = interceptors().filter { it.javaClass.simpleName == "CloudflareInterceptor" }
-                interceptors().removeAll(cf)
+                // Name-prefix match (v33): some Mihon forks rename their
+                // app-level interceptor (CloudflareInterceptorV2 etc.) — the
+                // exact-name filter silently missed those and left the
+                // cookie-wiping app interceptor in the chain.
+                interceptors().removeAll { it.javaClass.simpleName.contains("Cloudflare", ignoreCase = true) }
             }
             .build()
     }
@@ -115,8 +118,19 @@ abstract class ManhuaRMTL :
         // interactive-Turnstile tap mode, and (with the core round-1 no-wipe
         // change) it never destroys a valid clearance on a transient
         // challenge — a failed request just retries on the next load.
-        val appCloudflare = interceptors().filter { it.javaClass.simpleName == "CloudflareInterceptor" }
-        interceptors().removeAll(appCloudflare)
+        //
+        // v33: the app interceptor removal now matches ANY Cloudflare-named
+        // interceptor (forks rename it), and the core solver got the real
+        // fixes for the persistent "502 → open in WebView at startup and
+        // every ~1 h" report: the pre-solve clearance wipe actually works
+        // now (it was a silent no-op against CF's Domain cookies), the
+        // solving WebView takes REAL view focus (an unfocused challenge
+        // iframe stalls like a background tab — the manual WebView always
+        // passed because it was focused), solves load the site root (the
+        // exact URL the manual WebView opens), and the self-heal verify pass
+        // re-mints at 45 min — UNDER the user-measured ~1 h clearance TTL,
+        // so expiry is refreshed before it can interrupt a reading session.
+        interceptors().removeAll { it.javaClass.simpleName.contains("Cloudflare", ignoreCase = true) }
         //
         // Kept from the 2026-09 audit: OriginSanitizer strips the "Origin:
         // <baseUrl>" header KeiSource stamps onto every request — real

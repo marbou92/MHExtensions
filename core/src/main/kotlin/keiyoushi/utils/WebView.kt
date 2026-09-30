@@ -466,6 +466,17 @@ private fun findForegroundActivityReflective(): Activity? = runCatching {
  * sight — Chromium marks the page visible, the widget actually renders, and
  * the non-interactive branch auto-solves exactly like a real browser.
  *
+ * WHY THE WEBVIEW ALSO TAKES REAL VIEW FOCUS (v33): Chromium derives the web
+ * document's focus state from the WebView VIEW's focus — and the DOM-level
+ * `document.hasFocus()` patch below never reaches the CROSS-ORIGIN challenge
+ * iframe, where Cloudflare's managed challenge actually runs. An attached but
+ * unfocused WebView therefore stalls the challenge inside that iframe exactly
+ * like a background tab does, while the manual WebView screen the user gets
+ * pushed to is focused and always passes. `requestFocus()` flips AwContents'
+ * focus state for real; the IsolatingContainer still swallows all touches,
+ * and its `requestChildFocus` no-op keeps the app's own key-event routing
+ * intact — only the web contents' focus bit changes.
+ *
  * Returns an [AutoCloseable] that removes the WebView again, or null when no
  * usable activity was found (the WebView then stays unattached — the old
  * behavior — and only the DOM-level VISIBILITY_PATCH_JS applies).
@@ -475,8 +486,8 @@ private fun attachOffscreen(webView: WebView): AutoCloseable? = runCatching {
     val decor = activity.window?.decorView as? ViewGroup ?: return null
     val metrics = Resources.getSystem().displayMetrics
 
-    webView.isFocusable = false
-    webView.isFocusableInTouchMode = false
+    webView.isFocusable = true
+    webView.isFocusableInTouchMode = true
     webView.importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO
 
     val container = IsolatingContainer(webView.context).apply {
@@ -492,6 +503,14 @@ private fun attachOffscreen(webView: WebView): AutoCloseable? = runCatching {
         0,
         ViewGroup.LayoutParams(metrics.widthPixels, metrics.heightPixels),
     )
+
+    // Request focus immediately AND once attached/laid out — the first
+    // request on a just-added view can be dropped before the first
+    // traversal delivers it to the window.
+    webView.requestFocus()
+    webView.post {
+        if (webView.isAttachedToWindow) webView.requestFocus()
+    }
 
     AutoCloseable { runCatching { decor.removeView(container) } }
 }.getOrNull()

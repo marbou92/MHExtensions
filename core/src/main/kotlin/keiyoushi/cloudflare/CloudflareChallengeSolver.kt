@@ -19,8 +19,8 @@ import okhttp3.Response
 import java.io.IOException
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
-import kotlin.time.Duration.Companion.hours
 import kotlin.time.Duration.Companion.milliseconds
+import kotlin.time.Duration.Companion.minutes
 import kotlin.time.Duration.Companion.seconds
 
 /*
@@ -70,16 +70,30 @@ import kotlin.time.Duration.Companion.seconds
  *  6. Last resort: hands the challenge response back so the app-level
  *     CloudflareInterceptor (or a manual "Open in WebView") can still solve it.
  *
- *  7. SELF-HEALING (v26): sites rotate their clearance lifetimes (measured:
- *     365 d once, but users report a few hours on kagane.to/manhuarmtl.com
- *     today — Cloudflare lets site owners tune it). The interceptor therefore
- *     persists the time of the last successful solve per host and, when the
- *     first request of a session carries a clearance OLDER than ~3.5 h, runs
- *     a SILENT VERIFY pass: the site root loads in the window-attached
- *     WebView; if a challenge appears it is solved (same as below), if the
- *     page loads clean the existing clearance was still valid. Either way the
- *     user never sees an error — the "come back after 5 hours, open WebView"
- *     loop becomes a 5-15 s transparent pause on the first request.
+ *  7. SELF-HEALING (v26, re-tuned v33): sites tune their clearance lifetime —
+ *     users measure ~1 h on manhuarmtl.com today (365 d once). The interceptor
+ *     persists the time of the last confirmed-working clearance per host and,
+ *     when a request carries a clearance OLDER than 45 min, runs a SILENT
+ *     VERIFY pass: the site root loads in the window-attached WebView; if a
+ *     challenge appears it is solved (same as below), if the page loads clean
+ *     the existing clearance was still valid. The threshold now sits UNDER
+ *     the measured ~1 h TTL so expiry is re-minted before it can bite, and a
+ *     failed verify backs off instead of re-running on every request.
+ *
+ *  8. WHY THE HIDDEN SOLVE USED TO LOSE TO THE MANUAL WEBVIEW (v33 findings,
+ *     after "startup = endless load → 502 → enter webview; every ~1 h the
+ *     same"): (a) the pre-solve cookie wipe was a SILENT NO-OP — CF sets
+ *     cf_clearance with a Domain attribute, and Android's CookieManager only
+ *     removes the exact cookie variant a setCookie call describes, so the
+ *     attribute-less expired cookie written by the wipe never matched the
+ *     domain cookie and every round solved on the STALE clearance; (b) the
+ *     attached-but-unfocused WebView never had real web-document focus —
+ *     Chromium derives document.hasFocus() from the VIEW's focus, the DOM
+ *     patch does not reach the cross-origin challenge iframe, and an
+ *     unfocused challenge iframe stalls exactly like a background tab (the
+ *     manual WebView the user is pushed to is focused and visible, so it
+ *     always passed). The WebView now takes real view focus on attach, and
+ *     the wipe deletes every attribute variant of the cookie.
  *
  * 429s without a challenge marker are retried with backoff (rate-limit windows).
  */
@@ -154,7 +168,7 @@ class CloudflareSolverInterceptor(
         // Background-triggered fetches (library updates, downloads) therefore
         // skip BOTH the self-heal and the challenge solve: without the gate a
         // background challenge would wipe a still-valid clearance and spin
-        // 3 × 75 s for nothing before failing. The next foreground request
+        // 2 × 60 s for nothing before failing. The next foreground request
         // picks the solve up instead.
         val canSolve = hasForegroundActivity()
 
@@ -197,23 +211,22 @@ class CloudflareSolverInterceptor(
                 var round = 0
                 while (round < SOLVE_ROUNDS) {
                     round++
-                    // Round 1 KEEPS the existing clearance: a transient/edge
-                    // challenge (a rate-limit blip, a per-CDN rule) must not
-                    // destroy a still-valid cookie — wiping it first converted
-                    // working sessions into full re-solve loops (the reported
-                    // "CF issue is still there"). The VERIFY pass proves a
-                    // solve works without wiping; from round 2 on (the
-                    // previous round's solve+retry already failed) the wipe
-                    // is the fresh-cookie-state attempt it always was.
-                    if (round > 1) clearStaleClearance(request1.url)
+                    // Wipe the old clearance before the solve UNLESS it is
+                    // fresh. An EXPIRED clearance must not ride into the
+                    // solve (it feeds CF's bot score, and the manual WebView
+                    // the user gets pushed to never carries one), but a
+                    // challenge against a minutes-old clearance is a
+                    // transient/edge blip whose cookie is almost certainly
+                    // still valid — wiping that one would self-harm.
+                    if (!isClearanceFresh(request1.url)) clearStaleClearance(request1.url)
                     solveInWebView(request1, chain.call())
                     lastSolveAt = System.currentTimeMillis()
 
                     response = chain.proceed(request1)
                     if (!response.isCloudflareChallenge()) {
-                        // The solve produced a working clearance — remember
-                        // WHEN, or the self-heal would fire a pointless verify
-                        // pass 3.5 h after this moment on every later session.
+                        // The retry worked — the clearance is proven working
+                        // NOW. Remember when, or the self-heal would fire a
+                        // pointless verify pass on every later request.
                         recordSolveAt(request1.url.host)
                         return@withLock
                     }
@@ -242,15 +255,28 @@ class CloudflareSolverInterceptor(
     // Headless solve
     // ------------------------------------------------------------------
 
+    /**
+     * Runs one solve round. Returns true when the run RESOLVED — a new
+     * clearance was minted or the page loaded clean (verify mode); false on
+     * timeout/transport/render failure (the caller retries or hands the
+     * challenge response back).
+     */
     @SuppressLint("SetJavaScriptEnabled")
-    private fun solveInWebView(request: Request, call: Call, verifyOnly: Boolean = false) {
+    private fun solveInWebView(request: Request, call: Call, verifyOnly: Boolean = false): Boolean {
         val host = request.url.host
         val scheme = request.url.scheme
         val oldCookie = currentClearance(host, scheme)
-        val loadUrl = if (request.method == "GET") request.url.toString() else "$scheme://$host/"
+        // ALWAYS solve at the origin root — exactly what the manual
+        // "Open in WebView" visit opens, and the one URL guaranteed to render
+        // the challenge page when one is warranted. The challenged deep URL
+        // is frequently a JSON/API endpoint: in a WebView it can answer
+        // UN-challenged (plain data, JSON 403s) — nothing renders, no
+        // clearance is minted, and the whole round burns on a page that never
+        // needed a browser.
+        val loadUrl = "$scheme://$host/"
         val density = Resources.getSystem().displayMetrics.density
 
-        try {
+        return try {
             runWebViewBlocking(call, timeout = SOLVE_TIMEOUT) {
                 // Identity coherence: the WebView must present EXACTLY the UA
                 // the retried request will send (cf_clearance is bound to it).
@@ -343,13 +369,19 @@ class CloudflareSolverInterceptor(
 
                 loadUrl(loadUrl)
             }
+            // runWebViewBlocking only returns normally on resolve() — a new
+            // clearance or a clean page.
+            true
         } catch (_: InteractiveChallengeException) {
             // Unsolvable headless — the retry below hands the challenge
             // response back to the app-level flow.
+            false
         } catch (_: IOException) {
             // Canceled call or transport failure — same fallback.
+            false
         } catch (_: Exception) {
             // Timeout / render-process death — same fallback.
+            false
         }
     }
 
@@ -395,13 +427,25 @@ class CloudflareSolverInterceptor(
             // Re-check the activity inside the lock — the app could have been
             // backgrounded since canSolve was sampled.
             if (!hasForegroundActivity()) return
+            // A verify that recently FAILED (site down, solve stalled) backs
+            // off — otherwise every page request would burn a full solve
+            // round trip on a clearance we already know we can't refresh.
+            val lastFail = verifyFailAt(host)
+            if (lastFail != 0L && System.currentTimeMillis() - lastFail < VERIFY_FAIL_BACKOFF_MS) return
 
             // Verify-only: never wipe the cookie first (if the clearance is
             // still valid, wiping it would CONVERT a working session into a
             // challenge for no reason).
-            solveInWebView(request, call, verifyOnly = true)
-            recordSolveAt(host)
-            lastSolveAt = System.currentTimeMillis()
+            val ok = solveInWebView(request, call, verifyOnly = true)
+            if (ok) {
+                recordSolveAt(host)
+                lastSolveAt = System.currentTimeMillis()
+            } else {
+                // NOT recorded as solved — the next request re-verifies after
+                // the backoff window instead of trusting a clearance we could
+                // not confirm.
+                recordVerifyFail(host)
+            }
         }
     }
 
@@ -415,19 +459,63 @@ class CloudflareSolverInterceptor(
         }
     }
 
+    private fun verifyFailAt(host: String): Long = runCatching {
+        solveStore().getLong("verify_fail_$host", 0L)
+    }.getOrDefault(0L)
+
+    private fun recordVerifyFail(host: String) {
+        runCatching {
+            solveStore().edit().putLong("verify_fail_$host", System.currentTimeMillis()).apply()
+        }
+    }
+
+    /**
+     * True when the existing clearance was minted or last CONFIRMED working
+     * within [SOLVE_FRESH_MS] — a challenge against a clearance this fresh is
+     * a transient/edge blip, and the cookie must survive the solve. An old or
+     * history-less clearance is treated as stale (wipe before solving).
+     */
+    private fun isClearanceFresh(url: HttpUrl): Boolean {
+        if (currentClearance(url.host, url.scheme) == null) return false
+        val solvedAt = persistedSolveAt(url.host)
+        return solvedAt != 0L && System.currentTimeMillis() - solvedAt < SOLVE_FRESH_MS
+    }
+
     /** Tiny app-level prefs file shared by every source's solver instance. */
     private fun solveStore() = applicationContext
         .getSharedPreferences("keiyoushi_cf_solver", Context.MODE_PRIVATE)
 
     private fun keyFor(host: String) = "last_solve_$host"
 
-    /** Deletes the stale clearance cookie so the solve mints a fresh one. */
+    /**
+     * Deletes the stale clearance cookie so the solve mints a fresh one.
+     *
+     * The pre-v33 version was a SILENT NO-OP for exactly the cookies that
+     * matter: Cloudflare sets cf_clearance with a Domain attribute, and
+     * Android's CookieManager only removes the cookie variant a setCookie
+     * call literally describes — an attribute-less expired cookie is
+     * HOST-ONLY, which never matches the domain cookie, so the real
+     * clearance survived every wipe and every "fresh cookie state" round ran
+     * on the stale one. Delete ALL realistic attribute variants instead.
+     */
     private fun clearStaleClearance(url: HttpUrl) {
         runCatching {
-            CookieManager.getInstance().setCookie(
-                url.toString(),
-                "$CLEARANCE_COOKIE=; Path=/; Max-Age=0",
-            )
+            val host = url.host
+            val labels = host.split('.')
+            val apex = if (labels.size >= 2) labels.takeLast(2).joinToString(".") else host
+            val expired = "$CLEARANCE_COOKIE=; Path=/; Max-Age=0"
+            val variants = buildList {
+                add(expired) // host-only
+                add("$CLEARANCE_COOKIE=; Path=/; Domain=$host; Max-Age=0")
+                add("$CLEARANCE_COOKIE=; Path=/; Domain=.$host; Max-Age=0")
+                if (apex != host) {
+                    add("$CLEARANCE_COOKIE=; Path=/; Domain=$apex; Max-Age=0")
+                    add("$CLEARANCE_COOKIE=; Path=/; Domain=.$apex; Max-Age=0")
+                }
+            }
+            for (cookie in variants) {
+                CookieManager.getInstance().setCookie(url.toString(), cookie)
+            }
         }
     }
 
@@ -507,23 +595,32 @@ class CloudflareSolverInterceptor(
     }
 
     private companion object {
-        // 75s: interactive Turnstile has to render, run and pass — and with
-        // the window-attached WebView that now actually happens. 45s cut
-        // real solves off mid-run.
-        val SOLVE_TIMEOUT = 75.seconds
+        // 60s: with real web-document focus (v33) the challenge iframe no
+        // longer stalls, so completes are fast; 60 s still covers the full
+        // interactive tap sequence (6 s wait + 12 taps × 2 s) with margin.
+        val SOLVE_TIMEOUT = 60.seconds
 
         /**
-         * Clearances older than this get a silent verify pass on the first
-         * request of a session. Users reported needing a manual WebView after
-         * ~5 h away, so 3.5 h re-mints/validates BEFORE expiry can bite.
+         * Clearances older than this get a silent verify pass. Users measure
+         * the manhuarmtl.com clearance TTL at ~1 h today (Cloudflare lets
+         * site owners tune it; it once measured a year). The threshold must
+         * sit UNDER the real TTL — at 3.5 h the verify pass never fired
+         * before a 1 h expiry, so every session past an hour opened with a
+         * hard challenge instead of a silent re-mint.
          */
-        val WARMUP_AFTER_MS = 3.5.hours.inWholeMilliseconds
+        val WARMUP_AFTER_MS = 45.minutes.inWholeMilliseconds
+
+        /** A clearance minted/confirmed within this window survives a solve (transient blip). */
+        val SOLVE_FRESH_MS = 15.minutes.inWholeMilliseconds
+
+        /** After a FAILED verify, wait this long before the next attempt. */
+        val VERIFY_FAIL_BACKOFF_MS = 5.minutes.inWholeMilliseconds
 
         /** Queued requests within this window after a solve skip re-solving. */
         const val SOLVE_DEDUPE_MS = 20_000L
 
         /** Solve rounds per challenge before handing it to the app flow. */
-        const val SOLVE_ROUNDS = 3
+        const val SOLVE_ROUNDS = 2
 
         /** Start probing for the widget after this many ms even without an interactive signal. */
         const val TAP_AFTER_MS = 6_000L
