@@ -23,6 +23,7 @@ import eu.kanade.tachiyomi.source.model.Page
 import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverDiagnostics
 import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.get
 import keiyoushi.utils.applicationContext
@@ -1925,6 +1926,30 @@ abstract class ManhuaRMTL :
             entries = arrayOf("Don't show", "Top of description", "End of description")
             entryValues = arrayOf("none", "top", "end")
             setDefaultValue("end")
+        }.let(screen::addPreference)
+
+        // v36: solver field diagnostics. The hidden challenge solve runs
+        // without any visible surface, so a "still broken" report used to be
+        // pure guesswork. Everything the Cloudflare solver does now lands in
+        // a rolling persisted log; tapping opens it as selectable text
+        // (select-all + copy straight into a bug report). Built as an
+        // EditTextPreference because the lib's compile-time Preference API
+        // exposes no Context constructor.
+        androidx.preference.EditTextPreference(screen.context).apply {
+            key = "pref_cf_diagnostics"
+            title = "Cloudflare solver diagnostics"
+            summary = "Tap to view the recent Cloudflare solver log"
+            text = CloudflareSolverDiagnostics.snapshot().ifEmpty { "No Cloudflare events yet" }
+            setOnBindEditTextListener { editText ->
+                editText.setTextIsSelectable(true)
+                editText.setSingleLine(false)
+            }
+            // Refresh BEFORE the dialog opens (returning false keeps the
+            // default tap behavior instead of swallowing it).
+            setOnPreferenceClickListener {
+                text = CloudflareSolverDiagnostics.snapshot().ifEmpty { "No Cloudflare events yet" }
+                false
+            }
         }.let(screen::addPreference)
     }
 

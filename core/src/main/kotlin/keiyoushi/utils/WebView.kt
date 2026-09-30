@@ -9,6 +9,7 @@ import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
 import android.util.Log
+import android.view.InputDevice
 import android.view.MotionEvent
 import android.view.View
 import android.view.ViewGroup
@@ -37,6 +38,7 @@ import kotlinx.coroutines.withContext
 import kotlinx.coroutines.withTimeout
 import okhttp3.Call
 import java.io.IOException
+import java.util.Random
 import java.util.concurrent.CopyOnWriteArrayList
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.properties.ReadWriteProperty
@@ -241,18 +243,98 @@ class WebViewScope<T> internal constructor(
      * reCAPTCHA checkboxes) that page JavaScript can never click, because the
      * events enter at the platform input layer instead of the DOM. Fire-and-
      * forget: failures are logged, never fatal to the run.
+     *
+     * v36 (Pydoll's humanized-click lesson): a bare instant DOWN→UP pair is a
+     * machine-shaped gesture — Turnstile scores pointer-event timing and
+     * movement, and a robotic tap can be rejected outright. Produce a
+     * realistic touchscreen gesture instead: the finger lands with a little
+     * positional scatter, micro-drifts while pressed, and lifts after
+     * ~95-160 ms, with proper tool type, pressure and touch geometry so the
+     * event stream reads as a real finger. Events are spaced in REAL time
+     * (posted, not back-to-back) with matching eventTime deltas.
      */
     fun dispatchTap(x: Float, y: Float) {
         runOnMain {
             if (destroyed) return@runOnMain
             try {
-                val now = SystemClock.uptimeMillis()
-                val down = MotionEvent.obtain(now, now, MotionEvent.ACTION_DOWN, x, y, 0)
+                val rng = Random()
+                val startX = x + (rng.nextFloat() - 0.5f) * 6f
+                val startY = y + (rng.nextFloat() - 0.5f) * 6f
+                val pressMs = 95L + rng.nextInt(65)
+                val downTime = SystemClock.uptimeMillis()
+
+                fun touchEvent(action: Int, eventTime: Long, px: Float, py: Float): MotionEvent {
+                    val props = arrayOf(
+                        MotionEvent.PointerProperties().apply {
+                            id = 0
+                            toolType = MotionEvent.TOOL_TYPE_FINGER
+                        },
+                    )
+                    val coords = arrayOf(
+                        MotionEvent.PointerCoords().apply {
+                            clear()
+                            this.x = px
+                            this.y = py
+                            pressure = 0.9f + rng.nextFloat() * 0.1f
+                            size = 0.12f + rng.nextFloat() * 0.06f
+                            touchMajor = 14f
+                            touchMinor = 12f
+                        },
+                    )
+                    return MotionEvent.obtain(
+                        downTime,
+                        eventTime,
+                        action,
+                        1,
+                        props,
+                        coords,
+                        0, // metaState
+                        0, // buttonState
+                        1f, // xPrecision
+                        1f, // yPrecision
+                        0, // deviceId
+                        0, // edgeFlags
+                        InputDevice.SOURCE_TOUCHSCREEN,
+                        0, // flags
+                    )
+                }
+
+                val down = touchEvent(MotionEvent.ACTION_DOWN, downTime, startX, startY)
                 webView.dispatchTouchEvent(down)
                 down.recycle()
-                val up = MotionEvent.obtain(now, now + 60, MotionEvent.ACTION_UP, x, y, 0)
-                webView.dispatchTouchEvent(up)
-                up.recycle()
+                // Two micro-drift MOVEs while the finger is down (±1-2 px),
+                // then the lift — dispatched in real time, like a real press.
+                mainHandler.postDelayed({
+                    if (!destroyed) {
+                        val move = touchEvent(
+                            MotionEvent.ACTION_MOVE,
+                            downTime + 35,
+                            startX + (rng.nextFloat() - 0.5f) * 3f,
+                            startY + (rng.nextFloat() - 0.5f) * 3f,
+                        )
+                        webView.dispatchTouchEvent(move)
+                        move.recycle()
+                    }
+                }, 35L)
+                mainHandler.postDelayed({
+                    if (!destroyed) {
+                        val move = touchEvent(
+                            MotionEvent.ACTION_MOVE,
+                            downTime + 70,
+                            startX + (rng.nextFloat() - 0.5f) * 2f,
+                            startY + (rng.nextFloat() - 0.5f) * 2f,
+                        )
+                        webView.dispatchTouchEvent(move)
+                        move.recycle()
+                    }
+                }, 70L)
+                mainHandler.postDelayed({
+                    if (!destroyed) {
+                        val up = touchEvent(MotionEvent.ACTION_UP, downTime + pressMs, startX, startY)
+                        webView.dispatchTouchEvent(up)
+                        up.recycle()
+                    }
+                }, pressMs)
             } catch (t: Throwable) {
                 Log.w("KeiyoushiWebView", "dispatchTap failed", t)
             }

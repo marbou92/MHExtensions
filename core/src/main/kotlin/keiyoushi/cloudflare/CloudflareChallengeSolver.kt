@@ -18,12 +18,14 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import java.io.IOException
+import java.text.SimpleDateFormat
+import java.util.Date
+import java.util.Locale
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.locks.ReentrantLock
 import kotlin.concurrent.withLock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
-import kotlin.time.Duration.Companion.seconds
 
 /*
  * Extension-level Cloudflare managed-challenge solver — the "no manual WebView"
@@ -113,6 +115,25 @@ import kotlin.time.Duration.Companion.seconds
  *     is "inconclusive" and defers to the next request instead of burning a
  *     WebView round on a dead connection.
  *
+ * 10. v36 (the "loads until it says timeout, refresh gives 403 check-webview"
+ *     report): (a) ALL solve work on behalf of ONE call — warmup verify plus
+ *     challenge rounds — now runs under a hard 95 s BUDGET (Mihon kills a call
+ *     at 2 min; the free-running 60 s verify + 2 × 60 s rounds chain got the
+ *     call killed mid-solve with a timeout error, and the user's refresh then
+ *     landed inside the 20 s dedupe window and surfaced a raw 403); (b) after
+ *     a FAILED solve the dedupe window now fast-fails instead of silently
+ *     retrying the same doomed request — the refresh starts a fresh, full-
+ *     budget solve instead; (c) the Turnstile tap is HUMANIZED (Pydoll's
+ *     lesson): a real finger-shaped gesture — tool type, pressure, positional
+ *     scatter, micro-drift while pressed, 95-160 ms hold — instead of an
+ *     instant DOWN/UP pair, with the tap point cycling across the widget's
+ *     left-edge offsets; (d) a round whose widget made no progress past half
+ *     its budget gets ONE reload (FlareSolverr's "second loads clear far more
+ *     often"); (e) Cloudflare WAF blocks (Attention Required / error 1020)
+ *     are handed back UNSOLVED immediately — no WebView visit can clear them,
+ *     and every round spent on one was pure dead air; (f) everything above is
+ *     written to a persisted diagnostics log surfaced in the source settings.
+ *
  * 429s without a challenge marker are retried with backoff (rate-limit windows).
  */
 
@@ -163,6 +184,67 @@ private val CHALLENGE_BODY_MARKERS = listOf(
 /** Thrown when Cloudflare escalates to an interactive challenge (unsolvable headless). */
 class InteractiveChallengeException : IOException("The Cloudflare challenge requires interaction")
 
+/**
+ * Rolling record of what the solver actually did, persisted so it survives
+ * process death (the interesting moments are usually right after a restart).
+ * Surfaced in the source's settings screen ("tap to copy") so a field report
+ * carries evidence instead of guesses — the hidden solve runs without any
+ * visible surface, and on-device behavior is the one thing the sandbox can
+ * never measure.
+ */
+object CloudflareSolverDiagnostics {
+    private const val MAX_LINES = 40
+    private const val PREFS = "keiyoushi_cf_solver"
+    private const val KEY = "diagnostics"
+    private val fmt = SimpleDateFormat("HH:mm:ss", Locale.US)
+
+    @Volatile
+    private var loaded = false
+
+    @Volatile
+    private var lines: String = ""
+
+    fun record(event: String) {
+        ensureLoaded()
+        val stamped = "[${fmt.format(Date())}] $event"
+        synchronized(this) {
+            lines = (lines + "\n" + stamped)
+                .split('\n')
+                .takeLast(MAX_LINES)
+                .joinToString("\n")
+            persist()
+        }
+    }
+
+    private fun ensureLoaded() {
+        if (loaded) return
+        synchronized(this) {
+            if (loaded) return
+            lines = runCatching {
+                applicationContext
+                    .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                    .getString(KEY, "")
+                    .orEmpty()
+            }.getOrDefault("")
+            loaded = true
+        }
+    }
+
+    private fun persist() {
+        runCatching {
+            applicationContext
+                .getSharedPreferences(PREFS, Context.MODE_PRIVATE)
+                .edit()
+                .putString(KEY, lines)
+                .apply()
+        }
+    }
+
+    fun snapshot(): String = synchronized(this) { lines }
+
+    fun lastLine(): String = synchronized(this) { lines.lineSequence().lastOrNull().orEmpty() }
+}
+
 class CloudflareSolverInterceptor(
     /** Hosts (registrable domain + subdomains) this solver handles. */
     private val cookieHosts: Set<String>,
@@ -175,6 +257,10 @@ class CloudflareSolverInterceptor(
     @Volatile
     private var lastSolveAt = 0L
 
+    /** Whether that last solve actually cleared the challenge. */
+    @Volatile
+    private var lastSolveSucceeded = false
+
     override fun intercept(chain: Interceptor.Chain): Response {
         val request = chain.request()
         if (!isProtectedHost(request.url.host)) return chain.proceed(request)
@@ -186,13 +272,19 @@ class CloudflareSolverInterceptor(
         // Background-triggered fetches (library updates, downloads) therefore
         // skip BOTH the self-heal and the challenge solve: without the gate a
         // background challenge would wipe a still-valid clearance and spin
-        // 2 × 60 s for nothing before failing. The next foreground request
-        // picks the solve up instead.
+        // for nothing before failing. The next foreground request picks the
+        // solve up instead.
         val canSolve = hasForegroundActivity()
+
+        // v36: every solve phase on behalf of THIS call — warmup verify plus
+        // challenge rounds — must finish inside the app's call timeout (Mihon:
+        // 2 min) with room for the request round trips. Phases below check the
+        // clock and hand back early instead of letting the app kill the call.
+        val deadline = System.currentTimeMillis() + SOLVE_BUDGET_MS
 
         // Self-heal: a stale-but-present clearance gets a silent verify solve
         // BEFORE the request, so expiry never surfaces as a failed fetch.
-        if (canSolve) maybeWarmUpClearance(request1, chain.call())
+        if (canSolve) maybeWarmUpClearance(request1, chain.call(), deadline)
 
         var response = chain.proceed(request1)
 
@@ -201,13 +293,29 @@ class CloudflareSolverInterceptor(
         while (isRateLimited(response) && attempt < MAX_RATE_LIMIT_RETRIES) {
             attempt++
             response.close()
+            if (System.currentTimeMillis() >= deadline) break
             sleepQuietly(retryAfterMs(response, attempt))
             response = chain.proceed(request1)
+        }
+
+        if (isCloudflareBlock(response)) {
+            // WAF BLOCK (Attention Required / error 1020): no WebView visit
+            // can clear it — every solve round spent here was pure dead air
+            // before the 403 dialog appeared. Hand it back immediately,
+            // clearance untouched (a block is not an expired clearance).
+            CloudflareSolverDiagnostics.record(
+                "BLOCK ${response.code} ${request1.url.host}${request1.url.encodedPath} → handed back unsolved",
+            )
+            return response
         }
 
         if (!response.isCloudflareChallenge()) return response
 
         // ---- Cloudflare challenge: solve headless, then retry. ----
+        CloudflareSolverDiagnostics.record(
+            "CHALLENGE ${response.code} ${request1.url.host}${request1.url.encodedPath} " +
+                "(clearance ${clearanceAgeLabel(request1.url)})",
+        )
         response.close()
 
         if (!canSolve) {
@@ -228,7 +336,21 @@ class CloudflareSolverInterceptor(
                 // automatic round beats handing a WebView prompt to the user.
                 var round = 0
                 while (round < SOLVE_ROUNDS) {
+                    val remaining = deadline - System.currentTimeMillis()
+                    val roundBudget = minOf(ROUND_TIMEOUT_MS, remaining - ROUND_RESERVE_MS)
+                    if (roundBudget < MIN_ROUND_MS) {
+                        // Not enough budget for another full round plus a
+                        // request retry — failing FAST with the challenge is
+                        // strictly better than the app killing the call with
+                        // a timeout (a fast 403 dialog invites a refresh that
+                        // starts with a fresh budget).
+                        CloudflareSolverDiagnostics.record("BUDGET stop after $round round(s), ${remaining}ms left")
+                        break
+                    }
                     round++
+                    // Close the PREVIOUS retry before the next solve (the
+                    // initial challenge response was already closed above).
+                    if (round > 1) response.close()
                     // Wipe the old clearance before the solve UNLESS it is
                     // fresh. An EXPIRED clearance must not ride into the
                     // solve (it feeds CF's bot score, and the manual WebView
@@ -237,23 +359,42 @@ class CloudflareSolverInterceptor(
                     // transient/edge blip whose cookie is almost certainly
                     // still valid — wiping that one would self-harm.
                     if (!isClearanceFresh(request1.url)) clearStaleClearance(request1.url)
-                    solveInWebView(request1, chain.call())
+                    val solved = solveInWebView(request1, chain.call(), round, roundBudget)
                     lastSolveAt = System.currentTimeMillis()
 
                     response = chain.proceed(request1)
+                    if (isCloudflareBlock(response)) {
+                        CloudflareSolverDiagnostics.record("BLOCK after round $round → handed back unsolved")
+                        return@withLock
+                    }
                     if (!response.isCloudflareChallenge()) {
                         // The retry worked — the clearance is proven working
                         // NOW. Remember when, or the self-heal would fire a
                         // pointless verify pass on every later request.
                         recordSolveAt(request1.url.host)
+                        lastSolveAt = System.currentTimeMillis()
+                        lastSolveSucceeded = true
+                        CloudflareSolverDiagnostics.record("ROUND $round SOLVED (retry ${response.code})")
                         return@withLock
                     }
-                    // Keep the LAST response open — it is what we return.
-                    if (round < SOLVE_ROUNDS) response.close()
+                    lastSolveSucceeded = false
+                    CloudflareSolverDiagnostics.record("ROUND $round failed (webview=$solved, retry still challenged)")
                 }
                 return@withLock
             }
-            solvedRecently = true
+            if (lastSolveSucceeded) {
+                // A parallel request solved moments ago — retry on its cookie.
+                solvedRecently = true
+            } else {
+                // A solve FAILED within the dedupe window (its rounds already
+                // burned). Another immediate round cannot win, and retrying
+                // the request on the same cookies just buys the same 403 one
+                // round trip later. Give up fast — the user's refresh starts
+                // a fresh, full-budget solve instead of another silent spin.
+                CloudflareSolverDiagnostics.record("DEDUPE fast-fail (failed solve ${SOLVE_DEDUPE_MS / 1000}s ago)")
+                response = chain.proceed(request1)
+                return@withLock
+            }
         }
 
         if (solvedRecently) {
@@ -264,14 +405,38 @@ class CloudflareSolverInterceptor(
         if (response.isCloudflareChallenge()) {
             // Last resort: let the app-level interceptor (or a manual WebView
             // visit) solve it. Never swallow the response silently.
+            CloudflareSolverDiagnostics.record("HANDOFF challenge to app (${response.code})")
             return response
         }
         return response
     }
 
+    private fun clearanceAgeLabel(url: HttpUrl): String {
+        val solvedAt = persistedSolveAt(url.host)
+        return if (solvedAt == 0L) "none" else "${(System.currentTimeMillis() - solvedAt) / 1000}s old"
+    }
+
     // ------------------------------------------------------------------
     // Headless solve
     // ------------------------------------------------------------------
+
+    /**
+     * Cloudflare WAF BLOCK page ("Attention Required", error 1020):
+     * looks like a challenge in every header scan, but no WebView visit can
+     * clear it — it is an IP/firewall verdict, not a clearance gate. Detected
+     * strictly (both markers) so a rate-limit 403 from the site's own API is
+     * never misread as one; the caller hands it back immediately instead of
+     * burning the whole solve budget on rounds that cannot win.
+     */
+    private fun isCloudflareBlock(response: Response): Boolean {
+        if (response.code != 403) return false
+        if (response.header("server")?.contains("cloudflare", ignoreCase = true) != true) return false
+        val body = runCatching { response.peekBody(4096).string() }.getOrNull().orEmpty()
+        val attention = body.contains("Attention Required", ignoreCase = true)
+        val denied = body.contains("cf-error-details", ignoreCase = true) ||
+            body.contains("error code: 1020", ignoreCase = true)
+        return attention && denied
+    }
 
     /**
      * Runs one solve round. Returns true when the run RESOLVED — a new
@@ -280,7 +445,13 @@ class CloudflareSolverInterceptor(
      * challenge response back).
      */
     @SuppressLint("SetJavaScriptEnabled")
-    private fun solveInWebView(request: Request, call: Call, verifyOnly: Boolean = false): Boolean {
+    private fun solveInWebView(
+        request: Request,
+        call: Call,
+        round: Int,
+        timeoutMs: Long,
+        verifyOnly: Boolean = false,
+    ): Boolean {
         val host = request.url.host
         val scheme = request.url.scheme
         val oldCookie = currentClearance(host, scheme)
@@ -293,9 +464,13 @@ class CloudflareSolverInterceptor(
         // needed a browser.
         val loadUrl = "$scheme://$host/"
         val density = Resources.getSystem().displayMetrics.density
+        val label = if (verifyOnly) "verify" else "round $round"
+        CloudflareSolverDiagnostics.record(
+            "WEBVIEW $label start (${timeoutMs}ms, had-clearance=${oldCookie != null})",
+        )
 
         return try {
-            runWebViewBlocking(call, timeout = SOLVE_TIMEOUT) {
+            runWebViewBlocking(call, timeout = timeoutMs.milliseconds) {
                 // Identity coherence: the WebView must present EXACTLY the UA
                 // the retried request will send (cf_clearance is bound to it).
                 // The setter also spoofs Sec-CH-UA client hints to match.
@@ -305,7 +480,10 @@ class CloudflareSolverInterceptor(
                 // mode so the Turnstile checkbox gets tapped (below).
                 var interactive = false
                 jsBridge(BRIDGE_NAME) { message ->
-                    if (message == "interactive") interactive = true
+                    if (message == "interactive") {
+                        interactive = true
+                        CloudflareSolverDiagnostics.record("WEBVIEW $label interactive challenge — tap mode")
+                    }
                 }
 
                 onPageStarted { _ ->
@@ -325,15 +503,18 @@ class CloudflareSolverInterceptor(
                 var tapAttempts = 0
                 var lastTapAt = 0L
                 var lastCleanCheckAt = 0L
+                var reloaded = false
                 val startedAt = System.currentTimeMillis()
                 poll(500.milliseconds) {
                     val clearance = currentClearance(host, scheme)
                     if (clearance != null && clearance != oldCookie) {
+                        CloudflareSolverDiagnostics.record("WEBVIEW $label cleared — clearance minted")
                         resolve(Unit)
                         return@poll
                     }
 
                     val now = System.currentTimeMillis()
+                    val elapsed = now - startedAt
 
                     // Clean-load probe: check at most twice a second, from the
                     // first finished load. Challenge pages keep rendering the
@@ -342,9 +523,22 @@ class CloudflareSolverInterceptor(
                         lastCleanCheckAt = now
                         evaluateJs(CLEAN_PAGE_JS) { result ->
                             if (result?.contains("clean") == true) {
+                                CloudflareSolverDiagnostics.record("WEBVIEW $label cleared — page clean")
                                 resolve(Unit)
                             }
                         }
+                    }
+
+                    // v36 (FlareSolverr's "second loads clear far more
+                    // often"): a challenge that has made NO progress past
+                    // half the round's budget gets ONE reload — CF re-issues
+                    // the challenge and the fresh load frequently clears where
+                    // the stalled one never would. Round 2+ only: round 1
+                    // keeps the pure first-visit shape.
+                    if (round >= 2 && !reloaded && elapsed > timeoutMs / 2) {
+                        reloaded = true
+                        CloudflareSolverDiagnostics.record("WEBVIEW $label stalled — reloading challenge")
+                        evaluateJs("location.reload()")
                     }
 
                     // Tap the Turnstile checkbox when the challenge is (or
@@ -352,7 +546,7 @@ class CloudflareSolverInterceptor(
                     // cross-origin iframe; the synthetic tap enters at the
                     // platform input layer and reaches it anyway. A few
                     // spaced attempts, then give up for this round.
-                    val shouldTap = interactive || now - startedAt > TAP_AFTER_MS
+                    val shouldTap = interactive || elapsed > TAP_AFTER_MS
                     if (shouldTap && tapAttempts < MAX_TAP_ATTEMPTS && now - lastTapAt >= TAP_SPACING_MS) {
                         lastTapAt = now
                         evaluateJs(WIDGET_RECT_JS) { rectJson ->
@@ -375,11 +569,18 @@ class CloudflareSolverInterceptor(
                                     ?: 65f
                                 // Checkbox sits at the widget's left edge,
                                 // mid-height (Turnstile and reCAPTCHA both).
-                                dispatchTap(
-                                    (x + CHECKBOX_OFFSET_X_DP) * density,
-                                    (y + h / 2f) * density,
-                                )
+                                // v36: cycle across the plausible left-edge
+                                // offsets with a little scatter — widget
+                                // variants place the box differently, and the
+                                // humanized gesture carries its own jitter.
+                                val offsetDp = TAP_OFFSETS_DP[tapAttempts % TAP_OFFSETS_DP.size]
+                                val tapX = (x + offsetDp + (tapAttempts % 3 - 1) * 2f) * density
+                                val tapY = (y + h / 2f + (tapAttempts % 2 - 1) * 3f) * density
+                                dispatchTap(tapX, tapY)
                                 tapAttempts++
+                                if (tapAttempts == 1) {
+                                    CloudflareSolverDiagnostics.record("WEBVIEW $label widget found — tapping")
+                                }
                             }
                         }
                     }
@@ -393,12 +594,15 @@ class CloudflareSolverInterceptor(
         } catch (_: InteractiveChallengeException) {
             // Unsolvable headless — the retry below hands the challenge
             // response back to the app-level flow.
+            CloudflareSolverDiagnostics.record("WEBVIEW $label interactive-only → aborted")
             false
         } catch (_: IOException) {
             // Canceled call or transport failure — same fallback.
+            CloudflareSolverDiagnostics.record("WEBVIEW $label canceled/transport error")
             false
         } catch (_: Exception) {
             // Timeout / render-process death — same fallback.
+            CloudflareSolverDiagnostics.record("WEBVIEW $label timeout/render failure")
             false
         }
     }
@@ -472,7 +676,7 @@ class CloudflareSolverInterceptor(
      * clearance or confirms the old one still works; the request then just
      * proceeds. Single-flight via the same solve lock as real challenges.
      */
-    private fun maybeWarmUpClearance(request: Request, call: Call) {
+    private fun maybeWarmUpClearance(request: Request, call: Call, deadline: Long) {
         val host = request.url.host
         val scheme = request.url.scheme
 
@@ -494,12 +698,26 @@ class CloudflareSolverInterceptor(
         // error → inconclusive, skip this round (the next request re-probes).
         when (probeClearanceByXmlHttp(host, scheme, request.header("User-Agent") ?: FALLBACK_UA)) {
             true -> {
+                CloudflareSolverDiagnostics.record("PROBE healthy — session confirmed")
                 recordSolveAt(host)
                 lastSolveAt = System.currentTimeMillis()
                 return
             }
-            null -> return
-            false -> Unit
+            null -> {
+                CloudflareSolverDiagnostics.record("PROBE network error — round skipped")
+                return
+            }
+            false -> CloudflareSolverDiagnostics.record("PROBE challenged → WebView verify")
+        }
+
+        // v36: the verify must leave room for the request itself plus a full
+        // challenge round under the app's call timeout — with less than a
+        // minimal round left, skip the verify and let the request's own
+        // challenge path use what remains.
+        val verifyBudget = minOf(VERIFY_TIMEOUT_MS, deadline - System.currentTimeMillis() - ROUND_RESERVE_MS)
+        if (verifyBudget < MIN_ROUND_MS) {
+            CloudflareSolverDiagnostics.record("VERIFY skipped — ${deadline - System.currentTimeMillis()}ms left of budget")
+            return
         }
 
         solveLock.withLock {
@@ -518,15 +736,17 @@ class CloudflareSolverInterceptor(
             // Verify-only: never wipe the cookie first (if the clearance is
             // still valid, wiping it would CONVERT a working session into a
             // challenge for no reason).
-            val ok = solveInWebView(request, call, verifyOnly = true)
+            val ok = solveInWebView(request, call, round = 0, timeoutMs = verifyBudget, verifyOnly = true)
             if (ok) {
                 recordSolveAt(host)
                 lastSolveAt = System.currentTimeMillis()
+                CloudflareSolverDiagnostics.record("VERIFY ok")
             } else {
                 // NOT recorded as solved — the next request re-verifies after
                 // the backoff window instead of trusting a clearance we could
                 // not confirm.
                 recordVerifyFail(host)
+                CloudflareSolverDiagnostics.record("VERIFY failed — backoff ${VERIFY_FAIL_BACKOFF_MS / 60000}min")
             }
         }
     }
@@ -677,10 +897,24 @@ class CloudflareSolverInterceptor(
     }
 
     private companion object {
-        // 60s: with real web-document focus (v33) the challenge iframe no
-        // longer stalls, so completes are fast; 60 s still covers the full
-        // interactive tap sequence (6 s wait + 12 taps × 2 s) with margin.
-        val SOLVE_TIMEOUT = 60.seconds
+        // v36: total per-call solve budget. The host app kills a call at its
+        // call timeout (Mihon: 2 min) — the free-running chain (60 s verify +
+        // 2 × 60 s rounds) got killed mid-solve with a timeout error, and the
+        // user's refresh then landed inside the dedupe window and surfaced a
+        // raw 403. 95 s leaves ~25 s of headroom for request round trips.
+        const val SOLVE_BUDGET_MS = 95_000L
+
+        /** Cap for ONE solve round; each round re-checks the shared budget. */
+        const val ROUND_TIMEOUT_MS = 45_000L
+
+        /** Reserved for the request retry after the last round. */
+        const val ROUND_RESERVE_MS = 12_000L
+
+        /** Never start a round that cannot finish. */
+        const val MIN_ROUND_MS = 15_000L
+
+        /** Verify-pass cap (usually a clean root load — resolves in seconds). */
+        const val VERIFY_TIMEOUT_MS = 30_000L
 
         /**
          * Clearances older than this get a silent verify pass. Cloudflare's
@@ -710,13 +944,16 @@ class CloudflareSolverInterceptor(
         const val TAP_AFTER_MS = 6_000L
 
         /** Spacing between synthetic widget taps. */
-        const val TAP_SPACING_MS = 2_000L
+        const val TAP_SPACING_MS = 1_600L
 
-        /** Checkbox position inside the captcha widget (CSS dp, both providers). */
-        const val CHECKBOX_OFFSET_X_DP = 30f
+        /**
+         * Left-edge offsets cycled across tap attempts — Turnstile widget
+         * variants place the checkbox at slightly different x positions.
+         */
+        val TAP_OFFSETS_DP = floatArrayOf(22f, 30f, 38f)
 
         /** Cap for the widget taps within one solve round. */
-        const val MAX_TAP_ATTEMPTS = 12
+        const val MAX_TAP_ATTEMPTS = 18
 
         const val CLEARANCE_COOKIE = "cf_clearance="
         const val BRIDGE_NAME = "mhcfbridge"
