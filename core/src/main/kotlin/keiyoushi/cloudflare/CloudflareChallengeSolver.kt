@@ -135,6 +135,25 @@ import kotlin.time.Duration.Companion.minutes
  *     written to a persisted diagnostics log surfaced in the source settings.
  *
  * 429s without a challenge marker are retried with backoff (rate-limit windows).
+ *
+ * 11. v37 (field diagnostics from the 17:24 log: "interactive challenge — tap
+ *     mode" followed by "timeout/render failure" — and NOT ONE "widget found"
+ *     line, i.e. the tap loop ran 24 s + 38 s without ever locating the
+ *     Turnstile widget, then the call spun a full 77 s before the handoff):
+ *     (a) the widget search is WIDENED — same-origin challenge-platform
+ *     iframes, cross-origin-isolation iframes, challenge-stage descendants,
+ *     the .cf-turnstile container div, and a relaxed biggest-iframe fallback
+ *     (the old 200x50 floor could miss real widgets); (b) tap geometry is
+ *     TARGET-AWARE — widget-sized targets keep the classic left-edge offsets,
+ *     wide interstitial iframes/containers get center-spread probes plus
+ *     left-edge alternates (the checkbox is centered there, not at x+22);
+ *     (c) an INTERACTIVE challenge whose widget never renders fast-fails the
+ *     round ~10 s after the interactive signal (after one DOM dump for the
+ *     next field report) instead of burning its whole budget — the app
+ *     handoff now happens while the user is still looking, and the verify
+ *     pass no longer eats 30 s of the call budget on a challenge it cannot
+ *     confirm; (d) round 1 also gets the stall reload (at 2/3 budget, no
+ *     progress) — second loads clear far more often, first loads included.
  */
 
 /** True when [response] is a Cloudflare managed challenge (official detection). */
@@ -183,6 +202,13 @@ private val CHALLENGE_BODY_MARKERS = listOf(
 
 /** Thrown when Cloudflare escalates to an interactive challenge (unsolvable headless). */
 class InteractiveChallengeException : IOException("The Cloudflare challenge requires interaction")
+
+/**
+ * Thrown when an interactive challenge runs but its widget never renders into
+ * the main-frame DOM — the tap loop has no target, so the round is failed
+ * FAST (v37) instead of spinning to its timeout.
+ */
+internal class WidgetNotFoundException : IOException("The Cloudflare challenge widget never rendered")
 
 /**
  * Rolling record of what the solver actually did, persisted so it survives
@@ -479,10 +505,14 @@ class CloudflareSolverInterceptor(
                 // "interactive" no longer aborts: it flips the run into tap
                 // mode so the Turnstile checkbox gets tapped (below).
                 var interactive = false
+                var interactiveAt = 0L
                 jsBridge(BRIDGE_NAME) { message ->
                     if (message == "interactive") {
                         interactive = true
-                        CloudflareSolverDiagnostics.record("WEBVIEW $label interactive challenge — tap mode")
+                        if (interactiveAt == 0L) {
+                            interactiveAt = System.currentTimeMillis()
+                            CloudflareSolverDiagnostics.record("WEBVIEW $label interactive challenge — tap mode")
+                        }
                     }
                 }
 
@@ -504,6 +534,7 @@ class CloudflareSolverInterceptor(
                 var lastTapAt = 0L
                 var lastCleanCheckAt = 0L
                 var reloaded = false
+                var dumpDeadline = 0L
                 val startedAt = System.currentTimeMillis()
                 poll(500.milliseconds) {
                     val clearance = currentClearance(host, scheme)
@@ -530,15 +561,44 @@ class CloudflareSolverInterceptor(
                     }
 
                     // v36 (FlareSolverr's "second loads clear far more
-                    // often"): a challenge that has made NO progress past
-                    // half the round's budget gets ONE reload — CF re-issues
-                    // the challenge and the fresh load frequently clears where
-                    // the stalled one never would. Round 2+ only: round 1
-                    // keeps the pure first-visit shape.
-                    if (round >= 2 && !reloaded && elapsed > timeoutMs / 2) {
+                    // often"), widened in v37 to round 1: a challenge that has
+                    // made NO progress gets ONE reload — CF re-issues the
+                    // challenge and the fresh load frequently clears where the
+                    // stalled one never would. Round 2+ reloads at half the
+                    // round budget, round 1 at 2/3 (keeps the first visit
+                    // shape longer).
+                    if (!reloaded && elapsed > (if (round >= 2) timeoutMs / 2 else timeoutMs * 2 / 3)) {
                         reloaded = true
                         CloudflareSolverDiagnostics.record("WEBVIEW $label stalled — reloading challenge")
                         evaluateJs("location.reload()")
+                    }
+
+                    // v37: an INTERACTIVE challenge whose widget never
+                    // rendered into the main-frame DOM — the exact field case
+                    // behind the 17:24 diagnostics (77 s of silent spinning,
+                    // zero taps landed). Dump the challenge DOM once for the
+                    // next field report, then fail the round FAST so the app
+                    // handoff happens while the user is still looking.
+                    if (interactive && tapAttempts == 0 && interactiveAt > 0L &&
+                        now - interactiveAt > NO_WIDGET_GIVEUP_MS
+                    ) {
+                        if (dumpDeadline == 0L) {
+                            dumpDeadline = now + DOM_DUMP_LINGER_MS
+                            CloudflareSolverDiagnostics.record(
+                                "WEBVIEW $label no widget ${now - interactiveAt}ms after interactive — dumping DOM",
+                            )
+                            evaluateJs(DOM_DUMP_JS) { dump ->
+                                CloudflareSolverDiagnostics.record(
+                                    "WEBVIEW $label DOM ${dump?.take(320).orEmpty()}",
+                                )
+                            }
+                        } else if (now >= dumpDeadline) {
+                            CloudflareSolverDiagnostics.record(
+                                "WEBVIEW $label widget never rendered — fast-fail to handoff",
+                            )
+                            reject(WidgetNotFoundException())
+                        }
+                        return@poll
                     }
 
                     // Tap the Turnstile checkbox when the challenge is (or
@@ -567,19 +627,38 @@ class CloudflareSolverInterceptor(
                                     ?: return@runCatching
                                 val h = (rect["h"] as? JsonPrimitive)?.content?.toFloatOrNull()
                                     ?: 65f
-                                // Checkbox sits at the widget's left edge,
-                                // mid-height (Turnstile and reCAPTCHA both).
-                                // v36: cycle across the plausible left-edge
-                                // offsets with a little scatter — widget
-                                // variants place the box differently, and the
-                                // humanized gesture carries its own jitter.
-                                val offsetDp = TAP_OFFSETS_DP[tapAttempts % TAP_OFFSETS_DP.size]
-                                val tapX = (x + offsetDp + (tapAttempts % 3 - 1) * 2f) * density
+                                val w = (rect["w"] as? JsonPrimitive)?.content?.toFloatOrNull() ?: 0f
+                                val kind = (rect["k"] as? JsonPrimitive)?.content.orEmpty()
+                                // v37 target-aware geometry: a widget-sized
+                                // target (or an explicitly matched widget
+                                // iframe) carries its checkbox at the LEFT
+                                // edge (Turnstile and reCAPTCHA both); a WIDE
+                                // interstitial iframe or a container div is
+                                // centered — alternate center-spread probes
+                                // with left-edge alternates so every plausible
+                                // box position is visited within a few
+                                // attempts. The humanized gesture keeps its
+                                // own jitter either way.
+                                val baseX: Float
+                                val offsetDp: Float
+                                if (kind != "container" && w <= WIDGET_MAX_WIDTH_DP) {
+                                    baseX = x
+                                    offsetDp = TAP_OFFSETS_DP[tapAttempts % TAP_OFFSETS_DP.size]
+                                } else if (tapAttempts % 2 == 0) {
+                                    baseX = x + w / 2f
+                                    offsetDp = TAP_CENTER_SPREAD_DP[(tapAttempts / 2) % TAP_CENTER_SPREAD_DP.size]
+                                } else {
+                                    baseX = x
+                                    offsetDp = TAP_OFFSETS_DP[tapAttempts % TAP_OFFSETS_DP.size]
+                                }
+                                val tapX = (baseX + offsetDp + (tapAttempts % 3 - 1) * 2f) * density
                                 val tapY = (y + h / 2f + (tapAttempts % 2 - 1) * 3f) * density
                                 dispatchTap(tapX, tapY)
                                 tapAttempts++
                                 if (tapAttempts == 1) {
-                                    CloudflareSolverDiagnostics.record("WEBVIEW $label widget found — tapping")
+                                    CloudflareSolverDiagnostics.record(
+                                        "WEBVIEW $label widget found — tapping ($kind ${w.toInt()}x${h.toInt()})",
+                                    )
                                 }
                             }
                         }
@@ -595,6 +674,9 @@ class CloudflareSolverInterceptor(
             // Unsolvable headless — the retry below hands the challenge
             // response back to the app-level flow.
             CloudflareSolverDiagnostics.record("WEBVIEW $label interactive-only → aborted")
+            false
+        } catch (_: WidgetNotFoundException) {
+            // Already logged where it was raised — fail the round fast.
             false
         } catch (_: IOException) {
             // Canceled call or transport failure — same fallback.
@@ -952,6 +1034,26 @@ class CloudflareSolverInterceptor(
          */
         val TAP_OFFSETS_DP = floatArrayOf(22f, 30f, 38f)
 
+        /** A widget iframe or container up to this width carries its checkbox at the left edge. */
+        const val WIDGET_MAX_WIDTH_DP = 350f
+
+        /**
+         * Center spreads (dp) for WIDE interstitial targets — the checkbox
+         * sits near the horizontal center there, not at the left edge.
+         */
+        val TAP_CENTER_SPREAD_DP = floatArrayOf(0f, -40f, 40f, -90f, 90f)
+
+        /**
+         * v37: an interactive challenge gets this long to produce a widget
+         * target after the interactive signal before the round fast-fails
+         * (the checkbox IS the interactive UI — if it is not in the main
+         * frame DOM by then, tapping is doing nothing).
+         */
+        const val NO_WIDGET_GIVEUP_MS = 10_000L
+
+        /** Linger this long for the DOM dump callback before failing the round. */
+        const val DOM_DUMP_LINGER_MS = 1_500L
+
         /** Cap for the widget taps within one solve round. */
         const val MAX_TAP_ATTEMPTS = 18
 
@@ -1003,30 +1105,66 @@ class CloudflareSolverInterceptor(
         """.trimIndent()
 
         /**
-         * Locates the captcha widget iframe (Cloudflare Turnstile / challenge
-         * widget / reCAPTCHA) and returns its rect as JSON, for the synthetic
-         * tap. Falls back to the widest reasonably-sized iframe on the page.
+         * Locates the captcha widget (Cloudflare Turnstile / challenge widget /
+         * reCAPTCHA) and returns its rect + kind as JSON for the synthetic tap.
+         * v37 search order: explicit widget iframes → same-origin challenge-
+         * platform iframes → cross-origin-isolation iframes → challenge-stage
+         * descendants → the .cf-turnstile container div ("container") → the
+         * biggest visible iframe with a relaxed 40x40 floor ("fallback" — the
+         * old 200x50 floor could miss real widgets).
          */
         private val WIDGET_RECT_JS = """
             (function(){
               try{
-                var sel='iframe[src*="challenges.cloudflare.com"],iframe[src*="turnstile"],iframe[src*="/captcha/"],iframe[title*="Cloudflare"],iframe[title*="Security"],iframe[title*="security"],iframe[src*="recaptcha"]';
-                var fr=document.querySelector(sel);
+                var sel='iframe[src*="challenges.cloudflare.com"],iframe[src*="challenge-platform"],iframe[src*="turnstile"],iframe[src*="/captcha/"],iframe[title*="Cloudflare"],iframe[title*="Security"],iframe[title*="security"],iframe[allow*="cross-origin-isolation"],#challenge-stage iframe,#turnstile-wrapper iframe,[class*="turnstile"] iframe,iframe[src*="recaptcha"]';
+                var fr=document.querySelector(sel), kind='iframe';
+                if(!fr){
+                  var box=document.querySelector('#cf-turnstile,[class*="cf-turnstile"],#challenge-stage > div,#turnstile-wrapper');
+                  if(box){
+                    var bb=box.getBoundingClientRect();
+                    if(bb.width>=40&&bb.height>=20) return {x:bb.x,y:bb.y,w:bb.width,h:bb.height,k:'container'};
+                  }
+                }
                 if(!fr){
                   var frs=document.querySelectorAll('iframe');
                   var best=null,bestArea=0;
                   for(var i=0;i<frs.length;i++){
                     var r=frs[i].getBoundingClientRect();
                     var area=r.width*r.height;
-                    if(r.width>=200&&r.height>=50&&area>bestArea){ best=frs[i]; bestArea=area; }
+                    if(r.width>=40&&r.height>=40&&area>bestArea){ best=frs[i]; bestArea=area; }
                   }
-                  fr=best;
+                  fr=best; kind='fallback';
                 }
                 if(!fr) return null;
                 var b=fr.getBoundingClientRect();
                 if(b.width<40||b.height<20) return null;
-                return {x:b.x,y:b.y,w:b.width,h:b.height};
+                return {x:b.x,y:b.y,w:b.width,h:b.height,k:kind};
               }catch(e){ return null; }
+            })();
+        """.trimIndent()
+
+        /**
+         * v37: one-line dump of the challenge DOM for the diagnostics log —
+         * recorded when an interactive challenge produced NO widget target.
+         * This is what turns the next "still 403" field report into a
+         * precise fix instead of another guess.
+         */
+        private val DOM_DUMP_JS = """
+            (function(){
+              try{
+                var frs=document.querySelectorAll('iframe');
+                var parts=[];
+                for(var i=0;i<frs.length&&i<4;i++){
+                  var b=frs[i].getBoundingClientRect();
+                  var src=(frs[i].src||'').slice(0,48);
+                  parts.push(src+' '+Math.round(b.width)+'x'+Math.round(b.height));
+                }
+                var t=(document.title||'').slice(0,40);
+                var q=function(s){try{return document.querySelector(s)?1:0}catch(e){return 0}};
+                var stage=q('#challenge-stage')+q('#challenge-form')+q('[class*="cf-turnstile"]')+q('[id*="challenge"]');
+                var txt=(document.body&&document.body.innerText||'').replace(/\s+/g,' ').slice(0,60);
+                return 'iframes='+frs.length+'['+parts.join(' | ')+'] title="'+t+'" stage='+stage+' txt="'+txt+'"';
+              }catch(e){ return 'dump-failed'; }
             })();
         """.trimIndent()
     }

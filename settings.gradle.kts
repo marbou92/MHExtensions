@@ -45,6 +45,7 @@ loadIndividualExtension("en", "mkissa")
 loadIndividualExtension("all", "mangaball")
 loadIndividualExtension("en", "weebcentral")
 loadIndividualExtension("all", "xcomic")
+loadIndividualExtension("all", "mangadot")
 // loadAllIndividualExtensions()
 
 /**

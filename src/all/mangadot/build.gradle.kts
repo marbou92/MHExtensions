@@ -5,19 +5,18 @@ plugins {
 }
 
 keiyoushi {
-    name = "ManhuaRMTL"
-    versionCode = 42
-    contentWarning = ContentWarning.NSFW
-    libVersion = "1.6"
-    theme = "madara"
+    name = "MangaDot"
+    versionCode = 1
+    contentWarning = ContentWarning.MIXED
+    libVersion = "1.4"
 
     source {
         lang = "all"
-        baseUrl = "https://manhuarmtl.com"
+        baseUrl = "https://mangadot.net"
     }
 
     deeplink {
-        host("manhuarmtl.com")
+        host("mangadot.net")
         path("/manga/..*")
     }
 }
