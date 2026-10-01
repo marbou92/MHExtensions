@@ -3,7 +3,13 @@ package eu.kanade.tachiyomi.extension.all.manhuarmtl
 import eu.kanade.tachiyomi.multisrc.madara.GenreRoute
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.floatOrNull
+import kotlinx.serialization.json.jsonPrimitive
 
 @Serializable
 data class OcrResponse(
@@ -16,6 +22,109 @@ data class OcrResponse(
      * normalises both shapes to a flat list of pages.
      */
     fun pages(): List<OcrPage> = data ?: emptyList()
+}
+
+/**
+ * v39 lenient OCR payload parser.
+ *
+ * The gate response has been seen as a bare array of page objects and as a
+ * `{data|pages: [...]}` envelope; text entries as `{box|clean_box, text}`,
+ * as `[[x,y,w,h], text-or-map]` arrays, and as coordinate objects
+ * `{x, y, width, height, angle, ...}`. Field names drift between the site
+ * owner's obfuscation rounds, so the parser matches by SHAPE: image-ish
+ * string keys, box-ish arrays/objects, text-ish strings — not one fixed
+ * schema. This is what the WebView harvester (OcrHarvest) and the direct
+ * gate path both feed into.
+ *
+ * Returns null when [body] is not an OCR payload at all (challenge page,
+ * random JSON) and an empty list for a legitimate "nothing here" payload.
+ */
+fun parseOcrPayload(body: String): List<OcrPage>? {
+    val trimmed = body.trim()
+    if (trimmed.length < 10) return null
+    if (trimmed[0] != '[' && trimmed[0] != '{') return null
+
+    val root = try {
+        PAYLOAD_JSON.parseToJsonElement(trimmed)
+    } catch (_: Exception) {
+        return null
+    }
+
+    val pagesArray: JsonArray? = when (root) {
+        is JsonArray -> root
+        is JsonObject -> root["data"] as? JsonArray ?: root["pages"] as? JsonArray
+        else -> null
+    }
+    if (pagesArray == null) return null
+
+    return pagesArray.mapNotNull { el -> (el as? JsonObject)?.toOcrPage() }
+}
+
+private val PAYLOAD_JSON = Json {
+    ignoreUnknownKeys = true
+    isLenient = true
+}
+
+private fun JsonObject.toOcrPage(): OcrPage? {
+    val image = firstStringOf("image", "img", "file", "filename", "image_url", "imageurl", "url", "src")
+    val textsEl = this["texts"] ?: this["dialogues"] ?: this["dialogs"] ?: this["boxes"] ?: this["lines"]
+    val boxes = mutableListOf<OcrText>()
+
+    if (textsEl is JsonArray) {
+        for (t in textsEl) {
+            when (t) {
+                is JsonObject -> {
+                    val box = coordinateQuad(t) ?: (t["clean_box"] as? JsonArray) ?: (t["box"] as? JsonArray)
+                    val text = objectText(t)
+                    if (box != null && !text.isNullOrBlank()) {
+                        boxes += OcrText(text = text, boxList = box)
+                    }
+                }
+
+                is JsonArray -> {
+                    // Legacy shape: [[x, y, w, h], "text"] (or a map in slot 1)
+                    val box = t.firstOrNull() as? JsonArray
+                    val second = t.getOrNull(1)
+                    val text = (second as? JsonPrimitive)?.takeIf { it.isString }?.content
+                        ?: second?.let { s -> (s as? JsonObject)?.let(::objectText) }
+                    if (box != null && !text.isNullOrBlank()) {
+                        boxes += OcrText(text = text, boxList = box)
+                    }
+                }
+
+                else -> {}
+            }
+        }
+    }
+
+    if (image == null && boxes.isEmpty()) return null
+    return OcrPage(image = image, texts = boxes)
+}
+
+/** Text of an object-shaped entry: explicit "text" key first, then any string value. */
+private fun objectText(obj: JsonObject): String? {
+    (obj["text"] as? JsonPrimitive)?.takeIf { it.isString }?.let { return it.content }
+    return obj.entries
+        .asSequence()
+        .filter { it.value is JsonPrimitive && (it.value as JsonPrimitive).isString }
+        .map { (it.value as JsonPrimitive).content }
+        .firstOrNull { it.isNotBlank() }
+}
+
+/** `{x, y, width|w, height|h}` numeric object → box array, else null. */
+private fun coordinateQuad(obj: JsonObject): JsonArray? {
+    val x = obj["x"]?.jsonPrimitive?.floatOrNull ?: return null
+    val y = obj["y"]?.jsonPrimitive?.floatOrNull ?: return null
+    val w = (obj["width"] ?: obj["w"])?.jsonPrimitive?.floatOrNull ?: return null
+    val h = (obj["height"] ?: obj["h"])?.jsonPrimitive?.floatOrNull ?: return null
+    return JsonArray(listOf(JsonPrimitive(x), JsonPrimitive(y), JsonPrimitive(w), JsonPrimitive(h)))
+}
+
+private fun JsonObject.firstStringOf(vararg keys: String): String? {
+    for (key in keys) {
+        (this[key] as? JsonPrimitive)?.takeIf { it.isString }?.let { return it.content }
+    }
+    return null
 }
 
 @Serializable

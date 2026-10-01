@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ManhuaRMTL"
-    versionCode = 42
+    versionCode = 43
     contentWarning = ContentWarning.NSFW
     libVersion = "1.6"
     theme = "madara"

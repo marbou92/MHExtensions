@@ -820,94 +820,62 @@ abstract class MangaDot :
     }
 
     // ============================= Settings ==============================
+    // Organized like the Comix source: browse/content defaults first, then
+    // browse filtering, then chapter-list handling, then details display —
+    // every item titled by what it does with a summary that spells out where
+    // it applies and what the empty/default value means.
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        val mode = adultModePref()
-
+        // ---- Adult content exposure (gates the genre blacklists below) ----
         val nsfwPref = ListPreference(screen.context).apply {
             key = NSFW_MODE
-            title = "NSFW (18+) Content"
-            entries = arrayOf("No 18+", "18+ Only", "Both 18+ & No 18+")
+            title = "Adult (18+) content"
+            summary = "Whether 18+ titles show up in browse and search, and which " +
+                "genre blacklist below applies ('Adult' genre lists are used when " +
+                "18+ content is shown, 'regular' lists when it is hidden)"
+            entries = arrayOf("Hide 18+ titles", "18+ titles only", "Show both")
             entryValues = arrayOf("none", "1", "both")
             setDefaultValue("none")
-            summary = "%s"
         }
         screen.addPreference(nsfwPref)
 
-        val contentRatingPref = ListPreference(screen.context).apply {
+        // ---- Browse & search defaults ----
+        ListPreference(screen.context).apply {
             key = CONTENT_RATING_PREF
-            title = "Content Rating"
+            title = "Default content rating"
+            summary = "Highest content rating to show by default in browse and " +
+                "search (the same control is available per-search in the filter sheet)"
             entries = contentRatings.map { "Up to ${it.first}" }.toTypedArray()
             entryValues = contentRatings.map { it.second }.toTypedArray()
             setDefaultValue("suggestive")
-            summary = "%s"
-        }
-        screen.addPreference(contentRatingPref)
+        }.let(screen::addPreference)
 
-        val browseTypePref = MultiSelectListPreference(screen.context).apply {
+        MultiSelectListPreference(screen.context).apply {
             key = BROWSE_TYPE_PREF
-            title = "Type Blacklist"
+            title = "Default type filter"
+            summary = "Manga types to hide from Popular and Latest (empty = show all types)"
             entries = arrayOf("Manga", "Manhwa", "Manhua", "OEL", "One Shot")
             entryValues = arrayOf("JP", "KR", "CN", "EN", "ONESHOT")
             setDefaultValue(emptySet<String>())
-            summary = "Exclude types from Popular & Latest."
-        }
-        screen.addPreference(browseTypePref)
+        }.let(screen::addPreference)
 
-        val browseStatusPref = ListPreference(screen.context).apply {
+        ListPreference(screen.context).apply {
             key = BROWSE_STATUS_PREF
-            title = "Status Filter"
+            title = "Default status filter"
+            summary = "Publication status titles must have to appear in Popular and Latest"
             entries = arrayOf("Any Status", "Ongoing", "Completed", "Hiatus")
             entryValues = arrayOf("", "Ongoing", "Completed", "Hiatus")
             setDefaultValue("")
-            summary = "Applies to Popular & Latest."
-        }
-        screen.addPreference(browseStatusPref)
+        }.let(screen::addPreference)
 
-        val showTagsPref = SwitchPreferenceCompat(screen.context).apply {
-            key = SHOW_TAGS_PREF
-            title = "Show Tags In Details"
-            summary = "Show tags after genres in manga details."
-            setDefaultValue(true)
-        }
-        screen.addPreference(showTagsPref)
-
-        val chapterModePref = ListPreference(screen.context).apply {
-            key = CHAPTER_MODE
-            title = "Chapter List Mode"
-            entries = arrayOf("Chapters Only", "Volumes Only", "Chapters + Volumes")
-            entryValues = arrayOf("chapters", "volumes", "both")
-            setDefaultValue("chapters")
-            summary = "%s\nNote: Most titles don't have volumes. 'Volumes only' falls back to chapters if none are found."
-        }
-        screen.addPreference(chapterModePref)
-
-        val dedupeSwitch = SwitchPreferenceCompat(screen.context).apply {
-            key = DEDUPLICATE_CHAPTERS
-            title = "Deduplicate Chapters"
-            summary = "Keep only one version of each chapter, preferring selected scanlators."
-            setDefaultValue(false)
-        }
-        screen.addPreference(dedupeSwitch)
-
-        val priorityPref = EditTextPreference(screen.context).apply {
-            key = PREFERRED_SCANLATORS
-            title = "Scanlator Priority"
-            summary = "Comma-separated, in order of preference. First match wins. Supports unofficial only if scanlator name matches website.\nDefaults to official scrapers: Manga Plus, VIZ Media, Webtoon, Tapas, MangaDex, K Manga, Manga UP, Comikey, Shonen Jump"
-            setDefaultValue("VIZ Media, MANGA Plus, MangaPlus, Official, Webtoon, Tapas, MangaDex, K Manga, Manga UP, Comikey, Shonen Jump")
-            setEnabled(preferences.getBoolean(DEDUPLICATE_CHAPTERS, false))
-        }
-        screen.addPreference(priorityPref)
-
-        dedupeSwitch.setOnPreferenceChangeListener { _, newValue ->
-            priorityPref.setEnabled(newValue as Boolean)
-            true
-        }
+        // ---- Browse & search exclusion lists ----
+        val mode = adultModePref()
 
         val sortedDemographics = demographicNames.sortedBy { it.lowercase(Locale.ROOT) }.toTypedArray()
         val demographicPref = MultiSelectListPreference(screen.context).apply {
             key = EXCLUDE_DEMOGRAPHIC_PREF
-            title = "Demographic Blacklist"
-            summary = "Exclude demographics when browsing."
+            title = "Excluded demographics"
+            summary = "Demographics (Shounen, Seinen, …) to hide from browse and " +
+                "search (empty = show all)"
             entries = sortedDemographics
             entryValues = sortedDemographics
             setDefaultValue(emptySet<String>())
@@ -926,8 +894,9 @@ abstract class MangaDot :
 
         val normalGenrePref = MultiSelectListPreference(screen.context).apply {
             key = EXCLUDE_GENRE_PREF
-            title = "Genre Blacklist"
-            summary = "Exclude genres when browsing without 18+ content."
+            title = "Excluded genres (18+ hidden)"
+            summary = "Genres to hide from browse and search while adult content is " +
+                "hidden above (empty = show all genres)"
             entries = genres.toTypedArray()
             entryValues = genres.toTypedArray()
             setDefaultValue(emptySet<String>())
@@ -937,8 +906,9 @@ abstract class MangaDot :
 
         val adultGenrePref = MultiSelectListPreference(screen.context).apply {
             key = EXCLUDE_GENRE_ADULT_PREF
-            title = "Genre Blacklist (Adult Mode)"
-            summary = "Exclude genres when browsing with 18+ content."
+            title = "Excluded genres (18+ shown)"
+            summary = "Genres to hide from browse and search while adult content is " +
+                "shown above (empty = show all genres)"
             entries = genres.toTypedArray()
             entryValues = genres.toTypedArray()
             setDefaultValue(emptySet<String>())
@@ -946,12 +916,58 @@ abstract class MangaDot :
         }
         screen.addPreference(adultGenrePref)
 
+        // Keep the two genre blacklists in sync with the adult-content mode:
+        // only the list matching the current mode is selectable.
         nsfwPref.setOnPreferenceChangeListener { _, newValue ->
             val newMode = newValue as String
             normalGenrePref.setEnabled(genres.isNotEmpty() && newMode == "none")
             adultGenrePref.setEnabled(genres.isNotEmpty() && (newMode == "1" || newMode == "both"))
             true
         }
+
+        // ---- Chapter list ----
+        ListPreference(screen.context).apply {
+            key = CHAPTER_MODE
+            title = "Chapter list mode"
+            summary = "What the chapter list shows. Most titles have no volumes, so " +
+                "'Volumes only' falls back to chapters automatically"
+            entries = arrayOf("Chapters only", "Volumes only", "Chapters + Volumes")
+            entryValues = arrayOf("chapters", "volumes", "both")
+            setDefaultValue("chapters")
+        }.let(screen::addPreference)
+
+        val dedupeSwitch = SwitchPreferenceCompat(screen.context).apply {
+            key = DEDUPLICATE_CHAPTERS
+            title = "Deduplicate chapters"
+            summary = "Keep only one entry per chapter number — the site re-uploads " +
+                "the same chapter under several groups"
+            setDefaultValue(false)
+        }
+        screen.addPreference(dedupeSwitch)
+
+        val priorityPref = EditTextPreference(screen.context).apply {
+            key = PREFERRED_SCANLATORS
+            title = "Scanlator priority"
+            summary = "Comma-separated group names, most preferred first; first match " +
+                "wins when deduplicating. Defaults to the official scrapers: " +
+                "Manga Plus, VIZ Media, Webtoon, Tapas, MangaDex, K Manga, Manga UP, Comikey, Shonen Jump"
+            setDefaultValue("VIZ Media, MANGA Plus, MangaPlus, Official, Webtoon, Tapas, MangaDex, K Manga, Manga UP, Comikey, Shonen Jump")
+            setEnabled(preferences.getBoolean(DEDUPLICATE_CHAPTERS, false))
+        }
+        screen.addPreference(priorityPref)
+
+        dedupeSwitch.setOnPreferenceChangeListener { _, newValue ->
+            priorityPref.setEnabled(newValue as Boolean)
+            true
+        }
+
+        // ---- Details screen ----
+        SwitchPreferenceCompat(screen.context).apply {
+            key = SHOW_TAGS_PREF
+            title = "Show tags in details"
+            summary = "List the title's tags after the genres in its description"
+            setDefaultValue(true)
+        }.let(screen::addPreference)
     }
 
     // ============================ RSC Decoder ============================

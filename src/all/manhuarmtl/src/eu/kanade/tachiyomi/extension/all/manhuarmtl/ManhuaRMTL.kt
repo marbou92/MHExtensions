@@ -783,45 +783,54 @@ abstract class ManhuaRMTL :
         val mode = chapterTextMode()
         if (mode != MODE_RAW && !html.isNullOrBlank() && chapterUrl != null) {
             try {
+                // v39 fast path: shape-scanned credentials → direct gate POST
+                // (unchanged behaviour while the site honours its own vault).
                 val credentials = parseOcrCredentials(html)
-                if (credentials != null) {
-                    val ocrPages = fetchOcrData(credentials, chapterUrl)
-                    when {
-                        // Gate refused (rate-limit block / challenge). Instead
-                        // of letting the chapter render raw forever, schedule
-                        // the background heal that re-fetches everything once
-                        // the block window passes.
-                        ocrPages == null -> scheduleOcrHeal(chapterUrl, pages, mode)
+                var ocrPages: List<OcrPage>? =
+                    if (credentials != null) fetchOcrData(credentials, chapterUrl) else null
 
-                        // Gate answered but the chapter simply has no OCR
-                        // text (art-only pages) — nothing to store, nothing
-                        // to heal.
-                        ocrPages.isEmpty() -> {}
+                // v39 harvest fallback (MHRepo issue #4): the site owner keeps
+                // reshaping the vault/gate — historically right after each
+                // keiyoushi release — and every reshape used to mean EVERY
+                // chapter renders raw until re-reverse-engineered. When the
+                // scanner found no usable credentials (or the gate refused
+                // everything), load the chapter in a hidden WebView instead
+                // and pick the OCR payload up from the site's OWN scripts —
+                // they have to understand the new obfuscation anyway, and the
+                // response they receive is the same payload we need. Immune
+                // to vault rewrites, endpoint renames and envelope changes.
+                if (ocrPages == null) {
+                    OcrHarvest.harvest(chapterUrl, headers["User-Agent"] ?: "")?.let { ocrPages = it }
+                }
 
-                        else -> {
-                            val fresh = storeOcrBoxes(pages.mapNotNull { it.imageUrl }, ocrPages)
-                            if (fresh.isNotEmpty()) {
-                                noteOcrLanded()
+                when {
+                    // Nothing captured anywhere: gate refused / challenge.
+                    // Instead of letting the chapter render raw forever,
+                    // schedule the background heal that re-fetches everything
+                    // once the block window passes.
+                    ocrPages == null -> scheduleOcrHeal(chapterUrl, pages, mode)
 
-                                // Pre-translate THIS chapter's text boxes in
-                                // the background so the overlay is ready by the
-                                // time images arrive (non-English modes). Used
-                                // to walk EVERY stored chapter: strings whose
-                                // translation once failed are never cached, so
-                                // they re-queued on every single chapter open
-                                // and the queue grew into a 429 storm over a
-                                // long session.
-                                if (mode != MODE_EN) prefetchTranslations(fresh.values, mode)
-                            }
+                    // Gate answered but the chapter simply has no OCR
+                    // text (art-only pages) — nothing to store, nothing
+                    // to heal.
+                    ocrPages.isEmpty() -> {}
+
+                    else -> {
+                        val fresh = storeOcrBoxes(pages.mapNotNull { it.imageUrl }, ocrPages)
+                        if (fresh.isNotEmpty()) {
+                            noteOcrLanded()
+
+                            // Pre-translate THIS chapter's text boxes in
+                            // the background so the overlay is ready by the
+                            // time images arrive (non-English modes). Used
+                            // to walk EVERY stored chapter: strings whose
+                            // translation once failed are never cached, so
+                            // they re-queued on every single chapter open
+                            // and the queue grew into a 429 storm over a
+                            // long session.
+                            if (mode != MODE_EN) prefetchTranslations(fresh.values, mode)
                         }
                     }
-                } else {
-                    // v35: no vault in the served page — most likely a stale
-                    // page-cache render whose credentials were stripped or
-                    // expired. The heal's cache-busted re-reads mint fresh
-                    // ones; without this the chapter burned raw with NO
-                    // recovery path at all.
-                    scheduleOcrHeal(chapterUrl, pages, mode)
                 }
             } catch (_: Exception) {
                 // v35: an unexpected throw used to skip BOTH the overlay and
@@ -870,26 +879,82 @@ abstract class ManhuaRMTL :
 
     /**
      * Parse OCR credentials from the reading page HTML.
-     * The credentials are in a JS array: _0xvault = ["base64cid","hex64token",ts,"hex16nonce","url","hex32ref"]
+     *
+     * v39 — SHAPE-based, not schema-based. The credentials historically live
+     * in a JS array: `_0xvault = ["base64cid","hex64token",ts,"hex16nonce",
+     * "https://…/fetch-ocr.php","hex32ref"]` — but every obfuscation round
+     * (MHRepo issue #4: the site owner re-breaks the readers after each
+     * keiyoushi release) has been nudging element widths, charsets, escapes
+     * and the endpoint spelling. Roles are therefore assigned by what each
+     * element LOOKS LIKE, not by fixed position/charset:
+     *
+     *  - the element containing "http" + "ocr"  → gate URL
+     *  - the all-digit element                  → timestamp (optional)
+     *  - the longest remaining hex-ish string   → token
+     *  - the two shorter hex-ish strings        → nonce (shorter) + ref (longer)
+     *  - the first non-URL string               → cid (sent as-is, NOT decoded)
      */
     private fun parseOcrCredentials(html: String): OcrCredentials? {
-        // Find the _0xvault array — it contains exactly 6 elements
-        // ["base64","hex64",number,"hex16","url","hex32"]
-        val vaultRegex = Regex(
-            """_0xvault\s*=\s*\[\s*"([A-Za-z0-9+/=]+)"\s*,\s*"([0-9a-f]{64})"\s*,\s*(\d+)\s*,\s*"([0-9a-f]{16})"\s*,\s*"(https?:\\?/\\?/[^"]+fetch-ocr\.php)"\s*,\s*"([0-9a-f]{32})"\s*\]""",
-        )
-        val match = vaultRegex.find(html) ?: return null
+        // Any JS array literal of strings/numbers on one logical line —
+        // candidates are filtered by role matching below, so over-matching
+        // is harmless (worst case: an array without an OCR URL is skipped).
+        val arrayRegex = Regex("""\[\s*"(?:[^"\\]|\\.)*"(?:\s*,\s*(?:"(?:[^"\\]|\\.)*"|\d+))+\s*\]""")
 
-        // Unescape the URL (JS uses \/ for /)
-        val gateUrl = match.groupValues[5].replace("\\/", "/")
+        for (candidate in arrayRegex.findAll(html)) {
+            val elements = ELEMENT_SPLIT.findAll(candidate.value)
+                .map { it.value.trim().trim('"').replace("\\/", "/") }
+                .filter { it.isNotEmpty() }
+                .toList()
+            val creds = elements.asOcrCredentialsOrNull() ?: continue
+            return creds
+        }
+        return null
+    }
 
+    private fun List<String>.asOcrCredentialsOrNull(): OcrCredentials? {
+        val hexish = Regex("""^[0-9a-fA-F]{8,}$""")
+
+        val gateUrl = firstOrNull { it.startsWith("http") && it.contains("ocr", ignoreCase = true) }
+            ?.takeIf { it.startsWith("http") }
+            ?: return null
+        var cid: String? = null
+        var token: String? = null
+        var nonce: String? = null
+        var ref: String? = null
+        var timestamp = 0L
+
+        val hexes = mutableListOf<String>()
+        for (el in this) {
+            when {
+                el.startsWith("http") -> {}
+                el.all { it.isDigit() } && timestamp == 0L && el.length in 6..15 ->
+                    timestamp = el.toLongOrNull() ?: 0L
+                hexes.isEmpty() -> {
+                    // first non-URL, non-timestamp string: the cid (kept as-is)
+                    cid = el
+                }
+                else -> hexes += el
+            }
+        }
+        // Longest hex-ish leftover is the token; the two shorter ones are
+        // nonce/ref (order preserved: known layouts always put nonce first).
+        val sortedHexes = hexes.filter { hexish.matches(it) }.sortedByDescending { it.length }
+        when {
+            sortedHexes.size >= 3 -> {
+                token = sortedHexes[0]
+                nonce = minOf(sortedHexes[1], sortedHexes[2])
+                ref = maxOf(sortedHexes[1], sortedHexes[2])
+            }
+            else -> return null
+        }
+        cid ?: return null
         return OcrCredentials(
-            cid = match.groupValues[1], // base64 — sent as-is, do NOT decode
-            token = match.groupValues[2], // 64-hex
-            timestamp = match.groupValues[3].toLongOrNull() ?: 0L,
-            nonce = match.groupValues[4], // 16-hex
+            cid = cid,
+            token = token,
+            timestamp = timestamp,
+            nonce = nonce,
             gateUrl = gateUrl,
-            ref = match.groupValues[6], // 32-hex
+            ref = ref,
         )
     }
 
@@ -1003,16 +1068,10 @@ abstract class ManhuaRMTL :
                 return null
             }
 
-            // Try parsing as bare array first, then as envelope
-            try {
-                body.parseAs<List<OcrPage>>()
-            } catch (_: Exception) {
-                try {
-                    body.parseAs<OcrResponse>().pages()
-                } catch (_: Exception) {
-                    null
-                }
-            }
+            // v39: shape-based parse (bare array / envelope / drifting field
+            // names) replacing the strict DTO ladder — the site owner keeps
+            // nudging the payload shape between obfuscation rounds.
+            parseOcrPayload(body)
         } catch (_: Exception) {
             null
         }
@@ -1058,8 +1117,18 @@ abstract class ManhuaRMTL :
                         // vault until the ~4 min heal ran out, while the
                         // block window outlived it (the un-healed "first
                         // chapter of a session").
-                        val credentials = refreshOcrCredentials(chapterUrl) ?: continue
-                        val ocrPages = fetchOcrDataOnce(credentials, chapterUrl) ?: continue
+                        var ocrPages: List<OcrPage>? = refreshOcrCredentials(chapterUrl)
+                            ?.let { fetchOcrDataOnce(it, chapterUrl) }
+
+                        // v39: while the site owner keeps the vault/gate
+                        // reshaped, the direct path stays dead no matter how
+                        // fresh the credentials — the WebView harvest is the
+                        // heal round that still works then.
+                        if (ocrPages == null) {
+                            ocrPages = OcrHarvest.harvest(chapterUrl, headers["User-Agent"] ?: "")
+                        }
+
+                        if (ocrPages == null) continue // gate still blocking / nothing captured
                         if (ocrPages.isEmpty()) break // gate answered: chapter simply has no OCR text
 
                         val fresh = storeOcrBoxes(imageUrls, ocrPages)
@@ -1972,6 +2041,11 @@ abstract class ManhuaRMTL :
     private fun android.content.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
 
     companion object {
+        // v39: element splitter for the shape-based credential scan — matches
+        // a quoted string (escapes allowed) or a bare integer inside the
+        // candidate array literals.
+        val ELEMENT_SPLIT = Regex("""("(?:[^"\\]|\\.)*"|\d+)""")
+
         private const val MODE_EN = "en"
         private const val MODE_RAW = "raw"
         private const val GROUP_PARAGRAPH = "paragraph"
