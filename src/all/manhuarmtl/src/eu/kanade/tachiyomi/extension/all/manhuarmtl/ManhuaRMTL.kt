@@ -41,6 +41,7 @@ import kotlinx.serialization.json.jsonArray
 import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.Headers
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
@@ -781,54 +782,110 @@ abstract class ManhuaRMTL :
         val html = chapterUrl?.let { pendingChapterHtml.remove(it) }
 
         val mode = chapterTextMode()
+        // v52: captured BEFORE the OCR acquisition block. The page-cache
+        // fingerprint must describe the coverage the interceptor will see
+        // during THIS open's downloads — not the coverage after the in-line
+        // harvest lands. The v47 post-state token baked the freshly-landed
+        // coverage into the first open's identity, so a chapter whose
+        // harvest landed in-line locked its raw-served pages under an
+        // identity that could never change again — "stored healthy, screen
+        // raw", and re-opens never refetched because the token matched.
+        val rawEpochBefore = preferences.getInt(PREF_RAW_EPOCH, 0)
+        // Captured BEFORE the fingerprint fragments are appended — bare
+        // URLs are exactly what storeOcrBoxes / the interceptor match on.
+        val imageUrls = pages.mapNotNull { it.imageUrl }
+        val coveredBefore = coveredPageCount(imageUrls)
+
         if (mode != MODE_RAW && !html.isNullOrBlank() && chapterUrl != null) {
             try {
-                // v39 fast path: shape-scanned credentials → direct gate POST
-                // (unchanged behaviour while the site honours its own vault).
-                val credentials = parseOcrCredentials(html)
-                var ocrPages: List<OcrPage>? =
-                    if (credentials != null) fetchOcrData(credentials, chapterUrl) else null
-
-                // v39 harvest fallback (MHRepo issue #4): the site owner keeps
-                // reshaping the vault/gate — historically right after each
-                // keiyoushi release — and every reshape used to mean EVERY
-                // chapter renders raw until re-reverse-engineered. When the
-                // scanner found no usable credentials (or the gate refused
-                // everything), load the chapter in a hidden WebView instead
-                // and pick the OCR payload up from the site's OWN scripts —
-                // they have to understand the new obfuscation anyway, and the
-                // response they receive is the same payload we need. Immune
-                // to vault rewrites, endpoint renames and envelope changes.
-                if (ocrPages == null) {
-                    OcrHarvest.harvest(chapterUrl, headers["User-Agent"] ?: "")?.let { ocrPages = it }
-                }
-
                 when {
-                    // Nothing captured anywhere: gate refused / challenge.
-                    // Instead of letting the chapter render raw forever,
-                    // schedule the background heal that re-fetches everything
-                    // once the block window passes.
-                    ocrPages == null -> scheduleOcrHeal(chapterUrl, pages, mode)
+                    // v49 split by coverage: a chapter whose pages all have
+                    // boxes renders instantly — no visit, no direct path.
+                    imageUrls.isNotEmpty() && coveredBefore >= imageUrls.size -> {
+                        OcrDiagnostics.record(
+                            "ocr: open — stored coverage complete ($coveredBefore/${imageUrls.size} stored); re-opens render instantly",
+                        )
+                    }
 
-                    // Gate answered but the chapter simply has no OCR
-                    // text (art-only pages) — nothing to store, nothing
-                    // to heal.
-                    ocrPages.isEmpty() -> {}
+                    // v49: a PARTIAL re-open renders its stored pages at once
+                    // and only schedules background top-ups — the user's
+                    // re-open is never blocked behind a harvest again.
+                    coveredBefore > 0 -> {
+                        OcrDiagnostics.record(
+                            "ocr: re-open — rendering stored $coveredBefore/${imageUrls.size}, background top-up chases the rest",
+                        )
+                        scheduleOcrTopUp(chapterUrl, imageUrls, mode)
+                    }
 
+                    // First open (nothing stored): earn the data in-line.
                     else -> {
-                        val fresh = storeOcrBoxes(pages.mapNotNull { it.imageUrl }, ocrPages)
-                        if (fresh.isNotEmpty()) {
-                            noteOcrLanded()
+                        // v40 fast path: shape-scanned credentials → direct gate POST
+                        // (unchanged behaviour while the site honours its own vault).
+                        val credentials = parseOcrCredentials(html)
+                        if (credentials == null && !directGateWarned) {
+                            directGateWarned = true
+                            OcrDiagnostics.record("direct: no credential-shaped array in document (static vault gone — harvest handles OCR)")
+                        }
+                        var ocrPages: List<OcrPage>? =
+                            if (credentials != null) fetchOcrData(credentials, chapterUrl) else null
 
-                            // Pre-translate THIS chapter's text boxes in
-                            // the background so the overlay is ready by the
-                            // time images arrive (non-English modes). Used
-                            // to walk EVERY stored chapter: strings whose
-                            // translation once failed are never cached, so
-                            // they re-queued on every single chapter open
-                            // and the queue grew into a 429 storm over a
-                            // long session.
-                            if (mode != MODE_EN) prefetchTranslations(fresh.values, mode)
+                        // v40 harvest fallback (MHRepo issue #4): the site owner keeps
+                        // reshaping the vault/gate handshake. When the direct path
+                        // finds nothing, load the chapter in a COMPLETELY UNMODIFIED
+                        // WebView and read the site's own result instead.
+                        //
+                        // v48: the in-line harvest goes through harvestBlocking —
+                        // if a background top-up holds the slot, the foreground
+                        // visit PREEMPTS it (v49) instead of waiting 50s or
+                        // skipping to a raw burn.
+                        if (ocrPages == null) {
+                            val harvest = harvestBlocking(chapterUrl)
+                            if (harvest != null) {
+                                ocrPages = resolveHarvestResult(harvest, chapterUrl)
+                                    ?: harvest.pages.takeIf { it.isNotEmpty() }
+                            }
+                        }
+
+                        when {
+                            // Nothing captured anywhere: gate refused / challenge.
+                            // Instead of letting the chapter render raw forever,
+                            // schedule the background heal that re-fetches everything
+                            // once the block window passes.
+                            ocrPages == null -> scheduleOcrHeal(chapterUrl, pages, mode)
+
+                            // Gate answered but the chapter simply has no OCR
+                            // text (art-only pages) — nothing to store, nothing
+                            // to heal.
+                            ocrPages.isEmpty() -> {}
+
+                            else -> {
+                                val fresh = storeOcrBoxes(imageUrls, ocrPages)
+                                if (fresh.isNotEmpty()) {
+                                    noteOcrLanded()
+
+                                    // Pre-translate THIS chapter's text boxes in
+                                    // the background so the overlay is ready by the
+                                    // time images arrive (non-English modes). Used
+                                    // to walk EVERY stored chapter: strings whose
+                                    // translation once failed are never cached, so
+                                    // they re-queued on every single chapter open
+                                    // and the queue grew into a 429 storm over a
+                                    // long session.
+                                    if (mode != MODE_EN) prefetchTranslations(fresh.values, mode)
+                                }
+
+                                // v48 background top-up: partial coverage gets
+                                // two warm re-visits that chase the missing
+                                // pages (v49: skipped once a round proved the
+                                // site has nothing more).
+                                val coveredNow = coveredPageCount(imageUrls)
+                                if (imageUrls.isNotEmpty() && coveredNow < imageUrls.size) {
+                                    OcrDiagnostics.record(
+                                        "top-up: $coveredNow/${imageUrls.size} pages stored (${imageUrls.size - coveredNow} missing) — background re-visit scheduled",
+                                    )
+                                    scheduleOcrTopUp(chapterUrl, imageUrls, mode)
+                                }
+                            }
                         }
                     }
                 }
@@ -838,11 +895,11 @@ abstract class ManhuaRMTL :
                 // background ladder still gets its chance.
                 scheduleOcrHeal(chapterUrl, pages, mode)
             }
-        }
 
-        // Drop boxes of chapters nobody has touched in a while — bounds the
-        // map without ever erasing in-flight chapters.
-        pruneOcrMemory()
+            // Drop boxes of chapters nobody has touched in a while — bounds the
+            // map without ever erasing in-flight chapters.
+            pruneOcrMemory()
+        }
 
         // OCR render fingerprint (v26): encode the overlay settings into the
         // page URL fragment. Mihon's page caches key on the URL string, so
@@ -867,8 +924,29 @@ abstract class ManhuaRMTL :
         // open instead of showing raw pages forever. The "5-" prefix also
         // re-baselines every page once for this release.
         val epoch = overlayEpoch()
-        val rawEpoch = preferences.getInt(PREF_RAW_EPOCH, 0)
-        val fingerprint = "#ocrv=5-$mode-${overlayTextScale()}-$grouping-e$epoch-r$rawEpoch"
+        // The "-c<covered>-<total>" tail is per-chapter (v47, REPAIRED v52):
+        // it carries THIS chapter's PRE-open coverage (coveredBefore,
+        // captured before the acquisition block) and the "-r" tail the
+        // PRE-open raw epoch. The identity now changes exactly when the
+        // store changes between opens — the moment raw-served pages must be
+        // refetched and re-rendered with their boxes. v47's post-state token
+        // did the opposite: the in-line harvest landed BEFORE the token was
+        // computed, so the first open's raw-served pages were locked under
+        // an identity that already claimed the new coverage and never
+        // changed again.
+        //
+        // The "8-" prefix re-baselines every page once for this release:
+        // identities minted by v47-v51's post-state token can be permanently
+        // raw-poisoned (byte-identical URLs → no request → the overlay
+        // interceptor never runs).
+        //
+        // The "11-" prefix is v55: one-shot re-baseline for the coverage-based
+        // container prune — v54's exact-text prune let side-by-side wrapper
+        // boxes through (manga right-to-left text order, fused inline spans,
+        // skipped children). Pages burned with those combined boxes refetch
+        // and re-render from the corrected store.
+        val fingerprint = "#ocrv=12-$mode-${overlayTextScale()}-$grouping-e$epoch-r$rawEpochBefore" +
+            "-c$coveredBefore-${pages.size}"
         for (page in pages) {
             val url = page.imageUrl ?: continue
             if (!url.contains("#ocrv=")) page.imageUrl = url + fingerprint
@@ -893,6 +971,12 @@ abstract class ManhuaRMTL :
      *  - the longest remaining hex-ish string   → token
      *  - the two shorter hex-ish strings        → nonce (shorter) + ref (longer)
      *  - the first non-URL string               → cid (sent as-is, NOT decoded)
+     *
+     * v51: only {cid, ref} — the POST body — is REQUIRED anymore. The wire
+     * capture proves the site's own POST ships WITHOUT X-Gate-Token, and the
+     * runtime arrays no longer carry the gate URL element. Optional slots
+     * mean optional headers; a missing gate URL is resolved against the
+     * reading page's own host (the gate POST is same-origin).
      */
     private fun parseOcrCredentials(html: String): OcrCredentials? {
         // Any JS array literal of strings/numbers on one logical line —
@@ -900,27 +984,37 @@ abstract class ManhuaRMTL :
         // is harmless (worst case: an array without an OCR URL is skipped).
         val arrayRegex = Regex("""\[\s*"(?:[^"\\]|\\.)*"(?:\s*,\s*(?:"(?:[^"\\]|\\.)*"|\d+))+\s*\]""")
 
+        // v51: arrays that still carry the gate URL are the real vault —
+        // prefer them. URL-less arrays (the current runtime's shape) are a
+        // fallback so a reshaped vault can't silently blank the direct path.
+        var fallback: OcrCredentials? = null
         for (candidate in arrayRegex.findAll(html)) {
             val elements = ELEMENT_SPLIT.findAll(candidate.value)
                 .map { it.value.trim().trim('"').replace("\\/", "/") }
                 .filter { it.isNotEmpty() }
                 .toList()
             val creds = elements.asOcrCredentialsOrNull() ?: continue
-            return creds
+            if (creds.gateUrl.isNotEmpty()) return creds
+            if (fallback == null) fallback = creds
         }
-        return null
+        return fallback
     }
 
+    /**
+     * v51: the current protocol no longer mints every slot the v45 vault
+     * carried — the captured wire POST ships WITHOUT X-Gate-Token and the
+     * runtime arrays no longer carry the gate URL. Roles stay shape-based;
+     * only {cid, ref} is required now. Empty token/nonce means "header not
+     * sent"; an empty gateUrl is resolved by [fetchOcrDataOnce] against the
+     * reading page's own host. This is what un-deadened the payload
+     * channel: the strict parser rejected every runtime array the v50 scan
+     * collected (5 of them in the field log) and nothing was ever posted.
+     */
     private fun List<String>.asOcrCredentialsOrNull(): OcrCredentials? {
         val hexish = Regex("""^[0-9a-fA-F]{8,}$""")
 
-        val gateUrl = firstOrNull { it.startsWith("http") && it.contains("ocr", ignoreCase = true) }
-            ?.takeIf { it.startsWith("http") }
-            ?: return null
+        val gateUrl = firstOrNull { it.startsWith("http") && it.contains("ocr", ignoreCase = true) } ?: ""
         var cid: String? = null
-        var token: String? = null
-        var nonce: String? = null
-        var ref: String? = null
         var timestamp = 0L
 
         val hexes = mutableListOf<String>()
@@ -929,21 +1023,36 @@ abstract class ManhuaRMTL :
                 el.startsWith("http") -> {}
                 el.all { it.isDigit() } && timestamp == 0L && el.length in 6..15 ->
                     timestamp = el.toLongOrNull() ?: 0L
-                hexes.isEmpty() -> {
+                cid == null -> {
                     // first non-URL, non-timestamp string: the cid (kept as-is)
                     cid = el
                 }
                 else -> hexes += el
             }
         }
-        // Longest hex-ish leftover is the token; the two shorter ones are
-        // nonce/ref (order preserved: known layouts always put nonce first).
+        // Longest hex-ish leftover is the token (when the old triple-slot
+        // layout is intact); the two shorter ones are nonce/ref. With the
+        // token slot gone from the protocol, two hexes are nonce+ref and a
+        // single hex is the ref alone.
         val sortedHexes = hexes.filter { hexish.matches(it) }.sortedByDescending { it.length }
+        val token: String
+        val nonce: String
+        val ref: String
         when {
             sortedHexes.size >= 3 -> {
                 token = sortedHexes[0]
                 nonce = minOf(sortedHexes[1], sortedHexes[2])
                 ref = maxOf(sortedHexes[1], sortedHexes[2])
+            }
+            sortedHexes.size == 2 -> {
+                token = ""
+                nonce = minOf(sortedHexes[0], sortedHexes[1])
+                ref = maxOf(sortedHexes[0], sortedHexes[1])
+            }
+            sortedHexes.size == 1 -> {
+                token = ""
+                nonce = ""
+                ref = sortedHexes[0]
             }
             else -> return null
         }
@@ -966,6 +1075,18 @@ abstract class ManhuaRMTL :
      * - Origin and Referer headers are REQUIRED (site returns 403 without them)
      */
     private fun fetchOcrData(credentials: OcrCredentials, readingPageUrl: String): List<OcrPage>? {
+        // v52: while the protocol-level cooldown runs, skip the ladder —
+        // the harvest handles OCR and the resolver's per-harvest probes
+        // double as recovery checks.
+        if (System.currentTimeMillis() < gateCooldownUntil) {
+            if (!gateCooldownLogged) {
+                gateCooldownLogged = true
+                OcrDiagnostics.record(
+                    "gate: direct path cooling down — the gate rejects our POSTs; the harvest handles OCR",
+                )
+            }
+            return null
+        }
         var result = fetchOcrDataOnce(credentials, readingPageUrl)
         var creds = credentials
         for (gapMs in OCR_FETCH_RETRY_GAPS_MS) {
@@ -992,6 +1113,14 @@ abstract class ManhuaRMTL :
             refreshOcrCredentials(readingPageUrl)?.let { creds = it }
             result = fetchOcrDataOnce(creds, readingPageUrl)
         }
+        // v52: a full ladder of 400-empty answers is a PROTOCOL rejection,
+        // not a rate-limit window — re-running it on every chapter open
+        // costs ~10 s each and has never landed. Cool the direct path down
+        // for 30 minutes; the harvest (which works) takes over immediately.
+        if (result == null && lastGateWas400Empty) {
+            gateCooldownUntil = System.currentTimeMillis() + 30 * 60_000L
+            OcrDiagnostics.record("gate: 400 on every attempt — direct path cooling down 30 min")
+        }
         return result
     }
 
@@ -1012,7 +1141,41 @@ abstract class ManhuaRMTL :
         null
     }
 
+    // v52 gate forensics: the direct POST path has answered 400/empty all
+    // day in the field while the site's own POST succeeds — these make the
+    // credential shape visible in the paste and stop paying the ~10 s retry
+    // ladder on every chapter open for a protocol that rejects us.
+    @Volatile
+    private var gateShapeLogged = false
+
+    @Volatile
+    private var lastGateWas400Empty = false
+
+    @Volatile
+    private var gateCooldownUntil = 0L
+
+    @Volatile
+    private var gateCooldownLogged = false
+
+    /** v53: one burn-geometry line per process (bitmap dims + first box). */
+    private val burnGeometryLogged = AtomicBoolean(false)
+
     private fun fetchOcrDataOnce(credentials: OcrCredentials, readingPageUrl: String): List<OcrPage>? {
+        // One shape line per process — enough to spot a misassigned slot
+        // (the 400's most likely cause) without logging credential values.
+        if (!gateShapeLogged) {
+            gateShapeLogged = true
+            OcrDiagnostics.record(
+                "gate: creds — cid=${credentials.cid.length}ch, ref=${credentials.ref.length}ch, " +
+                    "nonce=${if (credentials.nonce.isEmpty()) "-" else credentials.nonce.length.toString() + "ch"}, " +
+                    "token=${if (credentials.token.isEmpty()) "-" else "sent"}, ts=fresh",
+            )
+        }
+        // v51: the runtime arrays no longer carry the gate URL — the site
+        // POSTs same-origin, so the reading page's own host IS the gate host.
+        val gateUrl = credentials.gateUrl.ifEmpty {
+            readingPageUrl.toHttpUrlOrNull()?.let { "${it.scheme}://${it.host}/fetch-ocr.php" } ?: return null
+        }
         // Body: cid stays base64, ref is hex — both as-is from _0xvault
         val jsonBody = """{"cid":"${credentials.cid}","ref":"${credentials.ref}"}"""
         val requestBody = jsonBody.toRequestBody("application/json".toMediaType())
@@ -1022,22 +1185,33 @@ abstract class ManhuaRMTL :
         // make this read as exactly what it is on the site: a same-origin
         // jQuery AJAX POST — the document-shaped defaults from
         // configureHeaders would be a bot signal on an XHR.
-        val request = Request.Builder()
-            .url(credentials.gateUrl)
+        // v51: X-Gate-Token/X-Gate-Nonce are sent only when the credential
+        // set carries them — the site's own POST no longer includes a token
+        // (wire capture: token=false) and echoing empty headers would be a
+        // bot signal. A missing timestamp is minted fresh, exactly what the
+        // site's JS does at call time.
+        val builder = Request.Builder()
+            .url(gateUrl)
             .post(requestBody)
             .headers(headers)
             .header("Accept", "application/json, text/javascript, */*; q=0.01")
             .header("Content-Type", "application/json")
             .header("X-Requested-With", "XMLHttpRequest")
             .header("Cache-Control", "no-cache")
-            .header("X-Gate-Token", credentials.token)
-            .header("X-Gate-Nonce", credentials.nonce)
-            .header("X-Gate-Timestamp", credentials.timestamp.toString())
+        if (credentials.token.isNotEmpty()) builder.header("X-Gate-Token", credentials.token)
+        if (credentials.nonce.isNotEmpty()) builder.header("X-Gate-Nonce", credentials.nonce)
+        // v52: ALWAYS mint the timestamp fresh. The vault's ts slot is the
+        // page-render time (minutes old through any page cache); the site's
+        // own JS mints its timestamp at call time — a stale ts is a plausible
+        // 400 trigger, and a fresh one costs nothing.
+        val ts = System.currentTimeMillis() / 1000
+        val request = builder
+            .header("X-Gate-Timestamp", ts.toString())
             .header("Referer", readingPageUrl)
             .header("Origin", baseUrl)
             .header("Sec-Fetch-Dest", "empty")
             .header("Sec-Fetch-Mode", "cors")
-            .header("Sec-Fetch-Site", secFetchSite(credentials.gateUrl.toHttpUrl().host))
+            .header("Sec-Fetch-Site", secFetchSite(gateUrl.toHttpUrl().host))
             .removeHeader("Upgrade-Insecure-Requests")
             .build()
 
@@ -1045,9 +1219,15 @@ abstract class ManhuaRMTL :
             val response = auxClient.newCall(request).execute()
             val body = response.body.string()
             val cfMitigated = response.header("cf-mitigated")
+            val status = response.code
             response.close()
 
-            if (body.isNullOrBlank()) return null
+            lastGateWas400Empty = false
+            if (body.isNullOrBlank()) {
+                lastGateWas400Empty = status == 400
+                OcrDiagnostics.record("gate: HTTP $status, empty body")
+                return null
+            }
 
             // Detect Cloudflare challenge / block pages. These are NOT
             // solvable here (and must never touch the cookie store — the aux
@@ -1065,16 +1245,107 @@ abstract class ManhuaRMTL :
                 body.contains("cf-error-details", ignoreCase = true) ||
                 body.contains("cf-turnstile", ignoreCase = true)
             ) {
+                OcrDiagnostics.record("gate: HTTP $status challenge/block page")
                 return null
             }
 
             // v39: shape-based parse (bare array / envelope / drifting field
             // names) replacing the strict DTO ladder — the site owner keeps
             // nudging the payload shape between obfuscation rounds.
-            parseOcrPayload(body)
-        } catch (_: Exception) {
+            val parsed = parseOcrPayload(body)
+            if (parsed == null) {
+                OcrDiagnostics.record(
+                    "gate: HTTP $status, unparsed body: ${body.take(140).replace(Regex("\\s+"), " ")}",
+                )
+            } else {
+                OcrDiagnostics.record("gate: HTTP $status → ${parsed.size} pages")
+            }
+            parsed
+        } catch (t: Exception) {
+            OcrDiagnostics.record("gate: threw ${t.javaClass.simpleName}")
             null
         }
+    }
+
+    // ============================== Harvest resolution (v45) ==============================
+    //
+    // The passive observatory returns everything the site's own runtime
+    // exposed during an unmodified visit. This resolver pulls it into the
+    // best coordinate space available, gate-space first:
+    //
+    //  1. site-memory OCR payload — the exact object the site's reader
+    //     renders from; its boxes are the gate's own pixel coordinates;
+    //  2. runtime-minted gate credentials → one direct gate POST of our own
+    //     — again the gate's own pixel coordinates (single attempt per
+    //     candidate: the site just used the same ones successfully, so
+    //     retry ladders here would only stall chapter open when a
+    //     credential happens to be single-use);
+    //  3. the DOM scrape's fraction boxes — resolution-independent rendered
+    //     geometry, the fallback when the page exposes neither payload nor
+    //     credentials (kept inside OcrHarvest's result as `pages`).
+    //
+    // 1 and 2 restore the alignment the direct path always had; 3 fixes the
+    // "works but misaligned" report by never depending on the WebView's
+    // image resolution or element geometry again.
+
+    private fun resolveHarvestResult(result: OcrHarvest.HarvestResult, readingPageUrl: String): List<OcrPage>? {
+        for (candidate in result.payloadCandidates) {
+            val pages = parseOcrPayload(candidate)
+                ?.takeIf { it.isNotEmpty() }
+                ?.bareFilenames()
+            if (pages != null) {
+                OcrDiagnostics.record("runtime: site-memory payload → ${pages.size} pages (gate coordinates)")
+                return pages
+            }
+        }
+
+        var attempts = 0
+        var unusable = 0
+        // v53: the resolver's direct POST attempts must honor the protocol
+        // cooldown too — the v52 field log showed two "gate: HTTP 400" lines
+        // AFTER the cooldown was declared, because the per-open ladder
+        // respects gateCooldownUntil but these recovery probes did not.
+        val gateCooling = System.currentTimeMillis() < gateCooldownUntil
+        if (gateCooling) {
+            OcrDiagnostics.record("runtime: direct POST probes skipped — gate cooling down")
+        }
+        for (candidate in result.credentialArrays) {
+            if (attempts >= 2) break
+            if (gateCooling) {
+                unusable++
+                continue
+            }
+            val creds = credentialArrayFromJson(candidate)
+            if (creds == null) {
+                unusable++
+                continue
+            }
+            attempts++
+            val pages = fetchOcrDataOnce(creds, readingPageUrl)
+            if (!pages.isNullOrEmpty()) {
+                OcrDiagnostics.record("runtime: direct POST with page-minted credentials → ${pages.size} pages (gate coordinates)")
+                return pages
+            }
+        }
+        // v51: silence is a bug — when the harvest handed us credential sets
+        // and none produced a POST, the paste must say why.
+        if (attempts == 0 && result.credentialArrays.isNotEmpty()) {
+            OcrDiagnostics.record(
+                "runtime: ${result.credentialArrays.size} credential set(s) unusable ($unusable shapeless) — no direct POST possible",
+            )
+        }
+        return null
+    }
+
+    /** JSON string of a runtime array → our credential model, or null. */
+    private fun credentialArrayFromJson(raw: String): OcrCredentials? = runCatching {
+        val arr = Json.parseToJsonElement(raw).jsonArray
+        arr.mapNotNull { (it as? JsonPrimitive)?.content }
+    }.getOrNull()?.asOcrCredentialsOrNull()
+
+    /** Normalises payload image values to the bare filename the matcher keys on. */
+    private fun List<OcrPage>.bareFilenames(): List<OcrPage> = map { page ->
+        page.copy(image = page.image?.trim()?.substringAfterLast('/')?.substringBefore('?'))
     }
 
     // ============================== OCR self-heal ==============================
@@ -1099,6 +1370,7 @@ abstract class ManhuaRMTL :
 
     private fun scheduleOcrHeal(chapterUrl: String, pages: List<Page>, mode: String) {
         preferences.edit().putBoolean(PREF_RAW_PENDING, true).apply()
+        OcrDiagnostics.record("heal scheduled for …${chapterUrl.takeLast(28)}")
         if (healingChapters.putIfAbsent(chapterUrl, true) != null) return
 
         // Captured BEFORE the fingerprint fragments are appended (this runs
@@ -1108,6 +1380,7 @@ abstract class ManhuaRMTL :
 
         healScheduler.execute {
             try {
+                var landed = false
                 for (gapMs in OCR_HEAL_GAPS_MS) {
                     Thread.sleep(gapMs)
                     try {
@@ -1120,21 +1393,30 @@ abstract class ManhuaRMTL :
                         var ocrPages: List<OcrPage>? = refreshOcrCredentials(chapterUrl)
                             ?.let { fetchOcrDataOnce(it, chapterUrl) }
 
-                        // v39: while the site owner keeps the vault/gate
+                        // v40: while the site owner keeps the vault/gate
                         // reshaped, the direct path stays dead no matter how
-                        // fresh the credentials — the WebView harvest is the
-                        // heal round that still works then.
+                        // fresh the credentials — the unmodified-WebView
+                        // observatory is the heal round that still works then.
+                        // v45: gate-space-first resolution inside the harvest
+                        // result (site-memory payload → runtime credentials →
+                        // DOM fractions), same as the in-line path.
                         if (ocrPages == null) {
-                            ocrPages = OcrHarvest.harvest(chapterUrl, headers["User-Agent"] ?: "")
+                            val harvest = OcrHarvest.harvest(chapterUrl, headers["User-Agent"] ?: "")
+                            if (harvest != null) {
+                                ocrPages = resolveHarvestResult(harvest, chapterUrl)
+                                    ?: harvest.pages.takeIf { it.isNotEmpty() }
+                            }
                         }
 
-                        if (ocrPages == null) continue // gate still blocking / nothing captured
+                        if (ocrPages == null) continue // gate still blocking / nothing observed
                         if (ocrPages.isEmpty()) break // gate answered: chapter simply has no OCR text
 
                         val fresh = storeOcrBoxes(imageUrls, ocrPages)
                         if (fresh.isNotEmpty()) {
+                            OcrDiagnostics.record("heal: stored ${fresh.size} pages — epoch will bump")
                             if (mode != MODE_EN) prefetchTranslations(fresh.values, mode)
                             noteOcrLanded()
+                            landed = true
                         }
                         break
                     } catch (_: Exception) {
@@ -1142,10 +1424,126 @@ abstract class ManhuaRMTL :
                         // the next spaced attempt takes over.
                     }
                 }
+                if (!landed) OcrDiagnostics.record("heal: ladder exhausted for …${chapterUrl.takeLast(28)}")
             } finally {
                 healingChapters.remove(chapterUrl)
             }
         }
+    }
+
+    // ============================== Background top-up (v48/v49) ==============================
+    //
+    // Field data from the 150-page mega chapter: the site renders its ENTIRE
+    // overlay payload up-front (~1s into the visit), so a partial store means
+    // the DOM gave everything it has — but earlier rounds could also have
+    // been cut short by the soft budget. Two WARM background re-visits chase
+    // the missing pages; the moment one round adds nothing, the chapter is
+    // marked exhausted (in-memory) and re-opens stop scheduling visits at
+    // all: the site's DOM provably holds no more OCR for it.
+
+    /** Chapters whose top-up rounds proved the site has nothing more. */
+    private val exhaustedChapters = ConcurrentHashMap<String, Boolean>()
+
+    /** v46: the "static vault gone" log fires once per process, not per chapter. */
+    @Volatile
+    private var directGateWarned = false
+
+    private fun scheduleOcrTopUp(chapterUrl: String, imageUrls: List<String>, mode: String) {
+        if (imageUrls.isEmpty()) return
+        if (exhaustedChapters.containsKey(chapterUrl)) {
+            OcrDiagnostics.record("top-up: skipped (top-up exhausted: the site shows no more OCR in its DOM)")
+            return
+        }
+        // One background job per chapter — shared with the heal ladder so a
+        // heal and a top-up can never hold the WebView slot at the same time.
+        if (healingChapters.putIfAbsent(chapterUrl, true) != null) return
+        val ua = headers["User-Agent"] ?: ""
+
+        healScheduler.execute {
+            try {
+                for (gapMs in OCR_TOPUP_GAPS_MS) {
+                    Thread.sleep(gapMs)
+
+                    val before = coveredPageCount(imageUrls)
+                    if (before >= imageUrls.size) break // a heal landed in between
+
+                    val harvest = OcrHarvest.harvest(chapterUrl, ua)
+                    val merged = harvest?.let {
+                        resolveHarvestResult(it, chapterUrl) ?: it.pages.takeIf { p -> p.isNotEmpty() }
+                    }
+                    if (!merged.isNullOrEmpty()) {
+                        val fresh = storeOcrBoxes(imageUrls, merged)
+                        if (fresh.isNotEmpty() && mode != MODE_EN) prefetchTranslations(fresh.values, mode)
+                    }
+
+                    val after = coveredPageCount(imageUrls)
+                    when {
+                        after >= imageUrls.size -> {
+                            OcrDiagnostics.record("top-up: coverage complete — $after/${imageUrls.size} pages (next open re-renders)")
+                            break
+                        }
+                        after > before -> {
+                            OcrDiagnostics.record("top-up: coverage $before → $after/${imageUrls.size} pages (next open re-renders)")
+                            continue
+                        }
+                        else -> {
+                            // v51: exhaustion must mean "the DOM ceiling was
+                            // REACHED", not "one visit yielded nothing" — the
+                            // v50 build let a single early-settled round (its
+                            // own settle bug) permanently lock chapters at
+                            // 1/56 stored. Only a majority-covered chapter
+                            // may be marked exhausted; a low-coverage
+                            // zero-gain round falls through to the next gap.
+                            val majority = after * 2 >= imageUrls.size
+                            if (majority) {
+                                exhaustedChapters[chapterUrl] = true
+                                OcrDiagnostics.record(
+                                    "top-up: no new pages — the site's DOM holds no more OCR ($after/${imageUrls.size} stored); re-opens render instantly",
+                                )
+                                break
+                            }
+                            OcrDiagnostics.record(
+                                "top-up: round added nothing (coverage still low: $after/${imageUrls.size}) — the site's data was not reached; the next gap retries",
+                            )
+                        }
+                    }
+                }
+            } catch (_: Exception) {
+                // Transient (visit failed, app tearing down) — the next open
+                // re-schedules while coverage is still partial.
+            } finally {
+                healingChapters.remove(chapterUrl)
+            }
+        }
+    }
+
+    /**
+     * How many of the chapter's pages currently have boxes, memory merged
+     * over the persistent store. Drives the v49 open split and the v47
+     * per-chapter coverage fingerprint token.
+     */
+    private fun coveredPageCount(imageUrls: List<String>): Int {
+        if (imageUrls.isEmpty()) return 0
+        var covered = 0
+        for (url in imageUrls) {
+            val key = url.trim()
+            val boxes = ocrData[key]?.boxes ?: loadOcrBoxes(key)
+            if (!boxes.isNullOrEmpty()) covered++
+        }
+        return covered
+    }
+
+    /**
+     * The v48/v49 in-line harvest wrapper: a foreground open never waits 50
+     * seconds behind a background top-up. If the slot is busy, the running
+     * background visit is ASKED to wrap up (preempt) and the foreground
+     * harvest proceeds as soon as it settles (≤12 s).
+     */
+    private fun harvestBlocking(chapterUrl: String): OcrHarvest.HarvestResult? {
+        if (OcrHarvest.isBusy()) {
+            OcrDiagnostics.record("harvest: slot busy (background top-up) — waiting")
+        }
+        return OcrHarvest.harvest(chapterUrl, headers["User-Agent"] ?: "", preemptCurrent = true)
     }
 
     /**
@@ -1181,62 +1579,209 @@ abstract class ManhuaRMTL :
     }
 
     /**
-     * Matches OCR pages against image URLs (several filename spellings) and
-     * MERGES the boxes into [ocrData] — images of earlier chapters may still
-     * be in flight (preload/download), so nothing is ever replaced or erased.
-     * Returns the boxes stored THIS call, keyed by image URL (empty when
-     * nothing matched).
+     * Matches OCR pages against image URLs and MERGES the boxes into
+     * [ocrData] — images of earlier chapters may still be in flight
+     * (preload/download), so nothing is ever replaced or erased. Returns the
+     * boxes stored THIS call, keyed by image URL (empty when nothing
+     * matched).
+     *
+     * v46 three-tier matching — the v45 bare-filename equality dropped every
+     * page whose WebView image spelling differed from the page-list URL
+     * (resize variants, -scaled suffixes, escapes; the "1 box per 7 pages"
+     * field report):
+     *  1. NORMALIZED FILENAME — URL-decoded, query/extension stripped,
+     *     -scaled/-NNNxNNN suffixes removed, lowercased, on both sides;
+     *  2. UNIQUE PAGE-NUMBER TOKEN — the last number group of the normalized
+     *     base, when it is unique among the still-unmatched on BOTH sides;
+     *  3. GATED POSITIONAL PAIRING — leftovers pair one-to-one only when
+     *     tier 1 already proved ≥30% of the pages (so a scrambled order can
+     *     never invent matches out of thin air).
+     * Every call logs its tier verdict: "stored: X/Y pages (filename a,
+     * page-number b, positional c)".
      */
     private fun storeOcrBoxes(pageUrls: List<String>, ocrPages: List<OcrPage>): Map<String, List<OcrTextBox>> {
-        // Build filename → text boxes map (try multiple key formats for robust matching)
-        val ocrByFilename = mutableMapOf<String, List<OcrTextBox>>()
+        class OcrSlot(val keys: Set<String>, val token: Int?, var boxes: List<OcrTextBox>)
+
+        val ocrSlots = mutableListOf<OcrSlot>()
         for (ocrPage in ocrPages) {
-            val filename = ocrPage.image ?: continue
-            val rawBoxes = ocrPage.normalisedTexts()
+            val filename = ocrPage.image?.trim().takeUnless { it.isNullOrEmpty() } ?: continue
+            val sweptBoxes = ocrPage.normalisedTexts()
+            // v56: site chrome first — ad banners and app promos captured by
+            // the sweep must never reach the store (they burned as English
+            // boxes even on foreign-language chapters and wasted translation
+            // quota on garbage).
+            val rawBoxes = sweptBoxes.filter { !isChromeBoxText(it.text) }
+            val chromeDropped = sweptBoxes.size - rawBoxes.size
+            if (chromeDropped > 0 && adFilterStoreLogs.incrementAndGet() <= 6) {
+                OcrDiagnostics.record(
+                    "adfilter: $filename — dropped $chromeDropped chrome/ad box(es)",
+                )
+            }
             if (rawBoxes.isEmpty()) continue
             // Rendering modes: the SITE renders each OCR entry as its own
             // overlay box (it cuts text into many small blocks); paragraph
-            // merging is an optional mode.
+            // merging is an optional mode. The dedupe bucket is space-aware
+            // (v45): fraction boxes need a finer grid than pixel boxes or
+            // same-text lines a tenth of the image apart would collapse.
+            // v54: the sweep also captures container divs BESIDE their line
+            // children (a wrapper's innerText equals its textContent) — a
+            // page-spanning wrapper burned its concatenated text as a slab.
+            // The prune drops wrappers/duplicates whose text the tighter
+            // boxes already carry, so only real bubbles reach the store.
             val textBoxes = when (grouping) {
-                GROUP_PARAGRAPH -> groupIntoParagraphs(
-                    rawBoxes.distinctBy { b ->
-                        "${b.text}|${b.box.map { (it * 10).toInt() }}"
-                    },
+                GROUP_PARAGRAPH -> pruneContainerBoxes(groupIntoParagraphs(dedupeBoxes(rawBoxes)))
+                else -> pruneContainerBoxes(dedupeBoxes(rawBoxes))
+            }
+            val pruned = rawBoxes.size - textBoxes.size
+            if (pruned > 0 && pruneHitLogs.incrementAndGet() <= 6) {
+                OcrDiagnostics.record(
+                    "prune: $filename — dropped $pruned container/duplicate box(es), kept ${textBoxes.size}",
                 )
-                else -> rawBoxes.distinctBy { b ->
-                    "${b.text}|${b.box.map { (it * 10).toInt() }}"
+            }
+            if (textBoxes.isEmpty()) continue
+            val keys = filenameKeys(filename)
+            ocrSlots += OcrSlot(keys, keys.mapNotNull { pageNumberToken(it) }.firstOrNull(), textBoxes)
+        }
+
+        // v56: repeated-banner sweep — the SAME text on 3+ different pages is
+        // site chrome (persistent ad banners, watermarks, chapter recaps),
+        // never dialogue. Ads rotate their headline per page, which is what
+        // the keyword filter above is for; banners that keep one creative get
+        // caught here.
+        run {
+            val pagesByText = HashMap<String, HashSet<String>>()
+            for (slot in ocrSlots) {
+                val pageId = slot.keys.firstOrNull() ?: continue
+                for (b in slot.boxes) {
+                    val key = chromeRepetitionKey(b.text)
+                    if (key.isEmpty()) continue
+                    pagesByText.getOrPut(key) { HashSet() }.add(pageId)
                 }
             }
-            if (textBoxes.isNotEmpty()) {
-                // Store under original name AND URL-decoded name
-                ocrByFilename[filename] = textBoxes
-                ocrByFilename[filename.replace("%20", " ")] = textBoxes
-                ocrByFilename[filename.replace(" ", "_")] = textBoxes
+            val bannerTexts = pagesByText.filterValues { it.size >= 3 }.keys
+            if (bannerTexts.isNotEmpty()) {
+                var dropped = 0
+                for (slot in ocrSlots) {
+                    val before = slot.boxes.size
+                    slot.boxes = slot.boxes.filter { chromeRepetitionKey(it.text) !in bannerTexts }
+                    dropped += before - slot.boxes.size
+                }
+                if (dropped > 0) {
+                    OcrDiagnostics.record(
+                        "adfilter: dropped $dropped repeated banner box(es) — same text on 3+ pages",
+                    )
+                }
+            }
+        }
+
+        // Index the OCR slots by every normalized key spelling (later pages
+        // win per key — duplicate filenames inside one chapter payload would
+        // be a site bug anyway).
+        val byKey = HashMap<String, OcrSlot>()
+        for (slot in ocrSlots) {
+            for (key in slot.keys) byKey[key] = slot
+        }
+
+        val slotOfPage = arrayOfNulls<OcrSlot>(pageUrls.size)
+        val pageKeys = pageUrls.map { filenameKeys(it) }
+        val pageTokens = pageKeys.map { keys -> keys.mapNotNull { pageNumberToken(it) }.distinct() }
+        val slotUsed = BooleanArray(ocrSlots.size)
+        var byFilename = 0
+        var byToken = 0
+        var byPosition = 0
+
+        // Tier 1: normalized filename keys.
+        for (i in pageUrls.indices) {
+            val slot = pageKeys[i].firstNotNullOfOrNull { byKey[it] } ?: continue
+            slotOfPage[i] = slot
+            slotUsed[ocrSlots.indexOf(slot)] = true
+            byFilename++
+        }
+
+        // Tier 2: unique page-number tokens among the still-unmatched.
+        for (i in pageUrls.indices) {
+            if (slotOfPage[i] != null) continue
+            val tokens = pageTokens[i]
+            if (tokens.size != 1) continue
+            val token = tokens[0]
+            val candidates = ocrSlots.withIndex()
+                .filter { (si, slot) -> !slotUsed[si] && slot.token == token }
+                .toList()
+            if (candidates.size != 1) continue
+            val (si, slot) = candidates[0]
+            slotOfPage[i] = slot
+            slotUsed[si] = true
+            byToken++
+        }
+
+        // Tier 3: positional pairing of the leftovers, only with enough
+        // tier-1 proof that the payload really belongs to this chapter.
+        val tier1 = byFilename
+        if (tier1 * 10 >= pageUrls.size * 3 && pageUrls.isNotEmpty()) {
+            val leftoverPages = (0 until pageUrls.size).filter { slotOfPage[it] == null }
+            val leftoverSlots = ocrSlots.withIndex().filter { !slotUsed[it.index] }.map { it.index }
+            if (leftoverPages.size == leftoverSlots.size && leftoverPages.isNotEmpty()) {
+                for ((n, pi) in leftoverPages.withIndex()) {
+                    val si = leftoverSlots[n]
+                    slotOfPage[pi] = ocrSlots[si]
+                    slotUsed[si] = true
+                    byPosition++
+                }
             }
         }
 
         val now = System.currentTimeMillis()
         val fresh = mutableMapOf<String, List<OcrTextBox>>()
-        for (imageUrl in pageUrls) {
-            // Strip leading spaces (site has src=" https://..."), get filename, strip query
-            val filename = imageUrl.trim().substringAfterLast("/").substringBefore("?")
-            // Also try URL-decoded version — decode is guarded: a stray '%'
-            // in a filename used to throw and kill the WHOLE chapter's
-            // matching via the outer catch (one more silent-raw source).
-            val decodedFilename = runCatching { java.net.URLDecoder.decode(filename, "UTF-8") }
-                .getOrDefault(filename)
-
-            val textBoxes = ocrByFilename[filename]
-                ?: ocrByFilename[decodedFilename]
-                ?: ocrByFilename[decodedFilename.replace(" ", "_")]
-            if (textBoxes != null && textBoxes.isNotEmpty()) {
-                val key = imageUrl.trim()
-                ocrData[key] = OcrEntry(textBoxes, now)
-                fresh[key] = textBoxes
-            }
+        for (i in pageUrls.indices) {
+            val slot = slotOfPage[i] ?: continue
+            val key = pageUrls[i].trim()
+            ocrData[key] = OcrEntry(slot.boxes, now)
+            fresh[key] = slot.boxes
         }
         if (fresh.isNotEmpty()) persistOcr(fresh)
+
+        OcrDiagnostics.record(
+            "stored: ${fresh.size}/${pageUrls.size} pages (filename $byFilename, page-number $byToken, positional $byPosition)",
+        )
         return fresh
+    }
+
+    /**
+     * v46 filename normalization: URL-decode, strip query + extension,
+     * remove the -scaled / -NNNxNNN resize-suffix family, lowercase. The
+     * result is the key both the page-list URL and the harvested image name
+     * collapse to.
+     */
+    private fun normalizeFileKey(name: String): String {
+        var s = runCatching { java.net.URLDecoder.decode(name, "UTF-8") }.getOrDefault(name)
+        s = s.substringBefore('?').trim()
+        val dot = s.lastIndexOf('.')
+        if (dot > 0 && s.lastIndexOf('/') < dot) s = s.substring(0, dot)
+        s = s.replace(Regex("""-scaled$"""), "")
+        s = s.replace(Regex("""-\d{2,5}x\d{2,5}$"""), "")
+        return s.lowercase()
+    }
+
+    /** Every normalized spelling a URL or bare filename should match under. */
+    private fun filenameKeys(urlOrName: String): Set<String> {
+        val bare = urlOrName.substringBefore('?').substringAfterLast('/').trim()
+        val keys = mutableSetOf<String>()
+        normalizeFileKey(bare).takeIf { it.isNotEmpty() }?.let { keys.add(it) }
+        val decoded = runCatching { java.net.URLDecoder.decode(bare, "UTF-8") }.getOrDefault(bare)
+        normalizeFileKey(decoded).takeIf { it.isNotEmpty() }?.let { keys.add(it) }
+        return keys
+    }
+
+    /** Last number group of a normalized key ("page 12" matching token). */
+    private fun pageNumberToken(key: String): Int? = Regex("""\d+""").findAll(key).lastOrNull()?.value?.toIntOrNull()
+
+    /**
+     * Identical (text + bucketed box) entries collapse. Fraction-space boxes
+     * bucket at 0.1% of the image, pixel boxes at 10 px.
+     */
+    private fun dedupeBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> = boxes.distinctBy { b ->
+        val bucket = if (b.normalized) 1000f else 10f
+        "${b.text}|${b.box.map { (it * bucket).toInt() }}"
     }
 
     // ============================== OCR box storage ==============================
@@ -1250,9 +1795,12 @@ abstract class ManhuaRMTL :
     }
 
     /**
-     * Persists a chapter's boxes. Value layout: "<savedAt>|<json>", json =
-     * [[x, y, w, h, "text"], …]. The store is pruned to the newest
-     * [OCR_DISK_MAX_ENTRIES] pages whenever it outgrows the cap.
+     * Persists a chapter's boxes. Value layout: "<savedAt>|<json>". For
+     * pixel-space boxes json = [[x, y, w, h, "text"], …]; fraction-space
+     * (normalized) boxes carry a leading "n" marker: ["n", x, y, w, h,
+     * "text"], … — fractions survive a restart without knowing the image
+     * resolution they were measured against. The store is pruned to the
+     * newest [OCR_DISK_MAX_ENTRIES] pages whenever it outgrows the cap.
      */
     private fun persistOcr(entries: Map<String, List<OcrTextBox>>) {
         if (entries.isEmpty()) return
@@ -1264,6 +1812,7 @@ abstract class ManhuaRMTL :
                     for (b in boxes) {
                         add(
                             buildJsonArray {
+                                if (b.normalized) add("n")
                                 add(b.box.getOrElse(0) { 0f }.toDouble())
                                 add(b.box.getOrElse(1) { 0f }.toDouble())
                                 add(b.box.getOrElse(2) { 0f }.toDouble())
@@ -1277,6 +1826,11 @@ abstract class ManhuaRMTL :
             }
             pruneOcrStore(editor, entries.size)
             editor.apply()
+            // v52: freshly stored pages must be visible to the interceptor's
+            // normalized-filename index immediately — the once-per-process
+            // index kept hiding pages stored after its build for the whole
+            // app session (and a miss there is invisible in every log).
+            filenameKeyIndex = null
         }
     }
 
@@ -1288,13 +1842,22 @@ abstract class ManhuaRMTL :
         return runCatching {
             Json.parseToJsonElement(raw.substringAfter('|')).jsonArray.mapNotNull { box ->
                 val f = box.jsonArray
-                val x = f.getOrNull(0)?.jsonPrimitive?.content?.toFloatOrNull() ?: return@mapNotNull null
-                val y = f.getOrNull(1)?.jsonPrimitive?.content?.toFloatOrNull() ?: return@mapNotNull null
-                val w = f.getOrNull(2)?.jsonPrimitive?.content?.toFloatOrNull() ?: return@mapNotNull null
-                val h = f.getOrNull(3)?.jsonPrimitive?.content?.toFloatOrNull() ?: return@mapNotNull null
-                val text = f.getOrNull(4)?.jsonPrimitive?.content ?: return@mapNotNull null
+                // v45: ["n", x, y, w, h, "text"] = fraction-space box;
+                // legacy entries (all numbers) stay pixel-space.
+                var idx = 0
+                var normalized = false
+                if (f.firstOrNull()?.jsonPrimitive?.content == "n") {
+                    normalized = true
+                    idx = 1
+                }
+                fun num(i: Int): Float? = f.getOrNull(i)?.jsonPrimitive?.content?.toFloatOrNull()
+                val x = num(idx) ?: return@mapNotNull null
+                val y = num(idx + 1) ?: return@mapNotNull null
+                val w = num(idx + 2) ?: return@mapNotNull null
+                val h = num(idx + 3) ?: return@mapNotNull null
+                val text = f.getOrNull(idx + 4)?.jsonPrimitive?.content ?: return@mapNotNull null
                 if (text.isBlank()) return@mapNotNull null
-                OcrTextBox(floatArrayOf(x, y, w, h), text)
+                OcrTextBox(floatArrayOf(x, y, w, h), text, normalized)
             }.takeIf { it.isNotEmpty() }
         }.getOrNull()
     }
@@ -1472,24 +2035,48 @@ abstract class ManhuaRMTL :
     private fun translateBatchAndComplete(keys: List<String>, target: String) {
         val results = translateBatch(keys.map { it.substringAfter('|') }, target)
         var anySuccess = false
+        var requeued = 0
         for (index in keys.indices) {
             val key = keys[index]
             val future = translationsInFlight[key] ?: continue
             val translated = results.getOrNull(index)
             if (translated.isNullOrBlank()) {
-                // Complete with null — deliberately NOT cached, so the next
-                // chapter load retries (the v31 "poison cache" lesson).
-                future.complete(null)
+                // v56: a failed string now re-queues IN-SESSION (bounded)
+                // instead of dying after the batch's 3 attempts — the old
+                // behavior stranded whole chapters on the English fallback
+                // after one 429 storm, and nothing retried until the next
+                // chapter load. The future stays registered, so a render
+                // waiting on it still receives the late translation; the
+                // retry budget exhausted, it completes(null) — never cached,
+                // the next chapter load retries.
+                val attempts = translateRetries.merge(key, 1, Int::plus) ?: 1
+                if (attempts <= TRANSLATE_SESSION_RETRIES) {
+                    requeued++
+                    pendingTranslations.add(key)
+                } else {
+                    translateRetries.remove(key)
+                    future.complete(null)
+                    translationsInFlight.remove(key, future)
+                }
             } else {
                 anySuccess = true
+                translateRetries.remove(key)
                 if (translationCache.size > MAX_TRANSLATION_CACHE) translationCache.clear()
                 translationCache[key] = translated
                 translationsSinceEpoch.incrementAndGet()
                 future.complete(translated)
+                translationsInFlight.remove(key, future)
             }
-            translationsInFlight.remove(key, future)
+        }
+        if (translateBatchLogs.incrementAndGet() <= 8) {
+            val ok = results.count { !it.isNullOrBlank() }
+            OcrDiagnostics.record(
+                "translate: $target batch ${keys.size} string(s) → ok $ok, fail ${keys.size - ok}" +
+                    (if (requeued > 0) ", requeued $requeued" else ""),
+            )
         }
         if (anySuccess) reportTranslateSuccess()
+        if (requeued > 0) scheduleFlush()
     }
 
     /**
@@ -1523,6 +2110,14 @@ abstract class ManhuaRMTL :
         }
 
         markFallbackBurn()
+        // v56: name the fallback burn — the field paste had no way to tell a
+        // dead endpoint from a slow queue; this line (rate-limited) plus the
+        // batch lines make the next report decidable.
+        if (translateFallbackLogs.incrementAndGet() <= 6) {
+            OcrDiagnostics.record(
+                "translate: fallback burn — \"${text.take(28)}\" ($target; translation pending or failed)",
+            )
+        }
         return text
     }
 
@@ -1633,6 +2228,107 @@ abstract class ManhuaRMTL :
     }
 
     /**
+     * Normalized filename → stored page URLs, built lazily ONCE per process
+     * from the persistent store (v47). Lets the interceptor find boxes whose
+     * stored key spells the filename differently than the wire URL (escapes,
+     * resize variants). The build is logged because it is the one thing that
+     * can make stored boxes invisible after an app restart.
+     *
+     * v56: the index keeps EVERY stored URL per spelling instead of letting
+     * the last one win. The site names pages "split_001.webp"-style inside
+     * every chapter, so spellings collide across chapters AND series — the
+     * field log showed 96 stored pages collapsing into 54 spellings. A bare
+     * filename match could then serve ANOTHER chapter's boxes (a
+     * foreign-language chapter burned an English chapter's dialogue). Lookups
+     * now prefer a stored URL in the SAME directory as the request (same
+     * chapter), then the most recently stored one; the build logs the
+     * collision count so a paste proves the shape of the store.
+     */
+    private class InterceptorIndex(
+        val bySpelling: Map<String, List<String>>,
+        val pageCount: Int,
+        val collisions: Int,
+    )
+
+    @Volatile
+    private var filenameKeyIndex: InterceptorIndex? = null
+
+    // v52: rate-limit counters for the interceptor's serve-path logs —
+    // the first misses/hits per process are logged, the rest stay silent
+    // so a long reading session can't flood the diagnostics.
+    private val serveMissLogs = AtomicInteger(0)
+    private val serveHitLogs = AtomicInteger(0)
+    private val pruneHitLogs = AtomicInteger(0)
+    private val wideBoxLogs = AtomicInteger(0)
+
+    // v56: rate-limit counters for the translation and ad-filter diagnostics —
+    // the field log had ZERO visibility into why foreign-language chapters
+    // burned English (batches failing? queued? endpoint dead?). The first
+    // events per process now name it.
+    private val serveTopupLogs = AtomicInteger(0)
+    private val translateBatchLogs = AtomicInteger(0)
+    private val translateFallbackLogs = AtomicInteger(0)
+    private val adFilterStoreLogs = AtomicInteger(0)
+    private val adFilterBurnLogs = AtomicInteger(0)
+
+    // v56: per-string requeue counts for in-session translation retries.
+    private val translateRetries = ConcurrentHashMap<String, Int>()
+
+    private fun interceptorFilenameIndex(): InterceptorIndex {
+        filenameKeyIndex?.let { return it }
+        synchronized(this) {
+            filenameKeyIndex?.let { return it }
+            val bySpelling = HashMap<String, MutableList<String>>()
+            var pages = 0
+            for (key in ocrStore.all.keys) {
+                if (!key.startsWith("p|")) continue
+                val url = key.removePrefix("p|")
+                pages++
+                for (normalized in filenameKeys(url)) {
+                    bySpelling.getOrPut(normalized) { mutableListOf() }.add(url)
+                }
+            }
+            var collisions = 0
+            for (urls in bySpelling.values) if (urls.size > 1) collisions += urls.size - 1
+            OcrDiagnostics.record(
+                "interceptor: filename-key index built — $pages stored pages, " +
+                    "normalized=${bySpelling.size} spellings, $collisions cross-chapter name collision(s)",
+            )
+            val index = InterceptorIndex(bySpelling, pages, collisions)
+            filenameKeyIndex = index
+            return index
+        }
+    }
+
+    /** Path part of a URL with the host stripped — different chapters of the
+     *  same series (and different series entirely) differ here even when the
+     *  bare filename is the generic "split_001.webp". */
+    private fun urlDirectory(url: String): String = url
+        .substringBefore('?')
+        .substringAfter("//")
+        .substringAfter('/', "")
+        .substringBeforeLast('/')
+
+    /**
+     * v56 filename-index lookup: same-directory candidates first (the same
+     * chapter — spelling variants only), then the most recently STORED one
+     * (the current session's harvest), never just an arbitrary owner of the
+     * spelling. Stored values lead with their savedAt timestamp.
+     */
+    private fun lookupFilenameKey(requestUrl: String, normalized: String): String? {
+        val candidates = interceptorFilenameIndex().bySpelling[normalized] ?: return null
+        if (candidates.size == 1) return candidates[0]
+        val dir = urlDirectory(requestUrl)
+        return candidates.firstOrNull { urlDirectory(it) == dir }
+            ?: candidates.maxByOrNull { stored ->
+                runCatching {
+                    ocrStore.getString("p|$stored", null)?.substringBefore('|')?.toLongOrNull() ?: 0L
+                }.getOrDefault(0L)
+            }
+            ?: candidates.first()
+    }
+
+    /**
      * Network interceptor that overlays translated text on raw chapter images.
      * Runs for every image served from the site/CDN while a text mode is active.
      */
@@ -1649,9 +2345,13 @@ abstract class ManhuaRMTL :
         // Only process images from the site hosts (covers cdn.manhuarmtl.com)
         if (!url.contains("manhuarmtl.com")) return response
 
-        // Look up OCR text boxes for this image URL — memory first, then the
-        // persistent store (covers chapters the reader restored from its DB
-        // after an app restart, whose re-downloads never saw getPageList).
+        // Look up OCR text boxes for this image URL — v47 three-step ladder:
+        // (1) exact URL (memory, then the persistent store — covers chapters
+        // the reader restored from its DB after an app restart, whose
+        // re-downloads never saw getPageList); (2) URL-decoded spelling (the
+        // store keys use the page-list spelling while okhttp's wire spelling
+        // can differ for non-ASCII/escaped names); (3) the filename-key index
+        // (normalized keys over every stored page, built once per process).
         var textBoxes = ocrData[url]?.boxes ?: ocrData[url.trim()]?.boxes
         if (textBoxes == null) {
             textBoxes = loadOcrBoxes(url) ?: loadOcrBoxes(url.trim())
@@ -1659,14 +2359,88 @@ abstract class ManhuaRMTL :
                 ocrData[url.trim()] = OcrEntry(textBoxes, System.currentTimeMillis())
             }
         }
-        if (textBoxes.isNullOrEmpty()) return response
+        if (textBoxes == null) {
+            val decoded = runCatching { java.net.URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
+            if (decoded != url) {
+                textBoxes = ocrData[decoded]?.boxes ?: loadOcrBoxes(decoded)
+                if (textBoxes != null) {
+                    ocrData[url.trim()] = OcrEntry(textBoxes, System.currentTimeMillis())
+                }
+            }
+        }
+        if (textBoxes == null) {
+            val bare = url.substringBefore('?').substringAfterLast('/')
+            val mapped = lookupFilenameKey(url, normalizeFileKey(bare))
+            if (mapped != null) {
+                textBoxes = ocrData[mapped]?.boxes ?: loadOcrBoxes(mapped)
+                if (textBoxes != null) {
+                    ocrData[url.trim()] = OcrEntry(textBoxes, System.currentTimeMillis())
+                }
+            }
+        }
+        if (textBoxes.isNullOrEmpty()) {
+            // v52: the serve path was the one blind spot — every upstream
+            // channel logs, but whether the interceptor BURNED or served RAW
+            // was invisible in the paste. Rate-limited to the first misses
+            // per process so a long session can't flood the log. v53: empty
+            // basenames (XHR endpoints, bare-host requests) are never page
+            // images — skip them instead of logging "serve:  → RAW miss".
+            val bare = url.substringBefore('?').substringAfterLast('/')
+            if (bare.isNotEmpty() && serveMissLogs.incrementAndGet() <= 12) {
+                OcrDiagnostics.record(
+                    "serve: $bare → RAW miss (store index: ${interceptorFilenameIndex().pageCount} pages)",
+                )
+            }
+            return response
+        }
+
+        // v56: top-up the translation queue for THIS page before rendering.
+        // Boxes restored from the disk store (app restart, cache eviction,
+        // chapters stored by older builds) never saw this session's store-time
+        // prefetch — without this they hit getTranslation with a cold cache
+        // and nothing in flight, burning the English fallback instantly. The
+        // queued strings land within a couple of batches — inside the render
+        // wait — so the FIRST render comes out translated.
+        if (mode != MODE_EN) {
+            var missing = 0
+            for (b in textBoxes) {
+                val key = "$mode|${b.text}"
+                if (!translationCache.containsKey(key) && !translationsInFlight.containsKey(key)) {
+                    prefetchTranslation(b.text, mode)
+                    missing++
+                }
+            }
+            if (missing > 0 && serveTopupLogs.incrementAndGet() <= 6) {
+                OcrDiagnostics.record(
+                    "translate: serve top-up — queued $missing untranslated string(s) for " +
+                        url.substringBefore('?').substringAfterLast('/'),
+                )
+            }
+        }
+        if (serveHitLogs.incrementAndGet() <= 3) {
+            // v53: the paste now carries the box GEOMETRY (space marker + raw
+            // values of the first boxes) — "squashed to the left" reports are
+            // decidable from the log alone instead of guessed at.
+            val geo = textBoxes.take(2).joinToString(" | ") { b ->
+                val v = b.box
+                "${if (b.normalized) "n" else "p"}:" +
+                    "${v.getOrElse(0) { 0f }}" + "," +
+                    "${v.getOrElse(1) { 0f }}" + "," +
+                    "${v.getOrElse(2) { 0f }}" + "," +
+                    "${v.getOrElse(3) { 0f }}"
+            }
+            OcrDiagnostics.record(
+                "serve: ${url.substringBefore('?').substringAfterLast('/')} → burned ${textBoxes.size} box(es) [$geo]",
+            )
+        }
 
         // Read the image bytes
         val imageBytes = response.body.bytes()
         if (imageBytes.isEmpty()) return response
 
         // Overlay text on the image
-        val modifiedBytes = overlayText(imageBytes, textBoxes, mode) ?: return response
+        val bare = url.substringBefore('?').substringAfterLast('/')
+        val modifiedBytes = overlayText(imageBytes, textBoxes, mode, bare) ?: return response
 
         // Build new response with modified image
         val contentType = response.body.contentType()
@@ -1685,12 +2459,31 @@ abstract class ManhuaRMTL :
      *   top (default 1.0 = same size as the site).
      * - Text horizontally centered on the box center (allowed to overflow the
      *   image edge, exactly like the site's overlay divs).
-     * - Text TOP-ALIGNED to the box top — the site anchors the first line at
-     *   the top of the box; vertically centering it made labels sit visibly
-     *   lower than on the website.
+     * - v54: text VERTICALLY CENTERED in the box. The sweep proves the site's
+     *   boxes are not always tight around their text (a 0.24-page-tall box
+     *   carrying one line) — top-aligning left that text floating above its
+     *   bubble. Tight boxes are unaffected (center == top within a few px);
+     *   tall boxes now anchor mid-bubble like the site's overlay.
+     * - v54: container/duplicate boxes are pruned here too — chapters stored
+     *   by older builds render clean without waiting for a refetch.
+     * - v55: any surviving box wider than half the page is logged as
+     *   "wide: <file> …" — the combined-wrapper signature, decisive in the
+     *   next paste.
      * - Black text with a white outline.
      */
-    private fun overlayText(imageBytes: ByteArray, textBoxes: List<OcrTextBox>, targetLang: String): ByteArray? {
+    private fun overlayText(imageBytes: ByteArray, textBoxes: List<OcrTextBox>, targetLang: String, pageLabel: String): ByteArray? {
+        val unpruned = pruneContainerBoxes(textBoxes)
+        // v56: burn-time chrome filter — chapters stored by older builds still
+        // carry ad-banner boxes; dropping them at render cleans legacy stores
+        // without waiting for a refetch (the store-time filter handles fresh
+        // harvests).
+        val boxes = unpruned.filter { !isChromeBoxText(it.text) }
+        val chromeDropped = unpruned.size - boxes.size
+        if (chromeDropped > 0 && adFilterBurnLogs.incrementAndGet() <= 6) {
+            OcrDiagnostics.record(
+                "adfilter: burn $pageLabel — dropped $chromeDropped chrome/ad box(es)",
+            )
+        }
         // inMutable avoids a second full-image copy (big win on the tall
         // webtoon strips this site serves).
         val options = BitmapFactory.Options().apply { inMutable = true }
@@ -1708,12 +2501,59 @@ abstract class ManhuaRMTL :
         }
         val canvas = Canvas(mutableBitmap)
         val imgWidth = mutableBitmap.width.toFloat()
+        val imgHeight = mutableBitmap.height.toFloat()
 
-        for (textBox in textBoxes) {
-            val x = textBox.box.getOrElse(0) { 0f }
-            val y = textBox.box.getOrElse(1) { 0f }
-            val w = textBox.box.getOrElse(2) { 0f }
-            val h = textBox.box.getOrElse(3) { 0f }
+        // v53: one geometry line per process — the bitmap's true dimensions
+        // and where the first box lands AFTER scaling. With the serve line's
+        // raw values this makes "squashed to the left" decidable from the
+        // paste: fraction boxes × bitmap dims must land inside the image.
+        if (burnGeometryLogged.compareAndSet(false, true)) {
+            boxes.firstOrNull()?.let { b0 ->
+                val raw = { i: Int -> b0.box.getOrElse(i) { 0f } }
+                val vx = if (b0.normalized) raw(0) * imgWidth else raw(0)
+                val vy = if (b0.normalized) raw(1) * imgHeight else raw(1)
+                val vw = if (b0.normalized) raw(2) * imgWidth else raw(2)
+                val vh = if (b0.normalized) raw(3) * imgHeight else raw(3)
+                OcrDiagnostics.record(
+                    "burn: bitmap ${imgWidth.toInt()}x${imgHeight.toInt()} — first box " +
+                        "(${if (b0.normalized) "fraction" else "pixel"} space) → x=${vx.toInt()}, y=${vy.toInt()}, " +
+                        "w=${vw.toInt()}, h=${vh.toInt()}, text=\"${b0.text.take(24)}\"",
+                )
+            }
+        }
+
+        // v55: name any surviving WIDE box — a text box wider than half the
+        // page is the signature of a combined multi-bubble wrapper that the
+        // prune could not match (or a site-side merge). Rate-limited to the
+        // first 6 per process; makes the next paste decisive.
+        for (b in boxes) {
+            val bw = b.box.getOrElse(2) { 0f }
+            if (bw <= 0f) continue
+            val fracW = if (b.normalized) bw else bw / imgWidth
+            if (fracW <= 0.5f) continue
+            if (wideBoxLogs.incrementAndGet() > 6) break
+            val bh = b.box.getOrElse(3) { 0f }
+            val fracH = if (b.normalized) bh else bh / imgHeight
+            OcrDiagnostics.record(
+                "wide: $pageLabel — w=$fracW h=$fracH " +
+                    "x=${b.box.getOrElse(0) { 0f }} y=${b.box.getOrElse(1) { 0f }} " +
+                    "text=\"${b.text.take(32)}\"",
+            )
+        }
+
+        for (textBox in boxes) {
+            // v45: fraction-space (normalized) boxes are relative to the page
+            // image and must be scaled to THIS bitmap's dimensions first —
+            // the harvest can't know the downloaded file's resolution. Pixel
+            // boxes (direct gate path) are used as-is.
+            val x0 = textBox.box.getOrElse(0) { 0f }
+            val y0 = textBox.box.getOrElse(1) { 0f }
+            val w0 = textBox.box.getOrElse(2) { 0f }
+            val h0 = textBox.box.getOrElse(3) { 0f }
+            val x = if (textBox.normalized) x0 * imgWidth else x0
+            val y = if (textBox.normalized) y0 * imgHeight else y0
+            val w = if (textBox.normalized) w0 * imgWidth else w0
+            val h = if (textBox.normalized) h0 * imgHeight else h0
 
             if (w <= 0 || h <= 0) continue
 
@@ -1773,18 +2613,15 @@ abstract class ManhuaRMTL :
             @Suppress("DEPRECATION")
             val fillLayout = StaticLayout(text, fillPaint, maxWidth, Layout.Alignment.ALIGN_CENTER, 1.2f, 0f, false)
 
-            // Position like the site: horizontally centered on the box center,
-            // then CLAMPED so the whole layout stays inside the image — text
-            // hanging off the left/right edge was cut off entirely. Vertical
-            // position stays top-aligned to the box top (site behaviour),
-            // clamped so tall layouts don't spill past the bottom.
+            // v54: vertically center the layout in the box (the site's tall
+            // overlay boxes used to leave the text pinned above its bubble),
+            // still clamped so tall layouts don't spill past the bitmap.
             val textHeight = strokeLayout.height.toFloat()
             val boxCenterX = x + w / 2f
 
-            val imgHeight = mutableBitmap.height.toFloat()
             val layoutWidth = maxWidth.toFloat()
             val translateX = (boxCenterX - layoutWidth / 2f).coerceIn(0f, (imgWidth - layoutWidth).coerceAtLeast(0f))
-            val translateY = (y + TEXT_TOP_PADDING).coerceIn(0f, (imgHeight - textHeight).coerceAtLeast(0f))
+            val translateY = (y + (h - textHeight) / 2f).coerceIn(0f, (imgHeight - textHeight).coerceAtLeast(0f))
 
             canvas.save()
             canvas.translate(translateX, translateY)
@@ -2020,6 +2857,11 @@ abstract class ManhuaRMTL :
                 false
             }
         }.let(screen::addPreference)
+
+        // v57 release: the "OCR diagnostics" preference was removed. The
+        // pipeline still records its rolling log (OcrDiagnostics) so a
+        // follow-up diagnostic build can re-expose it with one block —
+        // but the release settings screen stays clean.
     }
 
     private val grouping: String
@@ -2052,9 +2894,18 @@ abstract class ManhuaRMTL :
         private const val GROUP_LINE = "line"
         private const val MAX_TRANSLATION_CACHE = 3000
         private const val TRANSLATE_MIN_GAP_MS = 140L
-        private const val TRANSLATE_BACKOFF_START_MS = 20_000L
-        private const val TRANSLATE_BACKOFF_MAX_MS = 180_000L
+
+        // v56: the old 20 s initial backoff made ONE transient 429 freeze all
+        // translation for 20-180 s while 3-attempt batches died waiting —
+        // whole chapters burned the English fallback. Google's burst limits
+        // recover in seconds: start at 3 s, cap at 60 s.
+        private const val TRANSLATE_BACKOFF_START_MS = 3_000L
+        private const val TRANSLATE_BACKOFF_MAX_MS = 60_000L
         private const val TRANSLATE_ATTEMPTS = 3
+
+        // v56: failed strings re-queue up to this many times within the
+        // session before giving up (previously: never retried in-session).
+        private const val TRANSLATE_SESSION_RETRIES = 2
         private const val TRANSLATE_UA =
             "Mozilla/5.0 (Linux; Android 13; Pixel 7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Mobile Safari/537.36"
         private const val TRANSLATE_BATCH_DELAY_MS = 120L
@@ -2081,11 +2932,15 @@ abstract class ManhuaRMTL :
             20_000L, 30_000L, 45_000L, 60_000L, 90_000L, 90_000L, 120_000L, 120_000L, 180_000L,
         )
 
+        // Background top-up re-visits (v48): two warm WebView visits (the
+        // chapter's images are already in the app's caches) chasing pages the
+        // first pass missed. A zero-gain round exhausts the chapter (v49).
+        private val OCR_TOPUP_GAPS_MS = longArrayOf(25_000L, 70_000L)
+
         private const val OCR_MEMORY_TTL_MS = 90 * 60_000L
         private const val OCR_DISK_TTL_MS = 24 * 60 * 60_000L
         private const val OCR_DISK_MAX_ENTRIES = 160
         private const val OCR_DISK_PRUNE_SLACK = 20
-        private const val TEXT_TOP_PADDING = 2f
         private const val OVERLAY_JPEG_QUALITY = 85
         private const val PREF_CHAPTER_TEXT_MODE = "pref_chapter_text_mode"
         private const val PREF_OVERLAY_TEXT_SCALE = "pref_overlay_text_scale"
