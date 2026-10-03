@@ -945,7 +945,7 @@ abstract class ManhuaRMTL :
         // boxes through (manga right-to-left text order, fused inline spans,
         // skipped children). Pages burned with those combined boxes refetch
         // and re-render from the corrected store.
-        val fingerprint = "#ocrv=12-$mode-${overlayTextScale()}-$grouping-e$epoch-r$rawEpochBefore" +
+        val fingerprint = "#ocrv=13-$mode-${overlayTextScale()}-$grouping-e$epoch-r$rawEpochBefore" +
             "-c$coveredBefore-${pages.size}"
         for (page in pages) {
             val url = page.imageUrl ?: continue
@@ -2239,10 +2239,10 @@ abstract class ManhuaRMTL :
      * every chapter, so spellings collide across chapters AND series — the
      * field log showed 96 stored pages collapsing into 54 spellings. A bare
      * filename match could then serve ANOTHER chapter's boxes (a
-     * foreign-language chapter burned an English chapter's dialogue). Lookups
-     * now prefer a stored URL in the SAME directory as the request (same
-     * chapter), then the most recently stored one; the build logs the
-     * collision count so a paste proves the shape of the store.
+     * foreign-language chapter burned an English chapter's dialogue). v56
+     * still kept a newest-wins fallback for cross-directory candidates; v58
+     * removes it entirely — the lookup is same-directory ONLY (see
+     * [lookupFilenameKey]).
      */
     private class InterceptorIndex(
         val bySpelling: Map<String, List<String>>,
@@ -2257,6 +2257,7 @@ abstract class ManhuaRMTL :
     // the first misses/hits per process are logged, the rest stay silent
     // so a long reading session can't flood the diagnostics.
     private val serveMissLogs = AtomicInteger(0)
+    private val serveWaitLogs = AtomicInteger(0)
     private val serveHitLogs = AtomicInteger(0)
     private val pruneHitLogs = AtomicInteger(0)
     private val wideBoxLogs = AtomicInteger(0)
@@ -2310,22 +2311,59 @@ abstract class ManhuaRMTL :
         .substringBeforeLast('/')
 
     /**
-     * v56 filename-index lookup: same-directory candidates first (the same
-     * chapter — spelling variants only), then the most recently STORED one
-     * (the current session's harvest), never just an arbitrary owner of the
-     * spelling. Stored values lead with their savedAt timestamp.
+     * v58 filename-index lookup: same-directory candidates ONLY.
+     *
+     * v56 preferred the same directory but kept a newest-wins fallback, and
+     * its single-candidate fast path skipped the directory check entirely —
+     * so while THIS chapter's harvest had not stored the page yet, the index
+     * served whatever else owned the spelling (almost always the previously
+     * read chapter: the site reuses "split_001.webp" in every chapter). The
+     * burned geometry belongs to a different page image → random positions,
+     * exactly "first chapter perfect, next chapter random": the first
+     * chapter's own harvest wins the race on a cold store, the next one's
+     * images arrive while its harvest is still running. Refusing the
+     * cross-directory match leaves this pass RAW; the interceptor's bounded
+     * harvest wait (v58) covers the common race and the store/epoch
+     * machinery re-renders anything that slipped through on the next open.
      */
     private fun lookupFilenameKey(requestUrl: String, normalized: String): String? {
         val candidates = interceptorFilenameIndex().bySpelling[normalized] ?: return null
-        if (candidates.size == 1) return candidates[0]
         val dir = urlDirectory(requestUrl)
         return candidates.firstOrNull { urlDirectory(it) == dir }
-            ?: candidates.maxByOrNull { stored ->
-                runCatching {
-                    ocrStore.getString("p|$stored", null)?.substringBefore('|')?.toLongOrNull() ?: 0L
-                }.getOrDefault(0L)
+    }
+
+    /**
+     * v58: the interceptor's box lookup as ONE function — exact URL (memory,
+     * then store), URL-decoded spelling, filename-key index — with store hits
+     * cached into memory exactly like the inline tiers did. The harvest-
+     * coverage wait re-runs this verbatim, so a page the harvest stores
+     * mid-wait is found no matter which tier catches it.
+     */
+    private fun serveLookup(url: String): List<OcrTextBox>? {
+        (ocrData[url]?.boxes ?: ocrData[url.trim()]?.boxes)?.let { return it }
+        loadOcrBoxes(url)?.let {
+            ocrData[url.trim()] = OcrEntry(it, System.currentTimeMillis())
+            return it
+        }
+        loadOcrBoxes(url.trim())?.let {
+            ocrData[url.trim()] = OcrEntry(it, System.currentTimeMillis())
+            return it
+        }
+        val decoded = runCatching { java.net.URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
+        if (decoded != url) {
+            (ocrData[decoded]?.boxes ?: loadOcrBoxes(decoded))?.let {
+                ocrData[url.trim()] = OcrEntry(it, System.currentTimeMillis())
+                return it
             }
-            ?: candidates.first()
+        }
+        val bare = url.substringBefore('?').substringAfterLast('/')
+        lookupFilenameKey(url, normalizeFileKey(bare))?.let { mapped ->
+            (ocrData[mapped]?.boxes ?: loadOcrBoxes(mapped))?.let {
+                ocrData[url.trim()] = OcrEntry(it, System.currentTimeMillis())
+                return it
+            }
+        }
+        return null
     }
 
     /**
@@ -2352,32 +2390,7 @@ abstract class ManhuaRMTL :
         // store keys use the page-list spelling while okhttp's wire spelling
         // can differ for non-ASCII/escaped names); (3) the filename-key index
         // (normalized keys over every stored page, built once per process).
-        var textBoxes = ocrData[url]?.boxes ?: ocrData[url.trim()]?.boxes
-        if (textBoxes == null) {
-            textBoxes = loadOcrBoxes(url) ?: loadOcrBoxes(url.trim())
-            if (textBoxes != null) {
-                ocrData[url.trim()] = OcrEntry(textBoxes, System.currentTimeMillis())
-            }
-        }
-        if (textBoxes == null) {
-            val decoded = runCatching { java.net.URLDecoder.decode(url, "UTF-8") }.getOrDefault(url)
-            if (decoded != url) {
-                textBoxes = ocrData[decoded]?.boxes ?: loadOcrBoxes(decoded)
-                if (textBoxes != null) {
-                    ocrData[url.trim()] = OcrEntry(textBoxes, System.currentTimeMillis())
-                }
-            }
-        }
-        if (textBoxes == null) {
-            val bare = url.substringBefore('?').substringAfterLast('/')
-            val mapped = lookupFilenameKey(url, normalizeFileKey(bare))
-            if (mapped != null) {
-                textBoxes = ocrData[mapped]?.boxes ?: loadOcrBoxes(mapped)
-                if (textBoxes != null) {
-                    ocrData[url.trim()] = OcrEntry(textBoxes, System.currentTimeMillis())
-                }
-            }
-        }
+        var textBoxes = serveLookup(url)
         if (textBoxes.isNullOrEmpty()) {
             // v52: the serve path was the one blind spot — every upstream
             // channel logs, but whether the interceptor BURNED or served RAW
@@ -2386,12 +2399,37 @@ abstract class ManhuaRMTL :
             // basenames (XHR endpoints, bare-host requests) are never page
             // images — skip them instead of logging "serve:  → RAW miss".
             val bare = url.substringBefore('?').substringAfterLast('/')
-            if (bare.isNotEmpty() && serveMissLogs.incrementAndGet() <= 12) {
-                OcrDiagnostics.record(
-                    "serve: $bare → RAW miss (store index: ${interceptorFilenameIndex().pageCount} pages)",
-                )
+            // v58: the filename ladder is same-chapter only now, so a page
+            // whose harvest has not stored yet has legitimately nothing to
+            // serve. While a harvest IS running, give it a short bounded
+            // window to land this page (poll the full ladder every 300 ms,
+            // ≤6 s): the store lands at merge time, and a poll that catches
+            // it burns the RIGHT boxes on the FIRST render instead of
+            // leaving the page raw until the next open. No harvest running
+            // → RAW immediately; chapters the site gives no OCR for must
+            // not gain latency.
+            if (bare.isNotEmpty() && OcrHarvest.isBusy()) {
+                val deadline = System.currentTimeMillis() + SERVE_COVERAGE_WAIT_MS
+                while (System.currentTimeMillis() < deadline) {
+                    Thread.sleep(SERVE_COVERAGE_POLL_MS)
+                    textBoxes = serveLookup(url)
+                    if (!textBoxes.isNullOrEmpty()) {
+                        if (serveWaitLogs.incrementAndGet() <= 6) {
+                            OcrDiagnostics.record("serve: $bare → coverage landed during harvest wait")
+                        }
+                        break
+                    }
+                    if (!OcrHarvest.isBusy()) break
+                }
             }
-            return response
+            if (textBoxes.isNullOrEmpty()) {
+                if (bare.isNotEmpty() && serveMissLogs.incrementAndGet() <= 12) {
+                    OcrDiagnostics.record(
+                        "serve: $bare → RAW miss (store index: ${interceptorFilenameIndex().pageCount} pages)",
+                    )
+                }
+                return response
+            }
         }
 
         // v56: top-up the translation queue for THIS page before rendering.
@@ -2892,6 +2930,12 @@ abstract class ManhuaRMTL :
         private const val MODE_RAW = "raw"
         private const val GROUP_PARAGRAPH = "paragraph"
         private const val GROUP_LINE = "line"
+
+        // v58: bounded harvest-coverage wait on the serve path — the poll only
+        // ever runs while a harvest is actually busy (zero added latency when
+        // the store simply has nothing for a page).
+        private const val SERVE_COVERAGE_WAIT_MS = 6_000L
+        private const val SERVE_COVERAGE_POLL_MS = 300L
         private const val MAX_TRANSLATION_CACHE = 3000
         private const val TRANSLATE_MIN_GAP_MS = 140L
 

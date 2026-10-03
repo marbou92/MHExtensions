@@ -222,7 +222,7 @@ internal object OcrHarvest {
     private const val MAX_WINDOW_SCAN_TICKS = 25
 
     /** Diagnostics build tag — one line per visit, so logs are attributable. */
-    private const val DIAG_TAG = "v57"
+    private const val DIAG_TAG = "v58"
 
     /** v51 stalled-page escape hatch: ≥20 s old, ~5 s of total stillness. */
     private const val STALL_SETTLE_TICKS = 8
