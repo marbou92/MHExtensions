@@ -794,6 +794,9 @@ abstract class ManhuaRMTL :
         // Captured BEFORE the fingerprint fragments are appended — bare
         // URLs are exactly what storeOcrBoxes / the interceptor match on.
         val imageUrls = pages.mapNotNull { it.imageUrl }
+        // v59: this chapter's page-list directories become the filename-index
+        // serve scope (see activeChapterDirs / lookupFilenameKey).
+        setActiveChapterDirs(imageUrls)
         val coveredBefore = coveredPageCount(imageUrls)
 
         if (mode != MODE_RAW && !html.isNullOrBlank() && chapterUrl != null) {
@@ -945,7 +948,12 @@ abstract class ManhuaRMTL :
         // boxes through (manga right-to-left text order, fused inline spans,
         // skipped children). Pages burned with those combined boxes refetch
         // and re-render from the corrected store.
-        val fingerprint = "#ocrv=13-$mode-${overlayTextScale()}-$grouping-e$epoch-r$rawEpochBefore" +
+        //
+        // The "14-" prefix is v59: re-baseline for the chapter-scoped serve
+        // lookup. v58's wire-directory equality blanked pages whose wire
+        // spelling differs from the page-list spelling (raw images cached
+        // under the 13- identities refetch and burn their stored boxes).
+        val fingerprint = "#ocrv=14-$mode-${overlayTextScale()}-$grouping-e$epoch-r$rawEpochBefore" +
             "-c$coveredBefore-${pages.size}"
         for (page in pages) {
             val url = page.imageUrl ?: continue
@@ -2275,6 +2283,31 @@ abstract class ManhuaRMTL :
     // v56: per-string requeue counts for in-session translation retries.
     private val translateRetries = ConcurrentHashMap<String, Int>()
 
+    /**
+     * v59: URL directories of the page list of the chapter being served —
+     * set on every getPageList call from that chapter's own image URLs (the
+     * exact URLs the harvest stores its boxes under).
+     *
+     * v58 scoped the filename-index lookup by comparing the WIRE URL's
+     * directory against each stored URL's directory. That is too strict:
+     * when the reader's image request resolves through a redirect / CDN
+     * spelling whose PATH differs from the page-list spelling (or percent
+     * -encodes the directory), the equality check refuses the chapter's OWN
+     * stored boxes and the page renders RAW — the field report's "no OCR
+     * randomly in the middle of the chapter for like 10 pages" (v57 had
+     * masked exactly these pages by falling back to other chapters' boxes,
+     * which burned at random positions). Scoping by the page list's OWN
+     * directories instead keeps the cross-chapter refusal structural —
+     * another chapter's directories are never in this set — while every
+     * wire-vs-list spelling difference inside the chapter matches again.
+     */
+    @Volatile
+    private var activeChapterDirs: Set<String> = emptySet()
+
+    private fun setActiveChapterDirs(imageUrls: List<String>) {
+        activeChapterDirs = imageUrls.map { urlDirectory(it) }.filterTo(HashSet()) { it.isNotEmpty() }
+    }
+
     private fun interceptorFilenameIndex(): InterceptorIndex {
         filenameKeyIndex?.let { return it }
         synchronized(this) {
@@ -2311,25 +2344,31 @@ abstract class ManhuaRMTL :
         .substringBeforeLast('/')
 
     /**
-     * v58 filename-index lookup: same-directory candidates ONLY.
+     * v59 filename-index lookup: scoped to the chapter being served.
      *
-     * v56 preferred the same directory but kept a newest-wins fallback, and
-     * its single-candidate fast path skipped the directory check entirely —
-     * so while THIS chapter's harvest had not stored the page yet, the index
-     * served whatever else owned the spelling (almost always the previously
-     * read chapter: the site reuses "split_001.webp" in every chapter). The
-     * burned geometry belongs to a different page image → random positions,
-     * exactly "first chapter perfect, next chapter random": the first
-     * chapter's own harvest wins the race on a cold store, the next one's
-     * images arrive while its harvest is still running. Refusing the
-     * cross-directory match leaves this pass RAW; the interceptor's bounded
-     * harvest wait (v58) covers the common race and the store/epoch
-     * machinery re-renders anything that slipped through on the next open.
+     * The candidate's directory must be one of [activeChapterDirs] — the
+     * directories of the page list the reader is currently downloading —
+     * which is exactly where this chapter's harvest stored its boxes.
+     * Cross-chapter serving stays structurally impossible (v58's goal):
+     * another chapter's "split_001.webp" carries a foreign directory that
+     * is never in the scope set, so its boxes can never burn here. Unlike
+     * v58's wire-directory equality, a redirect/CDN/percent-encoding
+     * difference between the wire URL and the page-list spelling can no
+     * longer blank the chapter's own pages (see [activeChapterDirs]).
+     *
+     * Safety net: with NO page list seen yet in this process (scope empty —
+     * a reader restore that serves images before getPageList, never
+     * observed but cheap to guard), fall back to v58's strict
+     * wire-directory equality.
      */
     private fun lookupFilenameKey(requestUrl: String, normalized: String): String? {
         val candidates = interceptorFilenameIndex().bySpelling[normalized] ?: return null
-        val dir = urlDirectory(requestUrl)
-        return candidates.firstOrNull { urlDirectory(it) == dir }
+        val scope = activeChapterDirs
+        if (scope.isEmpty()) {
+            val dir = urlDirectory(requestUrl)
+            return candidates.firstOrNull { urlDirectory(it) == dir }
+        }
+        return candidates.firstOrNull { urlDirectory(it) in scope }
     }
 
     /**
@@ -2896,10 +2935,26 @@ abstract class ManhuaRMTL :
             }
         }.let(screen::addPreference)
 
-        // v57 release: the "OCR diagnostics" preference was removed. The
-        // pipeline still records its rolling log (OcrDiagnostics) so a
-        // follow-up diagnostic build can re-expose it with one block —
-        // but the release settings screen stays clean.
+        // v59: the OCR diagnostics pref is BACK (v40 block, verbatim). The
+        // v58 regression report arrived with no log — the release builds
+        // carried no way to produce one — and two symptoms (blank page
+        // stretches, re-combined side-by-side bubbles) are not decidable
+        // blind. The rolling OcrDiagnostics log never stopped recording;
+        // this only re-exposes it.
+        androidx.preference.EditTextPreference(screen.context).apply {
+            key = "pref_ocr_diagnostics"
+            title = "OCR diagnostics"
+            summary = "Tap to view the recent OCR pipeline log"
+            text = OcrDiagnostics.snapshot().ifEmpty { "No OCR events yet" }
+            setOnBindEditTextListener { editText ->
+                editText.setTextIsSelectable(true)
+                editText.setSingleLine(false)
+            }
+            setOnPreferenceClickListener {
+                text = OcrDiagnostics.snapshot().ifEmpty { "No OCR events yet" }
+                false
+            }
+        }.let(screen::addPreference)
     }
 
     private val grouping: String

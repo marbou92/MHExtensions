@@ -232,6 +232,17 @@ fun boxLooksFractional(vals: FloatArray): Boolean = vals.size == 4 && vals.all {
  * lost — the covered characters burn in the tighter boxes at their true
  * positions. Candidates are evaluated LARGEST FIRST so a wrapper is judged
  * while all of its children are still present.
+ *
+ * v59: the combining symptom returned in the field ("OCR combines bubbles
+ * right beside each other"). A wrapper captured in one sweep pass and its
+ * children in another can drift a few OCR characters between them; at the
+ * flat 95% floor that drift keeps the wrapper alive and it burns its
+ * concatenated text dead-center BETWEEN the two bubbles again. A wrapper
+ * with TWO OR MORE contained children is by definition a multi-bubble
+ * slab (a real single bubble never contains two other bubbles) — for that
+ * shape the coverage floor relaxes to 85%: the slab burning between the
+ * bubbles costs far more than the few drifted characters it might carry.
+ * Single-child wrappers keep the strict 95% floor.
  */
 fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
     if (boxes.size <= 1) return boxes
@@ -260,8 +271,8 @@ fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
         return counts
     }
 
-    /** True when [pool] covers all but a sliver of the container's characters. */
-    fun coveredBy(container: HashMap<Char, Int>, pool: HashMap<Char, Int>): Boolean {
+    /** Fraction of [container]'s characters the [pool] covers (v59). */
+    fun coverageFraction(container: HashMap<Char, Int>, pool: HashMap<Char, Int>): Float {
         var need = 0
         var missing = 0
         for ((c, n) in container) {
@@ -269,8 +280,8 @@ fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
             if (have < n) missing += n - have
             need += n
         }
-        if (need == 0) return pool.isNotEmpty()
-        return missing <= need * (1f - MIN_COVER)
+        if (need == 0) return if (pool.isEmpty()) 0f else 1f
+        return 1f - missing.toFloat() / need
     }
 
     data class Cand(val index: Int, val rect: FloatArray, val area: Float)
@@ -305,13 +316,17 @@ fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
             continue
         }
         // Coverage path: the union of the children's characters represents A.
+        // v59: a MULTI-child wrapper (≥2 bubbles' worth of text) drops at the
+        // relaxed slab floor — sweep-pass drift at the strict floor kept the
+        // slab alive and it burned between the bubbles again.
         val pool = HashMap<Char, Int>()
         for (cand in inner) {
             for ((c, n) in charCounts(boxes[cand.index].text)) {
                 pool.merge(c, n, Int::plus)
             }
         }
-        if (coveredBy(textA, pool)) {
+        val threshold = if (inner.size >= 2) MIN_COVER_SLAB else MIN_COVER
+        if (coverageFraction(textA, pool) >= threshold) {
             dropped[a.index] = true
             changed = true
         }
@@ -322,6 +337,12 @@ fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
 
 /** v55: fraction of a wrapper's characters its contained boxes must cover. */
 private const val MIN_COVER = 0.95f
+
+/** v59: relaxed floor for wrappers holding TWO OR MORE contained boxes —
+ *  a shape only a multi-bubble slab can have. Drift between the sweep pass
+ *  that captured the wrapper and the passes that captured its children used
+ *  to keep the slab alive at 95% and burn it between the bubbles. */
+private const val MIN_COVER_SLAB = 0.85f
 
 // ============================== v56: site-chrome / ad-box filter ==============================
 //
