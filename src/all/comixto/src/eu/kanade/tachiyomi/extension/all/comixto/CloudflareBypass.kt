@@ -5,34 +5,38 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
-import java.io.IOException
 
 /**
- * Modern Cloudflare bypass system for API-based extensions.
+ * Request-hardening helpers for the Comix API client.
  *
- * Hardens every request to look like a real browser XHR, which is what Cloudflare's
- * bot scoring actually checks beyond the `cf_clearance` cookie:
+ * v45: Cloudflare raised comix.to to managed challenges (`cf-mitigated:
+ * challenge`) on the API — the chapter-list calls started answering 403
+ * "Just a moment…" while the site itself kept loading fine in a browser.
+ * Header hardening of plain OkHttp traffic can NEVER pass a managed
+ * challenge (only a JS-executing browser can), so the hard block/retry
+ * loop this class used to carry is GONE — managed challenges are now
+ * solved by the repo's `CloudflareSolverInterceptor` (window-attached
+ * WebView, Turnstile tap, self-heal verify), installed ahead of these
+ * interceptors in [Comix.client].
  *
- * 1. **Browser fingerprint headers** — `sec-fetch-*`, `sec-ch-ua*` client hints
- *    (derived from the request's own user agent, so the versions always match the
- *    WebView that solved the challenge), `accept-language` and a proper `accept`.
- * 2. **Cookie sync** — explicitly attaches WebView cookies (`cf_clearance`,
- *    `__cf_bm`, session cookies) to requests for the protected hosts. Belt and
- *    braces on top of the app's cookie jar; guarantees clearance cookies flow even
- *    after a WebView solve mid-session.
- * 3. **Smart retry** — detects Cloudflare block responses (403/429/503 with
- *    `cf-mitigated` / `server: cloudflare` headers) and retries with backoff,
- *    honouring `Retry-After`. Survives short rate-limit windows without failing
- *    the whole refresh.
+ * What remains here is the belt-and-braces layer that made the old Comix
+ * CF handling good:
  *
- * The user agent is intentionally NOT overridden: `cf_clearance` is bound to the
- * user agent of the WebView that solved the challenge, and the app's default agent
- * always matches it (it is stamped onto every request by the app before this
- * interceptor chain runs). A custom UA here would break the app's own
- * challenge-solving flow.
+ * 1. **Cookie sync** — explicitly attaches WebView cookies (`cf_clearance`,
+ *    `__cf_bm`, session cookies) to requests for the protected hosts. The
+ *    solver wipes and re-mints clearances through the same CookieManager,
+ *    so a retried request that re-enters this interceptor picks up the
+ *    FRESH clearance automatically.
+ * 2. **Browser fingerprint headers** — `sec-fetch-*`, `sec-ch-ua*` client
+ *    hints (derived from the request's own user agent, so the versions
+ *    always match the WebView that solved the challenge), `accept-language`
+ *    and a proper `accept`. Keeps the request shape browser-like between
+ *    solves; the solver's own fingerprint pass only fills MISSING headers,
+ *    so the two never fight.
  *
- * Requests that are still blocked after the retries throw an [IOException] with an
- * actionable message, which Mihon surfaces to the user.
+ * The user agent is intentionally NOT overridden: `cf_clearance` is bound to
+ * the user agent of the WebView that solved the challenge, and the app's
+ * default agent always matches it.
  */
 class CloudflareBypass(
     /** Hosts that receive synced WebView cookies (site + API hosts). */
@@ -41,7 +45,6 @@ class CloudflareBypass(
     fun install(builder: OkHttpClient.Builder): OkHttpClient.Builder = builder.apply {
         addInterceptor(::cookieSyncInterceptor)
         addInterceptor(::fingerprintInterceptor)
-        addInterceptor(::retryInterceptor)
     }
 
     // ------------------------------------------------------------------------
@@ -120,58 +123,9 @@ class CloudflareBypass(
         return chain.proceed(builder.build())
     }
 
-    // ------------------------------------------------------------------------
-    // 3. Smart retry on Cloudflare blocks (rate limits, transient challenges)
-    // ------------------------------------------------------------------------
-
-    private fun retryInterceptor(chain: Interceptor.Chain): Response {
-        val request = chain.request()
-        var response = chain.proceed(request)
-
-        var attempt = 0
-        while (isCloudflareBlock(response) && attempt < MAX_RETRIES) {
-            attempt++
-            val retryAfterMs = response.header("Retry-After")
-                ?.trim()?.toLongOrNull()?.times(1000)
-                ?: (attempt * 1200L)
-
-            response.close()
-            try {
-                Thread.sleep(retryAfterMs.coerceAtMost(5_000L))
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
-            response = chain.proceed(request)
-        }
-
-        if (isCloudflareBlock(response)) {
-            val code = response.code
-            response.close()
-            throw IOException(
-                "Cloudflare is blocking requests to ${request.url.host} (HTTP $code). " +
-                    "Open the site in WebView (Browse → Sources → the source → ⋮ → " +
-                    "Open in WebView) to solve the challenge, then try again.",
-            )
-        }
-
-        return response
-    }
-
-    private fun isCloudflareBlock(response: Response): Boolean {
-        if (response.code !in BLOCK_CODES) return false
-
-        val mitigated = response.header("cf-mitigated")
-        if (mitigated?.contains("challenge", ignoreCase = true) == true) return true
-
-        val server = response.header("server") ?: return false
-        return server.contains("cloudflare", ignoreCase = true)
-    }
-
     private fun String.toHttpUrlOrNull() = runCatching { toHttpUrl() }.getOrNull()
 
     private companion object {
-        const val MAX_RETRIES = 2
-        val BLOCK_CODES = intArrayOf(403, 429, 503)
         val CHROME_VERSION_REGEX = Regex("""Chrome[/ ](\d+)""")
         val IMAGE_EXTENSIONS = setOf("jpg", "jpeg", "png", "gif", "webp", "avif", "jxl", "svg")
         const val FALLBACK_UA =

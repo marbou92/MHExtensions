@@ -11,6 +11,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -40,8 +41,19 @@ abstract class Comix :
         .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .apply {
-            // Modern Cloudflare bypass: browser fingerprint headers, WebView cookie
-            // sync and smart retry on CF blocks (rate limits / transient challenges).
+            // v45: comix.to raised managed Cloudflare challenges on the API
+            // (chapter-list calls answered 403 "Just a moment…" while the
+            // site itself kept loading in a browser). Header hardening of
+            // plain OkHttp can never pass a managed challenge — the shared
+            // solver does: window-attached WebView solve, Turnstile tap,
+            // self-heal verify, single-flight for parallel calls. Installed
+            // FIRST so its solve-retry re-enters the hardening + signing
+            // interceptors below with the fresh clearance.
+            addInterceptor(CloudflareSolverInterceptor(setOf("comix.to")))
+
+            // v45: browser fingerprint headers + WebView cookie sync (the
+            // old hard block/retry loop was folded into the solver — see
+            // CloudflareBypass for the split).
             CloudflareBypass(setOf("comix.to")).install(this)
         }
         .addInterceptor(::signRequestInterceptor)
