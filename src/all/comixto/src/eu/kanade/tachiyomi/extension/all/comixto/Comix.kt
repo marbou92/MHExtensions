@@ -11,7 +11,9 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverDiagnostics
 import keiyoushi.cloudflare.CloudflareSolverInterceptor
+import keiyoushi.cloudflare.isCloudflareChallenge
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -23,6 +25,9 @@ import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
 import okhttp3.ResponseBody.Companion.toResponseBody
 import okio.Buffer
+import org.json.JSONObject
+import rx.Observable
+import rx.schedulers.Schedulers
 import java.io.IOException
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
@@ -56,6 +61,13 @@ abstract class Comix :
             // CloudflareBypass for the split).
             CloudflareBypass(setOf("comix.to")).install(this)
         }
+        // v46: comix.to's origin answers flaky 502/503/522/523 behind Cloudflare
+        // (the official extension added the identical retry on Sep 25 after the
+        // same field reports). Single-shot calls surface those as "HTTP 5xx" in
+        // the app; this retries with an r= cache-buster, then walks the image
+        // CDN's scramble-path variants. Managed challenges are skipped — the
+        // solver above owns them.
+        .addInterceptor(::retryInterceptor)
         .addInterceptor(::signRequestInterceptor)
         .addInterceptor(::decryptResponseInterceptor)
         .addNetworkInterceptor(::descrambleImageInterceptor)
@@ -72,6 +84,141 @@ abstract class Comix :
             .set("X-Requested-With", "XMLHttpRequest")
             .build()
     }
+
+    // ========================================================================
+    // WebView fallback (v46) — the site's own bundle signs + decrypts
+    // ========================================================================
+
+    private fun webViewChapterList(manga: SManga): List<SChapter> {
+        val hid = manga.url
+        CloudflareSolverDiagnostics.record("COMIX native chapter list failed → WebView fallback (hid=$hid)")
+        val capture = ComixWebView.capture(client, baseUrl, headers["User-Agent"] ?: FALLBACK_UA) { mainScriptUrl, passName, rejectName ->
+            webViewChapterListCaptureScript(hid, mainScriptUrl, passName, rejectName)
+        }
+        capture.material?.takeIf { it.isValid() }?.let { material ->
+            applyCipherMaterial(material)
+        }
+        val items = capture.payload.parseAs<List<ComixChapterDto>>()
+        CloudflareSolverDiagnostics.record("COMIX WebView fallback chapter list OK (${items.size} items)")
+        return items.map { it.toSChapter() }
+    }
+
+    private fun webViewPageList(chapter: SChapter): List<Page> {
+        val chapterId = chapter.url
+        CloudflareSolverDiagnostics.record("COMIX native page list failed → WebView fallback (chapter=$chapterId)")
+        val capture = ComixWebView.capture(client, baseUrl, headers["User-Agent"] ?: FALLBACK_UA) { mainScriptUrl, passName, rejectName ->
+            webViewPageListCaptureScript(chapterId, mainScriptUrl, passName, rejectName)
+        }
+        capture.material?.takeIf { it.isValid() }?.let { material ->
+            applyCipherMaterial(material)
+        }
+        val payload = capture.payload.parseAs<WebViewPagesPayload>()
+        val container = payload.container()
+            ?: throw IOException("Comix WebView fallback returned no page container")
+        CloudflareSolverDiagnostics.record("COMIX WebView fallback page list OK (${container.items.size} pages)")
+        return buildPageList(container)
+    }
+
+    /**
+     * Imports the site's env bundle in the WebView and drives the site's OWN
+     * manga API (`mangaApi.chapters(...)`) — the exact call shape the official
+     * keiyoushi Comix extension uses, so signing + decryption happen in-JS.
+     */
+    private fun webViewChapterListCaptureScript(
+        hid: String,
+        mainScriptUrl: String,
+        passPayloadName: String,
+        rejectName: String,
+    ): String = $$"""
+        (function () {
+            const payloadKey = '__comixChapterPayload';
+            const mangaId = $${JSONObject.quote(hid)};
+            const mainScriptUrl = $${JSONObject.quote(mainScriptUrl)};
+            if (window[payloadKey]) return null;
+            window[payloadKey] = true;
+
+            (async () => {
+                try {
+                    if (!mainScriptUrl) throw new Error('Could not find main bundle');
+                    const mainResponse = await fetch(mainScriptUrl);
+                    if (!mainResponse.ok) throw new Error('Could not load main bundle');
+                    const mainJavaScript = await mainResponse.text();
+                    const environmentFile = mainJavaScript.match(/from\s*["']\.\/(env-[^"']+\.js)["']/)?.[1];
+                    if (!environmentFile) throw new Error('Could not find environment bundle');
+
+                    const importBundle = new Function('url', 'return import(url)');
+                    const environment = await importBundle(new URL(environmentFile, mainScriptUrl).href);
+                    const mangaApi = Object.values(environment).find(value =>
+                        value && typeof value === 'object' && typeof value.chapters === 'function');
+                    if (!mangaApi) throw new Error('Could not find manga API');
+
+                    const items = [];
+                    let page = 1;
+                    while (page <= $${ComixWebView.MAX_CHAPTER_PAGES}) {
+                        const response = await mangaApi.chapters(mangaId, {
+                            page,
+                            limit: 100,
+                            order: { number: 'desc' }
+                        });
+                        const pageItems = response?.items;
+                        if (!Array.isArray(pageItems) || pageItems.length === 0) break;
+                        items.push(...pageItems);
+                        const meta = response.meta || response.pagination || {};
+                        const lastPage = meta.lastPage || meta.last_page || page;
+                        if (!(meta.hasNext || page < lastPage)) break;
+                        page++;
+                    }
+                    window.$${passPayloadName}(JSON.stringify(items));
+                } catch (error) {
+                    window.$${rejectName}(error);
+                }
+            })();
+            return null;
+        })();
+    """.trimIndent()
+
+    /** Same env-bundle import, but drives the site's generic API client with the chapter-pages path. */
+    private fun webViewPageListCaptureScript(
+        chapterId: String,
+        mainScriptUrl: String,
+        passPayloadName: String,
+        rejectName: String,
+    ): String = $$"""
+        (function () {
+            const payloadKey = '__comixPagePayload';
+            const chapterId = $${JSONObject.quote(chapterId)};
+            const mainScriptUrl = $${JSONObject.quote(mainScriptUrl)};
+            if (window[payloadKey]) return null;
+            window[payloadKey] = true;
+
+            (async () => {
+                try {
+                    if (!mainScriptUrl) throw new Error('Could not find main bundle');
+                    const mainResponse = await fetch(mainScriptUrl);
+                    if (!mainResponse.ok) throw new Error('Could not load main bundle');
+                    const mainJavaScript = await mainResponse.text();
+                    const environmentFile = mainJavaScript.match(/from\s*["']\.\/(env-[^"']+\.js)["']/)?.[1];
+                    if (!environmentFile) throw new Error('Could not find environment bundle');
+
+                    const importBundle = new Function('url', 'return import(url)');
+                    const environment = await importBundle(new URL(environmentFile, mainScriptUrl).href);
+                    const apiClient = Object.values(environment).find(value =>
+                        value && typeof value === 'object' && typeof value.get === 'function');
+                    if (!apiClient) throw new Error('Could not find API client');
+
+                    const data = await apiClient.get('/chapters/' + chapterId);
+                    const container = data && (data.pages || (data.result && data.result.pages));
+                    if (!container || !Array.isArray(container.items)) {
+                        throw new Error('Unexpected chapter payload from API client');
+                    }
+                    window.$${passPayloadName}(JSON.stringify(data));
+                } catch (error) {
+                    window.$${rejectName}(error);
+                }
+            })();
+            return null;
+        })();
+    """.trimIndent()
 
     // ========================================================================
     // API
@@ -153,6 +300,18 @@ abstract class Comix :
     }
 
     // ============================= Chapters =============================
+
+    // v46: if the native signed path fails for ANY reason (flaky origin after
+    // 10 retries, rotated cipher material, handed-back challenge), rerun the
+    // fetch through the WebView where the site's OWN bundle signs + decrypts
+    // the calls — the same environment the user sees working when they open
+    // the site. A successful run also recaptures the current cipher material,
+    // so the fast native path self-heals afterwards.
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = super.fetchChapterList(manga).onErrorResumeNext { error ->
+        Observable.fromCallable { webViewChapterList(manga) }
+            .subscribeOn(Schedulers.io())
+            .onErrorResumeNext { Observable.error(error) }
+    }
 
     override fun chapterListRequest(manga: SManga): Request {
         val hid = manga.url
@@ -248,6 +407,14 @@ abstract class Comix :
         return GET("$apiBaseUrl/chapters/$chapterId", apiHeaders)
     }
 
+    // v46: same fallback shape as the chapter list — the site's own client
+    // signs + decrypts the /chapters/{id} call inside the WebView.
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = super.fetchPageList(chapter).onErrorResumeNext { error ->
+        Observable.fromCallable { webViewPageList(chapter) }
+            .subscribeOn(Schedulers.io())
+            .onErrorResumeNext { Observable.error(error) }
+    }
+
     override fun getChapterUrl(chapter: SChapter): String {
         // chapter.url is the numeric chapter ID; we cannot reconstruct the full web URL without
         // the manga slug, so we point back at the site root where the reader lives.
@@ -256,16 +423,51 @@ abstract class Comix :
 
     override fun pageListParse(response: Response): List<Page> {
         val data = response.parseAs<ComixChapterPagesDto>()
-        val container = data.pages
+        return buildPageList(data.pages)
+    }
+
+    /**
+     * v46: mirrors the official Comix extension's page-URL handling. The old
+     * code stripped the ENTIRE query string from image URLs — fine when the
+     * site put nothing there, but today's URLs carry parameters and the grid
+     * scramble is gated on a `v3` flag (without it the server does not send
+     * the x-scramble-* headers our descrambler needs). Legacy byte-XOR pages
+     * (every 4th, no `s` flag) keep a `#scrambled` marker like upstream.
+     */
+    private fun buildPageList(container: ComixPagesContainerDto?): List<Page> {
         val base = container?.baseUrl.orEmpty()
-        val pages = container?.items ?: emptyList()
-        return pages.mapIndexed { index, pageDto ->
-            val cleanUrl = (base + pageDto.url).substringBefore("?")
-            Page(index, imageUrl = cleanUrl)
+        return container?.items.orEmpty().mapIndexed { index, pageDto ->
+            val full = if (pageDto.url.startsWith("http")) pageDto.url else "$base/${pageDto.url.trimStart('/')}"
+            val isV3 = pageDto.s == 1 || full.contains("?v3")
+            val isLegacyScramble = !isV3 && (index + 1) % 4 == 0
+            val url = when {
+                isV3 -> {
+                    val httpUrl = full.toHttpUrl()
+                    if (httpUrl.queryParameterNames.contains("v3")) {
+                        full
+                    } else {
+                        httpUrl.newBuilder().addQueryParameter("v3", null).build().toString()
+                    }
+                }
+                isLegacyScramble -> "$full#scrambled"
+                else -> full
+            }
+            Page(index, imageUrl = url)
         }
     }
 
-    override fun imageRequest(page: Page): Request = GET(page.imageUrl!!, headers)
+    override fun imageRequest(page: Page): Request {
+        val imageUrl = page.imageUrl ?: return super.imageRequest(page)
+        // v46 (mirrors the official extension, Oct 3): comix image domains
+        // BLOCK any request carrying Referer or Origin — and the default
+        // source headers attach `Referer: $baseUrl/` to everything. Strip
+        // both (and any fragment marker) for image requests only.
+        val requestHeaders = headersBuilder()
+            .removeAll("Origin")
+            .removeAll("Referer")
+            .build()
+        return GET(imageUrl.substringBefore('#'), requestHeaders)
+    }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
 
@@ -456,12 +658,66 @@ abstract class Comix :
     // ========================================================================
 
     /**
-     * Intercepts outgoing GET requests to the manga and chapters API endpoints
-     * and appends the `_` signature query parameter that the server validates.
+     * v46: comix.to's origin answers flaky 502/503/522/523 (and intermittent
+     * 404s on image paths) behind Cloudflare — the site's own SPA retried
+     * them transparently, which is exactly why "the site works" while
+     * single-shot extension calls died with "HTTP 5xx". Port of the official
+     * extension's proceedWithRetry (Sep 25): up to 10 attempts, 1.5 s apart,
+     * each with an r= cache-buster so a poisoned CDN/edge entry can't serve
+     * the same failure twice. The origin excludes r from signature
+     * validation (the official extension adds r AFTER signing too).
      *
-     * The signature is a 3-stage chained S-box substitution (base64url encoded) over
-     * the request path (minus the `/api/v1` prefix) plus the sorted query string.
+     * Managed challenges are skipped here — they flow up to the solver.
+     *
+     * After the retry budget: walk the image CDN's scramble-path variants
+     * (/hi/, /fcf/, /i5/, ...) the official extension maintains for image
+     * URLs that 404 on their current path segment.
      */
+    private fun retryInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        var response = proceedWithRetry(chain, request)
+        if (response.isSuccessful) return response
+
+        val url = request.url.toString()
+        val fallbacks = listOf("/hi/", "/fcf/", "/i5/", "/si/", "/i/", "/sii/", "/ii/")
+            .map { url.replaceFirst(SCRAMBLE_PATH_FALLBACK_REGEX, it) }
+            .filter { it != url }
+
+        if (fallbacks.isEmpty()) return response
+
+        for (fallbackUrl in fallbacks) {
+            response.close()
+            response = proceedWithRetry(chain, request.newBuilder().url(fallbackUrl).build())
+            if (response.isSuccessful) break
+        }
+        return response
+    }
+
+    private fun proceedWithRetry(chain: Interceptor.Chain, request: Request): Response {
+        var response = chain.proceed(request)
+        if (response.isSuccessful) return response
+
+        // A managed challenge must reach the solver above untouched — retry
+        // rounds against "Just a moment…" pages are pure dead air.
+        if (response.isCloudflareChallenge()) return response
+
+        for (attempt in 1..10) {
+            if (response.code !in SERVER_ERROR_CODES && response.code != 404) break
+
+            response.close()
+            runCatching { Thread.sleep(1500) }
+
+            val retryUrl = request.url.newBuilder()
+                .setQueryParameter("r", attempt.toString())
+                .build()
+            response = chain.proceed(request.newBuilder().url(retryUrl).build())
+            if (response.isSuccessful) break
+            if (response.isCloudflareChallenge()) return response
+        }
+
+        return response
+    }
+
     private fun signRequestInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         if (request.method != "GET") return chain.proceed(request)
@@ -474,11 +730,13 @@ abstract class Comix :
 
         // Build the "normalized" path+query that the server expects for signing:
         //  - strip the /api/v1 prefix
-        //  - strip the existing _ param (if any)
+        //  - strip the existing _ param (if any) and the retry cache-buster r
+        //    (v46: the origin validates signatures WITHOUT those two — the
+        //    official extension adds r after signing as well)
         //  - serialize remaining params as raw "key=value" with sorted keys, arrays as key[0], key[1]...
         val normalizedPath = path.removePrefix("/api/v1")
         val paramsToSign = request.url.queryParameterNames
-            .filter { it != "_" }
+            .filter { it != "_" && it != "r" }
             .sorted()
 
         val queryParts = mutableListOf<String>()
@@ -552,8 +810,12 @@ abstract class Comix :
     }
 
     /**
-     * Descrambles images with x-scramble-* headers.
-     * Uses xorshift(13,17,5) + Fisher-Yates with inverse permutation.
+     * Descrambles images with x-scramble-* headers (5x5 grid) and de-XORs
+     * byte-encrypted pages carrying x-enc-seed/x-enc-len/x-enc-algo (v46 —
+     * the official extension handles both layers; the byte layer was added
+     * in late Sept when the site started XOR-encoding page bodies).
+     * Grid: xorshift(13,17,5) / LCG + Fisher-Yates with inverse permutation.
+     * XOR: LCG keystream (or xorshift candidates when algo=2), top byte.
      */
     private fun descrambleImageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
@@ -564,6 +826,9 @@ abstract class Comix :
         val rawScrambleGrid = response.header("x-scramble-grid")
         val rawScrambleAlgo = response.header("x-scramble-algo")
         val rawScrambleHash = response.header("x-scramble-hash")
+        val rawEncSeed = response.header("x-enc-seed")
+        val rawEncAlgo = response.header("x-enc-algo")
+        val encLen = response.header("x-enc-len")?.toIntOrNull()
 
         val scrambleSeed = rawScrambleSeed?.toLongOrNull()?.toInt()
         val scrambleHash = when (rawScrambleHash?.trim()) {
@@ -571,44 +836,129 @@ abstract class Comix :
             "02900" -> 117532
             else -> 0
         }
+        val encSeed = rawEncSeed?.toLongOrNull()?.toInt()
 
-        val shouldDescramble = rawScrambleGrid == "5x5" &&
+        val needsXor = encSeed != null && encSeed != 0 && encLen != null
+        val shouldDescrambleGrid = rawScrambleGrid == "5x5" &&
             (rawScrambleAlgo == null || rawScrambleAlgo == "1" || rawScrambleAlgo == "2" || rawScrambleAlgo == "3") &&
             scrambleSeed != null && scrambleSeed != 0
 
-        if (!shouldDescramble) return response
+        if (!needsXor && !shouldDescrambleGrid) return response
 
-        val body = response.body
-        val imageBytes = body.bytes()
+        val bodyMediaType = response.body.contentType()
+        val imageBytes = response.body.bytes()
+        val bytes = if (needsXor) decodeEncryptedBytes(imageBytes, encSeed!!, encLen!!, rawEncAlgo) else imageBytes
 
-        val bitmap = android.graphics.BitmapFactory.decodeByteArray(imageBytes, 0, imageBytes.size)
+        if (shouldDescrambleGrid) {
+            val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
 
-        // A scrambled page whose body doesn't decode is a transient bad fetch
-        // (CDN hiccup / interrupted stream). Handing the undecodable bytes to
-        // the reader is the "page only loads after refreshing twice" bug: the
-        // broken response counts as delivered, so Mihon shows a blank/error
-        // page until the user re-requests it manually. Retry the same request
-        // a couple of times right here instead — a fresh download decodes and
-        // the reader never sees the bad bytes.
-        var decoded: android.graphics.Bitmap? = bitmap
-        var currentResponse = response
-        var retries = 0
-        while (decoded == null && retries < 2) {
-            retries++
-            currentResponse.close()
-            currentResponse = chain.proceed(request)
-            if (!currentResponse.isSuccessful) return currentResponse
-            val retryBytes = currentResponse.body.bytes()
-            decoded = android.graphics.BitmapFactory.decodeByteArray(retryBytes, 0, retryBytes.size)
+            // A scrambled page whose body doesn't decode is a transient bad fetch
+            // (CDN hiccup / interrupted stream). Handing the undecodable bytes to
+            // the reader is the "page only loads after refreshing twice" bug: the
+            // broken response counts as delivered, so Mihon shows a blank/error
+            // page until the user re-requests it manually. Retry the same request
+            // a couple of times right here instead — a fresh download decodes and
+            // the reader never sees the bad bytes.
+            var decoded: android.graphics.Bitmap? = bitmap
+            var currentResponse = response
+            var retries = 0
+            while (decoded == null && retries < 2) {
+                retries++
+                currentResponse.close()
+                currentResponse = chain.proceed(request)
+                if (!currentResponse.isSuccessful) return currentResponse
+                val retryBytes = currentResponse.body.bytes()
+                val retryDecoded = if (needsXor) {
+                    decodeEncryptedBytes(retryBytes, encSeed!!, encLen!!, rawEncAlgo)
+                } else {
+                    retryBytes
+                }
+                decoded = android.graphics.BitmapFactory.decodeByteArray(retryDecoded, 0, retryDecoded.size)
+            }
+
+            if (decoded == null) {
+                currentResponse.close()
+                throw IOException("Comix page image didn't download correctly (tried ${retries + 1} times) — tap the page to retry")
+            }
+
+            return finishDescramble(currentResponse, decoded, rawScrambleAlgo, scrambleSeed!!, scrambleHash)
         }
 
-        if (decoded == null) {
-            currentResponse.close()
-            throw IOException("Comix page image didn't download correctly (tried ${retries + 1} times) — tap the page to retry")
+        // XOR-only page: re-encode the clean bytes as JPEG (mirrors upstream);
+        // if they still don't decode, hand the raw bytes back untouched.
+        val bitmap = android.graphics.BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+        if (bitmap != null) {
+            val output = Buffer()
+            bitmap.compress(android.graphics.Bitmap.CompressFormat.JPEG, 95, output.outputStream())
+            bitmap.recycle()
+
+            return response.newBuilder()
+                .removeHeader("Content-Encoding")
+                .header("Content-Type", "image/jpeg".toMediaType().toString())
+                .header("Content-Length", output.size.toString())
+                .body(output.asResponseBody("image/jpeg".toMediaType(), output.size))
+                .build()
         }
 
-        return finishDescramble(currentResponse, decoded, rawScrambleAlgo, scrambleSeed, scrambleHash)
+        return response.newBuilder()
+            .removeHeader("Content-Encoding")
+            .removeHeader("Content-Length")
+            .removeHeader("Content-Type")
+            .body(bytes.toResponseBody(bodyMediaType))
+            .build()
     }
+
+    /** Byte-XOR layer: algo 2 = xorshift candidates with image-signature picking; default LCG. */
+    private fun decodeEncryptedBytes(bytes: ByteArray, seed: Int, length: Int, algo: String?): ByteArray {
+        if (algo == "2") {
+            val candidates = listOf(
+                decodeWithXorshiftBytes(bytes, seed or 1, length, false),
+                decodeWithXorshiftBytes(bytes, seed, length, false),
+                decodeWithXorshiftBytes(bytes, seed or 1, length, true),
+                decodeWithLcgBytes(bytes, seed, length),
+            )
+            return candidates.firstOrNull { it.hasImageSignature() } ?: candidates.first()
+        }
+        return decodeWithLcgBytes(bytes, seed, length)
+    }
+
+    private fun decodeWithXorshiftBytes(bytes: ByteArray, initialState: Int, length: Int, highByte: Boolean): ByteArray {
+        val result = bytes.copyOf()
+        var state = initialState
+        val limit = minOf(result.size, length)
+        for (i in 0 until limit) {
+            state = state xor (state shl 13)
+            state = state xor (state ushr 17)
+            state = state xor (state shl 5)
+            val key = if (highByte) state ushr 24 else state and 0xFF
+            result[i] = (result[i].toInt() xor key).toByte()
+        }
+        return result
+    }
+
+    private fun decodeWithLcgBytes(bytes: ByteArray, seed: Int, length: Int): ByteArray {
+        val result = bytes.copyOf()
+        var state = seed
+        val limit = minOf(result.size, length)
+        for (i in 0 until limit) {
+            state = state * ENC_MULTIPLIER + ENC_INCREMENT
+            result[i] = (result[i].toInt() xor (state ushr 24)).toByte()
+        }
+        return result
+    }
+
+    private fun ByteArray.hasImageSignature(): Boolean = size >= 12 && (
+        (
+            this[0] == 'R'.code.toByte() && this[1] == 'I'.code.toByte() && this[2] == 'F'.code.toByte() &&
+                this[3] == 'F'.code.toByte() && this[8] == 'W'.code.toByte() && this[9] == 'E'.code.toByte() &&
+                this[10] == 'B'.code.toByte() && this[11] == 'P'.code.toByte()
+            ) ||
+            (this[0] == 0xFF.toByte() && this[1] == 0xD8.toByte()) ||
+            (
+                this[0] == 0x89.toByte() && this[1] == 'P'.code.toByte() && this[2] == 'N'.code.toByte() &&
+                    this[3] == 'G'.code.toByte()
+                )
+        )
 
     /**
      * Descrambles [bitmap] (from [imageBytes] of [response]) using the
@@ -696,19 +1046,55 @@ abstract class Comix :
         }
     }
 
-    // --- S-box constants (extracted from the site JS) ---
+    // --- Cipher material ---------------------------------------------------
+    // v46: the S-box/key material is no longer frozen at the constants we
+    // extracted at recon time. The site ROTATES this material — a rotation
+    // used to invalidate every native signature until a new extension release
+    // shipped. The WebView fallback now recaptures the live material (atob
+    // hook, see WebViewFallback.kt) and swaps it in here, so the fast native
+    // path self-heals after one fallback run. Defaults = the recon constants.
 
-    private val sbox1 = Base64.decode(SBOX1_B64, Base64.DEFAULT)
-    private val key1 = Base64.decode(KEY1_B64, Base64.DEFAULT)
-    private val sbox2 = Base64.decode(SBOX2_B64, Base64.DEFAULT)
-    private val key2 = Base64.decode(KEY2_B64, Base64.DEFAULT)
-    private val sbox3 = Base64.decode(SBOX3_B64, Base64.DEFAULT)
-    private val key3 = Base64.decode(KEY3_B64, Base64.DEFAULT)
+    @Volatile
+    private var cipherMaterial: ComixCipherMaterial = ComixCipherMaterial.fromDefaults()
 
-    // Inverse S-boxes for decryption
-    private val invSbox1: IntArray = IntArray(256).also { inv -> sbox1.forEachIndexed { i, v -> inv[v.toInt() and 0xFF] = i } }
-    private val invSbox2: IntArray = IntArray(256).also { inv -> sbox2.forEachIndexed { i, v -> inv[v.toInt() and 0xFF] = i } }
-    private val invSbox3: IntArray = IntArray(256).also { inv -> sbox3.forEachIndexed { i, v -> inv[v.toInt() and 0xFF] = i } }
+    @Synchronized
+    private fun applyCipherMaterial(material: WebViewCipherMaterial) {
+        if (!material.isValid()) return
+        runCatching {
+            cipherMaterial = ComixCipherMaterial(
+                sboxes = material.sboxes.map { list -> ByteArray(256) { i -> (list[i] and 0xFF).toByte() } }.toTypedArray(),
+                keys = material.keys.map { list -> ByteArray(list.size) { i -> (list[i] and 0xFF).toByte() } }.toTypedArray(),
+            )
+        }
+        CloudflareSolverDiagnostics.record("COMIX cipher material refreshed from site bundle")
+    }
+
+    /** One substitution round's material + its precomputed inverse. */
+    private class ComixCipherMaterial(
+        val sboxes: Array<ByteArray>,
+        val keys: Array<ByteArray>,
+    ) {
+        val inverseSboxes: Array<IntArray> = Array(3) { round ->
+            IntArray(256).also { inv ->
+                sboxes[round].forEachIndexed { i, v -> inv[v.toInt() and 0xFF] = i }
+            }
+        }
+
+        companion object {
+            fun fromDefaults(): ComixCipherMaterial = ComixCipherMaterial(
+                sboxes = arrayOf(
+                    Base64.decode(SBOX1_B64, Base64.DEFAULT),
+                    Base64.decode(SBOX2_B64, Base64.DEFAULT),
+                    Base64.decode(SBOX3_B64, Base64.DEFAULT),
+                ),
+                keys = arrayOf(
+                    Base64.decode(KEY1_B64, Base64.DEFAULT),
+                    Base64.decode(KEY2_B64, Base64.DEFAULT),
+                    Base64.decode(KEY3_B64, Base64.DEFAULT),
+                ),
+            )
+        }
+    }
 
     private fun sboxTransform(data: ByteArray, sbox: ByteArray, key: ByteArray, seed: Int): ByteArray {
         val out = ByteArray(data.size)
@@ -733,10 +1119,11 @@ abstract class Comix :
     }
 
     private fun sign(input: String): String {
+        val material = cipherMaterial
         var bytes = input.toByteArray(Charsets.UTF_8)
-        bytes = sboxTransform(bytes, sbox1, key1, 189)
-        bytes = sboxTransform(bytes, sbox2, key2, 133)
-        bytes = sboxTransform(bytes, sbox3, key3, 32)
+        bytes = sboxTransform(bytes, material.sboxes[0], material.keys[0], 189)
+        bytes = sboxTransform(bytes, material.sboxes[1], material.keys[1], 133)
+        bytes = sboxTransform(bytes, material.sboxes[2], material.keys[2], 32)
         return Base64.encodeToString(
             bytes,
             Base64.URL_SAFE or Base64.NO_WRAP or Base64.NO_PADDING,
@@ -744,12 +1131,13 @@ abstract class Comix :
     }
 
     private fun decrypt(eField: String): String {
+        val material = cipherMaterial
         val raw = Base64.decode(eField, Base64.URL_SAFE)
         var t = raw
         // Reverse order: undo stage 3, then 2, then 1
-        t = invSboxTransform(t, invSbox3, key3, 32)
-        t = invSboxTransform(t, invSbox2, key2, 133)
-        t = invSboxTransform(t, invSbox1, key1, 189)
+        t = invSboxTransform(t, material.inverseSboxes[2], material.keys[2], 32)
+        t = invSboxTransform(t, material.inverseSboxes[1], material.keys[1], 133)
+        t = invSboxTransform(t, material.inverseSboxes[0], material.keys[0], 189)
         return String(t, Charsets.UTF_8)
     }
 
@@ -1066,6 +1454,17 @@ abstract class Comix :
     private fun android.content.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
 
     companion object {
+
+        // v46: origin flakiness + image CDN path variants + byte-XOR keystream
+        // constants (mirror of the official extension's handling).
+        private val SERVER_ERROR_CODES = setOf(502, 503, 522, 523)
+        private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
+        private const val ENC_MULTIPLIER = 1000005
+        private const val ENC_INCREMENT = 1234567891
+
+        private const val FALLBACK_UA =
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) " +
+                "Chrome/124.0.0.0 Mobile Safari/537.36"
 
         private const val PREF_CONTENT_RATING = "pref_content_rating"
         private const val PREF_DEFAULT_TYPES = "pref_default_types"
