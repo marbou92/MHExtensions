@@ -11,14 +11,17 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.network.rateLimit
 import keiyoushi.utils.getPreferences
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
 import kotlinx.coroutines.awaitAll
 import kotlinx.coroutines.runBlocking
 import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
+import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import java.io.IOException
 import java.util.Locale
@@ -52,14 +55,20 @@ import java.util.Locale
  *    browse path (kept for old library entries).
  *  - Details        GET /title/{id6}; selectors below. The header stats row
  *    carries the star rating (+ user count), follows, reviews, comments.
- *  - Chapters       TWO-STEP: the title page renders ONE box per source
- *    group, each showing only that group's LATEST chapter (plus flag +
- *    /source/{id} link) — the v1 build mistook those for the full list. The
- *    FULL chapter list of a group lives on its /source/{id} page
- *    (`a[href^=/chapter/]` rows + `time[data-time]` epoch millis), so we
- *    fetch one /source/{id} per language-matching group. The same chapter
- *    number is frequently uploaded by several groups — the "Deduplicate
- *    chapters" setting keeps one per number × language.
+ *  - Chapters       TWO-STEP: the title page renders one box per VISIBLE
+ *    source group, each showing only that group's LATEST chapter (plus flag
+ *    + /source/{id} link) — the v1 build mistook those for the full list.
+ *    The grid is also INCOMPLETE: the page state's `comic_ids` array is the
+ *    site's COMPLETE source list, and sources missing from the DOM (adult/
+ *    sfw-filtered ones like Reset Scans or Xscans) keep live /source/{id}
+ *    pages with real chapters. The FULL chapter list of a group lives on
+ *    its /source/{id} page (`a[href^=/chapter/]` rows + `time[data-time]`
+ *    epoch millis), so we fetch one /source/{id} per group — rendered and
+ *    hidden — that matches the language setting. The group's REAL name is
+ *    the badge chip next to the "source #id" caption on that page (the
+ *    title-page boxes display series-title-style names instead). The same
+ *    chapter number is frequently uploaded by several groups — the
+ *    "Deduplicate chapters" setting keeps one per number × language.
  *  - Pages          GET /chapter/{id} — the reader has no <img> tags; the
  *    page URLs are absolute (`https://iXX.imgXX.org/_f/...`) inside the
  *    `"imageUrls"` qwik/json state. Parsed positionally with a URL regex;
@@ -89,6 +98,14 @@ abstract class XComic :
     override fun headersBuilder() = super.headersBuilder()
         .set("User-Agent", CHROME_UA)
         .set("Referer", "$mirror/")
+
+    // A chapter refresh fetches one /source/{id} page PER source group — a
+    // big series can have 40+ groups (the page state's complete list). Keep
+    // that burst polite. (lib-1.4 HttpSource has no configureClient hook —
+    // the client itself is overridden, same as Comix.)
+    override val client: OkHttpClient = network.client.newBuilder()
+        .rateLimit(5)
+        .build()
 
     /** Latest pagination state: the site paginates /latest with a `before`
      * cursor (oldest release timestamp of the page), so the cursor handed
@@ -480,13 +497,14 @@ abstract class XComic :
             .trim('/').removePrefix("title/").substringBefore('?')
             .ifBlank { throw IOException("XComic: unexpected chapter list response.") }
 
-        val document = response.asJsoup()
+        val html = response.body.string()
+        val document = Jsoup.parse(html, mirror)
         val preferredLang = preferences.chapterLanguage()
 
-        // The title page renders ONE box per source group, each with only that
-        // group's LATEST chapter. Collect (language, source id, source name)
-        // and fetch each group's FULL list from its /source/{id} page.
-        data class Group(val lang: String, val sourceId: String, val sourceName: String)
+        // The title page renders ONE box per VISIBLE source group, each with
+        // only that group's LATEST chapter. Collect (language, source id,
+        // display name) from the boxes…
+        data class Group(val lang: String, val sourceId: String, val domName: String)
 
         val groups = document.select("div.border.border-base-300").mapNotNull { groupBox ->
             val flag = groupBox.selectFirst("span.font-family-NotoColorEmoji")?.text()?.trim().orEmpty()
@@ -498,7 +516,15 @@ abstract class XComic :
             Group(lang, sourceId, sourceName)
         }
 
-        if (groups.isEmpty()) {
+        // …then reconcile with the page state: its `comic_ids` array is the
+        // site's COMPLETE source list for the title, and the Sources grid
+        // only renders a subset of it (adult/sfw-filtered sources stay
+        // hidden from the DOM while their /source/{id} pages — and chapters
+        // — stay live). The hidden ids are fetched like any other group.
+        val renderedIds = groups.mapTo(mutableSetOf()) { it.sourceId }
+        val hiddenIds = hiddenSourceIds(html, renderedIds)
+
+        if (groups.isEmpty() && hiddenIds.isEmpty()) {
             throw IOException("XComic: couldn't read the source groups on this series page (layout change?).")
         }
 
@@ -510,44 +536,63 @@ abstract class XComic :
                 groups
             }
 
-        val dedupe = preferences.deduplicateChapters()
+        // One /source/{id} page per group carries the group's FULL chapter
+        // list, its flag (the only language signal for hidden groups) and
+        // the REAL group name (the badge chip next to the "source #id"
+        // caption — the title-page boxes display series-title-style names
+        // instead). Hidden groups must be fetched to learn their language;
+        // they are filtered afterwards.
+        val renderedFetches = selected.map { Triple(it.sourceId, it.lang, it.domName) }
+        val candidates = renderedFetches.map { it.first } + hiddenIds
 
-        // Deduplicate ON = the site's own default view: the FIRST group the
-        // series page renders for the language, nothing else. v1.4.4 instead
-        // merged every group and kept one row per number — but a number that
-        // exists ONLY in a secondary group still surfaced, and secondary
-        // groups often number differently (a lone "Chapter 33" upload next
-        // to the primary's 31 real chapters). That mismatch was the
-        // "sometimes a chapter appears that doesn't exist" report. OFF =
-        // every selected group's list, downloaded in parallel.
-        val selectedGroups = if (dedupe) selected.take(1) else selected
-
-        val chapters = mutableListOf<SChapter>()
-        val seenNumbers = mutableSetOf<Float>()
-
-        val rowsPerGroup: List<Pair<Group, List<Triple<String, String, Long>>>> = if (selectedGroups.size == 1) {
-            selectedGroups.map { it to fetchSourceChapterRows(it.sourceId) }
+        val pagesById: Map<String, SourcePageData> = if (candidates.size == 1) {
+            mapOf(candidates.first() to fetchSourcePage(candidates.first()))
         } else {
             // Overlap the ~0.5-1 s per-group page latency instead of stacking
             // it (language "all" on a multi-group series used to serialize up
-            // to ten sequential fetches).
+            // to ten sequential fetches; a big series can have 40+ groups).
             runBlocking {
-                selectedGroups
-                    .map { group -> async(Dispatchers.IO) { group to fetchSourceChapterRows(group.sourceId) } }
+                candidates.distinct()
+                    .map { id -> async(Dispatchers.IO) { id to fetchSourcePage(id) } }
                     .awaitAll()
+                    .toMap()
             }
         }
 
-        for ((group, rows) in rowsPerGroup) {
+        data class FinalGroup(val lang: String, val sourceId: String, val groupName: String?)
+
+        val finalGroups = buildList {
+            for ((sourceId, boxLang, domName) in renderedFetches) {
+                val page = pagesById[sourceId] ?: continue
+                val lang = boxLang.ifBlank { page.lang }
+                add(FinalGroup(lang, sourceId, page.groupName ?: domName.ifBlank { null }))
+            }
+            for (sourceId in hiddenIds) {
+                val page = pagesById[sourceId] ?: continue
+                if (preferredLang != "all" && page.lang != preferredLang) continue
+                if (page.rows.isEmpty()) continue
+                add(FinalGroup(page.lang, sourceId, page.groupName))
+            }
+        }
+
+        val dedupe = preferences.deduplicateChapters()
+
+        val chapters = mutableListOf<SChapter>()
+        val seenNumbers = mutableSetOf<String>()
+
+        for (group in finalGroups) {
+            val rows = pagesById[group.sourceId]?.rows ?: continue
             for ((chapterId, name, dateMs) in rows) {
                 val number = chapterNumberOf(name)
-                // With "Deduplicate chapters" on, the list is a single group
-                // (see above); seenNumbers still collapses the duplicate
-                // uploads WITHIN that group (aggregators list the same
-                // number twice when two upstream sites carry it). Rows with
-                // an unparseable number are never deduped against each
-                // other.
-                if (dedupe && number > 0f && !seenNumbers.add(number)) continue
+                // With "Deduplicate chapters" ON the groups merge in site
+                // order (the site's own ranking puts the primary group
+                // first) and one row per number × language survives: the
+                // first group carrying a number wins, later copies of that
+                // number collapse. Rows with an unparseable number are
+                // never deduped against each other. OFF = every selected
+                // group's full list.
+                val dedupeKey = "$number|${group.lang}"
+                if (dedupe && number > 0f && !seenNumbers.add(dedupeKey)) continue
 
                 chapters += SChapter.create().apply {
                     url = "$chapterId|$titleSlug"
@@ -561,7 +606,7 @@ abstract class XComic :
                     }
                     chapter_number = number
                     date_upload = dateMs
-                    scanlator = group.sourceName.ifBlank { null }
+                    scanlator = group.groupName?.ifBlank { null }
                 }
             }
         }
@@ -598,16 +643,25 @@ abstract class XComic :
     }
 
     /**
-     * Fetches (and caches) one source group's full chapter list from
-     * /source/{id} as (chapter id, label, epoch millis) triples.
+     * One /source/{id} page: the group's full chapter list as (chapter id,
+     * label, epoch millis) triples, the page flag's language, and the real
+     * group-name badge.
      */
-    private fun fetchSourceChapterRows(sourceId: String): List<Triple<String, String, Long>> {
-        sourceChapterCache[sourceId]?.let { return it }
+    private class SourcePageData(
+        val rows: List<Triple<String, String, Long>>,
+        val lang: String,
+        val groupName: String?,
+    )
 
-        val rows = runCatching {
-            client.newCall(GET("$mirror/source/$sourceId", headers)).execute().use { response ->
-                val document = response.asJsoup()
-                document.select("a[href^=/chapter/]").map { row ->
+    private fun fetchSourcePage(sourceId: String): SourcePageData {
+        sourcePageCache[sourceId]?.let { return it }
+
+        val data = runCatching {
+            client.newCall(GET("$mirror/source/$sourceId", headers)).execute().use { pageResponse ->
+                if (!pageResponse.isSuccessful) return@runCatching SourcePageData(emptyList(), "", null)
+                val pageDocument = pageResponse.asJsoup()
+
+                val rows = pageDocument.select("a[href^=/chapter/]").map { row ->
                     val href = row.attr("href").trim('/').removePrefix("chapter/").substringBefore('?')
                     // Chapter title suffix lives in a sibling span (": Extra").
                     val suffix = row.nextElementSibling()
@@ -625,17 +679,53 @@ abstract class XComic :
                         ?.selectFirst("time[data-time]")?.attr("data-time")?.toLongOrNull() ?: 0L
                     Triple(href, name, dateMs)
                 }
+
+                // The group's language flag sits inside the header heading.
+                // (The page also renders the SERIES' original-language flag
+                // outside the heading — never fall back to a page-wide flag
+                // lookup, it grabs the wrong country.)
+                val lang = pageDocument.selectFirst("h3 span.font-family-NotoColorEmoji")
+                    ?.text()?.trim()?.let { flagToLanguage(it) }.orEmpty()
+
+                SourcePageData(rows, lang, sourceGroupName(pageDocument))
             }
-        }.getOrDefault(emptyList())
+        }.getOrDefault(SourcePageData(emptyList(), "", null))
 
-        sourceChapterCache[sourceId] = rows
-        return rows
+        sourcePageCache[sourceId] = data
+        return data
     }
 
-    /** Bounded per-session cache of source-group chapter rows (refresh speed). */
-    private val sourceChapterCache = object : LinkedHashMap<String, List<Triple<String, String, Long>>>(8, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, List<Triple<String, String, Long>>>): Boolean = size > 8
+    /** The group's REAL name: the badge chip rendered right after the
+     * "source #id" caption ("WebToon", "Thunderscans", "Reset Scans"…).
+     * The chip carries the rounded-box class — the heading's flag emoji
+     * span does not, which keeps a missing badge from resolving to the
+     * flag. Absent on badge-less groups; callers fall back to the
+     * title-page box display name.
+     */
+    private fun sourceGroupName(document: Document): String? = document.select("div.font-variant-small-caps")
+        .firstOrNull { it.ownText().startsWith("source #") }
+        ?.nextElementSibling()
+        ?.selectFirst("span.rounded-box")
+        ?.text()?.trim()?.takeIf { it.isNotBlank() }
+
+    /** Bounded per-session cache of source-group pages (refresh speed — a
+     * big title's full sweep is 40+ pages). */
+    private val sourcePageCache = object : LinkedHashMap<String, SourcePageData>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SourcePageData>): Boolean = size > 64
     }
+
+    /**
+     * The title page's qwik state carries `"comic_ids",4,[0,"vgreew",…]` —
+     * the site's COMPLETE source list for the title. The Sources grid only
+     * renders a subset of it; the ids missing from the DOM are the hidden
+     * groups whose /source/{id} pages stay live with full chapter lists.
+     * Returns those ids in state order.
+     */
+    private fun hiddenSourceIds(html: String, renderedIds: Set<String>): List<String> = COMIC_IDS_REGEX.find(html)?.groupValues?.get(1)
+        ?.let { segment -> STATE_ID_REGEX.findAll(segment).map { it.groupValues[1] }.toList() }
+        ?.filter { it !in renderedIds }
+        ?.distinct()
+        .orEmpty()
 
     /** 🇬🇧 → "gb" → "en". Regional-indicator pair → country code → language. */
     private fun flagToLanguage(flag: String): String {
@@ -755,9 +845,9 @@ abstract class XComic :
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_DEDUPLICATE_CHAPTERS
             title = "Deduplicate chapters"
-            summary = "ON: show the series' primary group only (what the site " +
-                "shows first — no phantom numbers from other groups). OFF: " +
-                "merge every group's list"
+            summary = "ON: merge every group and keep one row per chapter " +
+                "number per language (the primary group's upload wins; " +
+                "later copies collapse). OFF: keep every group's full list"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
@@ -844,6 +934,10 @@ abstract class XComic :
             "it" to "Italian",
             "tr" to "Turkish",
             "id" to "Indonesian",
+            "pl" to "Polish",
+            "fa" to "Persian",
+            "hu" to "Hungarian",
+            "sk" to "Slovak",
             "ja" to "Japanese",
             "ko" to "Korean",
             "zh" to "Chinese",
@@ -857,6 +951,9 @@ abstract class XComic :
             "ru" to "ru", "vn" to "vi", "it" to "it", "tr" to "tr", "id" to "id",
             "jp" to "ja", "kr" to "ko", "cn" to "zh", "tw" to "zh", "hk" to "zh",
             "de" to "de", "pl" to "pl", "th" to "th", "nl" to "nl",
+            "ir" to "fa", "hu" to "hu", "sk" to "sk", "cz" to "cs",
+            "ua" to "uk", "se" to "sv", "dk" to "da", "no" to "no",
+            "fi" to "fi", "ro" to "ro", "bg" to "bg", "il" to "he", "gr" to "el",
         )
 
         private val TYPE_WORDS = setOf("Manga", "Manhwa", "Manhua", "Comic", "Webtoon", "OEL", "One-shot")
@@ -924,6 +1021,14 @@ abstract class XComic :
 
         /** Numbers NOT glued to a letter ("S2" is excluded, "#98" isn't). */
         private val NUMBER_TOKEN_REGEX = Regex("""(?<![A-Za-z])\d+(?:[.,]\d+)?""")
+
+        /** `"comic_ids",4,[0,"vgreew",0,"82xv6a",…]` — the title page's
+         * qwik state carries the site's COMPLETE source list there, while
+         * the rendered Sources grid hides a subset of it. */
+        private val COMIC_IDS_REGEX = Regex(""""comic_ids",4,\[(.*?)\]""")
+
+        /** Quoted lowercase id tokens inside the comic_ids array. */
+        private val STATE_ID_REGEX = Regex(""""([a-z0-9]{3,10})""")
 
         /** Absolute page URLs in the reader's qwik state (iXX.imgXX.org and friends). */
         private val IMAGE_URL_REGEX = Regex("""(https://[a-zA-Z0-9.\-]+/_f/[a-zA-Z0-9./_\-]+)""")
