@@ -125,7 +125,7 @@ def main() -> None:
         icon_src = gradle.parent / "res" / "mipmap-xhdpi" / "ic_launcher.png"
         if icon_src.exists():
             shutil.copyfile(icon_src, ICONS / f"{dirname}.png")
-            icon_rel = f"./icons/{dirname}.png"
+            icon_rel = f"../icons/{dirname}.png"  # page-relative: cards render on /extensions/
         extensions.append(
             {
                 "name": info["name"],
