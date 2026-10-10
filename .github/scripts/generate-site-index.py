@@ -53,6 +53,38 @@ NOTES = {
     "weebcentral": "",
 }
 
+# Long-form notes for the guide's "Extension notes" section (docs/guide/).
+# Trusted repo-authored HTML (only <code> is used) — rendered via innerHTML by
+# app.js; the guide list is generated from this so new extensions appear there
+# automatically after the catalog regenerates.
+DESCRIPTIONS = {
+    "comixto": "signed+encrypted JSON API. The site's VM-protected signer means every "
+               "<code>/api/v1</code> call runs through a WebView bridge that boots the site's "
+               "own chunk graph and lets the site sign/decrypt in-JS; frozen native constants "
+               "stay as the fast path. Cloudflare bypass, tile descrambling, 10 settings.",
+    "manhuarmtl": "Madara theme with custom MRM selectors; Popular/Latest dedup via the archive "
+                  "endpoint; OCR text overlay burned onto raws in Arabic + 10 languages, "
+                  "toggleable; NSFW filter; full filter sheet.",
+    "kagane": "Komga-fork <code>/api/v2</code> with short-lived integrity tokens for chapter "
+              "manifests; transparent page-token refresh; data saver.",
+    "atsumaru": "<code>home2</code> browse endpoints + Typesense search; full filter set.",
+    "mkissa": "GraphQL persisted queries; browse/search/details only (anti-bot images).",
+    "mangadot": "one source per content language (100+); Cloudflare solver.",
+    "mangaball": "all-languages source.",
+    "swarm": "swarm sites.",
+    "xcomic": "reconciles the rendered Sources grid with the page state so hidden groups are "
+              "fetched too; real scanlator badge naming; per-number dedupe across languages.",
+    "weebcentral": "English source.",
+    "mangataro": "WordPress manga/v1 JSON API with the theme's double-encoded filters and MD5 "
+                 "chapter tokens; curated TriState genre list.",
+    "toonz": "Next.js + JSON endpoints; JSON-LD details; browse section setting.",
+    "mangago": "classic HTML browse/search; reader images harvested from the window-attached "
+               "WebView; route-level CF solving.",
+    "mangafire": "one source per content language (en, fr, es, es-la, pt, pt-br, ja); "
+                 "vrf-protected API signed offline by the site's own polyfill chunk running in "
+                 "a WebView; full filter sheet; smart description.",
+}
+
 RE_NAME = re.compile(r'^\s*name\s*=\s*"([^"]+)"', re.M)
 RE_CODE = re.compile(r'^\s*versionCode\s*=\s*(\d+)', re.M)
 RE_LIB = re.compile(r'^\s*libVersion\s*=\s*"([^"]+)"', re.M)
@@ -140,6 +172,7 @@ def main() -> None:
                 "apkUrl": f"https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/{apk}",
                 "icon": icon_rel,
                 "note": NOTES.get(dirname, ""),
+                "description": DESCRIPTIONS.get(dirname, NOTES.get(dirname, "")),
             }
         )
 

@@ -79,3 +79,29 @@ jobs:
             **/build/outputs/apk/release/*.apk
           retention-days: 7
           if-no-files-found: warn
+
+  # The main-branch ruleset requires a status check named exactly "build".
+  # The matrix legs above are reported as "Build extensions (N)", so this
+  # aggregate job provides the required "build" context and passes only when
+  # prepare + every matrix chunk succeeded (a skipped matrix — docs-only PRs —
+  # counts as passed). Keep the `name: build` in sync with the ruleset.
+  build-status:
+    name: build
+    needs: [prepare, build]
+    if: ${{ !cancelled() }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Aggregate PR check results
+        run: |
+          echo "prepare: ${{ needs.prepare.result }}"
+          echo "build:   ${{ needs.build.result }}"
+          if [[ "${{ needs.prepare.result }}" != "success" ]]; then
+            echo "::error::Prepare job did not succeed"
+            exit 1
+          fi
+          if [[ ! "${{ needs.build.result }}" =~ ^(success|skipped)$ ]]; then
+            echo "::error::Build extensions did not succeed"
+            exit 1
+          fi
+          echo "All PR check results OK"

@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: write
+  pull-requests: write
 
 concurrency:
   group: update-site
@@ -29,14 +30,29 @@ jobs:
       - name: Regenerate docs/index.json + icons
         run: python3 .github/scripts/generate-site-index.py
 
-      - name: Commit regenerated catalog
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add docs/index.json docs/icons
-          if git diff --cached --quiet; then
-            echo "No catalog changes"
-          else
-            git commit -m "chore(site): regenerate extension catalog"
-            git push
-          fi
+      # `main` is protected by a ruleset (pull requests only + required "build"
+      # status check), so the bot cannot push the catalog directly. Instead it
+      # opens/refreshes a PR; the PR runs the "PR check" workflow (whose
+      # aggregate "build" check satisfies the ruleset) and you merge it by hand.
+      - name: Open or refresh the catalog PR
+        uses: peter-evans/create-pull-request@v7
+        with:
+          branch: chore/site-catalog
+          delete-branch: true
+          base: main
+          title: "chore(site): regenerate extension catalog"
+          commit-message: "chore(site): regenerate extension catalog"
+          body: |
+            Automated catalog regeneration by the **Update website index** workflow.
+
+            - Updates `docs/index.json` (+ `docs/icons/`) from the current `src/` tree
+            - `main` is protected (PRs only + required `build` check), so this lands as a PR
+
+            **What to do:** review the diff, let the *PR check* workflow go green, then merge.
+            The GitHub Pages site picks up the new catalog automatically after merge.
+          labels: |
+            automated
+            site
+          add-paths: |
+            docs/index.json
+            docs/icons
