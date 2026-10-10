@@ -121,33 +121,20 @@
       </p>
 
       <h2 id="extension-notes">Extension notes</h2>
-      <ul>
-        <li><strong>Comix</strong> — signed+encrypted JSON API. The site's VM-protected signer means every
-          <code>/api/v1</code> call runs through a WebView bridge that boots the site's own chunk graph and
-          lets the site sign/decrypt in-JS; frozen native constants stay as the fast path. Cloudflare
-          bypass, tile descrambling, 10 settings.</li>
-        <li><strong>ManhuaRMTL</strong> — Madara theme with custom MRM selectors; Popular/Latest dedup via
-          the archive endpoint; OCR text overlay burned onto raws in Arabic + 10 languages, toggleable;
-          NSFW filter; full filter sheet.</li>
-        <li><strong>Kagane</strong> — Komga-fork <code>/api/v2</code> with short-lived integrity tokens for
-          chapter manifests; transparent page-token refresh; data saver.</li>
-        <li><strong>Atsumaru</strong> — <code>home2</code> browse endpoints + Typesense search; full filter set.</li>
-        <li><strong>MKissa</strong> — GraphQL persisted queries; browse/search/details only (anti-bot images).</li>
-        <li><strong>MangaDot</strong> — one source per content language (100+); Cloudflare solver.</li>
-        <li><strong>MangaBall</strong> — all-languages source.</li>
-        <li><strong>Swarm</strong> — swarm sites.</li>
-        <li><strong>XComic</strong> — reconciles the rendered Sources grid with the page state so hidden
-          groups are fetched too; real scanlator badge naming; per-number dedupe across languages.</li>
-        <li><strong>WeebCentral</strong> — English source.</li>
-        <li><strong>MangaTaro</strong> — WordPress manga/v1 JSON API with the theme's double-encoded
-          filters and MD5 chapter tokens; curated TriState genre list.</li>
-        <li><strong>Toonz</strong> — Next.js + JSON endpoints; JSON-LD details; browse section setting.</li>
-        <li><strong>MangaGo</strong> — classic HTML browse/search; reader images harvested from the
-          window-attached WebView; route-level CF solving.</li>
-        <li><strong>MangaFire</strong> — one source per content language (en, fr, es, es-la, pt, pt-br, ja);
-          vrf-protected API signed offline by the site's own polyfill chunk running in a WebView; full
-          filter sheet; smart description.</li>
+      <p>
+        Auto-generated from the site catalog (<code>docs/index.json</code>) — new extensions show up
+        here automatically when the catalog regenerates.
+      </p>
+      <ul id="ext-notes">
+        <li class="notes-loading">Loading the extension list…</li>
       </ul>
+      <noscript>
+        <p>
+          JavaScript is disabled — the auto-generated list can't render. Browse the
+          <a href="../extensions/">extensions page</a> or the
+          <a href="https://github.com/marbou92/MHExtensions/blob/main/docs/index.json" target="_blank" rel="noopener noreferrer">raw catalog</a>.
+        </p>
+      </noscript>
 
       <h2 id="structure">Project structure</h2>
       <pre><code>MHExtensions/
@@ -184,6 +171,6 @@
     </div>
   </footer>
 
-  <script src="../assets/app.js"></script>
+  <script src="../assets/app.js" data-catalog="../index.json"></script>
 </body>
 </html>

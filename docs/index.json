@@ -1,6 +1,6 @@
 {
   "meta": {
-    "generated": "2026-10-10T23:02:30+00:00",
+    "generated": "2026-10-10T23:21:57+00:00",
     "repoUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/repo.json",
     "repoHome": "https://github.com/marbou92/MHRepo",
     "sourceHome": "https://github.com/marbou92/MHExtensions"
@@ -20,7 +20,8 @@
       "apk": "tachiyomi-en.atsumaru-v1.4.28-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.atsumaru-v1.4.28-release.apk",
       "icon": "../icons/atsumaru.png",
-      "note": "Custom JSON API: home2 browse + Typesense search"
+      "note": "Custom JSON API: home2 browse + Typesense search",
+      "description": "<code>home2</code> browse endpoints + Typesense search; full filter set."
     },
     {
       "name": "Comix",
@@ -36,7 +37,8 @@
       "apk": "tachiyomi-all.comixto-v1.4.47-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.comixto-v1.4.47-release.apk",
       "icon": "../icons/comixto.png",
-      "note": "Signed+encrypted API via the WebView signing bridge; Cloudflare bypass; image descrambling"
+      "note": "Signed+encrypted API via the WebView signing bridge; Cloudflare bypass; image descrambling",
+      "description": "signed+encrypted JSON API. The site's VM-protected signer means every <code>/api/v1</code> call runs through a WebView bridge that boots the site's own chunk graph and lets the site sign/decrypt in-JS; frozen native constants stay as the fast path. Cloudflare bypass, tile descrambling, 10 settings."
     },
     {
       "name": "Kagane",
@@ -52,7 +54,8 @@
       "apk": "tachiyomi-en.kagane-v1.6.50-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.kagane-v1.6.50-release.apk",
       "icon": "../icons/kagane.png",
-      "note": "Integrity-token flow + Cloudflare bypass; data saver"
+      "note": "Integrity-token flow + Cloudflare bypass; data saver",
+      "description": "Komga-fork <code>/api/v2</code> with short-lived integrity tokens for chapter manifests; transparent page-token refresh; data saver."
     },
     {
       "name": "MangaBall",
@@ -68,7 +71,8 @@
       "apk": "tachiyomi-all.mangaball-v1.6.9-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangaball-v1.6.9-release.apk",
       "icon": "../icons/mangaball.png",
-      "note": ""
+      "note": "",
+      "description": "all-languages source."
     },
     {
       "name": "MangaDot",
@@ -191,7 +195,8 @@
       "apk": "tachiyomi-all.mangadot-v1.6.3-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangadot-v1.6.3-release.apk",
       "icon": "../icons/mangadot.png",
-      "note": "One source per language (100+ content languages)"
+      "note": "One source per language (100+ content languages)",
+      "description": "one source per content language (100+); Cloudflare solver."
     },
     {
       "name": "MangaFire",
@@ -213,7 +218,8 @@
       "apk": "tachiyomi-all.mangafire-v1.4.1-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangafire-v1.4.1-release.apk",
       "icon": "../icons/mangafire.png",
-      "note": "One source per content language (7); vrf-signed API computed offline in a WebView"
+      "note": "One source per content language (7); vrf-signed API computed offline in a WebView",
+      "description": "one source per content language (en, fr, es, es-la, pt, pt-br, ja); vrf-protected API signed offline by the site's own polyfill chunk running in a WebView; full filter sheet; smart description."
     },
     {
       "name": "MangaGo",
@@ -229,7 +235,8 @@
       "apk": "tachiyomi-en.mangago-v1.4.1-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangago-v1.4.1-release.apk",
       "icon": "../icons/mangago.png",
-      "note": "Reader images harvested via the window-attached WebView; CF solver"
+      "note": "Reader images harvested via the window-attached WebView; CF solver",
+      "description": "classic HTML browse/search; reader images harvested from the window-attached WebView; route-level CF solving."
     },
     {
       "name": "MangaTaro",
@@ -245,7 +252,8 @@
       "apk": "tachiyomi-en.mangataro-v1.4.1-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangataro-v1.4.1-release.apk",
       "icon": "../icons/mangataro.png",
-      "note": "WordPress manga/v1 JSON API with double-encoded filters"
+      "note": "WordPress manga/v1 JSON API with double-encoded filters",
+      "description": "WordPress manga/v1 JSON API with the theme's double-encoded filters and MD5 chapter tokens; curated TriState genre list."
     },
     {
       "name": "ManhuaRMTL",
@@ -261,7 +269,8 @@
       "apk": "tachiyomi-all.manhuarmtl-v1.6.114-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.manhuarmtl-v1.6.114-release.apk",
       "icon": "../icons/manhuarmtl.png",
-      "note": "Madara theme + OCR text overlay burned onto raws in 12 languages"
+      "note": "Madara theme + OCR text overlay burned onto raws in 12 languages",
+      "description": "Madara theme with custom MRM selectors; Popular/Latest dedup via the archive endpoint; OCR text overlay burned onto raws in Arabic + 10 languages, toggleable; NSFW filter; full filter sheet."
     },
     {
       "name": "MKissa",
@@ -277,7 +286,8 @@
       "apk": "tachiyomi-en.mkissa-v1.6.24-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mkissa-v1.6.24-release.apk",
       "icon": "../icons/mkissa.png",
-      "note": "Browse/search/details only \u2014 chapter images blocked by the site's anti-bot token"
+      "note": "Browse/search/details only \u2014 chapter images blocked by the site's anti-bot token",
+      "description": "GraphQL persisted queries; browse/search/details only (anti-bot images)."
     },
     {
       "name": "Swarm",
@@ -293,7 +303,8 @@
       "apk": "tachiyomi-all.swarm-v1.4.5-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.swarm-v1.4.5-release.apk",
       "icon": "../icons/swarm.png",
-      "note": ""
+      "note": "",
+      "description": "swarm sites."
     },
     {
       "name": "Toonz",
@@ -309,7 +320,8 @@
       "apk": "tachiyomi-en.toonz-v1.4.1-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.toonz-v1.4.1-release.apk",
       "icon": "../icons/toonz.png",
-      "note": "Next.js site + JSON endpoints; JSON-LD details"
+      "note": "Next.js site + JSON endpoints; JSON-LD details",
+      "description": "Next.js + JSON endpoints; JSON-LD details; browse section setting."
     },
     {
       "name": "WeebCentral",
@@ -325,7 +337,8 @@
       "apk": "tachiyomi-en.weebcentral-v1.4.2-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.weebcentral-v1.4.2-release.apk",
       "icon": "../icons/weebcentral.png",
-      "note": ""
+      "note": "",
+      "description": "English source."
     },
     {
       "name": "XComic",
@@ -341,7 +354,8 @@
       "apk": "tachiyomi-all.xcomic-v1.4.6-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.xcomic-v1.4.6-release.apk",
       "icon": "../icons/xcomic.png",
-      "note": "Fetches the complete source list incl. DOM-hidden groups; real scanlator badge naming"
+      "note": "Fetches the complete source list incl. DOM-hidden groups; real scanlator badge naming",
+      "description": "reconciles the rendered Sources grid with the page state so hidden groups are fetched too; real scanlator badge naming; per-number dedupe across languages."
     }
   ]
 }

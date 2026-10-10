@@ -378,6 +378,26 @@ pre code { background: none; padding: 0; color: var(--code-text); }
 
 .load-error { display: none; }
 
+/* ---------- Homepage showcase ---------- */
+
+.home-exts { padding: 16px 0 64px; }
+.home-exts-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 12px;
+  flex-wrap: wrap;
+  margin: 0 0 16px;
+}
+.home-exts-head h2 { margin: 0; font-size: 1.5rem; letter-spacing: -0.02em; }
+.home-exts-head .count { margin-left: 10px; }
+.home-exts-head a { font-size: 14px; font-weight: 600; }
+.home-exts .grid { margin-top: 4px; }
+
+/* ---------- Guide: generated extension notes ---------- */
+
+.notes-loading { color: var(--faint); font-style: italic; }
+
 /* ---------- Footer ---------- */
 
 .footer { border-top: 1px solid var(--divider); padding: 34px 0 44px; }
