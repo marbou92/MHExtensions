@@ -46,6 +46,10 @@ loadIndividualExtension("all", "mangaball")
 loadIndividualExtension("en", "weebcentral")
 loadIndividualExtension("all", "xcomic")
 loadIndividualExtension("all", "mangadot")
+loadIndividualExtension("en", "mangataro")
+loadIndividualExtension("en", "toonz")
+loadIndividualExtension("en", "mangago")
+loadIndividualExtension("all", "mangafire")
 // loadAllIndividualExtensions()
 
 /**
