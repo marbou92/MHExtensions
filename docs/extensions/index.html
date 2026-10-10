@@ -1,0 +1,91 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Extensions | MHExtensions</title>
+  <meta name="description" content="Browse and download manga sources for Mihon and variants.">
+  <link rel="icon" type="image/png" href="../assets/avatar.png">
+  <link rel="stylesheet" href="../assets/style.css">
+</head>
+<body>
+  <header class="navbar">
+    <div class="container nav-inner">
+      <a class="brand" href="../"><img class="logo-img" src="../assets/avatar.png" alt="marbou92 GitHub avatar" width="28" height="28">MHExtensions</a>
+      <nav class="nav-links" aria-label="Main navigation">
+        <a href="../guide/">Guide</a>
+        <a href="../extensions/" class="active">Extensions</a>
+        <a class="gh" href="https://github.com/marbou92/MHExtensions" target="_blank" rel="noopener noreferrer" aria-label="GitHub repository">
+          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+          <span>GitHub</span>
+        </a>
+      </nav>
+    </div>
+  </header>
+
+  <main class="page container">
+    <h1>Extensions</h1>
+    <p class="lead">Browse and download manga sources for Mihon and variants. Install the APK directly, or add the repo once and let the app manage updates.</p>
+
+    <div class="repo-card">
+      <h3>Add the repo to your app</h3>
+      <p class="sub">Mihon → More → Settings → Browse → Extension repositories → Add repository → paste this URL:</p>
+      <div class="repo-row">
+        <code id="repo-url">https://raw.githubusercontent.com/marbou92/MHRepo/main/repo.json</code>
+        <button class="copy-btn" type="button" data-copy-target="#repo-url" aria-label="Copy repository URL">Copy URL</button>
+        <a class="btn btn-alt btn-small" style="height:42px; border-radius:9px;" href="tachiyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmarbou92%2FMHRepo%2Fmain%2Frepo.json">Open in app</a>
+      </div>
+    </div>
+
+    <div id="ext-browser">
+      <div class="toolbar">
+        <div class="search-wrap">
+          <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="11" cy="11" r="7"/><line x1="21" y1="21" x2="16.5" y2="16.5"/></svg>
+          <input class="search" id="ext-search" type="search" placeholder="Search extensions…" aria-label="Search extensions">
+        </div>
+        <div class="chips">
+          <button class="chip active" type="button" data-lang="all">All</button>
+          <button class="chip" type="button" data-lang="multi">Multi-language</button>
+          <button class="chip" type="button" data-lang="all-lang">All languages</button>
+          <button class="chip" type="button" data-lang="en">English</button>
+          <span class="count" id="ext-count" aria-live="polite"></span>
+        </div>
+      </div>
+
+      <div class="grid" id="ext-grid" aria-live="polite">
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+        <div class="skeleton"></div>
+      </div>
+
+      <div class="block block-warning load-error" role="alert">
+        <p class="block-title">⚠️ Couldn't load the extension list</p>
+        <p>
+          <code>index.json</code> could not be fetched. When browsing locally, serve this folder over HTTP
+          (e.g. <code>python3 -m http.server -d docs</code>). On GitHub Pages it loads automatically — regenerate it with
+          <code>python3 .github/scripts/generate-site-index.py</code> or the <em>Update website index</em> workflow.
+        </p>
+      </div>
+    </div>
+  </main>
+
+  <footer class="footer">
+    <div class="container inner">
+      <p>
+        MHExtensions does not have any affiliation with the content providers available.<br>
+        Not affiliated with Mihon/Tachiyomi — don't ask for help about these extensions through the
+        official support channels. All credits for the codebase go to the original contributors.
+      </p>
+      <div class="links">
+        <a href="../add-repo/">Add store</a>
+        <a href="../guide/">Guide</a>
+        <a href="https://github.com/marbou92/MHExtensions/issues" target="_blank" rel="noopener noreferrer">Issues</a>
+        <a href="https://github.com/marbou92/MHExtensions" target="_blank" rel="noopener noreferrer">GitHub</a>
+      </div>
+    </div>
+  </footer>
+
+  <script src="../assets/app.js"></script>
+</body>
+</html>

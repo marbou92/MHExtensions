@@ -3,92 +3,11 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="0; url=./add-repo/">
+  <link rel="canonical" href="./add-repo/">
   <title>Add store | MHExtensions</title>
-  <meta name="description" content="Add this store to the app.">
-  <link rel="icon" type="image/png" href="./icons/comixto.png">
-  <link rel="stylesheet" href="./assets/style.css">
 </head>
 <body>
-  <header class="navbar">
-    <div class="container nav-inner">
-      <a class="brand" href="./index.html"><span class="logo">MH</span>MHExtensions</a>
-      <nav class="nav-links" aria-label="Main navigation">
-        <a href="./guide.html">Guide</a>
-        <a href="./extensions.html">Extensions</a>
-        <a class="gh" href="https://github.com/marbou92/MHExtensions" target="_blank" rel="noopener noreferrer" aria-label="GitHub repository">
-          <svg viewBox="0 0 16 16" fill="currentColor" aria-hidden="true"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
-          <span>GitHub</span>
-        </a>
-      </nav>
-    </div>
-  </header>
-
-  <main class="page container" style="max-width: 820px;">
-    <h1>Add store</h1>
-    <p class="lead">Add the MHExtensions store to the app, then install extensions straight from Browse → Extensions.</p>
-
-    <div class="repo-card">
-      <h3>Repository URL</h3>
-      <p class="sub">Copy and paste this into the app's extension repository settings:</p>
-      <div class="repo-row">
-        <code id="repo-url">https://raw.githubusercontent.com/marbou92/MHRepo/main/repo.json</code>
-        <button class="copy-btn" type="button" data-copy-target="#repo-url" aria-label="Copy repository URL">Copy URL</button>
-      </div>
-      <div class="repo-row" style="margin-top: 12px;">
-        <a class="btn btn-brand btn-small" style="height:42px; border-radius:9px;" href="tachiyomi://add-repo?url=https%3A%2F%2Fraw.githubusercontent.com%2Fmarbou92%2FMHRepo%2Fmain%2Frepo.json">Open in app (deep link)</a>
-      </div>
-      <p class="sub" style="margin: 12px 0 0;">
-        The deep link only works on a device that has Mihon, TachiyomiSY or Komikku installed. If nothing
-        happens, use the copy button and the manual steps below.
-      </p>
-    </div>
-
-    <div class="doc">
-      <h2>Manual steps (Mihon)</h2>
-      <ol>
-        <li>Open <strong>More → Settings → Browse</strong>.</li>
-        <li>Scroll to <strong>Extension repositories</strong> and tap <strong>Add repository</strong>.</li>
-        <li>Paste the URL above and confirm.</li>
-        <li>Go to <strong>Browse → Extensions</strong>, pull down to refresh — the MHExtensions catalog appears.</li>
-        <li>Tap <strong>Install</strong> on an extension, then enable its sources under <strong>Browse → Sources</strong>.</li>
-      </ol>
-
-      <h2>What the app downloads</h2>
-      <p>
-        <code>repo.json</code> points the app at the protobuf index
-        (<code>index.pb</code>) on <a href="https://github.com/marbou92/MHRepo" target="_blank" rel="noopener noreferrer">marbou92/MHRepo</a>,
-        which lists every extension with its version and signing-key fingerprint. APKs are signed —
-        the app verifies them against the fingerprint before installing.
-      </p>
-
-      <div class="block block-warning">
-        <p class="block-title">⚠️ First install warning</p>
-        <p>
-          On the first install from a new repo, the app asks you to trust its signing key once.
-          Accept it — the fingerprint is published in the repo index.
-        </p>
-      </div>
-
-      <p>Something not working? See the <a href="./guide.html#troubleshooting">troubleshooting guide</a>.</p>
-    </div>
-  </main>
-
-  <footer class="footer">
-    <div class="container inner">
-      <p>
-        MHExtensions does not have any affiliation with the content providers available.<br>
-        Not affiliated with Mihon/Tachiyomi — don't ask for help about these extensions through the
-        official support channels. All credits for the codebase go to the original contributors.
-      </p>
-      <div class="links">
-        <a href="./extensions.html">Extensions</a>
-        <a href="./guide.html">Guide</a>
-        <a href="https://github.com/marbou92/MHExtensions/issues" target="_blank" rel="noopener noreferrer">Issues</a>
-        <a href="https://github.com/marbou92/MHExtensions" target="_blank" rel="noopener noreferrer">GitHub</a>
-      </div>
-    </div>
-  </footer>
-
-  <script src="./assets/app.js"></script>
+  <p>This page moved to <a href="./add-repo/">/add-repo/</a>.</p>
 </body>
 </html>

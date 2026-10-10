@@ -133,7 +133,7 @@ if (browserRoot) {
     grid.innerHTML = filtered.map(cardHtml).join('')
   }
 
-  fetch('./index.json')
+  fetch('../index.json')
     .then((res) => {
       if (!res.ok) throw new Error(`index.json ${res.status}`)
       return res.json()

@@ -1,6 +1,6 @@
 {
   "meta": {
-    "generated": "2026-10-10T21:48:43+00:00",
+    "generated": "2026-10-10T23:02:30+00:00",
     "repoUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/repo.json",
     "repoHome": "https://github.com/marbou92/MHRepo",
     "sourceHome": "https://github.com/marbou92/MHExtensions"
@@ -19,7 +19,7 @@
       "baseUrl": "https://atsu.moe",
       "apk": "tachiyomi-en.atsumaru-v1.4.28-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.atsumaru-v1.4.28-release.apk",
-      "icon": "./icons/atsumaru.png",
+      "icon": "../icons/atsumaru.png",
       "note": "Custom JSON API: home2 browse + Typesense search"
     },
     {
@@ -35,7 +35,7 @@
       "baseUrl": "https://comix.to",
       "apk": "tachiyomi-all.comixto-v1.4.47-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.comixto-v1.4.47-release.apk",
-      "icon": "./icons/comixto.png",
+      "icon": "../icons/comixto.png",
       "note": "Signed+encrypted API via the WebView signing bridge; Cloudflare bypass; image descrambling"
     },
     {
@@ -51,7 +51,7 @@
       "baseUrl": "https://kagane.to",
       "apk": "tachiyomi-en.kagane-v1.6.50-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.kagane-v1.6.50-release.apk",
-      "icon": "./icons/kagane.png",
+      "icon": "../icons/kagane.png",
       "note": "Integrity-token flow + Cloudflare bypass; data saver"
     },
     {
@@ -67,7 +67,7 @@
       "baseUrl": "https://mangaball.com",
       "apk": "tachiyomi-all.mangaball-v1.6.9-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangaball-v1.6.9-release.apk",
-      "icon": "./icons/mangaball.png",
+      "icon": "../icons/mangaball.png",
       "note": ""
     },
     {
@@ -190,7 +190,7 @@
       "baseUrl": "https://mangadot.net",
       "apk": "tachiyomi-all.mangadot-v1.6.3-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangadot-v1.6.3-release.apk",
-      "icon": "./icons/mangadot.png",
+      "icon": "../icons/mangadot.png",
       "note": "One source per language (100+ content languages)"
     },
     {
@@ -212,7 +212,7 @@
       "baseUrl": "https://mangafire.to",
       "apk": "tachiyomi-all.mangafire-v1.4.1-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangafire-v1.4.1-release.apk",
-      "icon": "./icons/mangafire.png",
+      "icon": "../icons/mangafire.png",
       "note": "One source per content language (7); vrf-signed API computed offline in a WebView"
     },
     {
@@ -228,7 +228,7 @@
       "baseUrl": "https://www.mangago.me",
       "apk": "tachiyomi-en.mangago-v1.4.1-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangago-v1.4.1-release.apk",
-      "icon": "./icons/mangago.png",
+      "icon": "../icons/mangago.png",
       "note": "Reader images harvested via the window-attached WebView; CF solver"
     },
     {
@@ -244,7 +244,7 @@
       "baseUrl": "https://mangataro.org",
       "apk": "tachiyomi-en.mangataro-v1.4.1-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangataro-v1.4.1-release.apk",
-      "icon": "./icons/mangataro.png",
+      "icon": "../icons/mangataro.png",
       "note": "WordPress manga/v1 JSON API with double-encoded filters"
     },
     {
@@ -260,7 +260,7 @@
       "baseUrl": "https://manhuarmtl.com",
       "apk": "tachiyomi-all.manhuarmtl-v1.6.114-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.manhuarmtl-v1.6.114-release.apk",
-      "icon": "./icons/manhuarmtl.png",
+      "icon": "../icons/manhuarmtl.png",
       "note": "Madara theme + OCR text overlay burned onto raws in 12 languages"
     },
     {
@@ -276,7 +276,7 @@
       "baseUrl": "https://mkissa.to",
       "apk": "tachiyomi-en.mkissa-v1.6.24-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mkissa-v1.6.24-release.apk",
-      "icon": "./icons/mkissa.png",
+      "icon": "../icons/mkissa.png",
       "note": "Browse/search/details only \u2014 chapter images blocked by the site's anti-bot token"
     },
     {
@@ -292,7 +292,7 @@
       "baseUrl": "https://swarm.ws",
       "apk": "tachiyomi-all.swarm-v1.4.5-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.swarm-v1.4.5-release.apk",
-      "icon": "./icons/swarm.png",
+      "icon": "../icons/swarm.png",
       "note": ""
     },
     {
@@ -308,7 +308,7 @@
       "baseUrl": "https://toonz.to",
       "apk": "tachiyomi-en.toonz-v1.4.1-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.toonz-v1.4.1-release.apk",
-      "icon": "./icons/toonz.png",
+      "icon": "../icons/toonz.png",
       "note": "Next.js site + JSON endpoints; JSON-LD details"
     },
     {
@@ -324,7 +324,7 @@
       "baseUrl": "https://weebcentral.com",
       "apk": "tachiyomi-en.weebcentral-v1.4.2-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.weebcentral-v1.4.2-release.apk",
-      "icon": "./icons/weebcentral.png",
+      "icon": "../icons/weebcentral.png",
       "note": ""
     },
     {
@@ -340,7 +340,7 @@
       "baseUrl": "https://xcomic.me",
       "apk": "tachiyomi-all.xcomic-v1.4.6-release.apk",
       "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.xcomic-v1.4.6-release.apk",
-      "icon": "./icons/xcomic.png",
+      "icon": "../icons/xcomic.png",
       "note": "Fetches the complete source list incl. DOM-hidden groups; real scanlator badge naming"
     }
   ]

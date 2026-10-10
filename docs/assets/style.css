@@ -119,17 +119,13 @@ pre code { background: none; padding: 0; color: var(--code-text); }
   letter-spacing: -0.01em;
 }
 .brand:hover { color: var(--text); }
-.brand .logo {
+.brand .logo-img {
   width: 28px;
   height: 28px;
   border-radius: 8px;
-  background: linear-gradient(135deg, var(--brand-2), var(--brand-3));
-  display: inline-flex;
-  align-items: center;
-  justify-content: center;
-  color: #fff;
-  font-size: 13px;
-  font-weight: 800;
+  object-fit: cover;
+  display: block;
+  background: var(--bg-alt);
 }
 
 .nav-links { display: flex; align-items: center; gap: 4px; }

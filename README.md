@@ -8,9 +8,9 @@
 
 ## Usage
 
-**If you are new to repositories/extensions, please read the [Getting Started guide](https://marbou92.github.io/MHExtensions/guide.html#adding-the-repository) first.**
+**If you are new to repositories/extensions, please read the [Getting Started guide](https://marbou92.github.io/MHExtensions/guide/#adding-the-repository) first.**
 
-* You can add our repo by visiting the [MHExtensions Website](https://marbou92.github.io/MHExtensions/add-repo.html)
+* You can add our repo by visiting the [MHExtensions Website](https://marbou92.github.io/MHExtensions/add-repo/)
 * Otherwise, copy & paste the following URL: https://raw.githubusercontent.com/marbou92/MHRepo/main/repo.json
 
 ## Extensions
@@ -52,13 +52,14 @@ contributing! Issues are up-for-grabs for any developer if there is no assigned 
 Contributions are welcome!
 
 Check out the repo's [issue backlog](https://github.com/marbou92/MHExtensions/issues) for source
-requests and bug reports. See the [Adding a new extension guide](https://marbou92.github.io/MHExtensions/guide.html#adding-a-new-extension)
+requests and bug reports. See the [Adding a new extension guide](https://marbou92.github.io/MHExtensions/guide/#adding-a-new-extension)
 for how to wire one up.
 
 ## Website
 
 This repo ships a keiyoushi-style website in [`docs/`](docs/) — an extension browser, an add-repo
-page and the guides. Plain HTML/CSS/JS, zero build step.
+page and the guides, on clean directory URLs (`/extensions/`, `/add-repo/`, `/guide/`). Plain
+HTML/CSS/JS, zero build step.
 
 **https://marbou92.github.io/MHExtensions/**
 
@@ -74,7 +75,14 @@ The extension catalog (`docs/index.json`) regenerates automatically via the *Upd
 The workflow builds signed release APKs for all extensions in `settings.gradle.kts` and publishes
 APKs, icons and the protobuf index (`index.pb`) to [MHRepo](https://github.com/marbou92/MHRepo) —
 the repository URL Mihon consumes — then purges the jsDelivr CDN cache. Full details (signing
-secrets, cleanup mode) live in the [Publishing guide](https://marbou92.github.io/MHExtensions/guide.html#publishing).
+secrets, cleanup mode) live in the [Publishing guide](https://marbou92.github.io/MHExtensions/guide/#publishing).
+
+## Credits
+
+MHExtensions is built on the extension infrastructure of
+[keiyoushi/extensions-source](https://github.com/keiyoushi/extensions-source), and the README and
+website style follow [keiyoushi.github.io](https://keiyoushi.github.io/). Thanks to the keiyoushi
+contributors — go use their repo if you want a huge catalog of community-maintained sources.
 
 ## License
 
