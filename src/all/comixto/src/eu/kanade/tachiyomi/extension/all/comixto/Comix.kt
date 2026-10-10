@@ -20,6 +20,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
+import okhttp3.Protocol
 import okhttp3.Request
 import okhttp3.Response
 import okhttp3.ResponseBody.Companion.asResponseBody
@@ -31,6 +32,12 @@ import rx.schedulers.Schedulers
 import java.io.IOException
 import java.util.concurrent.Callable
 import java.util.concurrent.Executors
+
+/** Tolerant shape for the page-list payload when the site's client wraps it in `result`. */
+@kotlinx.serialization.Serializable
+private class WebViewPagesResult(
+    val pages: ComixPagesContainerDto? = null,
+)
 
 @Source
 abstract class Comix :
@@ -86,139 +93,81 @@ abstract class Comix :
     }
 
     // ========================================================================
-    // WebView fallback (v46) — the site's own bundle signs + decrypts
+    // WebView bridge (v47) — the site's own chunk graph signs + decrypts
     // ========================================================================
+    //
+    // Late 2026: the site rebuilt its API protection. The old env bundle
+    // (3×S-box chain, base64-decoded at boot — natively replicated and
+    // self-healed by v46) is GONE: a VM-protected "secure-<build>.js" chunk
+    // now computes the `_` token with a hash/MAC inside its bytecode VM —
+    // no material ever materialises for capture, so the native signer can
+    // no longer be taught new keys. Instead of chasing it, every /api/v1
+    // call can run through the WebView where the site's OWN chunk graph
+    // (axios + api client + secure signer) self-wires and does the work —
+    // the same environment the user sees working when they open the site.
+    //
+    // Strategy per call: try the fast native path first (it may work again
+    // if the site ever reverts); on ANY failure — token 403s included —
+    // rerun through the WebView bridge. One native round-trip is paid per
+    // call type, at most.
 
-    private fun webViewChapterList(manga: SManga): List<SChapter> {
-        val hid = manga.url
-        CloudflareSolverDiagnostics.record("COMIX native chapter list failed → WebView fallback (hid=$hid)")
-        val capture = ComixWebView.capture(client, baseUrl, headers["User-Agent"] ?: FALLBACK_UA) { mainScriptUrl, passName, rejectName ->
-            webViewChapterListCaptureScript(hid, mainScriptUrl, passName, rejectName)
-        }
-        capture.material?.takeIf { it.isValid() }?.let { material ->
-            applyCipherMaterial(material)
-        }
-        val items = capture.payload.parseAs<List<ComixChapterDto>>()
-        CloudflareSolverDiagnostics.record("COMIX WebView fallback chapter list OK (${items.size} items)")
-        return items.map { it.toSChapter() }
+    private val webViewUserAgent: String
+        get() = headers["User-Agent"] ?: FALLBACK_UA
+
+    /** Strips signing/retry params, keeps the canonical path the site client should call. */
+    private fun Request.apiPath(): String {
+        val query = url.queryParameterNames
+            .filter { it != "_" && it != "r" }
+            .flatMap { name -> url.queryParameterValues(name).map { "$name=$it" } }
+            .joinToString("&")
+        return url.encodedPath + (if (query.isEmpty()) "" else "?$query")
     }
 
-    private fun webViewPageList(chapter: SChapter): List<Page> {
-        val chapterId = chapter.url
-        CloudflareSolverDiagnostics.record("COMIX native page list failed → WebView fallback (chapter=$chapterId)")
-        val capture = ComixWebView.capture(client, baseUrl, headers["User-Agent"] ?: FALLBACK_UA) { mainScriptUrl, passName, rejectName ->
-            webViewPageListCaptureScript(chapterId, mainScriptUrl, passName, rejectName)
+    /** Runs one path through the WebView bridge and wraps the payload as a JSON Response. */
+    private fun webViewApiGet(request: Request): Response {
+        val path = request.apiPath()
+        CloudflareSolverDiagnostics.record("COMIX native call failed → WebView bridge ($path)")
+        val payload = ComixWebView.apiGet(client, baseUrl, webViewUserAgent, path)
+        if (payload.isBlank()) {
+            throw IOException("Comix WebView bridge returned an empty payload for $path")
         }
-        capture.material?.takeIf { it.isValid() }?.let { material ->
-            applyCipherMaterial(material)
-        }
-        val payload = capture.payload.parseAs<WebViewPagesPayload>()
-        val container = payload.container()
-            ?: throw IOException("Comix WebView fallback returned no page container")
-        CloudflareSolverDiagnostics.record("COMIX WebView fallback page list OK (${container.items.size} pages)")
-        return buildPageList(container)
+        CloudflareSolverDiagnostics.record("COMIX WebView bridge OK ($path)")
+        return Response.Builder()
+            .request(request)
+            .protocol(Protocol.HTTP_1_1)
+            .code(200)
+            .message("OK")
+            .body(payload.toResponseBody("application/json".toMediaType()))
+            .build()
     }
 
     /**
-     * Imports the site's env bundle in the WebView and drives the site's OWN
-     * manga API (`mangaApi.chapters(...)`) — the exact call shape the official
-     * keiyoushi Comix extension uses, so signing + decryption happen in-JS.
+     * Shared fetch shape: native call through the FULL source client first
+     * (solver + retry + signing interceptors ride along), then the WebView
+     * bridge on ANY failure. The request is built once and reused by both
+     * paths, so the WebView call hits the exact endpoint the native one
+     * wanted.
      */
-    private fun webViewChapterListCaptureScript(
-        hid: String,
-        mainScriptUrl: String,
-        passPayloadName: String,
-        rejectName: String,
-    ): String = $$"""
-        (function () {
-            const payloadKey = '__comixChapterPayload';
-            const mangaId = $${JSONObject.quote(hid)};
-            const mainScriptUrl = $${JSONObject.quote(mainScriptUrl)};
-            if (window[payloadKey]) return null;
-            window[payloadKey] = true;
+    private fun <T> fetchWithWebViewFallback(request: Request, parse: (Response) -> T): Observable<T> = Observable.fromCallable {
+        client.newCall(request).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+            parse(resp)
+        }
+    }
+        .subscribeOn(Schedulers.io())
+        .onErrorResumeNext { error ->
+            Observable.fromCallable { parse(webViewApiGet(request)) }
+                .subscribeOn(Schedulers.io())
+                .onErrorResumeNext { Observable.error<T>(error) }
+        }
 
-            (async () => {
-                try {
-                    if (!mainScriptUrl) throw new Error('Could not find main bundle');
-                    const mainResponse = await fetch(mainScriptUrl);
-                    if (!mainResponse.ok) throw new Error('Could not load main bundle');
-                    const mainJavaScript = await mainResponse.text();
-                    const environmentFile = mainJavaScript.match(/from\s*["']\.\/(env-[^"']+\.js)["']/)?.[1];
-                    if (!environmentFile) throw new Error('Could not find environment bundle');
+    override fun fetchPopularManga(page: Int): Observable<MangasPage> = fetchWithWebViewFallback(popularMangaRequest(page)) { response -> mangaListParse(response) }
 
-                    const importBundle = new Function('url', 'return import(url)');
-                    const environment = await importBundle(new URL(environmentFile, mainScriptUrl).href);
-                    const mangaApi = Object.values(environment).find(value =>
-                        value && typeof value === 'object' && typeof value.chapters === 'function');
-                    if (!mangaApi) throw new Error('Could not find manga API');
+    override fun fetchLatestUpdates(page: Int): Observable<MangasPage> = fetchWithWebViewFallback(latestUpdatesRequest(page)) { response -> mangaListParse(response) }
 
-                    const items = [];
-                    let page = 1;
-                    while (page <= $${ComixWebView.MAX_CHAPTER_PAGES}) {
-                        const response = await mangaApi.chapters(mangaId, {
-                            page,
-                            limit: 100,
-                            order: { number: 'desc' }
-                        });
-                        const pageItems = response?.items;
-                        if (!Array.isArray(pageItems) || pageItems.length === 0) break;
-                        items.push(...pageItems);
-                        const meta = response.meta || response.pagination || {};
-                        const lastPage = meta.lastPage || meta.last_page || page;
-                        if (!(meta.hasNext || page < lastPage)) break;
-                        page++;
-                    }
-                    window.$${passPayloadName}(JSON.stringify(items));
-                } catch (error) {
-                    window.$${rejectName}(error);
-                }
-            })();
-            return null;
-        })();
-    """.trimIndent()
+    override fun fetchSearchManga(page: Int, query: String, filters: FilterList): Observable<MangasPage> = fetchWithWebViewFallback(searchMangaRequest(page, query, filters)) { response -> mangaListParse(response) }
 
-    /** Same env-bundle import, but drives the site's generic API client with the chapter-pages path. */
-    private fun webViewPageListCaptureScript(
-        chapterId: String,
-        mainScriptUrl: String,
-        passPayloadName: String,
-        rejectName: String,
-    ): String = $$"""
-        (function () {
-            const payloadKey = '__comixPagePayload';
-            const chapterId = $${JSONObject.quote(chapterId)};
-            const mainScriptUrl = $${JSONObject.quote(mainScriptUrl)};
-            if (window[payloadKey]) return null;
-            window[payloadKey] = true;
-
-            (async () => {
-                try {
-                    if (!mainScriptUrl) throw new Error('Could not find main bundle');
-                    const mainResponse = await fetch(mainScriptUrl);
-                    if (!mainResponse.ok) throw new Error('Could not load main bundle');
-                    const mainJavaScript = await mainResponse.text();
-                    const environmentFile = mainJavaScript.match(/from\s*["']\.\/(env-[^"']+\.js)["']/)?.[1];
-                    if (!environmentFile) throw new Error('Could not find environment bundle');
-
-                    const importBundle = new Function('url', 'return import(url)');
-                    const environment = await importBundle(new URL(environmentFile, mainScriptUrl).href);
-                    const apiClient = Object.values(environment).find(value =>
-                        value && typeof value === 'object' && typeof value.get === 'function');
-                    if (!apiClient) throw new Error('Could not find API client');
-
-                    const data = await apiClient.get('/chapters/' + chapterId);
-                    const container = data && (data.pages || (data.result && data.result.pages));
-                    if (!container || !Array.isArray(container.items)) {
-                        throw new Error('Unexpected chapter payload from API client');
-                    }
-                    window.$${passPayloadName}(JSON.stringify(data));
-                } catch (error) {
-                    window.$${rejectName}(error);
-                }
-            })();
-            return null;
-        })();
-    """.trimIndent()
+    override fun fetchMangaDetails(manga: SManga): Observable<SManga> = fetchWithWebViewFallback(mangaDetailsRequest(manga)) { response -> mangaDetailsParse(response) }
 
     // ========================================================================
     // API
@@ -301,16 +250,47 @@ abstract class Comix :
 
     // ============================= Chapters =============================
 
-    // v46: if the native signed path fails for ANY reason (flaky origin after
-    // 10 retries, rotated cipher material, handed-back challenge), rerun the
-    // fetch through the WebView where the site's OWN bundle signs + decrypts
-    // the calls — the same environment the user sees working when they open
-    // the site. A successful run also recaptures the current cipher material,
-    // so the fast native path self-heals afterwards.
-    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = super.fetchChapterList(manga).onErrorResumeNext { error ->
+    // v47: native attempt first, then ONE WebView session sweeps ALL
+    // chapter-list pages (the site's own client signs every call in-JS).
+    override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = fetchWithWebViewFallback(chapterListRequest(manga)) { response ->
+        chapterListParse(response)
+    }.onErrorResumeNext { error ->
         Observable.fromCallable { webViewChapterList(manga) }
             .subscribeOn(Schedulers.io())
-            .onErrorResumeNext { Observable.error(error) }
+            .onErrorResumeNext { Observable.error<List<SChapter>>(error) }
+    }
+
+    /**
+     * Full chapter list via the WebView bridge: page 1 first (it carries the
+     * pagination meta), then the remaining pages batched inside ONE extra
+     * session when pagination says there is more.
+     */
+    private fun webViewChapterList(manga: SManga): List<SChapter> {
+        val hid = manga.url
+        CloudflareSolverDiagnostics.record("COMIX native chapter list failed → WebView bridge (hid=$hid)")
+        val firstPath = "/api/v1/manga/$hid/chapters?page=1&limit=100"
+        val first = ComixWebView.apiGet(client, baseUrl, webViewUserAgent, firstPath)
+            .parseAs<ComixChapterListDto>()
+        val items = first.items.toMutableList()
+        if (first.meta?.hasNext == true) {
+            val maxPage = minOf(first.meta?.lastPage ?: 2, ComixWebView.MAX_CHAPTER_PAGES)
+            val pages = (2..maxPage).toList()
+            if (pages.isNotEmpty()) {
+                val payloads = ComixWebView.apiGet(
+                    client,
+                    baseUrl,
+                    webViewUserAgent,
+                    pages.map { page -> "/api/v1/manga/$hid/chapters?page=$page&limit=100" },
+                )
+                payloads.forEach { payload ->
+                    if (payload.isNotBlank()) {
+                        items.addAll(payload.parseAs<ComixChapterListDto>().items)
+                    }
+                }
+            }
+        }
+        CloudflareSolverDiagnostics.record("COMIX WebView bridge chapter list OK (${items.size} items)")
+        return processChapterItems(items)
     }
 
     override fun chapterListRequest(manga: SManga): Request {
@@ -384,6 +364,47 @@ abstract class Comix :
         return chapters
     }
 
+    /** Shared post-processing (dedupe + scanlator filter) for the WebView chapter path. */
+    private fun processChapterItems(items: List<ComixChapterDto>): List<SChapter> {
+        var chapters = items.map { it.toSChapter() }
+
+        if (preferences.deduplicateChapters()) {
+            val bestByKey = mutableMapOf<Float, ComixChapterDto>()
+            for (dto in items) {
+                val key = dto.number ?: -1f
+                val existing = bestByKey[key]
+                if (existing == null || isBetterChapter(dto, existing)) {
+                    bestByKey[key] = dto
+                }
+            }
+            val bestIds = bestByKey.values.map { it.id }.toSet()
+            chapters = items.filter { it.id in bestIds }.map { it.toSChapter() }
+        }
+
+        val scanlatorPref = preferences.getScanlatorFilter()
+        if (scanlatorPref.isNotBlank()) {
+            chapters = chapters.filter { ch ->
+                scanlatorPref.split(",").any { s ->
+                    ch.scanlator?.contains(s.trim(), ignoreCase = true) == true
+                }
+            }
+        }
+
+        return chapters
+    }
+
+    /** Page list via the WebView bridge (tolerant of both payload shapes the site's client emits). */
+    private fun webViewPageList(chapter: SChapter): List<Page> {
+        val chapterId = chapter.url
+        CloudflareSolverDiagnostics.record("COMIX native page list failed → WebView bridge (chapter=$chapterId)")
+        val payload = ComixWebView.apiGet(client, baseUrl, webViewUserAgent, "/api/v1/chapters/$chapterId")
+        val container = runCatching { payload.parseAs<ComixChapterPagesDto>().pages }
+            .getOrElse { payload.parseAs<WebViewPagesResult>().pages }
+            ?: throw IOException("Comix WebView bridge returned no page container")
+        CloudflareSolverDiagnostics.record("COMIX WebView bridge page list OK (${container.items.size} pages)")
+        return buildPageList(container)
+    }
+
     /**
      * Returns true if [a] is a better chapter than [b] for deduplication.
      * Priority: official > more votes > more recent.
@@ -407,13 +428,14 @@ abstract class Comix :
         return GET("$apiBaseUrl/chapters/$chapterId", apiHeaders)
     }
 
-    // v46: same fallback shape as the chapter list — the site's own client
+    // v47: same fallback shape as the chapter list — the site's own client
     // signs + decrypts the /chapters/{id} call inside the WebView.
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = super.fetchPageList(chapter).onErrorResumeNext { error ->
-        Observable.fromCallable { webViewPageList(chapter) }
-            .subscribeOn(Schedulers.io())
-            .onErrorResumeNext { Observable.error(error) }
-    }
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = fetchWithWebViewFallback(pageListRequest(chapter)) { response -> pageListParse(response) }
+        .onErrorResumeNext { error ->
+            Observable.fromCallable { webViewPageList(chapter) }
+                .subscribeOn(Schedulers.io())
+                .onErrorResumeNext { Observable.error<List<Page>>(error) }
+        }
 
     override fun getChapterUrl(chapter: SChapter): String {
         // chapter.url is the numeric chapter ID; we cannot reconstruct the full web URL without
@@ -1047,27 +1069,13 @@ abstract class Comix :
     }
 
     // --- Cipher material ---------------------------------------------------
-    // v46: the S-box/key material is no longer frozen at the constants we
-    // extracted at recon time. The site ROTATES this material — a rotation
-    // used to invalidate every native signature until a new extension release
-    // shipped. The WebView fallback now recaptures the live material (atob
-    // hook, see WebViewFallback.kt) and swaps it in here, so the fast native
-    // path self-heals after one fallback run. Defaults = the recon constants.
+    // v47: the site's signing core now lives inside a VM-protected chunk
+    // (hash/MAC — no capturable material), so the recapture plumbing is
+    // gone. The frozen recon constants below keep the NATIVE path alive in
+    // case the site ever reverts its build; every native failure falls back
+    // to the WebView bridge (see WebViewFallback.kt).
 
-    @Volatile
-    private var cipherMaterial: ComixCipherMaterial = ComixCipherMaterial.fromDefaults()
-
-    @Synchronized
-    private fun applyCipherMaterial(material: WebViewCipherMaterial) {
-        if (!material.isValid()) return
-        runCatching {
-            cipherMaterial = ComixCipherMaterial(
-                sboxes = material.sboxes.map { list -> ByteArray(256) { i -> (list[i] and 0xFF).toByte() } }.toTypedArray(),
-                keys = material.keys.map { list -> ByteArray(list.size) { i -> (list[i] and 0xFF).toByte() } }.toTypedArray(),
-            )
-        }
-        CloudflareSolverDiagnostics.record("COMIX cipher material refreshed from site bundle")
-    }
+    private val cipherMaterial: ComixCipherMaterial = ComixCipherMaterial.fromDefaults()
 
     /** One substitution round's material + its precomputed inverse. */
     private class ComixCipherMaterial(

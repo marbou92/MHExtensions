@@ -37,7 +37,7 @@ https://raw.githubusercontent.com/marbou92/MHRepo/main/repo.json
 ## Features
 
 ### Comix (`src/all/comixto/`)
-- Reverse-engineered API with request signing and response decryption
+- Signed + encrypted JSON API. Since the site's late-2026 rebuild (VM-protected `secure-*.js` signer — no capturable material), **all `/api/v1` calls run through a WebView bridge that boots the site's own chunk graph (axios + api client + secure signer) and lets the site sign and decrypt every call in-JS**; the native signed path (frozen recon constants) is tried first and every failure falls back to the bridge. Chunk discovery scans the main bundle's imports, so chunk renames don't break it
 - **Modern Cloudflare bypass** — browser-grade fingerprint headers (`sec-fetch-*`, `sec-ch-ua*` client hints derived from the WebView user agent), WebView cookie sync (`cf_clearance`), and smart retry with `Retry-After` support on CF block responses
 - Image descrambling for tile-scrambled pages
 - 10 extension settings (content rating, deduplication, score display, etc.)
