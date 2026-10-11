@@ -56,14 +56,7 @@ requests and bug reports — fork the repo and open a pull request.
 
 ## Website
 
-This repo ships a keiyoushi-style website in [`docs/`](docs/) — an extension browser, an add-repo
-page and the guides, on clean directory URLs (`/extensions/`, `/add-repo/`, `/guide/`). Plain
-HTML/CSS/JS, zero build step.
-
 **https://marbou92.github.io/MHExtensions/**
-
-To publish it: push this repo, then enable **Settings → Pages → Deploy from a branch → `main` → `/docs`**.
-The extension catalog (`docs/index.json`) regenerates automatically via the *Update website index* workflow.
 
 ## Credits
 
