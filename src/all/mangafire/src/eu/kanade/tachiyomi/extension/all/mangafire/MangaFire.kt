@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
@@ -27,6 +28,7 @@ import okhttp3.Response
 import org.jsoup.Jsoup
 import rx.Observable
 import java.util.Locale
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.TimeUnit
 
 /**
@@ -58,8 +60,22 @@ abstract class MangaFire :
     override val client: OkHttpClient = network.client.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        // mangafire.to sits behind Cloudflare and increasingly challenges
+        // non-browser TLS fingerprints with a 403 "Just a moment" page (the
+        // site itself opens fine in WebView - the cookies the WebView earns
+        // are shared back to okhttp through this interceptor's solver).
+        .addInterceptor(CloudflareSolverInterceptor(setOf("mangafire.to")))
         .rateLimit(3)
         .build()
+
+    init {
+        // Warm the signing WebView while the app is still setting up the
+        // Browse screen so the first request does not pay the cold start.
+        Thread({ VrfGenerator.warmUp() }, "MangaFire-vrf-warmup").apply {
+            isDaemon = true
+            start()
+        }
+    }
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
@@ -295,7 +311,7 @@ abstract class MangaFire :
         return GET(url, headers)
     }
 
-    private val chapterPages = HashMap<String, MutableList<ChapterDto>>()
+    private val chapterPages = ConcurrentHashMap<String, MutableList<ChapterDto>>()
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val hid = response.request.url.pathSegments.getOrNull(2) ?: ""

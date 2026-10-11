@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.os.Handler
 import android.os.Looper
 import android.webkit.WebView
+import android.webkit.WebViewClient
 import keiyoushi.utils.applicationContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -23,10 +24,9 @@ import java.util.concurrent.atomic.AtomicReference
  * The site's React SPA signs every protected /api call with a `vrf` query
  * parameter produced by an obfuscated, VM-protected script (the "polyfill"
  * chunk: a bytecode VM with WASM-backed transforms, XOR keys derived from
- * native function fingerprints and navigator.appCodeName). The algorithm is
- * deterministic and — critically — does NOT depend on the site's runtime
- * `window.__config`, so the exact bytes of the site's own script can run
- * offline inside a plain WebView.
+ * native function arity fingerprints and navigator.appCodeName — all values
+ * that are identical on every JS engine, so the exact bytes of the site's
+ * script can run offline inside a plain WebView).
  *
  * This generator ships the site's polyfill chunk (transformed: its ESM
  * export is re-pointed at a global) inside a self-contained HTML asset,
@@ -51,14 +51,15 @@ import java.util.concurrent.atomic.AtomicReference
 @SuppressLint("SetJavaScriptEnabled")
 internal object VrfGenerator {
 
-    private const val ASSET = "file:///android_asset/mfvrf.html"
-    private const val ATTEMPTS = 12
-    private const val RETRY_DELAY_MS = 250L
+    private const val READY_TIMEOUT_MS = 15_000L
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
     private val lock = Any()
     private var webView: WebView? = null
+
+    /** Set once the WebView has loaded the asset and `window.__mfVrf` exists. */
+    private var readyLatch: CountDownLatch? = null
 
     /** canonical request string -> vrf token (the algorithm is pure). */
     private val cache = object : LinkedHashMap<String, String>(64, 0.75f, true) {
@@ -86,15 +87,19 @@ internal object VrfGenerator {
             cache[canonical]?.let { return it }
         }
 
+        awaitReady()
+
         val paramsJson = buildParamsJson(params).toString()
         val pathJson = JsonPrimitive(path).toString()
         val script = "window.__mfVrf($pathJson, $paramsJson)"
 
+        // The machine is initialized; a single evaluation is enough. Retry
+        // only for transient evaluate failures, briefly.
         var token: String? = null
-        for (attempt in 0 until ATTEMPTS) {
+        for (attempt in 1..3) {
             token = evaluate(script)
             if (token != null) break
-            Thread.sleep(RETRY_DELAY_MS)
+            Thread.sleep(150L * attempt)
         }
 
         token ?: throw IOException(
@@ -105,6 +110,71 @@ internal object VrfGenerator {
             cache[canonical] = token
         }
         return token
+    }
+
+    /**
+     * Creates and warms the WebView ahead of the first request so the token
+     * machine is ready when the UI asks for it. Safe to call from any thread;
+     * the actual work happens on the main thread. Idempotent.
+     */
+    fun warmUp() {
+        runCatching { awaitReady() }
+    }
+
+    /** Blocks until the WebView has loaded the signing asset, or throws. */
+    private fun awaitReady() {
+        val latch = synchronized(lock) {
+            readyLatch ?: run {
+                val new = CountDownLatch(1)
+                readyLatch = new
+                mainHandler.post { initialize() }
+                new
+            }
+        }
+        if (!latch.await(READY_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
+            throw IOException(
+                "MangaFire: the signing WebView did not initialize in time — try again",
+            )
+        }
+    }
+
+    /** Runs on the main thread. Creates the WebView, loads the asset, and
+     * waits for the page's own `__mfVrfReady` flag before releasing callers. */
+    @SuppressLint("SetJavaScriptEnabled")
+    private fun initialize() {
+        val latch = synchronized(lock) { readyLatch } ?: return
+        try {
+            val wv = webView ?: WebView(applicationContext).also { wv ->
+                wv.settings.javaScriptEnabled = true
+                wv.settings.domStorageEnabled = true
+                // The page is a self-contained bundle; it never needs network.
+                runCatching { wv.settings.blockNetworkLoads = true }
+                webView = wv
+            }
+            // Release the waiters only after the page's scripts have actually
+            // executed - not on a timer, not on a best-effort guess. All the
+            // polling stays on the main thread and fully async (never block
+            // the UI thread on a WebView callback).
+            wv.webViewClient = object : WebViewClient() {
+                override fun onPageFinished(view: WebView, url: String) {
+                    fun poll(attempt: Int) {
+                        view.evaluateJavascript("!!window.__mfVrfReady") { value ->
+                            if (value?.contains("true") == true) {
+                                latch.countDown()
+                            } else if (attempt < 25) {
+                                mainHandler.postDelayed({ poll(attempt + 1) }, 200)
+                            }
+                        }
+                    }
+                    poll(0)
+                }
+            }
+            wv.loadDataWithBaseURL("https://mangafire.to/", assetHtml(), "text/html", "UTF-8", null)
+        } catch (_: Throwable) {
+            // Let awaitReady() time out with a clear IOException instead of
+            // leaving callers blocked forever.
+            latch.countDown()
+        }
     }
 
     /** Same ordering rule the site's interceptor applies to its own input. */
@@ -141,10 +211,13 @@ internal object VrfGenerator {
         val latch = CountDownLatch(1)
         val result = AtomicReference<String?>(null)
 
-        val started = CountDownLatch(1)
         mainHandler.post {
             try {
-                val wv = obtain() ?: return@post
+                val wv = webView
+                if (wv == null) {
+                    latch.countDown()
+                    return@post
+                }
                 wv.evaluateJavascript(script) { value ->
                     try {
                         // evaluateJavascript returns a quote-wrapped JSON string.
@@ -155,34 +228,16 @@ internal object VrfGenerator {
                             result.set(vrf.jsonPrimitive.content)
                         }
                     } catch (_: Throwable) {
+                    } finally {
+                        latch.countDown()
                     }
-                    latch.countDown()
                 }
             } catch (_: Throwable) {
                 latch.countDown()
-            } finally {
-                started.countDown()
             }
         }
-
-        started.await()
         latch.await(10, TimeUnit.SECONDS)
         return result.get()
-    }
-
-    @SuppressLint("SetJavaScriptEnabled")
-    private fun obtain(): WebView? {
-        webView?.let { return it }
-        return runCatching {
-            val wv = WebView(applicationContext)
-            wv.settings.javaScriptEnabled = true
-            wv.settings.domStorageEnabled = true
-            // The page is a self-contained bundle; it never needs network.
-            runCatching { wv.settings.blockNetworkLoads = true }
-            wv.loadDataWithBaseURL("https://mangafire.to/", assetHtml(), "text/html", "UTF-8", null)
-            webView = wv
-            wv
-        }.getOrNull()
     }
 
     private fun assetHtml(): String = applicationContext.assets.open("mfvrf.html").bufferedReader().use { it.readText() }

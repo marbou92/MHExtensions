@@ -30,6 +30,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
 import okio.Buffer
+import org.jsoup.nodes.Document
+import org.jsoup.select.Elements
 import rx.Observable
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -110,12 +112,18 @@ abstract class MangaGo :
 
     private fun searchParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        val mangas = document.select("#search_list li div.box").mapNotNull { box ->
-            val a = box.selectFirst("a[href*=/read-manga/]") ?: return@mapNotNull null
+        // 2026-10 layout: #search_list > li > (div.left > a cover) + span.tit > a title.
+        // The old div.box wrapper is gone; select the manga link at li level
+        // so both layouts parse.
+        val mangas = document.select("#search_list li").mapNotNull { li ->
+            val a = li.selectFirst("a[href*=/read-manga/]") ?: return@mapNotNull null
+            val path = a.attr("href").toHttpUrlOrNull()?.encodedPath ?: return@mapNotNull null
+            val title = a.attr("title").ifBlank { a.text().trim() }
+            if (title.isBlank()) return@mapNotNull null
             SManga.create().apply {
-                url = a.attr("href").toHttpUrlOrNull()?.encodedPath ?: return@mapNotNull null
-                title = a.attr("title").ifBlank { a.text() }
-                thumbnail_url = box.selectFirst("img")?.attr("abs:src")
+                url = path
+                this.title = title
+                thumbnail_url = li.selectFirst("img")?.attr("abs:src")
             }
         }
         return MangasPage(mangas, mangas.size >= 20)
@@ -201,7 +209,7 @@ abstract class MangaGo :
         val infoLine = if (showExtraInfoPref()) {
             buildList {
                 releaseYear?.let { add("**Year:** $it") }
-                val chapterCount = document.select("#chapter_table tr").size
+                val chapterCount = chapterRows(document).size
                 if (chapterCount > 0) add("**Chapters:** $chapterCount")
                 votes?.takeIf { it > 0 }?.let { add("**$it ratings**") }
             }.joinToString(" · ")
@@ -261,31 +269,67 @@ abstract class MangaGo :
 
     override fun chapterListParse(response: Response): List<SChapter> {
         val document = response.asJsoup()
-        val rows = document.select("#chapter_table tr")
+        val rows = chapterRows(document)
         if (rows.isEmpty()) throw Exception("No chapters found — open the manga page once to refresh")
 
         return rows.mapNotNull { row ->
-            val a = row.selectFirst("a[href*=read-manga]") ?: return@mapNotNull null
-            val path = a.attr("href").toHttpUrlOrNull()?.encodedPath ?: return@mapNotNull null
+            // 2026-10 layout: <td><a class="chico" href="https://www.mangago.zone/chapter/…">
+            // where the host can be any mirror (mangago.zone, youhim.me, …).
+            // Legacy layout: <a href*=read-manga> on mangago.me itself.
+            val a = row.selectFirst("a.chico")
+                ?: row.selectFirst("td a[href*=chapter]")
+                ?: row.selectFirst("a[href*=read-manga]")
+                ?: return@mapNotNull null
+
+            // Keep the ABSOLUTE url - chapters are served from mirror hosts
+            // now, and prepending $baseUrl would point at a dead address.
+            val link = a.attr("abs:href").ifBlank { a.attr("href") }
+            val chapterUrl = when {
+                link.startsWith("http") -> link
+                link.startsWith("/") -> "$baseUrl$link"
+                else -> return@mapNotNull null
+            }
+
             val rawTitle = a.text().trim()
             val bold = a.selectFirst("b")?.text()?.trim().orEmpty()
             val namePart = rawTitle.removePrefix(bold).trim().removePrefix(":").trim()
 
             SChapter.create().apply {
-                url = path
-                name = if (namePart.isNotBlank()) "$bold : $namePart" else bold
-                chapter_number = parseChapterNumber(path, bold)
-                date_upload = row.select("td.no").lastOrNull()?.text()?.trim()?.parseDate() ?: 0L
-                scanlator = null
+                url = chapterUrl
+                name = when {
+                    bold.isBlank() -> rawTitle
+                    namePart.isNotBlank() -> "$bold : $namePart"
+                    else -> bold
+                }
+                chapter_number = parseChapterNumber(chapterUrl, rawTitle)
+                date_upload = (
+                    row.select("td.no").lastOrNull()?.text()?.trim()
+                        ?: row.select("td").lastOrNull()?.text()?.trim()
+                    ).parseDate()
+                // New layout lists the uploader/group in the second column.
+                scanlator = row.select("td").getOrNull(1)
+                    ?.selectFirst("a[href*=/home/people/]")?.text()?.trim()
+                    ?.takeIf(String::isNotBlank)
             }
         }
     }
 
-    private fun parseChapterNumber(path: String, display: String): Float {
-        Regex("""-chapter-([0-9.]+)""").find(path)?.groupValues?.get(1)?.let {
+    /** Chapter rows across both known layouts. */
+    private fun chapterRows(document: Document): Elements {
+        document.select("#chapter_table tr").takeIf(Elements::isNotEmpty)?.let { return it }
+        // New layout: the table follows the "Chapters(N)" heading.
+        document.selectFirst("h4:containsOwn(Chapters)")?.nextElementSibling()
+            ?.select("tr")?.takeIf(Elements::isNotEmpty)?.let { return it }
+        return document.select("table.uk-table tr")
+    }
+
+    private fun parseChapterNumber(url: String, display: String): Float {
+        Regex("""(?:^|[^a-z])ch\.?\s*([0-9]+(?:\.[0-9]+)?)""", RegexOption.IGNORE_CASE)
+            .find(display)?.groupValues?.get(1)?.let { return it.toFloatOrNull() ?: 0f }
+        Regex("""-chapter-([0-9.]+)""").find(url)?.groupValues?.get(1)?.let {
             return it.toFloatOrNull() ?: 0f
         }
-        Regex("""/c([0-9.]+)/""").find(path)?.groupValues?.get(1)?.let {
+        Regex("""/c([0-9.]+)/""").find(url)?.groupValues?.get(1)?.let {
             return it.toFloatOrNull() ?: 0f
         }
         Regex("""(\d+[0-9.]*)\s*$""").find(display)?.groupValues?.get(1)?.let {
@@ -294,7 +338,8 @@ abstract class MangaGo :
         return 0f
     }
 
-    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url}"
+    override fun getChapterUrl(chapter: SChapter): String =
+        if (chapter.url.startsWith("http")) chapter.url else "$baseUrl${chapter.url}"
 
     // =============================== Pages ===============================
     //
@@ -361,8 +406,15 @@ abstract class MangaGo :
                     interceptRequest { request ->
                         val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
                             ?: return@interceptRequest emptyResponse
-                        val allowed = requestUrl.host == "www.mangago.me" ||
+                        // Chapters now load on mirror hosts (mangago.zone,
+                        // youhim.me, …) - always allow the host the chapter
+                        // itself lives on, on top of the static allowlist.
+                        val chapterHost = runCatching { chapterUrl.toHttpUrlOrNull()?.host }.getOrNull()
+                        val allowed = requestUrl.host == chapterHost ||
+                            requestUrl.host == "www.mangago.me" ||
                             requestUrl.host.endsWith(".mangago.me") ||
+                            requestUrl.host.endsWith("mangago.zone") ||
+                            requestUrl.host.endsWith("youhim.me") ||
                             requestUrl.host.endsWith("mangapicgallery.com") ||
                             requestUrl.host == "challenges.cloudflare.com" ||
                             requestUrl.host.endsWith(".cloudflare.com") ||

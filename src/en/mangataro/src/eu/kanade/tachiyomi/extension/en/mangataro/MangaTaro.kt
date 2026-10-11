@@ -343,14 +343,20 @@ abstract class MangaTaro :
     // ============================= Chapters ==============================
 
     override fun chapterListRequest(manga: SManga): Request {
+        val id = manga.url.parseAs<MangaUrl>().id
+        return chaptersRequest(id, offset = 0)
+    }
+
+    /** The /auth/manga-chapters endpoint silently caps every call at 500 rows
+     * no matter the requested limit, so long series need offset paging. */
+    private fun chaptersRequest(mangaId: String, offset: Int): Request {
         val timestamp = System.currentTimeMillis() / 1000
         val token = md5("${timestamp}mng_ch_${isoDateFormatter.format(Date())}").substring(0, 16)
-        val id = manga.url.parseAs<MangaUrl>().id
 
         val url = "$baseUrl/auth/manga-chapters".toHttpUrl().newBuilder()
-            .addQueryParameter("manga_id", id)
-            .addQueryParameter("offset", "0")
-            .addQueryParameter("limit", "9999")
+            .addQueryParameter("manga_id", mangaId)
+            .addQueryParameter("offset", offset.toString())
+            .addQueryParameter("limit", "500")
             .addQueryParameter("order", "DESC")
             .addQueryParameter("_t", token)
             .addQueryParameter("_ts", timestamp.toString())
@@ -363,10 +369,28 @@ abstract class MangaTaro :
         val data = response.parseAs<ChapterListResponse>()
         if (!data.success) throw Exception("The site refused the chapter request — try again later")
 
+        val collected = data.chapters.toMutableList()
+        if (collected.size >= 500) {
+            val mangaId = response.request.url.queryParameter("manga_id").orEmpty()
+            var offset = collected.size
+            var pages = 0
+            while (pages < 20) {
+                pages++
+                val page = runCatching {
+                    client.newCall(chaptersRequest(mangaId, offset)).execute()
+                }.getOrNull()?.use { it.parseAs<ChapterListResponse>() } ?: break
+                if (!page.success || page.chapters.isEmpty()) break
+                collected += page.chapters
+                if (page.chapters.size < 500) break
+                offset += page.chapters.size
+            }
+        }
+
         val placeholders = listOf(null, "", "N/A", "—")
         var hasScanlator = false
 
-        val chapters = data.chapters
+        val chapters = collected
+            .distinctBy { it.id }
             .filter { it.language.equals(lang, ignoreCase = true) }
             .map { dto ->
                 SChapter.create().apply {
@@ -471,10 +495,16 @@ abstract class MangaTaro :
     // ============================= Helpers ===============================
 
     private fun BrowseManga.toSManga() = SManga.create().apply {
-        url = MangaUrl(id = id, slug = url.substringAfterLast('/')).toJsonString()
-        title = title.htmlUnescape()
+        // NOTE: every DTO field MUST be qualified - inside `apply` the bare
+        // name resolves to SManga's own property, and SManga.url is a lateinit
+        // that is not assigned yet. Reading it on the right-hand side of its
+        // own assignment crashed every browse list with
+        // UninitializedPropertyAccessException ("lateinit property url has
+        // not been initialized").
+        url = MangaUrl(id = id, slug = this@toSManga.url.substringAfterLast('/')).toJsonString()
+        title = this@toSManga.title.htmlUnescape()
         thumbnail_url = cover
-        description = description?.htmlUnescape()
+        description = this@toSManga.description?.htmlUnescape()
         status = when (this@toSManga.status) {
             "Ongoing" -> SManga.ONGOING
             "Completed" -> SManga.COMPLETED

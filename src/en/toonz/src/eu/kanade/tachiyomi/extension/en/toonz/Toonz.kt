@@ -5,6 +5,7 @@ import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
+import eu.kanade.tachiyomi.network.HEAD
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
@@ -25,6 +26,7 @@ import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
 import java.text.SimpleDateFormat
@@ -95,8 +97,53 @@ abstract class Toonz :
             }
             .distinctBy { it.url }
 
+        if (mangas.isEmpty()) {
+            // The adult catalog now 301s to toonx.to, whose browse grid renders
+            // client-side - no SSR cards. The RSC flight payload still carries
+            // every card, so recover them from there.
+            return toonxFlightParse(document)
+        }
         return MangasPage(mangas, mangas.size >= 12)
     }
+
+    /** Parses the toonx.to RSC flight data into browse cards.
+     *
+     * Card shape in the payload (after unescaping): each card starts with
+     * `["$","div","<comicId>",{"className":"group relative"` and contains
+     * `"href":"/comic/<slug>","className":"block"`, a cover at
+     * `"src":"/uploads/covers/<slug>_thumb.webp"` and the title as the h3's
+     * `"children":"<title>"`. */
+    private fun toonxFlightParse(document: Document): MangasPage {
+        val flight = document.select("script").joinToString("\n") { it.data() }
+            .replace("\\\"", "\"")
+        val anchor = Regex("""\["\$","div","(\d+)",\{"className":"group relative"""")
+        val marks = anchor.findAll(flight).toList()
+
+        val mangas = marks.mapIndexedNotNull { index, match ->
+            val start = match.range.last + 1
+            val end = marks.getOrNull(index + 1)?.range?.first ?: flight.length
+            val card = flight.substring(start, end)
+
+            val slug = Regex("\"href\":\"/comic/([a-z0-9-]+)\",\"className\":\"block\"")
+                .find(card)?.groupValues?.get(1) ?: return@mapIndexedNotNull null
+            val title = Regex("\"h3\",null,[{]\"className\":\"mt-1\\.5[^\"]*\",\"children\":\"([^\"]+)\"")
+                .find(card)?.groupValues?.get(1)
+                ?: slug.replace('-', ' ')
+            val cover = Regex("\"src\":\"/uploads/covers/([^\"]+)\"")
+                .find(card)?.groupValues?.get(1)
+
+            SManga.create().apply {
+                // Absolute url: adult entries live on toonx.to under /adult/.
+                url = "https://toonx.to/adult/$slug#${match.groupValues[1]}"
+                this.title = htmlUnescape(title).trim()
+                thumbnail_url = cover?.let { "https://toonx.to/uploads/$it" }
+            }
+        }.distinctBy { it.url }
+
+        return MangasPage(mangas, mangas.size >= 12)
+    }
+
+    private fun htmlUnescape(text: String): String = org.jsoup.parser.Parser.unescapeEntities(text, false)
 
     // ============================== Search ===============================
 
@@ -126,7 +173,11 @@ abstract class Toonz :
 
     // ============================== Details ==============================
 
-    override fun mangaDetailsRequest(manga: SManga): Request = GET("$baseUrl${manga.url}", headers)
+    /** Series urls may be absolute (adult entries live on toonx.to). */
+    private fun seriesUrl(seriesPath: String): String =
+        if (seriesPath.startsWith("http")) seriesPath else "$baseUrl$seriesPath"
+
+    override fun mangaDetailsRequest(manga: SManga): Request = GET(seriesUrl(manga.url.substringBefore('#')), headers)
 
     override fun mangaDetailsParse(response: Response): SManga {
         val document = response.asJsoup()
@@ -151,9 +202,11 @@ abstract class Toonz :
             }
         }
 
-        // RSC flight data: comicId (needed by the chapters API).
-        val comicId = Regex(""""comicId":(\d+),""").find(rawHtml)?.groupValues?.get(1)
-            ?: Regex("""data-comic-id="(\d+)"""").find(rawHtml)?.groupValues?.get(1)
+        // RSC flight data: comicId (needed by the chapters API). The site now
+        // exposes it as data-comic-id on the page root; the flight payload is
+        // kept as a fallback.
+        val comicId = Regex("""data-comic-id="(\d+)"""").find(rawHtml)?.groupValues?.get(1)
+            ?: Regex(""""comicId":(\d+),""").find(rawHtml)?.groupValues?.get(1)
 
         val title = document.selectFirst("h1")?.text()?.trim().orEmpty()
 
@@ -242,17 +295,38 @@ abstract class Toonz :
         }
     }
 
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl${manga.url.substringBefore('#')}"
+    override fun getMangaUrl(manga: SManga): String = seriesUrl(manga.url.substringBefore('#'))
 
     // ============================= Chapters ==============================
 
     override fun chapterListRequest(manga: SManga): Request {
         currentSeriesPath = manga.url.substringBefore('#')
-        val comicId = manga.url.substringAfter('#', "")
-        if (comicId.isBlank() || !comicId.all(Char::isDigit)) {
-            throw Exception("Open the manga details once to refresh this entry")
+        // The chapters API needs the numeric comic id. NEVER depend on
+        // mangaDetailsParse having run first: on the very first open from
+        // Browse the url is a bare path (Mihon does not copy the details url
+        // back onto the entry it fetches chapters with), which used to throw
+        // "Open the manga details once to refresh this entry" - reported as
+        // "chapter list not loading". Resolve the id from the series page
+        // itself whenever the fragment is missing.
+        val fragment = manga.url.substringAfter('#', "")
+        val comicId = fragment.takeIf { it.isNotEmpty() && it.all(Char::isDigit) }
+            ?: resolveComicId(currentSeriesPath)
+            ?: throw Exception("Could not resolve the series id — open the manga details once and try again")
+        // Both hosts share the same chapters API path.
+        val apiHost = if (currentSeriesPath.startsWith("http"))
+            "https://" + currentSeriesPath.removePrefix("https://").substringBefore('/')
+        else baseUrl
+        return GET("$apiHost/api/comics/$comicId/chapters", headers)
+    }
+
+    private fun resolveComicId(seriesPath: String): String? {
+        val seriesResponse = client.newCall(GET(seriesUrl(seriesPath), headers)).execute()
+        return seriesResponse.use { resp ->
+            if (!resp.isSuccessful) return@use null
+            val document = resp.asJsoup()
+            document.selectFirst("[data-comic-id]")?.attr("data-comic-id")
+                ?: Regex(""""comicId":(\d+),""").find(document.outerHtml())?.groupValues?.get(1)
         }
-        return GET("$baseUrl/api/comics/$comicId/chapters", headers)
     }
 
     override fun chapterListParse(response: Response): List<SChapter> {
@@ -263,7 +337,11 @@ abstract class Toonz :
         val data = response.parseAs<ChaptersResponse>()
         return data.chapters.map { dto ->
             SChapter.create().apply {
-                url = "$seriesPath/chapter/${dto.slug}"
+                // The slug IS the page segment ("chapter-12", "chapter-15.01") -
+                // the reader page lives at {series}/{slug}. The old
+                // "$seriesPath/chapter/{slug}" produced /chapter/chapter-12,
+                // which 404s on the site and killed every page fetch.
+                url = "$seriesPath/${dto.slug}"
                 name = buildChapterName(dto)
                 chapter_number = dto.chapterNumber.toFloatOrNull() ?: 0f
                 date_upload = dto.date?.parseDate() ?: 0L
@@ -278,16 +356,67 @@ abstract class Toonz :
     }
 
     // =============================== Pages ===============================
+    //
+    // The reader server-renders only the first handful of <img> tags and
+    // lazy-loads the rest, and the site's own pageCount metadata overshoots
+    // (its value would produce dead links). So: take the image URL pattern
+    // from the embedded tags, then binary-probe how far the file sequence
+    // actually goes (~10 HEAD requests per chapter, not one per page).
 
-    override fun pageListRequest(chapter: SChapter): Request = GET("$baseUrl${chapter.url}", headers)
+    private companion {
+        const val MAX_PAGES = 500
+    }
+
+    override fun pageListRequest(chapter: SChapter): Request =
+        if (chapter.url.startsWith("http")) GET(chapter.url, headers) else GET("$baseUrl${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
-        val images = document.select("img[src^=/uploads/chapters/]")
-        if (images.isEmpty()) throw Exception("No page images found — the chapter may be unavailable")
-        return images.mapIndexed { index, img ->
-            Page(index, imageUrl = img.attr("abs:src"))
+        val embedded = (
+            document.select("img[src^=/uploads/chapters/]").map { it.attr("src") } +
+                document.select("link[rel=preload][href^=/uploads/chapters/]").map { it.attr("href") }
+            )
+            .map { it.substringBefore(' ') }
+            .distinct()
+            .sorted()
+        if (embedded.isEmpty()) throw Exception("No page images found — the chapter may be unavailable")
+
+        val first = embedded.first()
+        val prefix = first.substringBeforeLast('/') + '/'
+        val ext = first.substringAfterLast('.', "webp")
+        val firstIndex = first.substringAfterLast('/').substringBeforeLast('.').toIntOrNull() ?: 1
+        val width = first.substringAfterLast('/').substringBeforeLast('.').length.coerceAtLeast(1)
+
+        fun pageUrl(n: Int): String = "$prefix${n.toString().padStart(width, '0')}.$ext"
+
+        fun exists(n: Int): Boolean = runCatching {
+            client.newCall(HEAD(pageUrl(n), headers)).execute().use { it.isSuccessful }
+        }.getOrDefault(false)
+
+        // Exponential probe for the first missing index, then binary descent.
+        var hi = 1
+        while (hi <= MAX_PAGES && exists(hi)) hi *= 2
+        val last = if (hi > MAX_PAGES) {
+            MAX_PAGES
+        } else {
+            var lo = hi / 2
+            while (hi - lo > 1) {
+                val mid = (lo + hi) / 2
+                if (exists(mid)) lo = mid else hi = mid
+            }
+            lo
         }
+
+        if (last < firstIndex) {
+            // Pattern probing found nothing beyond the embedded tags - use
+            // those directly rather than showing an empty reader.
+            return embedded.mapIndexed { index, url ->
+                Page(index, imageUrl = if (url.startsWith("http")) url else "$baseUrl$url")
+            }
+        }
+
+        val pageOrigin = response.request.url.let { "${it.scheme}://${it.host}" }
+        return (1..last).mapIndexed { index, _ -> Page(index, imageUrl = "$pageOrigin${pageUrl(index + 1)}") }
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
