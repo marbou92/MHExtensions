@@ -109,36 +109,6 @@ document.querySelectorAll('[data-copy-target], [data-copy]').forEach((btn) => {
   })
 })
 
-/* ---------- Homepage showcase ---------- */
-
-const homeGrid = document.getElementById('home-ext-grid')
-if (homeGrid) {
-  const blurb = document.getElementById('ext-blurb')
-  const homeError = document.getElementById('home-ext-error')
-
-  fetchCatalog()
-    .then((data) => {
-      const extensions = data.extensions || []
-      if (!extensions.length) throw new Error('catalog is empty')
-
-      if (blurb) {
-        const names = extensions.slice(0, 3).map((e) => esc(e.name))
-        blurb.innerHTML =
-          `${extensions.length} manga sources served through MHRepo — ` +
-          `${names.join(', ')} and more.`
-      }
-
-      homeGrid.innerHTML = extensions.map(cardHtml).join('')
-      const homeCount = document.getElementById('home-ext-count')
-      if (homeCount) homeCount.textContent = `${extensions.length} extensions`
-    })
-    .catch(() => {
-      if (blurb) blurb.textContent = 'Manga sources served through MHRepo.'
-      if (homeError) homeError.style.display = 'block'
-      homeGrid.innerHTML = ''
-    })
-}
-
 /* ---------- Extension browser (/extensions/) ---------- */
 
 const browserRoot = document.getElementById('ext-browser')
