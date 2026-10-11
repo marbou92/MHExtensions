@@ -93,7 +93,7 @@ abstract class Comix :
     }
 
     // ========================================================================
-    // WebView bridge (v47) — the site's own chunk graph signs + decrypts
+    // WebView bridge (v48) — the site's own chunk graph signs + decrypts
     // ========================================================================
     //
     // Late 2026: the site rebuilt its API protection. The old env bundle
@@ -106,10 +106,17 @@ abstract class Comix :
     // (axios + api client + secure signer) self-wires and does the work —
     // the same environment the user sees working when they open the site.
     //
+    // v48: the build under analysis exports only a thin facade with minified
+    // method names (`{Oo, EN, xG, ...}`) — no get/post object for the old
+    // detection to find (that is why v47 kept surfacing the native 403). The
+    // bridge now patch-serves the api-client chunk with an extra
+    // `__MH_CLIENT__` export pointing at the signed axios instance itself.
+    //
     // Strategy per call: try the fast native path first (it may work again
     // if the site ever reverts); on ANY failure — token 403s included —
     // rerun through the WebView bridge. One native round-trip is paid per
-    // call type, at most.
+    // call type, at most. If BOTH paths fail, the combined error (native
+    // code + bridge reason) surfaces instead of a bare "HTTP 403".
 
     private val webViewUserAgent: String
         get() = headers["User-Agent"] ?: FALLBACK_UA
@@ -158,7 +165,13 @@ abstract class Comix :
         .onErrorResumeNext { error ->
             Observable.fromCallable { parse(webViewApiGet(request)) }
                 .subscribeOn(Schedulers.io())
-                .onErrorResumeNext { Observable.error<T>(error) }
+                .onErrorResumeNext { bridgeError ->
+                    // Both paths failed: surface the native status AND the
+                    // bridge's reason instead of the bare "HTTP 403".
+                    Observable.error<T>(
+                        IOException("${error.message} (WebView bridge: ${bridgeError.message})", bridgeError),
+                    )
+                }
         }
 
     override fun fetchPopularManga(page: Int): Observable<MangasPage> = fetchWithWebViewFallback(popularMangaRequest(page)) { response -> mangaListParse(response) }
