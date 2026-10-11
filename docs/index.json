@@ -30,11 +30,11 @@
       "langs": [
         "all"
       ],
-      "version": "1.4.47",
-      "versionCode": 47,
+      "version": "1.4.48",
+      "versionCode": 48,
       "baseUrl": "https://comix.to",
-      "apk": "tachiyomi-all.comixto-v1.4.47-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.comixto-v1.4.47-release.apk",
+      "apk": "tachiyomi-all.comixto-v1.4.48-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.comixto-v1.4.48-release.apk",
       "icon": "../icons/comixto.png",
       "note": "Signed+encrypted API via the WebView signing bridge; Cloudflare bypass; image descrambling",
       "description": "signed+encrypted JSON API. The site's VM-protected signer means every <code>/api/v1</code> call runs through a WebView bridge that boots the site's own chunk graph and lets the site sign/decrypt in-JS; frozen native constants stay as the fast path. Cloudflare bypass, tile descrambling, 10 settings."
