@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Guide | MHExtensions</title>
-  <meta name="description" content="Getting started, publishing and troubleshooting guides for MHExtensions.">
+  <meta name="description" content="Adding the repo, installing extensions and troubleshooting for MHExtensions.">
   <link rel="icon" type="image/png" href="../assets/avatar.png">
   <link rel="stylesheet" href="../assets/style.css">
 </head>
@@ -25,7 +25,7 @@
 
   <main class="page container" style="max-width: 820px;">
     <h1>Guide</h1>
-    <p class="lead">Everything about using, publishing and extending MHExtensions.</p>
+    <p class="lead">How to add the repo, install extensions and fix common issues.</p>
 
     <div class="doc">
       <h2 id="adding-the-repository">Adding the repository</h2>
@@ -67,59 +67,6 @@
           <a href="https://github.com/marbou92/MHExtensions/issues" target="_blank" rel="noopener noreferrer">File an issue</a>.</li>
       </ul>
 
-      <h2 id="publishing">Publishing extensions</h2>
-      <p>Signing secrets live in <strong>Settings → Secrets and variables → Actions</strong>:</p>
-      <table>
-        <thead>
-          <tr><th>Secret</th><th>Purpose</th></tr>
-        </thead>
-        <tbody>
-          <tr><td><code>SIGNING_KEY</code></td><td>Base64-encoded <code>.jks</code> keystore file</td></tr>
-          <tr><td><code>KEY_STORE_PASSWORD</code></td><td>Keystore password</td></tr>
-          <tr><td><code>ALIAS</code></td><td>Key alias name</td></tr>
-          <tr><td><code>KEY_PASSWORD</code></td><td>Key password</td></tr>
-          <tr><td><code>REPO_PAT</code></td><td>GitHub PAT with write access to <code>marbou92/MHRepo</code></td></tr>
-          <tr><td><code>SIGNING_FINGERPRINT_MANUAL</code></td><td>SHA-256 fingerprint of the signing key (cleanup mode)</td></tr>
-        </tbody>
-      </table>
-      <h3>Release flow</h3>
-      <ol>
-        <li>Bump <code>versionCode</code> in the extension's <code>build.gradle.kts</code>.</li>
-        <li>Commit and push to <code>main</code>.</li>
-        <li><strong>Actions → Release &amp; Publish → Run workflow</strong>, select <code>publish</code>, run.</li>
-      </ol>
-      <p>The workflow builds signed release APKs for every extension in <code>settings.gradle.kts</code>,
-      computes the signing-key fingerprint, and publishes APKs, icons and the protobuf index
-      (<code>index.pb</code>) to <a href="https://github.com/marbou92/MHRepo" target="_blank" rel="noopener noreferrer">MHRepo</a>,
-      then purges the jsDelivr CDN cache.</p>
-      <h3>Cleaning up orphaned extensions</h3>
-      <p>If an extension is renamed or moved, its old entry stays in MHRepo's index. Run
-      <strong>Release &amp; Publish</strong> with <code>cleanup-dry-run</code> to preview deletions, then
-      <code>cleanup</code> to apply.</p>
-      <h3>Local builds</h3>
-      <p>Anything built locally (e.g. a fix delivery) can be installed directly — the debug/release key
-      matches what CI signs with, so local APKs install over published ones.</p>
-
-      <h2 id="adding-a-new-extension">Adding a new extension</h2>
-      <ol>
-        <li>Create <code>src/&lt;lang&gt;/&lt;name&gt;/</code> with the extension source.</li>
-        <li>Add <code>loadIndividualExtension("&lt;lang&gt;", "&lt;name&gt;")</code> to <code>settings.gradle.kts</code>.</li>
-        <li>Add the launcher icon at <code>src/&lt;lang&gt;/&lt;name&gt;/res/mipmap-xhdpi/ic_launcher.png</code>.</li>
-        <li>Commit, push, run the publish workflow.</li>
-      </ol>
-      <p>The website catalog picks it up automatically — the <em>Update website index</em> workflow
-      regenerates <code>docs/index.json</code> and the icon copies whenever <code>src/</code> changes.</p>
-
-      <h2 id="website">The website</h2>
-      <p>
-        This site lives in <a href="https://github.com/marbou92/MHExtensions/tree/main/docs" target="_blank" rel="noopener noreferrer"><code>docs/</code></a>
-        — plain HTML/CSS/JS, zero build step, served by GitHub Pages
-        (<strong>Settings → Pages → Deploy from a branch → <code>main</code> → <code>/docs</code></strong>).
-        Pages use clean directory URLs (<code>/extensions/</code>, <code>/add-repo/</code>, <code>/guide/</code>) —
-        the old <code>*.html</code> links redirect automatically. The style mirrors
-        <a href="https://keiyoushi.github.io/" target="_blank" rel="noopener noreferrer">keiyoushi.github.io</a>.
-      </p>
-
       <h2 id="extension-notes">Extension notes</h2>
       <p>
         Auto-generated from the site catalog (<code>docs/index.json</code>) — new extensions show up
@@ -135,23 +82,6 @@
           <a href="https://github.com/marbou92/MHExtensions/blob/main/docs/index.json" target="_blank" rel="noopener noreferrer">raw catalog</a>.
         </p>
       </noscript>
-
-      <h2 id="structure">Project structure</h2>
-      <pre><code>MHExtensions/
-├── .github/
-│   ├── scripts/
-│   │   ├── publish-repo.py            # publish &amp; cleanup (protobuf index)
-│   │   ├── generate-site-index.py     # regenerates docs/index.json + icons
-│   │   └── index.proto
-│   └── workflows/
-│       ├── release_publish.yml        # build + publish + cleanup
-│       └── update-site.yml            # regenerate the website catalog
-├── docs/                              # this website (GitHub Pages)
-├── core/  compiler/  lib/  lib-multisrc/
-├── src/
-│   ├── all/…                          # multi-language extensions
-│   └── en/…                           # English extensions
-└── settings.gradle.kts</code></pre>
     </div>
   </main>
 

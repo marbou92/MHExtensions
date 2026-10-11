@@ -52,7 +52,7 @@ contributing! Issues are up-for-grabs for any developer if there is no assigned 
 Contributions are welcome!
 
 Check out the repo's [issue backlog](https://github.com/marbou92/MHExtensions/issues) for source
-requests and bug reports. See the [Adding a new extension guide](https://marbou92.github.io/MHExtensions/guide/#adding-a-new-extension)
+requests and bug reports. See [MAINTAINING.md](MAINTAINING.md#adding-a-new-extension)
 for how to wire one up.
 
 ## Website
@@ -75,7 +75,7 @@ The extension catalog (`docs/index.json`) regenerates automatically via the *Upd
 The workflow builds signed release APKs for all extensions in `settings.gradle.kts` and publishes
 APKs, icons and the protobuf index (`index.pb`) to [MHRepo](https://github.com/marbou92/MHRepo) —
 the repository URL Mihon consumes — then purges the jsDelivr CDN cache. Full details (signing
-secrets, cleanup mode) live in the [Publishing guide](https://marbou92.github.io/MHExtensions/guide/#publishing).
+secrets, cleanup mode) live in [MAINTAINING.md](MAINTAINING.md).
 
 ## Credits
 
