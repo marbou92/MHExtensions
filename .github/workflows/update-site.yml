@@ -61,6 +61,7 @@ jobs:
       # opens/refreshes a PR; the PR runs the "PR check" workflow (whose
       # aggregate "build" check satisfies the ruleset) and you merge it by hand.
       - name: Open or refresh the catalog PR
+        id: catalog-pr
         uses: peter-evans/create-pull-request@v7
         with:
           branch: chore/site-catalog
@@ -82,3 +83,28 @@ jobs:
           add-paths: |
             docs/index.json
             docs/icons
+
+      # Always report where the catalog stands, so a blocked PR creation is
+      # self-explanatory in the run log instead of a bare 403 from the API.
+      - name: Catalog PR status
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          url="${{ steps.catalog-pr.outputs.pull-request-url }}"
+          if [ -n "$url" ]; then
+            echo "Catalog PR ready: $url"
+            exit 0
+          fi
+          if gh pr view chore/site-catalog --json url -q .url 2>/dev/null; then
+            exit 0
+          fi
+          if git ls-remote --heads origin chore/site-catalog | grep -q .; then
+            echo "::warning::chore/site-catalog is pushed but no PR exists for it."
+            echo "If this run failed with 'GitHub Actions is not permitted to create or approve pull requests':"
+            echo "  Repo Settings -> Actions -> General -> Workflow permissions ->"
+            echo "  check 'Allow GitHub Actions to create and approve pull requests', Save, then re-run this job."
+            echo "Manual fallback: ${{ github.server_url }}/${{ github.repository }}/pull/new/chore/site-catalog"
+          else
+            echo "Catalog unchanged - nothing to propose."
+          fi

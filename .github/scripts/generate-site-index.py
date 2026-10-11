@@ -22,7 +22,6 @@ from __future__ import annotations
 import json
 import re
 import shutil
-from datetime import datetime, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
@@ -179,7 +178,6 @@ def main() -> None:
     extensions.sort(key=lambda e: e["name"].lower())
     catalog = {
         "meta": {
-            "generated": datetime.now(timezone.utc).isoformat(timespec="seconds"),
             "repoUrl": REPO_URL,
             "repoHome": REPO_HOME,
             "sourceHome": SOURCE_HOME,
