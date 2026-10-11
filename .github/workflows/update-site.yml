@@ -30,6 +30,32 @@ jobs:
       - name: Regenerate docs/index.json + icons
         run: python3 .github/scripts/generate-site-index.py
 
+      # create-pull-request internally does `git stash push --include-untracked`
+      # -> reset base -> rebuild the branch -> `git stash pop`. ANY dirty file
+      # outside docs/index.json + docs/icons (e.g. EOL phantom dirt reported on
+      # gradlew.bat right after checkout) makes that stash pop conflict and kills
+      # the job after the branch was already built. Keep the tree clean except
+      # for the catalog output.
+      - name: Keep working tree clean except catalog output
+        run: |
+          echo "Working tree before cleanup:"
+          git status --porcelain -unormal || true
+          # 1) Drop every tracked modification that is not catalog output.
+          git restore --worktree -- . ':(exclude)docs/index.json' ':(exclude)docs/icons' || true
+          # 2) Drop untracked noise that is not catalog output.
+          git clean -fd -- . ':(exclude)docs/index.json' ':(exclude)docs/icons' || true
+          # 3) EOL phantom dirt survives restore (content identical, only the
+          #    EOL conversion differs between worktree and index). Hide those
+          #    paths from status so the stash cycle cannot trip over them.
+          leftover="$(git status --porcelain -unormal -- . ':(exclude)docs/index.json' ':(exclude)docs/icons')"
+          if [ -n "$leftover" ]; then
+            echo "Phantom-dirty paths (marking assume-unchanged):"
+            printf '%s\n' "$leftover"
+            printf '%s\n' "$leftover" | sed 's/^...//' | xargs -r -d '\n' git update-index --assume-unchanged -- || true
+          fi
+          echo "Working tree after cleanup:"
+          git status --porcelain -unormal || true
+
       # `main` is protected by a ruleset (pull requests only + required "build"
       # status check), so the bot cannot push the catalog directly. Instead it
       # opens/refreshes a PR; the PR runs the "PR check" workflow (whose
