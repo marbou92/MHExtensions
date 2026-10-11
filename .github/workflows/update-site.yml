@@ -30,12 +30,13 @@ jobs:
       - name: Regenerate docs/index.json + icons
         run: python3 .github/scripts/generate-site-index.py
 
-      # create-pull-request internally does `git stash push --include-untracked`
-      # -> reset base -> rebuild the branch -> `git stash pop`. ANY dirty file
-      # outside docs/index.json + docs/icons (e.g. EOL phantom dirt reported on
-      # gradlew.bat right after checkout) makes that stash pop conflict and kills
-      # the job after the branch was already built. Keep the tree clean except
-      # for the catalog output.
+      # The fallback PR step (peter-evans/create-pull-request) internally does
+      # `git stash push --include-untracked` -> reset base -> rebuild the branch
+      # -> `git stash pop`. ANY dirty file outside docs/index.json + docs/icons
+      # (e.g. EOL phantom dirt on gradlew.bat right after checkout) makes that
+      # stash pop conflict and kills the job after the branch was already built.
+      # Keep the tree clean except for the catalog output so the fallback path
+      # is always safe.
       - name: Keep working tree clean except catalog output
         run: |
           echo "Working tree before cleanup:"
@@ -56,13 +57,91 @@ jobs:
           echo "Working tree after cleanup:"
           git status --porcelain -unormal || true
 
-      # `main` is protected by a ruleset (pull requests only + required "build"
-      # status check), so the bot cannot push the catalog directly. Instead it
-      # opens/refreshes a PR; the PR runs the "PR check" workflow (whose
-      # aggregate "build" check satisfies the ruleset) and merges itself via
-      # auto-merge the moment that check is green (see the step below).
-      - name: Open or refresh the catalog PR
+      # `main` is protected by a ruleset (PRs only + required "build" check).
+      # GitHub does NOT let the built-in Actions bot (GITHUB_TOKEN) onto a
+      # ruleset bypass list - it never appears in the picker. The working
+      # equivalent: add "Repository admin" to the bypass list (that is you)
+      # and let the bot push with YOUR personal access token via the REPO_PAT
+      # secret. A PAT push counts as you, so the bypass applies, while the
+      # commit itself is still authored by github-actions[bot] so the history
+      # reads as automation. If REPO_PAT is not set (or the push is rejected
+      # anyway), the run prints the exact setup steps and falls back to the
+      # classic catalog PR below.
+      - name: Push the catalog straight to main (admin PAT bypass)
+        id: direct-push
+        env:
+          REPO_PAT: ${{ secrets.REPO_PAT }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          # Stage the two outputs separately - a single `git add a b` is
+          # all-or-nothing, so a missing docs/icons would silently skip the
+          # catalog too.
+          git add -A -- docs/index.json
+          [ -d docs/icons ] && git add -A -- docs/icons || true
+          if git diff --cached --quiet; then
+            echo "Catalog unchanged - nothing to push."
+            echo "outcome=nothing" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git commit -m "chore(site): regenerate extension catalog"
+          if [ -n "${REPO_PAT:-}" ]; then
+            # Push as the repo admin (the PAT owner) so the ruleset bypass applies.
+            git remote set-url origin "https://x-access-token:${REPO_PAT}@github.com/${GITHUB_REPOSITORY}.git"
+          fi
+          if git push origin HEAD:main; then
+            echo "outcome=pushed" >> "$GITHUB_OUTPUT"
+            echo "Catalog pushed straight to main - the Pages site picks it up automatically."
+          else
+            echo "outcome=rejected" >> "$GITHUB_OUTPUT"
+            # Unwind the local commit but keep the catalog diff in the working
+            # tree (mixed reset; shallow-safe - HEAD~1 does not exist here) so
+            # the fallback PR step can pick it up.
+            git reset origin/main
+            # Hand the fallback path back to the default GITHUB_TOKEN
+            # credentials so a broken/expired PAT can never affect it.
+            git remote set-url origin "https://github.com/${GITHUB_REPOSITORY}.git"
+            if [ -z "${REPO_PAT:-}" ]; then
+              echo "::warning::Push to main was rejected - the PAT bypass is not configured yet."
+              echo "GitHub does not let the built-in Actions bot onto a ruleset bypass list (it"
+              echo "never shows up in the picker), so the one-time setup is:"
+              echo "  1. Settings -> Rules -> Rulesets -> (your main ruleset) -> Bypass list ->"
+              echo "     Add bypass target -> 'Repository admin' -> Save changes."
+              echo "  2. Settings -> Developer settings -> Personal access tokens -> Fine-grained"
+              echo "     tokens -> Generate new token (Only select repositories: this repo;"
+              echo "     Permissions -> Contents: Read and write)."
+              echo "  3. Settings -> Secrets and variables -> Actions -> New repository secret:"
+              echo "     Name REPO_PAT, value = the token. Then re-run this job."
+              echo "Until then the catalog lands as a PR you merge by hand."
+            else
+              echo "::warning::Push to main was rejected even with REPO_PAT set. Check:"
+              echo "  1. the main ruleset bypass list still contains 'Repository admin';"
+              echo "  2. the PAT is not expired and has Contents: Read and write on this repo."
+              echo "Falling back to the classic catalog PR."
+            fi
+          fi
+
+      # After a successful direct push the old catalog PR (if one is still open
+      # from before the bypass was configured) is redundant - close it and
+      # delete its branch so nothing stale lingers around.
+      - name: Close stale catalog PR
+        if: steps.direct-push.outputs.outcome == 'pushed'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if gh pr close chore/site-catalog --delete-branch 2>/dev/null; then
+            echo "Closed the stale chore/site-catalog PR and deleted its branch."
+          else
+            echo "No open catalog PR to close - nothing to clean up."
+          fi
+
+      # Reached only when the direct push is not possible yet (no REPO_PAT or
+      # the push was rejected). Opens/refreshes chore/site-catalog the classic
+      # way; you merge it by hand after the required "build" check goes green.
+      - name: Fallback - open or refresh the catalog PR
         id: catalog-pr
+        if: steps.direct-push.outputs.outcome == 'rejected'
         uses: peter-evans/create-pull-request@v7
         with:
           branch: chore/site-catalog
@@ -74,12 +153,15 @@ jobs:
             Automated catalog regeneration by the **Update website index** workflow.
 
             - Updates `docs/index.json` (+ `docs/icons/`) from the current `src/` tree
-            - `main` is protected (PRs only + required `build` check), so this lands as a PR
+            - The direct push to `main` was rejected because the PAT bypass is not
+              configured yet — so this lands as a PR.
 
-            Auto-merge is queued on this PR: it merges itself as soon as the
-            required `build` check passes. (If auto-merge is disabled in repo
-            settings, merge it by hand after the check goes green.)
-            The GitHub Pages site picks up the new catalog automatically after merge.
+            **Make it automatic (one-time):** the built-in Actions bot cannot be added to
+            a ruleset bypass list (it never shows up in the picker), so instead:
+            Rules → Rulesets → (the main ruleset) → Bypass list → add **Repository admin**;
+            then create a fine-grained PAT (Contents: Read and write) and store it as the
+            repo secret **REPO_PAT**. Re-run Update website index and the catalog will
+            push straight to main.
           labels: |
             automated
             site
@@ -87,48 +169,23 @@ jobs:
             docs/index.json
             docs/icons
 
-      # Queue the catalog PR for auto-merge. This removes the manual merge step
-      # AND the clash where the PR sits "Merging is blocked" while the required
-      # `build` check runs (or while a later run force-pushes the branch):
-      # GitHub merges the PR by itself the instant the check passes.
-      # Runs on every execution (not just when the PR step touched the PR) so a
-      # PR that already exists with an unchanged tree still gets queued.
-      # Needs the one-time repo setting:
-      #   Settings -> General -> Pull Requests -> Allow auto-merge
-      # If that setting is off (or the ruleset blocks it) the PR simply stays
-      # open for a manual merge after the check goes green.
-      - name: Queue the catalog PR for auto-merge
+      - name: Catalog status
         if: always()
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          state="$(gh pr view chore/site-catalog --json state -q .state 2>/dev/null || true)"
-          if [ "$state" != "OPEN" ]; then
-            echo "No open catalog PR (state: ${state:-none}) - nothing to queue."
+          outcome="${{ steps.direct-push.outputs.outcome }}"
+          if [ "$outcome" = "pushed" ]; then
+            echo "Catalog pushed straight to main."
             exit 0
           fi
-          err=$(mktemp)
-          if gh pr merge chore/site-catalog --auto --squash 2>"$err"; then
-            echo "Auto-merge queued: the catalog PR merges by itself once the required 'build' check passes."
-          elif [ "$(gh pr view chore/site-catalog --json autoMergeRequest -q .autoMergeRequest.enabled 2>/dev/null)" = "true" ]; then
-            echo "Auto-merge already queued on the catalog PR - nothing to do."
-          else
-            echo "::warning::Could not queue auto-merge: $(tr '\n' ' ' < "$err")"
-            echo "Enable it once in: Settings -> General -> Pull Requests -> check 'Allow auto-merge'."
-            echo "Until then, merge the catalog PR by hand after the 'build' check goes green."
+          if [ "$outcome" = "nothing" ]; then
+            echo "Catalog unchanged - nothing to do."
+            exit 0
           fi
-          rm -f "$err"
-
-      # Always report where the catalog stands, so a blocked PR creation is
-      # self-explanatory in the run log instead of a bare 403 from the API.
-      - name: Catalog PR status
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-        run: |
           url="${{ steps.catalog-pr.outputs.pull-request-url }}"
           if [ -n "$url" ]; then
-            echo "Catalog PR ready: $url"
+            echo "Direct push rejected - catalog PR ready (merge by hand once the build check is green): $url"
             exit 0
           fi
           if gh pr view chore/site-catalog --json url -q .url 2>/dev/null; then
@@ -136,10 +193,10 @@ jobs:
           fi
           if git ls-remote --heads origin chore/site-catalog | grep -q .; then
             echo "::warning::chore/site-catalog is pushed but no PR exists for it."
-            echo "If this run failed with 'GitHub Actions is not permitted to create or approve pull requests':"
+            echo "If the run failed at PR creation with 'GitHub Actions is not permitted to create or approve pull requests':"
             echo "  Repo Settings -> Actions -> General -> Workflow permissions ->"
-            echo "  check 'Allow GitHub Actions to create and approve pull requests', Save, then re-run this job."
+            echo "  check 'Allow GitHub Actions to create and approve pull requests', Save, then re-run."
             echo "Manual fallback: ${{ github.server_url }}/${{ github.repository }}/pull/new/chore/site-catalog"
           else
-            echo "Catalog unchanged - nothing to propose."
+            echo "Catalog unchanged - nothing to do."
           fi
