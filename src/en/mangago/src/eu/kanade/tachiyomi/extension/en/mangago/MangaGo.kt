@@ -305,7 +305,7 @@ abstract class MangaGo :
                 date_upload = (
                     row.select("td.no").lastOrNull()?.text()?.trim()
                         ?: row.select("td").lastOrNull()?.text()?.trim()
-                    ).parseDate()
+                    )?.parseDate() ?: 0L
                 // New layout lists the uploader/group in the second column.
                 scanlator = row.select("td").getOrNull(1)
                     ?.selectFirst("a[href*=/home/people/]")?.text()?.trim()
@@ -338,8 +338,7 @@ abstract class MangaGo :
         return 0f
     }
 
-    override fun getChapterUrl(chapter: SChapter): String =
-        if (chapter.url.startsWith("http")) chapter.url else "$baseUrl${chapter.url}"
+    override fun getChapterUrl(chapter: SChapter): String = if (chapter.url.startsWith("http")) chapter.url else "$baseUrl${chapter.url}"
 
     // =============================== Pages ===============================
     //

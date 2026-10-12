@@ -5,7 +5,6 @@ import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
-import eu.kanade.tachiyomi.network.HEAD
 import eu.kanade.tachiyomi.network.asObservableSuccess
 import eu.kanade.tachiyomi.source.ConfigurableSource
 import eu.kanade.tachiyomi.source.model.Filter
@@ -174,8 +173,7 @@ abstract class Toonz :
     // ============================== Details ==============================
 
     /** Series urls may be absolute (adult entries live on toonx.to). */
-    private fun seriesUrl(seriesPath: String): String =
-        if (seriesPath.startsWith("http")) seriesPath else "$baseUrl$seriesPath"
+    private fun seriesUrl(seriesPath: String): String = if (seriesPath.startsWith("http")) seriesPath else "$baseUrl$seriesPath"
 
     override fun mangaDetailsRequest(manga: SManga): Request = GET(seriesUrl(manga.url.substringBefore('#')), headers)
 
@@ -313,9 +311,11 @@ abstract class Toonz :
             ?: resolveComicId(currentSeriesPath)
             ?: throw Exception("Could not resolve the series id — open the manga details once and try again")
         // Both hosts share the same chapters API path.
-        val apiHost = if (currentSeriesPath.startsWith("http"))
+        val apiHost = if (currentSeriesPath.startsWith("http")) {
             "https://" + currentSeriesPath.removePrefix("https://").substringBefore('/')
-        else baseUrl
+        } else {
+            baseUrl
+        }
         return GET("$apiHost/api/comics/$comicId/chapters", headers)
     }
 
@@ -363,12 +363,7 @@ abstract class Toonz :
     // from the embedded tags, then binary-probe how far the file sequence
     // actually goes (~10 HEAD requests per chapter, not one per page).
 
-    private companion {
-        const val MAX_PAGES = 500
-    }
-
-    override fun pageListRequest(chapter: SChapter): Request =
-        if (chapter.url.startsWith("http")) GET(chapter.url, headers) else GET("$baseUrl${chapter.url}", headers)
+    override fun pageListRequest(chapter: SChapter): Request = if (chapter.url.startsWith("http")) GET(chapter.url, headers) else GET("$baseUrl${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
         val document = response.asJsoup()
@@ -390,7 +385,13 @@ abstract class Toonz :
         fun pageUrl(n: Int): String = "$prefix${n.toString().padStart(width, '0')}.$ext"
 
         fun exists(n: Int): Boolean = runCatching {
-            client.newCall(HEAD(pageUrl(n), headers)).execute().use { it.isSuccessful }
+            // The network layer ships no HEAD helper - build the probe manually.
+            val request = Request.Builder()
+                .url(pageUrl(n))
+                .headers(headers)
+                .head()
+                .build()
+            client.newCall(request).execute().use { it.isSuccessful }
         }.getOrDefault(false)
 
         // Exponential probe for the first missing index, then binary descent.
@@ -476,6 +477,9 @@ abstract class Toonz :
     }.getOrDefault(0L)
 
     companion object {
+        /** Cap for the binary page-count probe (defensive: no chapter is 500 pages). */
+        private const val MAX_PAGES = 500
+
         private val SERIES_PATH = Regex("""^/(manga|manhwa|adult)/[a-z0-9-]+$""")
 
         private const val PREF_CATALOG = "pref_catalog"
