@@ -108,16 +108,17 @@ jobs:
               echo "never shows up in the picker), so the one-time setup is:"
               echo "  1. Settings -> Rules -> Rulesets -> (your main ruleset) -> Bypass list ->"
               echo "     Add bypass target -> 'Repository admin' -> Save changes."
-              echo "  2. Settings -> Developer settings -> Personal access tokens -> Fine-grained"
-              echo "     tokens -> Generate new token (Only select repositories: this repo;"
-              echo "     Permissions -> Contents: Read and write)."
+              echo "  2. Create the token — a CLASSIC token with the 'repo' scope works as-is;"
+              echo "     a fine-grained token (this repo only, Permissions -> Contents: Read"
+              echo "     and write) works too."
               echo "  3. Settings -> Secrets and variables -> Actions -> New repository secret:"
               echo "     Name REPO_PAT, value = the token. Then re-run this job."
               echo "Until then the catalog lands as a PR you merge by hand."
             else
               echo "::warning::Push to main was rejected even with REPO_PAT set. Check:"
               echo "  1. the main ruleset bypass list still contains 'Repository admin';"
-              echo "  2. the PAT is not expired and has Contents: Read and write on this repo."
+              echo "  2. the PAT is not expired (classic tokens: 'repo' scope is enough;"
+              echo "     fine-grained: this repo + Contents: Read and write)."
               echo "Falling back to the classic catalog PR."
             fi
           fi
@@ -159,8 +160,9 @@ jobs:
             **Make it automatic (one-time):** the built-in Actions bot cannot be added to
             a ruleset bypass list (it never shows up in the picker), so instead:
             Rules → Rulesets → (the main ruleset) → Bypass list → add **Repository admin**;
-            then create a fine-grained PAT (Contents: Read and write) and store it as the
-            repo secret **REPO_PAT**. Re-run Update website index and the catalog will
+            then store a PAT as the repo secret **REPO_PAT** — a classic token with the
+            'repo' scope works as-is (fine-grained: this repo only + Contents: Read and
+            write). Re-run Update website index and the catalog will
             push straight to main.
           labels: |
             automated
