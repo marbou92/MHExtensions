@@ -12,7 +12,10 @@ Usage:
   python publish-repo.py --cleanup --dry    # Cleanup dry-run
 
 Environment variables:
-  REPO_PAT    — GitHub PAT for the MHRepo repository (required)
+  REPO_PAT    — GitHub PAT for the MHRepo repository (required; validated
+                against the GitHub API up front — invalid/expired/revoked
+                tokens or tokens without push access fail in seconds with
+                instructions, instead of after the whole publish)
   REPO_OWNER  — Owner of the MHRepo repo (default: marbou92)
   REPO_NAME   — Name of the MHRepo repo (default: MHRepo)
   SOURCE_OWNER — Owner of the source repo (default: marbou92)
@@ -29,6 +32,8 @@ import re
 import shutil
 import subprocess
 import sys
+import urllib.error
+import urllib.request
 from pathlib import Path
 
 from google.protobuf import json_format
@@ -41,7 +46,9 @@ import index_pb2
 
 REPO_OWNER = os.environ.get("REPO_OWNER", "marbou92")
 REPO_NAME = os.environ.get("REPO_NAME", "MHRepo")
-REPO_URL = f"https://x-access-token:{os.environ['REPO_PAT']}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
+# Stripped: a trailing newline/space in the secret would poison the URL.
+REPO_PAT = os.environ.get("REPO_PAT", "").strip()
+REPO_URL = f"https://x-access-token:{REPO_PAT}@github.com/{REPO_OWNER}/{REPO_NAME}.git"
 REPO_DIR = Path("/tmp/MHRepo")
 
 SOURCE_OWNER = os.environ.get("SOURCE_OWNER", "marbou92")
@@ -76,6 +83,7 @@ def normalize_fingerprint(fp):
 
 def run(cmd, **kwargs):
     """Run a shell command, exit on failure."""
+    kwargs.setdefault("env", dict(os.environ, GIT_TERMINAL_PROMPT="0"))
     result = subprocess.run(cmd, shell=True, **kwargs)
     if result.returncode != 0:
         print(f"ERROR: Command failed: {cmd}", file=sys.stderr)
@@ -86,12 +94,113 @@ def run(cmd, **kwargs):
 def git(*args, cwd=REPO_DIR):
     """Run a git command in the repo directory."""
     cmd = ["git"] + list(args)
-    result = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True)
+    env = dict(os.environ, GIT_TERMINAL_PROMPT="0")
+    result = subprocess.run(cmd, cwd=str(cwd), capture_output=True, text=True, env=env)
     if result.returncode != 0:
         print(f"git {' '.join(args)} failed:", file=sys.stderr)
         print(result.stderr, file=sys.stderr)
+        if args and args[0] == "push" and "Invalid username or token" in result.stderr:
+            print(
+                "HINT: GitHub rejected the token at push time even though the pre-flight "
+                "passed. The token may have been revoked mid-run, or it authenticates "
+                f"without push rights on {REPO_OWNER}/{REPO_NAME} (fine-grained tokens need "
+                "MHRepo in 'Repository access' with 'Contents: Read and write'; classic "
+                "tokens need the 'repo' scope).",
+                file=sys.stderr,
+            )
         sys.exit(1)
     return result.stdout.strip()
+
+
+def token_description():
+    """Safe description of the token for logs — never the token itself."""
+    if not REPO_PAT:
+        return "(empty)"
+    if REPO_PAT.startswith("github_pat_"):
+        kind = "fine-grained PAT"
+    elif REPO_PAT.startswith("ghp_"):
+        kind = "classic PAT"
+    elif REPO_PAT.startswith(("gho_", "ghu_", "ghs_", "ghr_")):
+        kind = "GitHub App/OAuth token"
+    else:
+        kind = "unrecognized format"
+    return f"{kind}, {len(REPO_PAT)} chars"
+
+
+def preflight_token_check():
+    """
+    Validate REPO_PAT against the GitHub API BEFORE doing any real work.
+
+    GitHub's git server silently ignores credentials when FETCHING a public
+    repository (verified: a clone with a garbage token succeeds), so a dead
+    token sails through the clone and only explodes at push time — after
+    the whole build/publish is wasted. The REST API tells the truth up
+    front: 401 = invalid/expired/revoked, and the repo payload carries the
+    token's actual push permission on MHRepo.
+    """
+    print(f"Pre-flight: REPO_PAT looks like {token_description()}")
+
+    api_url = f"https://api.github.com/repos/{REPO_OWNER}/{REPO_NAME}"
+    req = urllib.request.Request(
+        api_url,
+        headers={
+            "Authorization": f"token {REPO_PAT}",
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "publish-repo.py",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.load(resp)
+    except urllib.error.HTTPError as e:
+        body = ""
+        try:
+            body = e.read().decode("utf-8", "replace")
+        except Exception:
+            pass
+        if "rate limit" in body.lower():
+            print(f"WARNING: api.github.com rate-limited the pre-flight (HTTP {e.code}); continuing — push will decide.")
+            return
+        if e.code == 401:
+            print(
+                "::error::GitHub rejected REPO_PAT (HTTP 401) — the token is invalid, "
+                "expired, or revoked. Tokens expire (30/60/90 days), and pushes to "
+                "MHRepo last succeeded via this same secret, so expiry is the most "
+                "likely cause. Fix: create a new classic PAT with the 'repo' scope "
+                "(Settings → Developer settings → Personal access tokens → Tokens "
+                f"(classic)), update the REPO_PAT secret in {SOURCE_OWNER}/{SOURCE_NAME}, "
+                "then re-run this job."
+            )
+            sys.exit(1)
+        if e.code in (403, 404):
+            print(
+                f"::error::GitHub denied REPO_PAT access to {REPO_OWNER}/{REPO_NAME} "
+                f"(HTTP {e.code}). If the token is fine-grained, its 'Repository "
+                "access' must include MHRepo with 'Contents: Read and write'. If it "
+                "is classic, it needs the 'repo' scope. Update the REPO_PAT secret "
+                "and re-run."
+            )
+            sys.exit(1)
+        print(f"WARNING: api.github.com returned HTTP {e.code}; skipping pre-flight — push will decide.")
+        return
+    except (urllib.error.URLError, OSError, ValueError) as e:
+        print(f"WARNING: could not reach api.github.com ({e}); skipping pre-flight — push will decide.")
+        return
+
+    perms = data.get("permissions") or {}
+    if perms.get("push") is False:
+        print(
+            f"::error::REPO_PAT authenticates but CANNOT push to {REPO_OWNER}/{REPO_NAME}. "
+            "This is the signature of a fine-grained token scoped to other repos only: "
+            "it can READ this public repo but not push. Edit the token so 'Repository "
+            "access' includes MHRepo with 'Contents: Read and write' — or switch to a "
+            "classic token with the 'repo' scope, which covers every repo and just "
+            "works. Update the REPO_PAT secret and re-run."
+        )
+        sys.exit(1)
+
+    print(f"Pre-flight OK: token can push to {REPO_OWNER}/{REPO_NAME}.")
 
 
 def get_valid_packages():
@@ -553,9 +662,18 @@ def main():
     parser.add_argument("--dry", action="store_true")
     args = parser.parse_args()
 
-    if "REPO_PAT" not in os.environ:
-        print("ERROR: REPO_PAT environment variable is required", file=sys.stderr)
+    # Fail fast on a missing/empty/broken token BEFORE any real work — a bad
+    # token otherwise only surfaces at the final push, after the whole
+    # clone + index build is wasted (public fetches ignore credentials).
+    if not REPO_PAT:
+        print(
+            "::error::REPO_PAT is empty — the secret is not set (or is whitespace "
+            f"only). Set it in {SOURCE_OWNER}/{SOURCE_NAME} → Settings → Secrets "
+            "and variables → Actions. A classic token with the 'repo' scope is "
+            "enough (it must cover MHRepo too)."
+        )
         sys.exit(1)
+    preflight_token_check()
 
     if args.cleanup:
         cleanup(dry_run=args.dry)
