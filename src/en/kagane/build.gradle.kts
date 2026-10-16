@@ -6,17 +6,22 @@ plugins {
 
 keiyoushi {
     name = "Kagane"
-    versionCode = 50
+    versionCode = 51
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
     source {
         lang = "en"
-        baseUrl = "https://kagane.to"
+        // v72: kagane.to is gone (NXDOMAIN). kagane.si is the current primary;
+        // cx/moe/net are the site's own mirrors (one shared backend + ID space).
+        baseUrl = "https://kagane.si"
     }
 
     deeplink {
-        host("kagane.to")
+        host("kagane.si")
+        host("kagane.cx")
+        host("kagane.moe")
+        host("kagane.net")
         path("/series/..*")
     }
 }

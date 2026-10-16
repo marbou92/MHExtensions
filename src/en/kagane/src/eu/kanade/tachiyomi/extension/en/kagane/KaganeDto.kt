@@ -5,6 +5,10 @@ import eu.kanade.tachiyomi.source.model.SManga
 import keiyoushi.utils.tryParse
 import kotlinx.serialization.SerialName
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonNull
+import kotlinx.serialization.json.JsonPrimitive
 import org.jsoup.Jsoup
 import java.text.SimpleDateFormat
 import java.util.Locale
@@ -351,6 +355,64 @@ class ChapterDto(
     )
     companion object {
         val dateFormat = SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.ENGLISH)
+    }
+}
+
+/**
+ * The books INDEX endpoint (`GET /series/{id}/books/index?fields=List`) —
+ * the v72 replacement for the chapter list. The details response stopped
+ * embedding `series_books`, and the plain `/books` endpoint caps at 100
+ * rows and ignores its cursor, while the index returns EVERY book in one
+ * request (live-checked 2026-10: a 202-chapter series and a 120-book one
+ * both come back complete, on every mirror).
+ *
+ * The payload is columnar: [fields] names the columns, every entry of
+ * [books] is a positional row:
+ *   fields = [book_id, sort_no, chapter_no, volume_no, group_ix,
+ *             released_at, title, page_count, published_on, internal_release]
+ * with [groups] resolving the group_ix indices to scanlator names.
+ */
+@Serializable
+class BooksIndexDto(
+    val count: Int = 0,
+    val fields: List<String> = emptyList(),
+    val groups: List<ChapterDto.Group> = emptyList(),
+    val books: List<List<JsonElement>> = emptyList(),
+) {
+    fun toSChapterList(
+        seriesId: String,
+        useSourceChapterNumber: Boolean = false,
+        chapterTitleMode: String = "optional",
+    ): List<SChapter> {
+        val columnOf = fields.withIndex().associate { (index, name) -> name to index }
+
+        fun cell(row: List<JsonElement>, name: String): JsonElement? = columnOf[name]?.let { row.getOrNull(it) }
+
+        fun JsonElement?.asText(): String? = (this as? JsonPrimitive)?.takeIf { it !== JsonNull }?.content
+
+        return books.mapNotNull { row ->
+            val bookId = cell(row, "book_id").asText() ?: return@mapNotNull null
+            val groupTitles = (cell(row, "group_ix") as? JsonArray)
+                ?.mapNotNull { entry -> entry.asText()?.toIntOrNull() }
+                ?.mapNotNull { groupIx -> groups.getOrNull(groupIx)?.title }
+                .orEmpty()
+
+            // The index carries an epoch `released_at` instead of the old
+            // ISO `created_at`, so build through the shared Book mapping and
+            // stamp the date afterwards.
+            ChapterDto.Book(
+                id = bookId,
+                title = cell(row, "title").asText().orEmpty(),
+                createdAt = null,
+                pagesCount = cell(row, "page_count").asText()?.toIntOrNull() ?: 0,
+                number = cell(row, "sort_no").asText()?.toFloatOrNull() ?: 0f,
+                chapterNo = cell(row, "chapter_no").asText(),
+                volumeNo = cell(row, "volume_no").asText(),
+                groups = groupTitles.map { ChapterDto.Group(it) },
+            ).toSChapter(seriesId, useSourceChapterNumber, chapterTitleMode).apply {
+                date_upload = (cell(row, "released_at").asText()?.toLongOrNull() ?: 0L) * 1000
+            }
+        }.reversed()
     }
 }
 

@@ -343,16 +343,37 @@ abstract class MangaGo :
     // =============================== Pages ===============================
     //
     // The reader page assembles its image list in-JS (the encrypted
-    // `imgsrcs` payload is decoded by the site's own WASM-backed script
-    // and Cloudflare gates the whole host), so the extraction runs the
-    // reader URL inside the repo's window-attached WebView and harvests
-    // the <img> sources the site's script actually renders.
+    // `imgsrcs` payload is decoded by the site's own obfuscated script and
+    // Cloudflare gates the whole host), so the extraction runs the reader
+    // URL inside the repo's window-attached WebView and lets the site's own
+    // code decrypt + render — we only collect what it produces.
 
     @Serializable
     internal class WebViewPages(
         val urls: List<String> = emptyList(),
         val expected: Int = 0,
+        val page: Int = 0,
     )
+
+    // =============================== Pages ===============================
+    //
+    // 2026-10: the reader became ONE PAGE PER URL — /…/pg-1/ renders a single
+    // <img> (the encrypted `imgsrcs` payload still carries the whole chapter,
+    // but the old all-pages slider markup is gone). The v70 flow waited for
+    // total_pages <img> tags to appear at once, which can never happen now,
+    // so it burned its whole 60s budget and timed out on every chapter.
+    //
+    // The replacement harvests pages two ways:
+    //  1. FAST LANE: the site's own image requests are intercepted — if it
+    //     preloads upcoming pages (its imgReady/imgonload machinery suggests
+    //     it does), their urls land in the set while only page 1 renders.
+    //     Resolve fires as soon as the set reaches total_pages.
+    //  2. SEQUENTIAL WALKER: otherwise the WebView is driven through
+    //     /pg-{N}/ (the site's own next-page path) one page at a time,
+    //     harvesting each page's rendered <img> — total_pages read from the
+    //     reader globals, navigation capped at that many pages.
+    // Insertion order = the order the site produced the images in, which is
+    // the reading order (page 1 renders first, preloads follow).
 
     override fun pageListRequest(chapter: SChapter): Request = GET(getChapterUrl(chapter), headers)
 
@@ -366,6 +387,17 @@ abstract class MangaGo :
             )
         }
         return pages.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
+    }
+
+    /** The reader is one page per URL: {chapterBase}/pg-{N}/ (live-verified
+     * 2026-10). Older chapter urls may already carry a /pg-N/ segment. */
+    private fun buildPageUrl(chapterUrl: String, page: Int): String? {
+        val base = if (chapterUrl.contains("/pg-")) {
+            chapterUrl.substringBefore("/pg-")
+        } else {
+            chapterUrl.trimEnd('/')
+        }
+        return "$base/pg-$page/".takeIf { it.toHttpUrlOrNull() != null }
     }
 
     private fun runWebViewPages(chapterUrl: String): List<String> {
@@ -383,28 +415,45 @@ abstract class MangaGo :
                 };
                 var nodes = document.querySelectorAll(
                     '#readmangaslider img, .readmangaslider img, #slider img, ' +
-                    '.mangaread img, .chapter_container img, div[id*=read] img, img[src]'
+                    '.mangaread img, .chapter_container img, div[id*=read] img, ' +
+                    '#pic_container img, img[src], img[data-src]'
                 );
                 for (var i = 0; i < nodes.length; i++) {
                     push(nodes[i].getAttribute('src'));
                     push(nodes[i].getAttribute('data-src'));
                 }
-                window.scrollTo(0, document.body.scrollHeight);
+                var m = /\/pg-(\d+)/.exec(location.pathname);
                 return JSON.stringify({
                     urls: found,
-                    expected: (typeof total_pages === 'number' ? total_pages : 0)
+                    expected: (typeof total_pages === 'number' ? total_pages : 0),
+                    page: (m ? parseInt(m[1], 10) : 0)
                 });
             })();
         """.trimIndent()
 
+        // --- shared harvest state (poll runs on the main thread, request
+        // interception on a WebView background thread — hence synchronize).
+        val collected = LinkedHashSet<String>()
+        var expectedPages = 0
+        val donePages = HashSet<Int>()
+        val idlePolls = HashMap<Int, Int>()
+        val navigated = HashSet<String>()
+        var lastSize = 0
+        var inFlight = false
+
         return runCatching {
             runBlocking {
-                runWebView<List<String>>(timeout = 60.seconds) {
+                runWebView<List<String>>(timeout = 300.seconds) {
                     blockImages = true
 
                     interceptRequest { request ->
-                        val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
+                        val raw = request.url?.toString()
+                        val requestUrl = raw?.toHttpUrlOrNull()
                             ?: return@interceptRequest emptyResponse
+                        // FAST LANE: collect the reader's own image requests.
+                        if (raw.contains("mangapicgallery.com") || raw.contains("/r/")) {
+                            synchronized(collected) { collected.add(raw) }
+                        }
                         // Chapters now load on mirror hosts (mangago.zone,
                         // youhim.me, …) - always allow the host the chapter
                         // itself lives on, on top of the static allowlist.
@@ -425,16 +474,55 @@ abstract class MangaGo :
                     }
 
                     poll(1.seconds) {
+                        if (inFlight) return@poll
+                        inFlight = true
                         evaluateJs(collector) { value ->
-                            runCatching {
-                                // evaluateJavascript wraps the result in JSON string quotes.
-                                val payload = Json.decodeFromString<String>(value)
-                                val data = Json.decodeFromString<WebViewPages>(payload)
-                                if (data.urls.isNotEmpty() &&
-                                    (data.expected <= 0 || data.urls.size >= data.expected)
-                                ) {
-                                    resolve(data.urls)
+                            try {
+                                runCatching {
+                                    // evaluateJavascript wraps the result in JSON string quotes.
+                                    val payload = Json.decodeFromString<String>(value)
+                                    val data = Json.decodeFromString<WebViewPages>(payload)
+                                    synchronized(collected) { data.urls.forEach { collected.add(it) } }
+                                    if (data.expected > 0) expectedPages = data.expected
+
+                                    val size = synchronized(collected) { collected.size }
+                                    val grew = size > lastSize
+                                    lastSize = size
+
+                                    if (expectedPages > 0 && size >= expectedPages) {
+                                        resolve(synchronized(collected) { collected.toList() })
+                                        return@runCatching
+                                    }
+                                    if (expectedPages <= 0 && size > 0) {
+                                        // Legacy all-pages slider (no total_pages global).
+                                        resolve(synchronized(collected) { collected.toList() })
+                                        return@runCatching
+                                    }
+
+                                    // SEQUENTIAL WALKER: a page counts as done
+                                    // when its image landed while we were on it,
+                                    // or after a few idle polls (don't wedge on
+                                    // a page whose render failed — its url may
+                                    // still arrive via the request stream).
+                                    if (data.page in 1..expectedPages) {
+                                        if (grew) {
+                                            donePages.add(data.page)
+                                        } else {
+                                            val idle = (idlePolls[data.page] ?: 0) + 1
+                                            if (idle >= 4) donePages.add(data.page) else idlePolls[data.page] = idle
+                                        }
+                                    }
+
+                                    val missing = (1..expectedPages).firstOrNull { it !in donePages }
+                                    if (missing != null) {
+                                        val target = buildPageUrl(chapterUrl, missing)
+                                        if (target != null && navigated.add(target)) {
+                                            loadUrl(target)
+                                        }
+                                    }
                                 }
+                            } finally {
+                                inFlight = false
                             }
                         }
                     }

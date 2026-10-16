@@ -25,6 +25,7 @@ import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -40,6 +41,7 @@ import java.util.Date
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicLong
 
 /**
  * MangaTaro (mangataro.org).
@@ -67,8 +69,60 @@ abstract class MangaTaro :
     override val client: OkHttpClient = network.client.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        .addInterceptor(::serverClockInterceptor)
         .rateLimit(3)
         .build()
+
+    // ========================= Server clock (v72) =========================
+    //
+    // The /auth/manga-chapters token validates a brutal window around the
+    // SERVER's clock: live checks (2026-10) accept _ts only ~60-120s old and
+    // REJECT future timestamps outright - a device clock off by a minute in
+    // either direction (hour-boundary races are enough) makes every chapter
+    // fetch 403 forever, which on the details screen reads as "manga details
+    // failing to load". Fix: keep the server/device offset observed from the
+    // standard Date response header of every request, compute _ts/_t from
+    // that, and self-heal any residual 403 by re-reading the header the
+    // rejection itself carries and retrying once with a fresh token.
+
+    private val serverClockOffsetMs = AtomicLong(UNSET_OFFSET)
+
+    private fun serverNowMs(): Long {
+        val offset = serverClockOffsetMs.get()
+        return System.currentTimeMillis() + (if (offset == UNSET_OFFSET) 0L else offset)
+    }
+
+    private fun observeServerClock(headers: okhttp3.Headers) {
+        headers.getDate("Date")?.let { serverMs ->
+            serverClockOffsetMs.set(serverMs.time - System.currentTimeMillis())
+        }
+    }
+
+    private fun serverClockInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+        observeServerClock(response.headers)
+
+        // Token rejected (bad/out-of-window _t or _ts): rebuild BOTH from the
+        // just-observed server time and retry once. The original request is
+        // replayed with only the two query params replaced, so any endpoint
+        // that starts validating tokens benefits automatically.
+        if (response.code == 403 && request.url.queryParameter("_t") != null) {
+            response.close()
+            val timestamp = serverNowMs() / 1000
+            val token = md5("${timestamp}mng_ch_${isoDateFormatter.format(Date(timestamp * 1000))}").substring(0, 16)
+            val retry = request.newBuilder()
+                .url(
+                    request.url.newBuilder()
+                        .setQueryParameter("_t", token)
+                        .setQueryParameter("_ts", timestamp.toString())
+                        .build(),
+                )
+                .build()
+            return chain.proceed(retry)
+        }
+        return response
+    }
 
     override fun headersBuilder() = super.headersBuilder()
         .set("Referer", "$baseUrl/")
@@ -182,10 +236,35 @@ abstract class MangaTaro :
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        val id = response.asJsoup().body().attr("data-manga-id")
+        val document = response.asJsoup()
+        val id = document.body().attr("data-manga-id")
             .takeIf(String::isNotBlank)
+            ?: resolveMangaIdBySlug(response)
             ?: throw Exception("Manga id missing from the page — refresh the entry URL")
         return mangaDetailsParse(response, id)
+    }
+
+    /** The page embeds the numeric manga id on <body data-manga-id>. If the
+     * theme ever stops rendering it, resolve the id from the WordPress REST
+     * API by slug (verified live 2026-10: /wp-json/wp/v2/manga?slug=…) so
+     * details keep loading instead of hard-failing. */
+    private fun resolveMangaIdBySlug(response: Response): String? {
+        val slug = response.request.url.encodedPath
+            .trimEnd('/')
+            .substringAfterLast('/')
+            .takeIf { it.isNotBlank() && !it.startsWith("manga-") }
+            ?: return null
+        return runCatching {
+            client.newCall(GET("$baseUrl/wp-json/wp/v2/manga?slug=$slug", headers))
+                .execute()
+                .use { resp ->
+                    if (!resp.isSuccessful) return@use null
+                    resp.parseAs<List<WpManga>>()
+                        .firstOrNull()
+                        ?.id
+                        ?.toString()
+                }
+        }.getOrNull()
     }
 
     private fun mangaDetailsParse(response: Response, id: String): SManga {
@@ -348,10 +427,11 @@ abstract class MangaTaro :
     }
 
     /** The /auth/manga-chapters endpoint silently caps every call at 500 rows
-     * no matter the requested limit, so long series need offset paging. */
+     * no matter the requested limit, so long series need offset paging. The
+     * token is derived from the SERVER's clock (see [serverClockInterceptor]). */
     private fun chaptersRequest(mangaId: String, offset: Int): Request {
-        val timestamp = System.currentTimeMillis() / 1000
-        val token = md5("${timestamp}mng_ch_${isoDateFormatter.format(Date())}").substring(0, 16)
+        val timestamp = serverNowMs() / 1000
+        val token = md5("${timestamp}mng_ch_${isoDateFormatter.format(Date(timestamp * 1000))}").substring(0, 16)
 
         val url = "$baseUrl/auth/manga-chapters".toHttpUrl().newBuilder()
             .addQueryParameter("manga_id", mangaId)
@@ -543,6 +623,9 @@ abstract class MangaTaro :
     private fun String.htmlUnescape(): String = org.jsoup.parser.Parser.unescapeEntities(this, false)
 
     companion object {
+        /** Sentinel for "no server-clock offset observed yet" — see [serverClockInterceptor]. */
+        private const val UNSET_OFFSET = Long.MIN_VALUE
+
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
 
         private val NUMBER_ONLY = Regex("\\d+(?:\\.\\d+)?")

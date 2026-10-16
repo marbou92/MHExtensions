@@ -16,6 +16,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
@@ -44,6 +45,15 @@ import java.util.concurrent.TimeUnit
  * - chapters: GET /api/comics/{comicId}/chapters (full JSON list),
  * - pages: the reader chapter page server-renders <img> tags pointing at
  *   /uploads/chapters/... (plain HTTP, no WebView needed).
+ *
+ * Cloudflare (v72): the site now serves a managed challenge (403,
+ * cf-mitigated: challenge) on EVERY endpoint - browse, /api/search, the
+ * chapters API and even cover/reader images. The window-attached WebView
+ * solver clears it once; cf_clearance then lasts ~a year, so the challenge
+ * cost is a single one-time WebView pass per installation. toonx.to (the
+ * adult catalog host the old entries still point at) 301s into toonz.to
+ * but is kept in the solver's domain set so a challenge on the redirect
+ * source itself can be solved too.
  */
 @Source
 abstract class Toonz :
@@ -57,6 +67,7 @@ abstract class Toonz :
     override val client: OkHttpClient = network.client.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        .addInterceptor(CloudflareSolverInterceptor(setOf("toonz.to", "toonx.to")))
         .rateLimit(3)
         .build()
 

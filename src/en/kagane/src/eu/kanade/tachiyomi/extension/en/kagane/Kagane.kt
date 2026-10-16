@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.en.kagane
 
 import android.util.Log
+import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.MultiSelectListPreference
 import androidx.preference.PreferenceScreen
@@ -20,6 +21,7 @@ import keiyoushi.network.get
 import keiyoushi.network.post
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.getStringSafe
@@ -42,8 +44,10 @@ import kotlinx.serialization.json.putJsonArray
 import kotlinx.serialization.json.putJsonObject
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.Interceptor
 import okhttp3.OkHttpClient
+import okhttp3.Request
 import okhttp3.Response
 import okio.IOException
 
@@ -55,10 +59,61 @@ abstract class Kagane :
     private val kaganeLangs: List<String>
         get() = if (lang == "zh") listOf("zh-Hans", "zh-Hant") else listOf(lang)
 
-    private val domain get() = baseUrl.removePrefix("https://")
-    private val apiUrl get() = "https://$domain/api/v2"
-
     private val prefs = getPreferences()
+
+    // ============================ Mirrors (v72) ============================
+    //
+    // kagane.to (the v50 domain) is gone — NXDOMAIN. The site now lives on
+    // kagane.si with kagane.cx / kagane.moe / kagane.net as mirrors; ALL of
+    // them serve the same backend and the same ID space (verified 2026-10:
+    // /api/integrity answers on every host, /api/v2/* paths identical), so a
+    // mirror switch never invalidates library entries — manga/chapter urls
+    // are bare ids.
+    //
+    // Three layers of fallback, closest to xcomic's mirror system:
+    //  1. a fixed mirror list the user can switch in the extension settings
+    //     (plus a free-text custom mirror override),
+    //  2. an auto-refresh that scrapes kagane.org — the site's OWN
+    //     mirror-status page (server-rendered <a> links) — whenever every
+    //     known mirror is down, so new domains appear WITHOUT an app update
+    //     (throttled to once every 6h; toggle in the extension settings),
+    //  3. automatic failover: an interceptor that rewrites a request whose
+    //     host is dead (connect failure / DNS NXDOMAIN / CF 521+523) onto
+    //     the next mirror and persists the winner.
+
+    private val staticMirrors = listOf(
+        "https://kagane.si",
+        "https://kagane.cx",
+        "https://kagane.moe",
+        "https://kagane.net",
+    )
+
+    private val discoveredMirrors: List<String>
+        get() = prefs.getStringSetSafe(PREF_DISCOVERED_MIRRORS, emptySet())
+            .filter { it.startsWith("https://") && it.toHttpUrlOrNull() != null }
+            .sorted()
+
+    private val knownMirrors: List<String>
+        get() = (staticMirrors + discoveredMirrors).distinct()
+
+    private val knownMirrorHosts: Set<String>
+        get() = knownMirrors.map { it.toHttpUrl().host }.toSet()
+
+    /** The active mirror: a user-entered custom URL wins, then the last
+     * mirror that worked (switched in settings or picked by failover), then
+     * the primary. */
+    private val mirror: String
+        get() {
+            prefs.getStringSafe(PREF_CUSTOM_MIRROR, "")?.trim()?.trimEnd('/')?.let { custom ->
+                if (custom.startsWith("https://") && custom.toHttpUrlOrNull() != null) return custom
+            }
+            val active = prefs.getStringSafe(PREF_MIRROR, "")?.trim()?.trimEnd('/')
+            if (!active.isNullOrEmpty() && active in knownMirrors) return active
+            return knownMirrors.first()
+        }
+
+    private val domain get() = mirror.toHttpUrl().host
+    private val apiUrl get() = "https://$domain/api/v2"
 
     override fun OkHttpClient.Builder.configureClient() = apply {
         // The Cloudflare method (v23): a challenge SOLVER in a window-attached
@@ -83,12 +138,114 @@ abstract class Kagane :
         // - refreshTokenInterceptor: Kagane's own auth (token-bearing URLs)
         //   stays handled here; CF-challenge responses pass through it
         //   untouched (they can't be fixed by a token refresh).
-        addInterceptor(CloudflareSolverInterceptor(setOf(domain)))
+        //
+        // v72: the mirror-failover interceptor runs FIRST (it rewrites the
+        // host before anything else looks at the request); the CF solver
+        // covers every known mirror so a challenge on any of them can be
+        // solved. The old kagane.to stays swappable so thumbnails stored by
+        // previous versions get rewritten instead of erroring forever.
+        addInterceptor(::mirrorFailoverInterceptor)
+
+        addInterceptor(CloudflareSolverInterceptor(knownMirrorHosts + "kagane.to"))
 
         addInterceptor(::originSanitizerInterceptor)
         addInterceptor(::refreshTokenInterceptor)
 
         rateLimit(3)
+    }
+
+    /** The hosts the failover may rewrite onto a mirror: every known mirror
+     * plus the dead v50 domain (stored thumbnail urls point there). */
+    private fun failoverHosts(): Set<String> = knownMirrorHosts + "kagane.to"
+
+    private fun Request.withMirrorHost(mirrorUrl: String): Request {
+        val newHost = mirrorUrl.toHttpUrl().host
+        val builder = newBuilder().url(
+            url.newBuilder().scheme("https").host(newHost).build(),
+        )
+        // Keep the Referer consistent with the host we are now talking to.
+        if (!header("Referer").isNullOrBlank()) {
+            builder.header("Referer", "https://$newHost/")
+        }
+        return builder.build()
+    }
+
+    private fun nextMirror(excludeHosts: Set<String>): String? = knownMirrors.firstOrNull { it.toHttpUrl().host !in excludeHosts }
+
+    /** Lock guarding the throttled auto-refresh (reads-then-writes prefs). */
+    private val mirrorRefreshLock = Any()
+
+    /** When every known mirror just failed: fetch kagane.org's current
+     * mirror list once (throttled) so the NEXT request can use fresh
+     * domains. Returns true when new mirrors appeared. */
+    private fun maybeAutoRefreshMirrors(): Boolean {
+        if (!prefs.getBoolean(PREF_AUTO_REFRESH, true)) return false
+        val now = System.currentTimeMillis()
+        if (now - prefs.getLong(PREF_LAST_MIRROR_REFRESH, 0L) < AUTO_REFRESH_INTERVAL_MS) return false
+        synchronized(mirrorRefreshLock) {
+            if (now - prefs.getLong(PREF_LAST_MIRROR_REFRESH, 0L) < AUTO_REFRESH_INTERVAL_MS) return false
+            prefs.edit().putLong(PREF_LAST_MIRROR_REFRESH, now).apply()
+            val knownBefore = knownMirrors.toSet()
+            val result = runCatching { refreshMirrorsFromOrg() }
+                .onFailure { Log.e(TAG, "Auto mirror refresh failed", it) }
+                .getOrNull().orEmpty()
+            Log.i(TAG, "Auto mirror refresh: $result")
+            return knownMirrors.toSet() != knownBefore
+        }
+    }
+
+    /**
+     * Rewrites a failed request onto the next mirror and retries — mirrors
+     * share one backend and one ID space, so only scheme+host change.
+     * Triggers: connect-level IOExceptions (DNS-dead hosts — the exact
+     * kagane.to failure mode) and Cloudflare's 521/523 origin-down codes.
+     * The first mirror that answers is persisted as the active one so later
+     * requests start there. Requests whose host is not a mirror host (e.g.
+     * the kagane.org mirror-list fetch) pass through untouched.
+     */
+    private fun mirrorFailoverInterceptor(chain: Interceptor.Chain): Response {
+        val originalHost = chain.request().url.host
+        if (originalHost !in failoverHosts()) return chain.proceed(chain.request())
+
+        var request = chain.request()
+        val tried = mutableSetOf(originalHost)
+
+        while (true) {
+            val response = try {
+                chain.proceed(request)
+            } catch (e: IOException) {
+                var next = nextMirror(tried)
+                if (next == null) {
+                    // All known mirrors failed: maybe the site moved again.
+                    // Pull kagane.org's list (throttled) and retry if it grew.
+                    maybeAutoRefreshMirrors()
+                    next = nextMirror(tried) ?: throw e
+                }
+                request = request.withMirrorHost(next)
+                tried += next.toHttpUrl().host
+                continue
+            }
+
+            if (response.code == 521 || response.code == 523) {
+                response.close()
+                var next = nextMirror(tried)
+                if (next == null) {
+                    maybeAutoRefreshMirrors()
+                    next = nextMirror(tried)
+                        ?: throw IOException("Kagane: all mirrors are unreachable")
+                }
+                request = request.withMirrorHost(next)
+                tried += next.toHttpUrl().host
+                continue
+            }
+
+            if (request.url.host != originalHost) {
+                prefs.edit()
+                    .putString(PREF_MIRROR, "https://" + request.url.host)
+                    .apply()
+            }
+            return response
+        }
     }
 
     /**
@@ -266,7 +423,8 @@ abstract class Kagane :
     }
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (url.host != baseUrl.toHttpUrl().host) return null
+        // Deep links can arrive from any mirror (kagane.org links them all).
+        if (url.host !in knownMirrorHosts) return null
         val segments = url.pathSegments
         if (segments.size < 2) return null
         val seriesId = segments[1]
@@ -285,7 +443,7 @@ abstract class Kagane :
         return details.toSManga(apiUrl, sourceName, baseUrl, showEdition, showSource, cleanTitle)
     }
 
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/series/${manga.url}"
+    override fun getMangaUrl(manga: SManga): String = "$mirror/series/${manga.url}"
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -299,7 +457,13 @@ abstract class Kagane :
         val updatedManga = parseMangaDetails(dto).apply {
             memo = buildMemo(dto)
         }
-        val updatedChapters = parseChapterList(dto, seriesId)
+        val useSourceChapterNumber = dto.format in setOf(
+            "Dark Horse Comics",
+            "Flame Comics",
+            "MangaDex",
+            "Square Enix Manga",
+        )
+        val updatedChapters = parseChapterList(seriesId, useSourceChapterNumber)
 
         return SMangaUpdate(updatedManga, updatedChapters)
     }
@@ -327,20 +491,17 @@ abstract class Kagane :
         ?.mapNotNull { (it as? JsonPrimitive)?.content }
         .orEmpty()
 
-    private fun parseChapterList(details: DetailsDto, seriesId: String): List<SChapter> {
-        val useSourceChapterNumber = details.format in setOf(
-            "Dark Horse Comics",
-            "Flame Comics",
-            "MangaDex",
-            "Square Enix Manga",
-        )
+    /**
+     * Chapters come from the books INDEX endpoint (v72): the details
+     * response stopped embedding `series_books`, and the plain /books
+     * endpoint caps at 100 rows while ignoring its cursor — the index
+     * returns every book in one request (live-checked on all mirrors).
+     */
+    private suspend fun parseChapterList(seriesId: String, useSourceChapterNumber: Boolean): List<SChapter> = client.get("$apiUrl/series/$seriesId/books/index?fields=List")
+        .parseAs<BooksIndexDto>()
+        .toSChapterList(seriesId, useSourceChapterNumber, chapterTitleMode)
 
-        return details.seriesBooks.map { book ->
-            book.toSChapter(seriesId, useSourceChapterNumber, chapterTitleMode)
-        }.reversed()
-    }
-
-    override fun getChapterUrl(chapter: SChapter): String = "$baseUrl${chapter.url}"
+    override fun getChapterUrl(chapter: SChapter): String = "$mirror${chapter.url}"
 
     // =========================== Related Manga ============================
     override val supportsRelatedMangas = true
@@ -428,7 +589,7 @@ abstract class Kagane :
             error("Outdated chapter URL. Please refresh the chapter list")
         }
 
-        val chapterId = "$baseUrl${chapter.url}".toHttpUrl().pathSegments.last()
+        val chapterId = "$mirror${chapter.url}".toHttpUrl().pathSegments.last()
         val challengeResp = getChallengeResponse(chapterId)
 
         accessToken = challengeResp.accessToken
@@ -469,10 +630,14 @@ abstract class Kagane :
      */
     private suspend fun getIntegrityToken(): String {
         if (integrityExp < System.currentTimeMillis()) {
-            client.get("$baseUrl/").close()
+            // Site-root "priming" GET (kept from upstream, host now dynamic):
+            // a plain GET to the mirror root, so when the clearance cookie is
+            // missing the app's CloudflareInterceptor can solve the challenge
+            // there (a WebView can only navigate with GET).
+            client.get("$mirror/").close()
 
             val res = client.post(
-                "$baseUrl/api/integrity",
+                "$mirror/api/integrity",
                 "".toJsonRequestBody(),
             ).parseAs<IntegrityDto>()
             integrityToken = res.token
@@ -529,6 +694,34 @@ abstract class Kagane :
         get() = prefs.getStringSafe(CHAPTER_TITLE_MODE, CHAPTER_TITLE_MODE_DEFAULT)!!
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        ListPreference(screen.context).apply {
+            key = PREF_MIRROR
+            title = "Mirror"
+            val mirrors = knownMirrors
+            entries = mirrors.map { it.toHttpUrl().host }.toTypedArray()
+            entryValues = mirrors.toTypedArray()
+            summary = "All mirrors share the same content and ids (%s)"
+            setDefaultValue(mirrors.first())
+            setOnPreferenceChangeListener { _, newValue ->
+                summary = "All mirrors share the same content and ids ($newValue)"
+                true
+            }
+        }.let(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_CUSTOM_MIRROR
+            title = "Custom mirror"
+            summary = "Full https:// URL — overrides the mirror list when set (e.g. a brand-new mirror kagane.org lists)"
+            setDefaultValue("")
+        }.let(screen::addPreference)
+
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_AUTO_REFRESH
+            title = "Auto-refresh mirror list"
+            summary = "When every known mirror is down, fetch the mirrors currently listed on kagane.org (the site's own mirror page) — new domains appear without an app update (at most once every 6h)"
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+
         ListPreference(screen.context).apply {
             key = CONTENT_RATING
             title = "Content Rating"
@@ -615,7 +808,68 @@ abstract class Kagane :
 
     // ============================= Utilities ==============================
 
+    /**
+     * Scrapes the site's own mirror-status page (kagane.org) for the mirrors
+     * it currently advertises and persists any that aren't known yet. The
+     * page is fully server-rendered — one `<a href="https://kagane.X/">`
+     * per mirror — so plain HTML parsing suffices; kagane.org itself is
+     * excluded (it's the directory, not a mirror).
+     *
+     * @return a human-readable result for the settings Toast.
+     */
+    private fun refreshMirrorsFromOrg(): String {
+        val found = try {
+            // Plain blocking call — this runs on a worker Thread, not in a
+            // coroutine, so the suspend network helpers can't be used here.
+            val request = Request.Builder()
+                .url(MIRROR_LIST_URL)
+                .headers(headers)
+                .build()
+            client.newCall(request).execute().use { resp ->
+                if (!resp.isSuccessful) return "Mirror refresh failed: HTTP ${resp.code}"
+                resp.asJsoup()
+                    .select("a[href^=https://kagane.]")
+                    .mapNotNull { it.attr("href").takeIf { href -> href.startsWith("https://") } }
+                    .map { it.trimEnd('/') }
+                    .filter { it != MIRROR_LIST_URL.trimEnd('/') && it.toHttpUrlOrNull() != null }
+                    .toSortedSet()
+            }
+        } catch (e: Exception) {
+            Log.e(TAG, "Mirror refresh failed", e)
+            return "Mirror refresh failed: ${e.message ?: e.javaClass.simpleName}"
+        }
+
+        if (found.isEmpty()) return "kagane.org listed no mirrors — is the page up?"
+
+        val known = knownMirrors.toSet()
+        val newOnes = found - known
+        if (newOnes.isEmpty()) return "No new mirrors — ${found.size} known one(s) confirmed"
+
+        prefs.edit()
+            .putStringSet(PREF_DISCOVERED_MIRRORS, discoveredMirrors.toSet() + newOnes)
+            .apply()
+        // If the active mirror is dead, move to the first fresh one.
+        if (prefs.getStringSafe(PREF_MIRROR, "") !in found) {
+            prefs.edit().putString(PREF_MIRROR, newOnes.first()).apply()
+        }
+        return "Added ${newOnes.size} new mirror(s): ${newOnes.joinToString(", ") { it.toHttpUrl().host }}"
+    }
+
     companion object {
+        private const val TAG = "Kagane"
+
+        /** The site's own mirror-status page (server-rendered mirror links). */
+        private const val MIRROR_LIST_URL = "https://kagane.org/"
+
+        private const val PREF_MIRROR = "kagane_mirror"
+        private const val PREF_CUSTOM_MIRROR = "kagane_custom_mirror"
+        private const val PREF_DISCOVERED_MIRRORS = "kagane_discovered_mirrors"
+        private const val PREF_AUTO_REFRESH = "kagane_auto_refresh"
+        private const val PREF_LAST_MIRROR_REFRESH = "kagane_last_mirror_refresh"
+
+        /** Auto-refresh throttle: at most one kagane.org fetch per 6 hours. */
+        private const val AUTO_REFRESH_INTERVAL_MS = 6L * 60 * 60 * 1000
+
         private const val CONTENT_RATING = "kagane_content_rating"
         private const val CONTENT_RATING_DEFAULT = "pornographic"
         internal val CONTENT_RATINGS = arrayOf(
