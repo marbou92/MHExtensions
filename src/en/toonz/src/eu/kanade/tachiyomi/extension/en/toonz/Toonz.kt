@@ -1,6 +1,7 @@
 package eu.kanade.tachiyomi.extension.en.toonz
 
 import android.content.SharedPreferences
+import android.webkit.WebResourceResponse
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -18,14 +19,19 @@ import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
 import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.rateLimit
+import keiyoushi.utils.asJsoup
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
+import keiyoushi.utils.runWebView
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
+import okio.Buffer
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
@@ -33,6 +39,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+import kotlin.time.Duration.Companion.seconds
 
 /**
  * Toonz (toonz.to).
@@ -377,17 +384,50 @@ abstract class Toonz :
     override fun pageListRequest(chapter: SChapter): Request = if (chapter.url.startsWith("http")) GET(chapter.url, headers) else GET("$baseUrl${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        val document = response.asJsoup()
+        // v74: the chapter page is read ONCE and parsed three ways, layered:
+        //  1. the classic server-rendered <img>/preload tags,
+        //  2. a raw scan of the WHOLE body for /uploads/chapters/ urls — the
+        //     site progressively moved markup into its React flight payload,
+        //     where the urls survive only as escaped JSON strings,
+        //  3. a WebView harvest of the reader URL (the site's own code
+        //     renders the <img> tags we can no longer see in plain HTML).
+        // The old single-shape parse is what turned into "No page images
+        // found" on every chapter once (1) stopped matching.
+        val raw = response.body.string()
+        val document = raw.asJsoup(response.request.url.toString())
+
         val embedded = (
             document.select("img[src^=/uploads/chapters/]").map { it.attr("src") } +
                 document.select("link[rel=preload][href^=/uploads/chapters/]").map { it.attr("href") }
             )
             .map { it.substringBefore(' ') }
             .distinct()
-            .sorted()
-        if (embedded.isEmpty()) throw Exception("No page images found — the chapter may be unavailable")
 
-        val first = embedded.first()
+        val scanned = if (embedded.isEmpty()) {
+            // Flight/JSON payloads escape " as \" and / as \/ — normalize
+            // before scanning, and strip srcset-style trailing descriptors.
+            CHAPTER_IMAGE_REGEX.findAll(raw.replace("\\/", "/").replace("\\\"", "\""))
+                .map { it.groupValues[1].substringBefore(' ').trim() }
+                .filter { it.isNotBlank() }
+                .distinct()
+                .toList()
+        } else {
+            emptyList()
+        }
+
+        val harvested = if (embedded.isEmpty() && scanned.isEmpty()) {
+            runWebViewPages(response.request.url.toString())
+        } else {
+            emptyList()
+        }
+
+        val urls = (embedded + scanned + harvested)
+            .map { it.substringBefore(' ') }
+            .distinct()
+            .sorted()
+        if (urls.isEmpty()) throw Exception("No page images found — the chapter may be unavailable")
+
+        val first = urls.first()
         val prefix = first.substringBeforeLast('/') + '/'
         val ext = first.substringAfterLast('.', "webp")
         val firstIndex = first.substringAfterLast('/').substringBeforeLast('.').toIntOrNull() ?: 1
@@ -422,13 +462,76 @@ abstract class Toonz :
         if (last < firstIndex) {
             // Pattern probing found nothing beyond the embedded tags - use
             // those directly rather than showing an empty reader.
-            return embedded.mapIndexed { index, url ->
+            return urls.mapIndexed { index, url ->
                 Page(index, imageUrl = if (url.startsWith("http")) url else "$baseUrl$url")
             }
         }
 
         val pageOrigin = response.request.url.let { "${it.scheme}://${it.host}" }
         return (1..last).mapIndexed { index, _ -> Page(index, imageUrl = "$pageOrigin${pageUrl(index + 1)}") }
+    }
+
+    /**
+     * Last-resort page harvest: run the reader URL in the repo's
+     * window-attached WebView (one Cloudflare pass, then the site's own
+     * script renders the pages) and collect every /uploads/chapters/ img
+     * source it produces. Resolves once the set stops growing.
+     */
+    private fun runWebViewPages(chapterUrl: String): List<String> {
+        val emptyResponse = WebResourceResponse("text/plain", "utf-8", Buffer().inputStream())
+        return runCatching {
+            runBlocking {
+                runWebView<List<String>>(timeout = 90.seconds) {
+                    blockImages = true
+
+                    interceptRequest { request ->
+                        val url = request.url?.toString() ?: return@interceptRequest emptyResponse
+                        val allowed = url.contains("toonz.to") ||
+                            url.contains("toonx.to") ||
+                            url.contains("challenges.cloudflare.com") ||
+                            url.endsWith(".cloudflare.com") ||
+                            url.contains("/uploads/chapters/")
+                        if (allowed) null else emptyResponse
+                    }
+
+                    val collected = LinkedHashSet<String>()
+                    var lastSize = 0
+                    var stable = 0
+
+                    poll(1.seconds) {
+                        evaluateJs(
+                            """
+                            (function() {
+                                var out = [];
+                                var nodes = document.querySelectorAll('img[src], img[data-src], link[rel=preload][href]');
+                                for (var i = 0; i < nodes.length; i++) {
+                                    var u = nodes[i].getAttribute('src') || nodes[i].getAttribute('data-src') || nodes[i].getAttribute('href') || '';
+                                    if (u.indexOf('/uploads/chapters/') >= 0) out.push(u.split(' ')[0]);
+                                }
+                                return JSON.stringify(out);
+                            })()
+                            """.trimIndent(),
+                        ) { value ->
+                            runCatching {
+                                val payload = Json.decodeFromString<String>(value)
+                                val urls = Json.decodeFromString<List<String>>(payload)
+                                synchronized(collected) {
+                                    urls.forEach { collected.add(it) }
+                                    val size = collected.size
+                                    stable = if (size > lastSize && size > 0) 0 else stable + 1
+                                    lastSize = size
+                                    if (size > 0 && stable >= 3) {
+                                        resolve(collected.toList())
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    loadUrl(chapterUrl)
+                }
+            }
+        }.getOrElse { emptyList() }
     }
 
     override fun imageUrlParse(response: Response): String = throw UnsupportedOperationException()
@@ -488,6 +591,12 @@ abstract class Toonz :
     }.getOrDefault(0L)
 
     companion object {
+        /** Matches /uploads/chapters/… image paths in any markup shape. */
+        private val CHAPTER_IMAGE_REGEX = Regex(
+            """(?:https?://[^\s"'<>\\]+)?/uploads/chapters/[^\s"'<>\\]+\.(?:webp|jpg|jpeg|png|avif|gif)""",
+            RegexOption.IGNORE_CASE,
+        )
+
         /** Cap for the binary page-count probe (defensive: no chapter is 500 pages). */
         private const val MAX_PAGES = 500
 

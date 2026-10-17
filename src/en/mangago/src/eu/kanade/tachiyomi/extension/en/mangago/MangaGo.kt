@@ -410,6 +410,14 @@ abstract class MangaGo :
                     if (!u) return;
                     if (u.indexOf('data:') === 0) return;
                     if (u.indexOf('mangapicgallery.com') < 0 && u.indexOf('/r/') < 0) return;
+                    // v74: the reader page also pulls favicons and tracking
+                    // pixels from the image host (favicon.ico, ywz.ico) and
+                    // ad/JS assets under /r/ — those used to win slots in the
+                    // harvested list (they arrive first), so Page 0 decoded a
+                    // favicon and the app threw "failed to create image
+                    // decoder: unimplemented input contained an error".
+                    // Only accept real image paths.
+                    if (/\\.(ico|js|css|html?|json)(\\?|&|#|$)/i.test(u)) return;
                     if (found.indexOf(u) >= 0) return;
                     found.push(u);
                 };
@@ -451,8 +459,15 @@ abstract class MangaGo :
                         val requestUrl = raw?.toHttpUrlOrNull()
                             ?: return@interceptRequest emptyResponse
                         // FAST LANE: collect the reader's own image requests.
+                        // v74: same rule as the DOM collector — the image host
+                        // also serves favicons (favicon.ico, ywz.ico), scripts
+                        // and /r/ ad beacons; those arrived first and used to
+                        // fill the page list with undecodable garbage.
                         if (raw.contains("mangapicgallery.com") || raw.contains("/r/")) {
-                            synchronized(collected) { collected.add(raw) }
+                            val isRealImage = IMAGE_URL_REGEX.containsMatchIn(raw)
+                            if (isRealImage) {
+                                synchronized(collected) { collected.add(raw) }
+                            }
                         }
                         // Chapters now load on mirror hosts (mangago.zone,
                         // youhim.me, …) - always allow the host the chapter
@@ -579,6 +594,13 @@ abstract class MangaGo :
 
     companion object {
         private val SIMPLE_DATE = SimpleDateFormat("MMM d, yyyy", Locale.US)
+
+        /** Real page images only — excludes favicons (.ico), scripts and
+         *  other reader assets that share the image host. */
+        private val IMAGE_URL_REGEX = Regex(
+            "\\.(?:jpg|jpeg|png|webp|gif|avif|bmp)(?:[?#]|$)",
+            RegexOption.IGNORE_CASE,
+        )
 
         private const val PREF_EXTRA_INFO = "pref_extra_info"
         private const val PREF_ALT_NAMES = "pref_alt_names"

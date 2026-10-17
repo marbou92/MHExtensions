@@ -17,6 +17,7 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.online.HttpSource
 import eu.kanade.tachiyomi.util.asJsoup
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.rateLimit
 import keiyoushi.utils.firstInstance
 import keiyoushi.utils.firstInstanceOrNull
@@ -69,6 +70,13 @@ abstract class MangaTaro :
     override val client: OkHttpClient = network.client.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
+        // v74: mangataro.org sits behind Cloudflare (server: cloudflare) and
+        // started managed-challenging non-browser clients per IP — the whole
+        // details screen (page + chapters, both same host) dies with 403 on
+        // affected networks while every flow passes from others. Route the
+        // client through the repo's window-attached WebView solver like the
+        // other CF sources here; the clearance is earned once and reused.
+        .addInterceptor(CloudflareSolverInterceptor(setOf("mangataro.org")))
         .addInterceptor(::serverClockInterceptor)
         .rateLimit(3)
         .build()

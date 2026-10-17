@@ -39,7 +39,9 @@ import java.util.TimeZone
  * Swarm (swarm.ws) — Next.js front-end over a MongoDB-backed aggregator API
  * (web APIs on swarm.ws/api, backend on api.swarm.ws — NOT behind Cloudflare).
  * Content is multi-source (MangaPark-style ids, Comick ULIDs, numeric ids), so
- * chapters carry a per-chapter `lang` and group/quality ranks.
+ * chapters carry a per-chapter `lang` and group/quality ranks. v74: one
+ * source per content language (like MangaDot) — the source's `lang` is the
+ * chapter language; Mihon's language picker switches.
  *
  * Endpoints (all live-verified 2026-09, no Cloudflare challenges):
  *  - Popular    GET /api/analytics/popular?window=all&limit=50&offset=N
@@ -575,7 +577,10 @@ abstract class Swarm :
             throw IOException("Swarm: no chapters found for this series.")
         }
 
-        val preferredLang = preferences.chapterLanguage().lowercase()
+        // v74: the source language IS the chapter language — one Swarm source
+        // per language now (like MangaDot), so the old "Chapter language"
+        // setting is gone and Mihon's language picker decides instead.
+        val preferredLang = lang.lowercase()
         val dedupe = preferences.deduplicateChapters()
 
         // Strict language filter: the aggregator indexes the same series once
@@ -802,21 +807,6 @@ abstract class Swarm :
             setDefaultValue(false)
         }.let(screen::addPreference)
 
-        androidx.preference.ListPreference(screen.context).apply {
-            key = PREF_CHAPTER_LANGUAGE
-            title = "Chapter language"
-            summary = "Preferred chapter language (%s) — series without " +
-                "chapters in this language show an empty list"
-            setDefaultValue("en")
-            entries = CHAPTER_LANGUAGES.map { it.second }.toTypedArray()
-            entryValues = CHAPTER_LANGUAGES.map { it.first }.toTypedArray()
-            setOnPreferenceChangeListener { _, newValue ->
-                summary = "Preferred chapter language ($newValue) — series without " +
-                    "chapters in this language show an empty list"
-                true
-            }
-        }.let(screen::addPreference)
-
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_DEDUPLICATE_CHAPTERS
             title = "Deduplicate chapters"
@@ -848,8 +838,6 @@ abstract class Swarm :
     }
 
     private fun android.content.SharedPreferences.showNsfw(): Boolean = getBoolean(PREF_SHOW_NSFW, false)
-
-    private fun android.content.SharedPreferences.chapterLanguage(): String = getString(PREF_CHAPTER_LANGUAGE, "en") ?: "en"
 
     private fun android.content.SharedPreferences.deduplicateChapters(): Boolean = getBoolean(PREF_DEDUPLICATE_CHAPTERS, true)
 
@@ -925,30 +913,10 @@ abstract class Swarm :
         )
 
         private const val PREF_SHOW_NSFW = "pref_show_nsfw"
-        private const val PREF_CHAPTER_LANGUAGE = "pref_chapter_language"
         private const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
         private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
         private const val PREF_SHOW_ALT_NAMES = "pref_show_alt_names"
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
-
-        private val CHAPTER_LANGUAGES = listOf(
-            "en" to "English",
-            "fr" to "French",
-            "ar" to "Arabic",
-            "es" to "Spanish",
-            "es-la" to "Spanish (LatAm)",
-            "pt-br" to "Portuguese (Brazil)",
-            "id" to "Indonesian",
-            "th" to "Thai",
-            "vi" to "Vietnamese",
-            "tr" to "Turkish",
-            "ru" to "Russian",
-            "de" to "German",
-            "it" to "Italian",
-            "ja" to "Japanese",
-            "ko" to "Korean",
-            "zh" to "Chinese",
-        )
 
         private val RANK_ORDER = listOf("a", "b", "c", "d", "e", "f", "g", "h", "i", "j", "k", "l")
 

@@ -55,7 +55,15 @@ class CloudflareBypass(
         val request = chain.request()
         val host = request.url.host
 
-        if (host !in cookieHosts || request.header("Cookie") != null) {
+        // v74: subdomain-aware matching. cf_clearance is issued zone-wide
+        // (Domain=.comix.to), and the page images live on a CDN subdomain of
+        // comix.to — the old exact-match check dropped them, so every image
+        // request went out cookie-less and Cloudflare challenged it (the
+        // "extension doesn't utilize the cf token" report). Match the host
+        // itself and any subdomain of a protected host, mirroring the
+        // solver's own isProtectedHost().
+        val applies = cookieHosts.any { root -> host == root || host.endsWith(".$root") }
+        if (!applies || request.header("Cookie") != null) {
             return chain.proceed(request)
         }
 

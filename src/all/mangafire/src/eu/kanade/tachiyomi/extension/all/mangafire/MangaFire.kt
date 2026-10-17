@@ -85,7 +85,14 @@ abstract class MangaFire :
 
     override fun popularMangaRequest(page: Int) = titlesRequest(page) {
         put("limit", VrfGenerator.scalar("24"))
-        put("languages", VrfGenerator.list(listOf(lang)))
+        // 2026-10: the server rebuilds the signed canonical from the PARSED
+        // query and PHP re-indexes `languages[]` into `languages[0]` — a
+        // `languages[]=`-style wire form no longer matches the token and every
+        // listing dies with 403 "Invalid token.". Send the language as an
+        // indexed object so BOTH the canonical and the wire carry
+        // `languages[0]=<lang>` (verified live: 200 with this shape, 403 with
+        // the old one).
+        put("languages", VrfGenerator.obj(mapOf("0" to lang)))
         put("order", VrfGenerator.obj(mapOf("trending" to "desc")))
         put("page", VrfGenerator.scalar(page.toString()))
     }
@@ -94,7 +101,8 @@ abstract class MangaFire :
 
     override fun latestUpdatesRequest(page: Int) = titlesRequest(page) {
         put("limit", VrfGenerator.scalar("24"))
-        put("languages", VrfGenerator.list(listOf(lang)))
+        // Same indexed-language rule as popular — see the note there.
+        put("languages", VrfGenerator.obj(mapOf("0" to lang)))
         put("order", VrfGenerator.obj(mapOf("chapter_updated_at" to "desc")))
         put("page", VrfGenerator.scalar(page.toString()))
     }
@@ -113,7 +121,8 @@ abstract class MangaFire :
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = titlesRequest(page) {
         put("limit", VrfGenerator.scalar("24"))
         put("page", VrfGenerator.scalar(page.toString()))
-        put("languages", VrfGenerator.list(listOf(lang)))
+        // Same indexed-language rule as popular — see the note there.
+        put("languages", VrfGenerator.obj(mapOf("0" to lang)))
 
         val trimmed = query.trim()
         if (trimmed.isNotEmpty()) put("keyword", VrfGenerator.scalar(trimmed))

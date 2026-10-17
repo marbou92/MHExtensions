@@ -68,6 +68,14 @@ import java.util.TimeZone
  * numeric title ids the site now links with (/title-detail/{id}); old v24
  * slug urls resolve via the same /title/search lookup the site's own code
  * uses as its fallback.
+ *
+ * v74: one source per content language (like MangaDot) — the source's `lang`
+ * is the chapter language; Mihon's language picker switches. The old
+ * "Chapter language" / "Fallback to any language" / "Show upload language
+ * tags" settings are gone; chapters are strictly language-filtered. The
+ * description follows MangaDot's format (meta line, `---` rule, bold
+ * **Links:** and **Alternative Names:** blocks) with a "Show tags in genres"
+ * option to match.
  */
 @Source
 abstract class MangaBall :
@@ -328,6 +336,7 @@ abstract class MangaBall :
     private fun MbDetailDto.toSManga(): SManga {
         val showAltNames = preferences.showAltNames()
         val showExtraInfo = preferences.showExtraInfo()
+        val showTags = preferences.showTagsInGenres()
 
         val synopsis = description
             .map { it.trim() }
@@ -335,8 +344,8 @@ abstract class MangaBall :
             .distinct()
             .joinToString("\n\n")
 
-        // Info line (Comix-style, bold labels) — status, original language,
-        // publication year, chapter/views/likes counters.
+        // Info line (bold labels) — status, original language, publication
+        // year, chapter/views/likes counters, content rating.
         val infoLine = if (showExtraInfo) {
             buildString {
                 if (!status.isNullOrBlank()) {
@@ -345,6 +354,10 @@ abstract class MangaBall :
                 if (!originalLanguage.isNullOrBlank()) {
                     if (isNotEmpty()) append(" · ")
                     append("**Original:** ").append(formatOriginalLanguage(originalLanguage))
+                }
+                if (!publicationDemographic.isNullOrBlank()) {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Content Rating:** ").append(publicationDemographic.replaceFirstChar { c -> c.uppercase(Locale.ROOT) })
                 }
                 val year = JsonElements.asStringOrNull(date_published)?.takeIf { it.isNotBlank() }
                 if (year != null) {
@@ -371,16 +384,33 @@ abstract class MangaBall :
             null
         }
 
+        // v74: MangaDot-style description — meta info, a `---` rule, the
+        // synopsis, a bold **Links:** block and bold **Alternative Names:**
+        // bullets.
         val desc = buildString {
             if (infoLine != null) {
                 append(infoLine)
-                append("\n\n")
+                append("\n\n---\n\n")
             }
             append(synopsis)
+
+            val links = listOfNotNull(
+                links?.mangadex?.takeIf(String::isNotBlank)?.let { "[MangaDex](${externalUrl("mangadex", it)})" },
+                links?.mangaUpdate?.takeIf(String::isNotBlank)?.let { "[MangaUpdates](${externalUrl("mangaupdates", it)})" },
+                links?.myanimelist?.takeIf(String::isNotBlank)?.let { "[MyAnimeList](${externalUrl("myanimelist", it)})" },
+                links?.animePlanet?.takeIf(String::isNotBlank)?.let { "[AnimePlanet](${externalUrl("anime-planet", it)})" },
+                links?.kitsu?.takeIf(String::isNotBlank)?.let { "[Kitsu](${externalUrl("kitsu", it)})" },
+            ).distinct()
+            if (links.isNotEmpty()) {
+                if (isNotEmpty()) append("\n\n")
+                append("**Links:**\n")
+                links.forEach { append("- ", it, "\n") }
+            }
+
             if (showAltNames && alternateName.isNotEmpty()) {
                 if (isNotEmpty()) append("\n\n")
-                append("Alternative names:\n")
-                append(alternateName.map { it.trim() }.filter { it.isNotEmpty() }.distinct().joinToString("\n") { "• $it" })
+                append("**Alternative Names:**\n")
+                append(alternateName.map { it.trim() }.filter { it.isNotEmpty() }.distinct().joinToString("\n") { "- $it" })
             }
         }.trim()
 
@@ -388,11 +418,30 @@ abstract class MangaBall :
             url = idOrNull().orEmpty()
             title = name.orEmpty()
             author = (authors.ifEmpty { this@toSManga.author }).mapNotNull { it.name }.distinct().joinToString(", ").ifBlank { null }
-            genre = tags.mapNotNull { it.name }.distinct().joinToString(", ").ifBlank { null }
+            genre = tags
+                .filter { showTags || it.group.equals("genre", ignoreCase = true) || it.group.isNullOrBlank() }
+                .mapNotNull { it.name }
+                .distinct()
+                .joinToString(", ")
+                .ifBlank { null }
             description = desc.ifBlank { synopsis.ifBlank { null } }
             thumbnail_url = coverUrlOf(image)
             status = statusStringToSManga(this@toSManga.status)
             initialized = true
+        }
+    }
+
+    /** MangaBall link fields mix ids, slugs and full urls — normalize. */
+    private fun externalUrl(site: String, value: String): String = if (value.startsWith("http")) {
+        value
+    } else {
+        when (site) {
+            "mangadex" -> "https://mangadex.org/title/$value"
+            "mangaupdates" -> "https://www.mangaupdates.com/series/$value"
+            "myanimelist" -> "https://myanimelist.net/manga/$value"
+            "anime-planet" -> "https://www.anime-planet.com/manga/$value"
+            "kitsu" -> "https://kitsu.app/manga/$value"
+            else -> value
         }
     }
 
@@ -476,24 +525,21 @@ abstract class MangaBall :
             }
         }
 
-        val preferredLang = preferences.preferredLanguage().lowercase()
-        val fallback = preferences.fallbackLanguage()
+        // v74: the source language IS the chapter language — one MangaBall
+        // source per language now (like MangaDot), so the old "Chapter
+        // language" and "Fallback to any language" settings are gone and
+        // Mihon's language picker decides instead. Same strict rule Swarm and
+        // MangaDot use: no chapters in this language → empty list, never a
+        // mixed-language dump.
+        val preferredLang = lang.lowercase()
         val dedupe = preferences.deduplicateUploads()
-        val showLangTags = preferences.showAllUploads()
 
         val rows = fetchedRows
             .filter { it.idOrNull() != null }
             .sortedByDescending { it.chapterNumber() }
 
-        var candidates = rows.filter { it.lang?.lowercase() == preferredLang }
-        if (candidates.isEmpty() && fallback) candidates = rows
-        if (candidates.isEmpty()) {
-            throw IOException(
-                "MangaBall returned no chapters in \"$preferredLang\" for this title. " +
-                    "Enable \"Fallback to any language\" in MangaBall settings to see the " +
-                    "other translations.",
-            )
-        }
+        val candidates = rows.filter { it.lang?.lowercase() == preferredLang }
+        if (candidates.isEmpty()) return emptyList()
 
         // One row per (chapter number, volume) when deduplicating: the site
         // itself aggregates multiple group uploads per chapter; keep the most
@@ -511,10 +557,10 @@ abstract class MangaBall :
             candidates
         }
 
-        return chosen.map { it.toSChapter(preferredLang, showLangTags) }
+        return chosen.map { it.toSChapter(preferredLang) }
     }
 
-    private fun MbChapterDto.toSChapter(preferredLang: String, showLangTag: Boolean): SChapter {
+    private fun MbChapterDto.toSChapter(preferredLang: String): SChapter {
         val id = idOrNull().orEmpty()
         val num = chapterNumber()
         val vol = volumeNumber()
@@ -538,11 +584,6 @@ abstract class MangaBall :
                     append(rawTitle)
                 }
                 if (isEmpty()) append(if (num <= 0) "Oneshot" else "Chapter ${formatNumber(num)}")
-                if (showLangTag && lang.isNotBlank() && lang != preferredLang) {
-                    append(" [")
-                    append(lang)
-                    append("]")
-                }
             }
             chapter_number = num.toFloat().takeIf { num > 0 } ?: -1f
             date_upload = parseDate(created_at ?: updated_at)
@@ -821,26 +862,6 @@ abstract class MangaBall :
             setDefaultValue(true)
         }.let(screen::addPreference)
 
-        androidx.preference.ListPreference(screen.context).apply {
-            key = PREF_CHAPTER_LANGUAGE
-            title = "Chapter language"
-            summary = "Preferred translation language for chapters (%s)"
-            setDefaultValue("en")
-            entries = CHAPTER_LANGUAGES.map { it.second }.toTypedArray()
-            entryValues = CHAPTER_LANGUAGES.map { it.first }.toTypedArray()
-            setOnPreferenceChangeListener { _, newValue ->
-                summary = "Preferred translation language for chapters ($newValue)"
-                true
-            }
-        }.let(screen::addPreference)
-
-        androidx.preference.SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_FALLBACK_LANGUAGE
-            title = "Fallback to any language"
-            summary = "Show chapters even when no translation in the preferred language exists"
-            setDefaultValue(true)
-        }.let(screen::addPreference)
-
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
             key = PREF_DEDUPLICATE_UPLOADS
             title = "Deduplicate chapter uploads"
@@ -850,10 +871,9 @@ abstract class MangaBall :
         }.let(screen::addPreference)
 
         androidx.preference.SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_SHOW_ALL_UPLOADS
-            title = "Show upload language tags"
-            summary = "Append the translation language to chapter names when it differs from " +
-                "the preferred language"
+            key = PREF_SHOW_TAGS_IN_GENRE
+            title = "Show tags in genres"
+            summary = "Include format and theme tags next to the genres in the genre field"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
@@ -873,19 +893,15 @@ abstract class MangaBall :
         }.let(screen::addPreference)
     }
 
-    private fun android.content.SharedPreferences.preferredLanguage(): String = getString(PREF_CHAPTER_LANGUAGE, "en") ?: "en"
-
-    private fun android.content.SharedPreferences.fallbackLanguage(): Boolean = getBoolean(PREF_FALLBACK_LANGUAGE, true)
-
     private fun android.content.SharedPreferences.deduplicateUploads(): Boolean = getBoolean(PREF_DEDUPLICATE_UPLOADS, true)
-
-    private fun android.content.SharedPreferences.showAllUploads(): Boolean = getBoolean(PREF_SHOW_ALL_UPLOADS, true)
 
     private fun android.content.SharedPreferences.showNsfw(): Boolean = getBoolean(PREF_SHOW_NSFW, true)
 
     private fun android.content.SharedPreferences.showAltNames(): Boolean = getBoolean(PREF_SHOW_ALT_NAMES, true)
 
     private fun android.content.SharedPreferences.showExtraInfo(): Boolean = getBoolean(PREF_SHOW_EXTRA_INFO, true)
+
+    private fun android.content.SharedPreferences.showTagsInGenres(): Boolean = getBoolean(PREF_SHOW_TAGS_IN_GENRE, true)
 
     companion object {
         private val TITLE_PATHS = setOf("manga", "title-detail")
@@ -918,37 +934,10 @@ abstract class MangaBall :
 
         /** What the site's own client sends as user_id for logged-out visitors. */
 
-        private const val PREF_CHAPTER_LANGUAGE = "pref_chapter_language"
-        private const val PREF_FALLBACK_LANGUAGE = "pref_fallback_language"
         private const val PREF_DEDUPLICATE_UPLOADS = "pref_deduplicate_uploads"
-        private const val PREF_SHOW_ALL_UPLOADS = "pref_show_all_uploads"
         private const val PREF_SHOW_NSFW = "pref_show_nsfw"
         private const val PREF_SHOW_ALT_NAMES = "pref_show_alt_names"
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
-
-        private val CHAPTER_LANGUAGES = listOf(
-            "en" to "English",
-            "es" to "Spanish",
-            "es-419" to "Spanish (LatAm)",
-            "pt-BR" to "Portuguese (Brazil)",
-            "fr" to "French",
-            "de" to "German",
-            "it" to "Italian",
-            "ru" to "Russian",
-            "tr" to "Turkish",
-            "ar" to "Arabic",
-            "id" to "Indonesian",
-            "th" to "Thai",
-            "vi" to "Vietnamese",
-            "hi" to "Hindi",
-            "tl" to "Filipino",
-            "ja" to "Japanese",
-            "ko" to "Korean",
-            "zh" to "Chinese",
-            "zh-Hant" to "Chinese (Traditional)",
-            "pl" to "Polish",
-            "nl" to "Dutch",
-            "uk" to "Ukrainian",
-        )
+        private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
     }
 }
