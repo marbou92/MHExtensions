@@ -25,6 +25,7 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import kotlinx.serialization.Serializable
+import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -33,6 +34,7 @@ import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import rx.Observable
 import java.security.MessageDigest
@@ -183,9 +185,10 @@ abstract class MangaTaro :
         return client.newCall(GET("$baseUrl/manga/$slug", headers))
             .asObservableSuccess()
             .map { response ->
-                val id = response.asJsoup().body().attr("data-manga-id")
+                val document = response.asJsoup()
+                val id = document.body().attr("data-manga-id")
                 if (id.isBlank()) throw Exception("Could not resolve manga id from the page")
-                mangaDetailsParse(response, id)
+                mangaDetailsParse(document, response.request.url, id)
             }
             .map { MangasPage(listOf(it), false) }
     }
@@ -244,12 +247,16 @@ abstract class MangaTaro :
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
+        // Parse the page body exactly ONCE and hand the document down — a
+        // second asJsoup() on the same response reads an already-consumed
+        // body and dies with "IllegalStateException: closed" (v74 shipped
+        // exactly that bug: every details load failed).
         val document = response.asJsoup()
         val id = document.body().attr("data-manga-id")
             .takeIf(String::isNotBlank)
             ?: resolveMangaIdBySlug(response)
             ?: throw Exception("Manga id missing from the page — refresh the entry URL")
-        return mangaDetailsParse(response, id)
+        return mangaDetailsParse(document, response.request.url, id)
     }
 
     /** The page embeds the numeric manga id on <body data-manga-id>. If the
@@ -275,9 +282,7 @@ abstract class MangaTaro :
         }.getOrNull()
     }
 
-    private fun mangaDetailsParse(response: Response, id: String): SManga {
-        val document = response.asJsoup()
-
+    private fun mangaDetailsParse(document: Document, requestUrl: HttpUrl, id: String): SManga {
         // --- JSON-LD block: status, type, author, episode count, dates ----
         val ldJson = document.select("script[type=application/ld+json]")
             .map(Element::data)
@@ -405,7 +410,7 @@ abstract class MangaTaro :
         }.trim()
 
         val slug = wp?.slug
-            ?: response.request.url.pathSegments.lastOrNull().orEmpty()
+            ?: requestUrl.pathSegments.lastOrNull().orEmpty()
 
         return SManga.create().apply {
             url = MangaUrl(id, slug).toJsonString()

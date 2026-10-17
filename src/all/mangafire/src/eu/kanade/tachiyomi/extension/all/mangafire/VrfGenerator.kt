@@ -5,6 +5,7 @@ import android.os.Handler
 import android.os.Looper
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import app.cash.quickjs.QuickJs
 import keiyoushi.utils.applicationContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -33,6 +34,13 @@ import java.util.concurrent.atomic.AtomicReference
  * drives it with the same mock axios the SPA bootstraps it with
  * (`extendClient(instance)` registers the site's own request interceptor),
  * and asks that interceptor for the token — the site's code does the signing.
+ *
+ * v75: the asset runs in an embedded QuickJS engine first (no WebView
+ * lifecycle, works on any thread); the WebView is the fallback engine and
+ * stays warm for it. The glue expects the params as a JSON *string* (it
+ * `JSON.parse()`s its input) — the object literal v74 passed made that parse
+ * throw, the canonical silently collapse to the bare path, and every signed
+ * listing come back 403 "Invalid token.".
  *
  * For a call with path P and params K→V the interceptor computes:
  *
@@ -66,6 +74,14 @@ internal object VrfGenerator {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean = size > 400
     }
 
+    // --- QuickJS engine (primary) ----------------------------------------
+
+    private val quickJsLock = Any()
+    private var quickJsEngine: QuickJs? = null
+
+    /** Set when the QuickJS engine failed structurally; the WebView takes over. */
+    private var quickJsBroken = false
+
     /** Raw (unencoded) parameter value. */
     internal sealed class Param {
         data class Text(val value: String) : Param()
@@ -79,37 +95,59 @@ internal object VrfGenerator {
 
     /**
      * Computes the `vrf` token for [path] with [params]. Blocks the caller —
-     * call from a worker thread only.
+     * call from a worker thread only. Set [forceWebView] to bypass QuickJS
+     * and the token cache (the 403 self-heal path re-signs this way).
      */
-    fun token(path: String, params: Map<String, Param>): String {
+    fun token(
+        path: String,
+        params: Map<String, Param>,
+        forceWebView: Boolean = false,
+    ): String {
         val canonical = canonicalKey(path, params)
-        synchronized(lock) {
-            cache[canonical]?.let { return it }
+        if (!forceWebView) {
+            synchronized(lock) {
+                cache[canonical]?.let { return it }
+            }
         }
 
-        awaitReady()
-
-        val paramsJson = buildParamsJson(params).toString()
-        val pathJson = JsonPrimitive(path).toString()
+        // The site's glue does `JSON.parse(paramsJson)` — the params must
+        // arrive as a JSON *string*, not an object literal. `JsonPrimitive(...)
+        // .toString()` produces exactly that: a properly escaped string literal.
+        val pathJson = JsonPrimitive(path)
+        val paramsJson = JsonPrimitive(buildParamsJson(params).toString())
         val script = "window.__mfVrf($pathJson, $paramsJson)"
 
-        // The machine is initialized; a single evaluation is enough. Retry
-        // only for transient evaluate failures, briefly.
         var token: String? = null
-        for (attempt in 1..3) {
-            token = evaluate(script)
-            if (token != null) break
-            Thread.sleep(150L * attempt)
+        if (!forceWebView) {
+            // QuickJS first: pure JS, no network, no WebView lifecycle.
+            token = tokenViaQuickJs(script)
         }
+        if (token == null) {
+            awaitReady()
 
-        token ?: throw IOException(
-            "MangaFire: could not sign the request (the site's protection script failed to initialize)",
-        )
+            // The machine is initialized; a single evaluation is enough. Retry
+            // only for transient evaluate failures, briefly.
+            for (attempt in 1..3) {
+                token = evaluate(script)
+                if (token != null) break
+                Thread.sleep(150L * attempt)
+            }
+            token ?: throw IOException(
+                "MangaFire: could not sign the request (the site's protection script failed to initialize)",
+            )
+        }
 
         synchronized(lock) {
             cache[canonical] = token
         }
         return token
+    }
+
+    /** Drops every cached token — used by the 403 self-heal before a re-sign. */
+    fun invalidate() {
+        synchronized(lock) {
+            cache.clear()
+        }
     }
 
     /**
@@ -177,6 +215,38 @@ internal object VrfGenerator {
         }
     }
 
+    /** Runs the signing script through the embedded QuickJS engine, or null. */
+    private fun tokenViaQuickJs(script: String): String? {
+        synchronized(quickJsLock) {
+            if (quickJsBroken) return null
+            try {
+                val engine = quickJsEngine ?: QuickJs.create().also { engine ->
+                    engine.evaluate(QUICKJS_BOOTSTRAP)
+                    assetScripts().forEach(engine::evaluate)
+                    quickJsEngine = engine
+                }
+                // The glue returns an object; stringify it so it crosses the
+                // JNI boundary as a plain string.
+                val raw = engine.evaluate("JSON.stringify(($script) || {})") as? String
+                return parseVrfResult(raw)
+            } catch (_: Throwable) {
+                // Structural failure (engine API, OOM, asset parse): give up on
+                // QuickJS for the process lifetime — the WebView path is the
+                // proven fallback and is kept warm.
+                runCatching { quickJsEngine?.close() }
+                quickJsEngine = null
+                quickJsBroken = true
+                return null
+            }
+        }
+    }
+
+    /** The asset's `<script>` bodies, in document order (config, VM, glue). */
+    private fun assetScripts(): List<String> = Regex("<script>(.*?)</script>", RegexOption.DOT_MATCHES_ALL)
+        .findAll(assetHtml())
+        .map { it.groupValues[1] }
+        .toList()
+
     /** Same ordering rule the site's interceptor applies to its own input. */
     private fun canonicalKey(path: String, params: Map<String, Param>): String {
         if (params.isEmpty()) return path
@@ -222,11 +292,7 @@ internal object VrfGenerator {
                     try {
                         // evaluateJavascript returns a quote-wrapped JSON string.
                         val payload = Json.parseToJsonElement(value).jsonPrimitive.content
-                        val parsed = Json.parseToJsonElement(payload).jsonObject
-                        val vrf = parsed["vrf"]
-                        if (parsed["ok"]?.jsonPrimitive?.content == "true" && vrf != null && vrf !is JsonNull) {
-                            result.set(vrf.jsonPrimitive.content)
-                        }
+                        parseVrfResult(payload)?.let(result::set)
                     } catch (_: Throwable) {
                     } finally {
                         latch.countDown()
@@ -240,5 +306,28 @@ internal object VrfGenerator {
         return result.get()
     }
 
+    /** Parses the glue's `{ok, vrf}` result, or null when it did not sign. */
+    private fun parseVrfResult(raw: String?): String? {
+        raw ?: return null
+        return runCatching {
+            val parsed = Json.parseToJsonElement(raw).jsonObject
+            val vrf = parsed["vrf"]
+            if (parsed["ok"]?.jsonPrimitive?.content == "true" && vrf != null && vrf !is JsonNull) {
+                vrf.jsonPrimitive.content.takeIf(String::isNotEmpty)
+            } else {
+                null
+            }
+        }.getOrNull()
+    }
+
     private fun assetHtml(): String = applicationContext.assets.open("mfvrf.html").bufferedReader().use { it.readText() }
+
+    /** Shims the globals the asset expects from a browser before the
+     * site's scripts run in QuickJS. `navigator.appCodeName` is part of
+     * the VM's static key material and is "Mozilla" in every engine. */
+    private val QUICKJS_BOOTSTRAP = """
+        var window = globalThis;
+        var console = { log: function() {}, warn: function() {}, error: function() {}, info: function() {}, debug: function() {}, trace: function() {} };
+        var navigator = { appCodeName: "Mozilla", userAgent: "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36" };
+    """.trimIndent()
 }

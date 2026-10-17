@@ -531,14 +531,24 @@ abstract class MangaBall :
         // Mihon's language picker decides instead. Same strict rule Swarm and
         // MangaDot use: no chapters in this language → empty list, never a
         // mixed-language dump.
+        // v75: the site's chapter rows don't all use Mihon's language codes —
+        // Chinese is indexed as "cn" (never "zh"/"zh-Hant"; verified live:
+        // every zh-tagged title carries cn rows) and Korean appears as both
+        // "ko" and "kr". Map the source language onto the codes the rows
+        // actually carry before the strict filter.
         val preferredLang = lang.lowercase()
+        val preferredLangs = when (preferredLang) {
+            "zh" -> setOf("zh", "cn")
+            "ko" -> setOf("ko", "kr")
+            else -> setOf(preferredLang)
+        }
         val dedupe = preferences.deduplicateUploads()
 
         val rows = fetchedRows
             .filter { it.idOrNull() != null }
             .sortedByDescending { it.chapterNumber() }
 
-        val candidates = rows.filter { it.lang?.lowercase() == preferredLang }
+        val candidates = rows.filter { it.lang?.lowercase() in preferredLangs }
         if (candidates.isEmpty()) return emptyList()
 
         // One row per (chapter number, volume) when deduplicating: the site

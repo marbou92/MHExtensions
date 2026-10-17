@@ -22,6 +22,7 @@ import keiyoushi.utils.parseAs
 import kotlinx.serialization.Serializable
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
+import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.Response
@@ -36,8 +37,9 @@ import java.util.concurrent.TimeUnit
  *
  * React SPA backed by a clean JSON API. Every protected endpoint requires a
  * `vrf` protection token computed by the site's own obfuscated script — this
- * extension runs that exact script offline in a WebView (see [VrfGenerator])
- * and signs each request the way the site does:
+ * extension runs that exact script offline in an embedded QuickJS engine
+ * (WebView fallback — see [VrfGenerator]) and signs each request the way the
+ * site does:
  *
  *   canonical = path + "?" + sorted("k=v"; arrays k[0]=v, objects k[key]=v)
  *   request   = path + "?" + url-encoded params + "&vrf=" + token
@@ -66,6 +68,11 @@ abstract class MangaFire :
         // are shared back to okhttp through this interceptor's solver).
         .addInterceptor(CloudflareSolverInterceptor(setOf("mangafire.to")))
         .rateLimit(3)
+        // v75 self-heal: when the API rejects a carried token (site rotated
+        // its keys, stale cache entry, engine quirk), drop every cached token,
+        // re-sign THE SAME canonical through the WebView engine and replay
+        // the request once.
+        .addInterceptor(::selfHealInvalidToken)
         .build()
 
     init {
@@ -414,6 +421,72 @@ abstract class MangaFire :
     }
 
     // ============================= Helpers ===============================
+
+    /**
+     * Replays a 403 "Invalid token." response with a freshly signed token.
+     * Everything else (Cloudflare 403s carry no vrf and an HTML body; image
+     * hosts are other domains) passes through untouched.
+     */
+    private fun selfHealInvalidToken(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        val response = chain.proceed(request)
+        val url = request.url
+
+        if (response.code != 403 || url.queryParameter("vrf") == null || url.host != baseUrl.toHttpUrl().host) {
+            return response
+        }
+        val bodyText = runCatching { response.peekBody(4096L).string() }.getOrNull()
+        if (bodyText?.contains("Invalid token") != true) return response
+
+        val params = rebuildSignedParams(url) ?: return response
+        val signPath = url.encodedPathSegments
+            .takeIf { it.firstOrNull() == "api" }
+            ?.let { "/" + it.drop(1).joinToString("/") }
+            ?: url.encodedPath
+        VrfGenerator.invalidate()
+        val freshVrf = runCatching {
+            VrfGenerator.token(signPath, params, forceWebView = true)
+        }.getOrNull() ?: return response
+
+        response.close()
+        return chain.proceed(
+            request.newBuilder()
+                .url(url.newBuilder().setQueryParameter("vrf", freshVrf).build())
+                .build(),
+        )
+    }
+
+    /** Rebuilds the [VrfGenerator.Param] map a signed request URL carried:
+     * `k[]=v` (repeated) is a list, `k[name]=v` an object, bare `k=v` text. */
+    private fun rebuildSignedParams(url: HttpUrl): Map<String, VrfGenerator.Param>? {
+        val texts = linkedMapOf<String, String>()
+        val lists = linkedMapOf<String, MutableList<Pair<Int, String>>>()
+        val maps = linkedMapOf<String, MutableList<Pair<String, String>>>()
+        for (name in url.queryParameterNames) {
+            if (name == "vrf") continue
+            val values = url.queryParameterValues(name)
+            when {
+                name.endsWith("[]") ->
+                    lists.getOrPut(name.removeSuffix("[]")) { mutableListOf() }
+                        .addAll(values.mapIndexed { index, v -> index to (v ?: "") })
+                name.endsWith("]") -> {
+                    val key = name.substringBefore('[')
+                    val index = name.substringAfter('[', "").removeSuffix("]")
+                    maps.getOrPut(key) { mutableListOf() }
+                        .add(index to values.firstOrNull().orEmpty())
+                }
+                else -> texts[name] = values.firstOrNull().orEmpty()
+            }
+        }
+        if (texts.isEmpty() && lists.isEmpty() && maps.isEmpty()) return emptyMap()
+        return buildMap {
+            texts.forEach { (k, v) -> put(k, VrfGenerator.scalar(v)) }
+            lists.forEach { (k, v) ->
+                put(k, VrfGenerator.list(v.sortedBy { it.first }.map { it.second }))
+            }
+            maps.forEach { (k, v) -> put(k, VrfGenerator.obj(v.toMap())) }
+        }
+    }
 
     private fun hidOf(manga: SManga): String {
         val path = manga.url.substringBefore('#')

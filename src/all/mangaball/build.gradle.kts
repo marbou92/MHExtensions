@@ -4,12 +4,13 @@ plugins {
     alias(kei.plugins.extension)
 }
 
-// v74: one source per content language — language switching now happens in
+// v75: one source per content language — language switching happens in
 // Mihon's own UI (Browse → Languages → pick a language → MangaBall), exactly
 // like MangaDot. Each generated source strictly filters chapters to its
-// language. The codes are the site's own translation set, curated to the
-// languages the catalog actually serves — deliberately NOT every code it has
-// ever emitted.
+// language. The list is the site's own ground truth (2026-10-17): chapter
+// rows are coded es (never es-419), cn (never zh/zh-Hant — see the zh→cn
+// mapping in MangaBall.kt) and ko/kr; ja has no rows at all. Dead codes
+// es-419, ja and zh-Hant are dropped.
 //
 // NOTE for the maintainer: source ids are derived from name/lang/versionId,
 // so switching from the old single "all" source to per-language sources gives
@@ -17,14 +18,14 @@ plugins {
 // and need to be re-added under the new per-language sources (Mihon's source
 // migration can't carry them across a lang change).
 val languages = listOf(
-    "en", "es", "es-419", "pt-BR", "fr", "de", "it", "ru", "tr", "ar",
-    "id", "th", "vi", "hi", "tl", "ja", "ko", "zh", "zh-Hant", "pl",
+    "en", "es", "pt-BR", "fr", "de", "it", "ru", "tr", "ar",
+    "id", "th", "vi", "hi", "tl", "ko", "zh", "pl",
     "nl", "uk",
 )
 
 keiyoushi {
     name = "MangaBall"
-    versionCode = 10
+    versionCode = 11
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
