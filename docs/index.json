@@ -273,6 +273,23 @@
       "description": "WordPress manga/v1 JSON API with the theme's double-encoded filters and MD5 chapter tokens; curated TriState genre list."
     },
     {
+      "name": "MangaTek",
+      "pkg": "ar.mangatek",
+      "dirname": "mangatek",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.1",
+      "versionCode": 1,
+      "baseUrl": "https://mangatek.com",
+      "apk": "tachiyomi-ar.mangatek-v1.6.1-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatek-v1.6.1-release.apk",
+      "icon": "../icons/mangatek.png",
+      "note": "",
+      "description": ""
+    },
+    {
       "name": "ManhuaRMTL",
       "pkg": "all.manhuarmtl",
       "dirname": "manhuarmtl",
@@ -305,6 +322,23 @@
       "icon": "../icons/mkissa.png",
       "note": "Browse/search/details only \u2014 chapter images blocked by the site's anti-bot token",
       "description": "GraphQL persisted queries; browse/search/details only (anti-bot images)."
+    },
+    {
+      "name": "ProComic",
+      "pkg": "ar.procomic",
+      "dirname": "procomic",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.1",
+      "versionCode": 1,
+      "baseUrl": "https://procomic.pro",
+      "apk": "tachiyomi-ar.procomic-v1.6.1-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.1-release.apk",
+      "icon": "../icons/procomic.png",
+      "note": "",
+      "description": ""
     },
     {
       "name": "Swarm",
