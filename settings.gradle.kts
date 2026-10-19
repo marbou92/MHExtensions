@@ -50,6 +50,8 @@ loadIndividualExtension("en", "mangataro")
 loadIndividualExtension("en", "toonz")
 loadIndividualExtension("en", "mangago")
 loadIndividualExtension("all", "mangafire")
+loadIndividualExtension("ar", "mangatek")
+loadIndividualExtension("ar", "procomic")
 // loadAllIndividualExtensions()
 
 /**
