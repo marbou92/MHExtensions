@@ -105,6 +105,8 @@ class TocChapterDto(
     val language: String? = null,
     val group: String? = null,
     val translator: String? = null,
+    /** Only set by the chapters API rows (the reader TOC carries none). */
+    val publishedAt: String? = null,
 )
 
 // =============================== Reader ================================
@@ -171,6 +173,32 @@ class PlanDataDto(
 class PlanResponseDto(
     val success: Boolean? = null,
     val data: PlanDataDto? = null,
+)
+
+// ============================== Chapters API ============================
+
+/**
+ * GET /api/public/chapters?contentId={id}&page={n}&limit=50 —
+ * `{chapters:[...], total, hasMore}` — newest first, dates included. The
+ * server caps `limit` at 50. Works for client-rendered series too.
+ */
+@Serializable
+class ApiChapterDto(
+    val id: Int,
+    val content_id: Int? = null,
+    val chapter_number: String? = null,
+    val title: String? = null,
+    val language: String? = null,
+    val translator: String? = null,
+    val status: String? = null,
+    val created_at: String? = null,
+    val published_at: String? = null,
+)
+
+@Serializable
+class ApiChaptersResponseDto(
+    val chapters: List<ApiChapterDto> = emptyList(),
+    val hasMore: Boolean? = null,
 )
 
 // ========================= Latest-updates feed ==========================

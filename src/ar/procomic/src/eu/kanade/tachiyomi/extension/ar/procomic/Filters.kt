@@ -26,12 +26,13 @@ class TypeFilter :
     val selected get() = typeOptions[state].second
 }
 
+// Novels are not offered: their chapters are text (no page images) and
+// their pages render client-side, so the source drops novel rows everywhere.
 private val typeOptions = listOf(
     "الكل" to "",
     "مانجا (يابانية)" to "manga",
     "مانهوا (كورية)" to "manhwa",
     "مانها (صينية)" to "manhua",
-    "روايات" to "novel",
 )
 
 /**

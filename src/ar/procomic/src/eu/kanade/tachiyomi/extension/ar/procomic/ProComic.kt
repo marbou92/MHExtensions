@@ -2,6 +2,8 @@ package eu.kanade.tachiyomi.extension.ar.procomic
 
 import android.content.SharedPreferences
 import android.util.Log
+import androidx.preference.EditTextPreference
+import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -20,8 +22,6 @@ import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
-import kotlinx.coroutines.async
-import kotlinx.coroutines.coroutineScope
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -52,19 +52,27 @@ import kotlin.math.roundToInt
  *     "trusted" for requests that carry a non-empty `search` term and
  *     Turnstile-gated otherwise, so the source always sends one (`e` covers
  *     the overwhelmingly English-titled catalog for the popular tab).
+ *     Novel-type rows are dropped everywhere: novel chapters are text and
+ *     their pages render client-side, so they are unusable in a reader.
  *   - latest updates: the SSR flight payload of /ar/updates (18 groups with
  *     real chapter dates), with the paginated search API as fallback.
  *   - details: the SSR flight payload of the series page (`{"series":{...}}`
- *     with author/artist/year/descriptions.ar inside `metadata`).
+ *     with author/artist/year/descriptions.ar inside `metadata`). Series
+ *     whose page renders client-side (no flight payload at all — the old
+ *     chapter-list killer) fall back to the search API, matched by id.
  *   - chapters: the reader page of the series' newest chapter embeds the
  *     FULL chapter table of contents (ids, numbers, teams) — the series
  *     page only carries the latest 30 (with dates), which are merged in.
+ *     Series that render client-side get their full TOC from the public
+ *     chapters API (/api/public/chapters?contentId=...) instead.
  *   - pages: reader SSR exposes a few direct CDN images plus a
  *     `deferredMedia` JWT; ProtectedPageInterceptor stitches the remaining
  *     pages through /chapter-deferred-media + /chapter-map-proxy-plan.
  *
- * Details follow the MangaDot description layout: star rating header, a meta
- * info line, the synopsis, a Links section.
+ * Details follow the Comix description layout: the star score and a bold
+ * info line rendered once in the configured position, the synopsis, and —
+ * behind the same options the Comix source ships — tag and blocked-genre
+ * filtering.
  */
 @Source
 abstract class ProComic :
@@ -163,7 +171,7 @@ abstract class ProComic :
                 }
                 runCatching { json.decodeFromString(UpdateRowDto.serializer(), obj) }
                     .getOrNull()
-                    ?.takeIf { row -> row.chapters.isNotEmpty() }
+                    ?.takeIf { row -> row.chapters.isNotEmpty() && !row.type.equals("novel", true) }
                     ?.let(rows::add)
                 index = objStart + obj.length
             }
@@ -177,12 +185,7 @@ abstract class ProComic :
         title = mangaTitle
         thumbnail_url = coverImage?.takeIf { it.startsWith("http") }
         genre = type?.let { it.replaceFirstChar { c -> c.uppercase() } }
-        status = when (this@toSManga.status) {
-            "مستمر" -> SManga.ONGOING
-            "مكتمل" -> SManga.COMPLETED
-            "متوقف" -> SManga.ON_HIATUS
-            else -> SManga.UNKNOWN
-        }
+        status = this@toSManga.status.toProComicStatus()
         initialized = true
     }
 
@@ -211,6 +214,28 @@ abstract class ProComic :
         genres: String = "",
         year: String = "",
     ): MangasPage {
+        val data = searchSeries(query, sort, page, type, genres, year)
+        // Novel rows are dropped: text chapters, client-rendered pages —
+        // nothing a reader can show.
+        val rows = data.data.filterNot { it.type.equals("novel", true) }
+        val hasNext = when (val pages = data.meta?.pages) {
+            null -> rows.size >= PAGE_LIMIT
+            else -> page < pages
+        }
+        return MangasPage(
+            rows.map { series -> series.toSManga() },
+            hasNext && rows.isNotEmpty(),
+        )
+    }
+
+    private suspend fun searchSeries(
+        query: String,
+        sort: String,
+        page: Int,
+        type: String = "",
+        genres: String = "",
+        year: String = "",
+    ): SearchResponseDto {
         val url = "$baseUrl/api/public/series/search".toHttpUrl().newBuilder().apply {
             addQueryParameter("status", "approved")
             addQueryParameter("limit", PAGE_LIMIT.toString())
@@ -234,15 +259,7 @@ abstract class ProComic :
                 throw IOException("ProComic: the search endpoint challenged this client (Turnstile)")
             }
             if (!it.isSuccessful) throw IOException("HTTP ${it.code} while searching ProComic")
-            val data = json.decodeFromString(SearchResponseDto.serializer(), it.body.string())
-            val hasNext = when (val pages = data.meta?.pages) {
-                null -> data.data.size >= PAGE_LIMIT
-                else -> page < pages
-            }
-            return MangasPage(
-                data.data.map { series -> series.toSManga() },
-                hasNext && data.data.isNotEmpty(),
-            )
+            return json.decodeFromString(SearchResponseDto.serializer(), it.body.string())
         }
     }
 
@@ -254,12 +271,7 @@ abstract class ProComic :
             this@toSManga.type?.let { add(it.replaceFirstChar { c -> c.uppercase() }) }
             addAll(this@toSManga.metadata?.genres.orEmpty())
         }.distinct().joinToString(", ")
-        status = when (this@toSManga.progress) {
-            "مستمر" -> SManga.ONGOING
-            "مكتمل" -> SManga.COMPLETED
-            "متوقف" -> SManga.ON_HIATUS
-            else -> SManga.UNKNOWN
-        }
+        status = progress.toProComicStatus()
         initialized = true
     }
 
@@ -340,18 +352,66 @@ abstract class ProComic :
         chapters: List<SChapter>,
         fetchDetails: Boolean,
         fetchChapters: Boolean,
-    ): SMangaUpdate = coroutineScope {
-        val detailsDeferred = async {
-            if (fetchDetails) fetchSeriesDetails(manga) else manga
+    ): SMangaUpdate {
+        if (fetchDetails && fetchChapters) {
+            // One series-page fetch feeds both details and the chapter
+            // list — fetching them independently would issue the same
+            // GET twice, concurrently.
+            val pageData = fetchSeriesPageWithFallback(manga)
+            return SMangaUpdate(buildManga(manga, pageData), buildChapters(manga, pageData))
         }
-        val chaptersDeferred = async {
-            if (fetchChapters) fetchChapterListInternal(manga) else chapters
+        if (fetchChapters) {
+            return SMangaUpdate(manga, buildChapters(manga, fetchSeriesPageWithFallback(manga)))
         }
-        SMangaUpdate(detailsDeferred.await(), chaptersDeferred.await())
+        if (fetchDetails) {
+            return SMangaUpdate(fetchSeriesDetails(manga), chapters)
+        }
+        return SMangaUpdate(manga, chapters)
     }
 
-    private suspend fun fetchSeriesDetails(manga: SManga): SManga {
-        val pageData = fetchSeriesPage(manga.url)
+    private suspend fun fetchSeriesDetails(manga: SManga): SManga = buildManga(manga, fetchSeriesPageWithFallback(manga))
+
+    /**
+     * Some series render client-side: their SSR flight carries no
+     * `{"series":{...}}` payload at all (novels are the usual case, and
+     * they are filtered out of every list for exactly this reason). When
+     * the series page comes back without a payload, fall back to the
+     * trusted search API and match the row by id.
+     */
+    private suspend fun fetchSeriesPageWithFallback(manga: SManga): SeriesPageData = runCatching { fetchSeriesPage(manga.url) }
+        .recoverCatching { error ->
+            Log.w(TAG, "series page failed (${error.message}); falling back to the search API", error)
+            fetchSeriesPageViaSearch(manga) ?: throw error
+        }
+        .getOrThrow()
+
+    private suspend fun fetchSeriesPageViaSearch(manga: SManga): SeriesPageData? {
+        val id = manga.url.substringAfterLast('-').toIntOrNull() ?: return null
+        val slug = manga.url.substringBeforeLast('-')
+        for (term in listOf(slug, slug.replace('-', ' '))) {
+            val row = runCatching { searchSeries(term, sort = "latest", page = 1) }
+                .getOrNull()
+                ?.data
+                ?.firstOrNull { it.id == id }
+                ?: continue
+            return SeriesPageData(
+                series = SeriesDetailsDto(
+                    id = row.id,
+                    title = row.title,
+                    slug = row.slug,
+                    type = row.type,
+                    description = row.description,
+                    thumbnail = row.thumbnail,
+                    metadata = row.metadata,
+                ),
+                recentChapters = emptyList(),
+                statusText = row.progress,
+            )
+        }
+        return null
+    }
+
+    private fun buildManga(manga: SManga, pageData: SeriesPageData): SManga {
         val series = pageData.series
         val meta = series.metadata
         val showTags = preferences.getBoolean(PREF_SHOW_TAGS, true)
@@ -368,76 +428,118 @@ abstract class ProComic :
                 if (showTags) {
                     meta?.tags.orEmpty().forEach { add(it.trim()) }
                 }
-            }.distinct().joinToString(", ")
-            // The series SSR carries no publish status — leave it unknown
-            // (browse rows carry the site's own progress field instead).
-            status = SManga.UNKNOWN
+            }.distinct()
+                .filterNot { it.lowercase() in blockedGenres() }
+                .joinToString(", ")
+                .ifBlank { null }
+            // The series SSR carries no publish status; the search fallback
+            // carries the site's own progress field when available.
+            status = pageData.statusText.toProComicStatus()
             description = buildDescription(series)
             initialized = true
         }
     }
 
+    private fun String?.toProComicStatus(): Int = when (this) {
+        "مستمر" -> SManga.ONGOING
+        "مكتمل" -> SManga.COMPLETED
+        "متوقف" -> SManga.ON_HIATUS
+        else -> SManga.UNKNOWN
+    }
+
+    private fun blockedGenres(): Set<String> = preferences.getString(PREF_BLOCKED_GENRES, "")
+        ?.split(',')
+        ?.map { it.trim().lowercase() }
+        ?.filter { it.isNotBlank() }
+        ?.toSet()
+        ?: emptySet()
+
     /**
-     * MangaDot-style description block:
-     *   ★★★★★ 4.99
-     *   **Year:** 2023 · **Chapters:** 307 · 1614 ratings
-     *   ---
+     * Comix-style description block (score rendered exactly once, in the
+     * configured position):
+     *   ★★★★☆ 4.99
+     *   **Year:** 2023 · **Chapters:** 307 · **Favorites:** 493 · **1614 ratings**
      *   <Arabic synopsis>
-     *   **Links:** - [Source](...)
+     *   ★★★★☆ 4.99
+     *   **Year:** 2023 · **Chapters:** 307 · ...
      */
-    private fun buildDescription(series: SeriesDetailsDto): String = buildString {
-        val rating = series.average_rating
-        if (rating != null && rating > 0.0) {
-            val stars = rating.roundToInt().coerceIn(0, 5)
-            append(
-                "${"★".repeat(stars)}${"☆".repeat(5 - stars)} " +
-                    String.format(Locale.US, "%.2f", rating),
-                "\n\n",
-            )
+    private fun buildDescription(series: SeriesDetailsDto): String {
+        val showExtraInfo = preferences.getBoolean(PREF_SHOW_EXTRA_INFO, true)
+        val scorePosition = preferences.getString(PREF_SCORE_POSITION, "end") ?: "end"
+
+        val rating = series.average_rating?.takeIf { it > 0.0 }
+        val stars = rating?.let {
+            val full = it.roundToInt().coerceIn(0, 5)
+            "★".repeat(full) + "☆".repeat(5 - full) + " " +
+                String.format(Locale.US, "%.2f", it)
         }
 
-        val metaInfo = buildList {
-            series.metadata?.year?.takeIf { it.isNotBlank() }?.let { add("**Year:** $it") }
-            series.chaptersCount?.let { add("**Chapters:** $it") }
-            series.favorites_count?.takeIf { it > 0 }?.let { add("$it favorites") }
-            series.ratings_count?.takeIf { it > 0 }?.let { add("$it ratings") }
-        }
-        if (metaInfo.isNotEmpty()) {
-            append(metaInfo.joinToString(" · "), "\n\n")
-        }
-
-        if (isNotEmpty()) {
-            append("---\n\n")
-        }
-
-        val synopsis = series.metadata?.descriptions?.get("ar")
-            ?: series.metadata?.descriptions?.values?.firstOrNull()
-            ?: series.description
-        synopsis?.let {
-            append(
-                it.replace("\r\n", "\n")
-                    .replace(Regex("\n{3,}"), "\n\n")
-                    .trim(),
-                "\n\n",
-            )
+        val infoLine = if (showExtraInfo) {
+            buildString {
+                series.metadata?.year?.takeIf { it.isNotBlank() }?.let { append("**Year:** $it") }
+                series.chaptersCount?.takeIf { it > 0 }?.let {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Chapters:** $it")
+                }
+                series.favorites_count?.takeIf { it > 0 }?.let {
+                    if (isNotEmpty()) append(" · ")
+                    append("**Favorites:** $it")
+                }
+                series.ratings_count?.takeIf { it > 0 }?.let {
+                    if (isNotEmpty()) append(" · ")
+                    append("**$it ratings**")
+                }
+            }.ifBlank { null }
+        } else {
+            null
         }
 
-        listOfNotNull(
-            "[Source](${seriesPageUrl(series.slug + "-" + series.id)})",
-        ).also { links ->
-            if (links.isNotEmpty()) {
-                append("\n**Links:**\n")
-                links.forEach { link -> append("- ", link, "\n") }
+        return buildString {
+            if (scorePosition == "top" && stars != null) {
+                append(stars)
+                append("\n")
+                if (infoLine != null) {
+                    append(infoLine)
+                    append("\n\n")
+                } else {
+                    append("\n\n")
+                }
             }
-        }
-    }.trim()
+
+            val synopsis = series.metadata?.descriptions?.get("ar")
+                ?: series.metadata?.descriptions?.values?.firstOrNull()
+                ?: series.description
+            synopsis?.let {
+                append(
+                    it.replace("\r\n", "\n")
+                        .replace(Regex("\n{3,}"), "\n\n")
+                        .trim(),
+                )
+            }
+
+            if (scorePosition == "end" && stars != null) {
+                if (isNotEmpty()) append("\n\n")
+                append(stars)
+                if (infoLine != null) {
+                    append("\n")
+                    append(infoLine)
+                }
+            }
+
+            if (scorePosition == "none" && infoLine != null) {
+                if (isNotEmpty()) append("\n\n")
+                append(infoLine)
+            }
+        }.trim()
+    }
 
     // ============================= Chapters ==============================
 
-    /** Parsed from the series page flight payload. */
+    /** Parsed from the series page flight payload (or the search fallback). */
     private class SeriesPageData(
         val series: SeriesDetailsDto,
         val recentChapters: List<ChapterRowDto>,
+        val statusText: String? = null,
     )
 
     private suspend fun fetchSeriesPage(mangaUrl: String): SeriesPageData {
@@ -479,21 +581,31 @@ abstract class ProComic :
         return rows
     }
 
-    private suspend fun fetchChapterListInternal(manga: SManga): List<SChapter> {
-        val pageData = fetchSeriesPage(manga.url)
+    private suspend fun buildChapters(manga: SManga, pageData: SeriesPageData): List<SChapter> {
         val recent = pageData.recentChapters
         val newestChapter = recent.maxByOrNull { it.id }
         val seriesSlug = manga.url.substringBeforeLast('-')
+        val seriesId = manga.url.substringAfterLast('-').toIntOrNull()
 
-        // Full TOC lives on the newest chapter's reader page.
-        val toc: List<TocChapterDto> = newestChapter?.let { chapter ->
+        // Full TOC lives on the newest chapter's reader page (one request,
+        // SSR series only). Client-rendered series have no recent rows to
+        // anchor that request, and their reader route is client-side too —
+        // for those the public chapters API is the full-TOC source.
+        var toc: List<TocChapterDto> = newestChapter?.let { chapter ->
             val number = chapter.chapter_number ?: ""
             runCatching {
                 fetchReaderToc(chapterPageUrl(ChapterRef(seriesSlug, number, chapter.id)))
             }
-                .onFailure { Log.w(TAG, "reader TOC failed; using the recent-30 list", it) }
+                .onFailure { Log.w(TAG, "reader TOC failed; trying the chapters API", it) }
                 .getOrNull()
         }.orEmpty()
+
+        if (toc.isEmpty() && seriesId != null) {
+            toc = runCatching { fetchChaptersApi(seriesId) }
+                .onFailure { Log.w(TAG, "chapters API failed (${it.message}); using the recent list", it) }
+                .getOrNull()
+                .orEmpty()
+        }
 
         val entries = toc.ifEmpty {
             recent.map { row ->
@@ -503,6 +615,7 @@ abstract class ProComic :
                     language = row.language,
                     group = null,
                     translator = row.translator,
+                    publishedAt = row.published_at,
                 )
             }
         }
@@ -533,7 +646,7 @@ abstract class ProComic :
                     scanlator = entry.group?.takeIf { it.isNotBlank() && it != "null" }
                         ?: entry.translator?.takeIf { it.isNotBlank() && it != "null" }
                         ?: row?.translator?.takeIf { it.isNotBlank() }
-                    date_upload = parseDate(row?.published_at)
+                    date_upload = parseDate(row?.published_at ?: entry.publishedAt)
                 }
             }
     }
@@ -560,6 +673,47 @@ abstract class ProComic :
                     }.getOrNull()
                 }
         }
+    }
+
+    /**
+     * GET /api/public/chapters?contentId={seriesId}&page={n}&limit=50 —
+     * `{chapters:[...], hasMore}` — newest first, dates included. The server
+     * caps `limit` at 50; page through until `hasMore` flips false.
+     */
+    private suspend fun fetchChaptersApi(seriesId: Int): List<TocChapterDto> {
+        val entries = mutableListOf<TocChapterDto>()
+        var page = 1
+        while (page <= 30) { // 30 × 50 = 1500 chapters — far past any series
+            val url = "$baseUrl/api/public/chapters".toHttpUrl().newBuilder()
+                .addQueryParameter("contentId", seriesId.toString())
+                .addQueryParameter("page", page.toString())
+                .addQueryParameter("limit", "50")
+                .build()
+            val request = Request.Builder()
+                .url(url)
+                .header("Accept", "application/json")
+                .header("Referer", "$baseUrl/ar/series")
+                .build()
+
+            val response = client.newCall(request).execute()
+            response.use {
+                if (!it.isSuccessful) throw IOException("HTTP ${it.code} on chapters API")
+                val data = json.decodeFromString(ApiChaptersResponseDto.serializer(), it.body.string())
+                entries += data.chapters.map { row ->
+                    TocChapterDto(
+                        id = row.id,
+                        chapterNumber = row.chapter_number,
+                        language = row.language,
+                        group = null,
+                        translator = row.translator,
+                        publishedAt = row.published_at,
+                    )
+                }
+                if (data.hasMore != true) return entries
+                page++
+            }
+        }
+        return entries
     }
 
     // =============================== Pages ===============================
@@ -707,12 +861,35 @@ abstract class ProComic :
     // ========================= Preference screen =========================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        // ---- Details screen ----
+        // ---- Description (the Comix-style options) ----
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SHOW_EXTRA_INFO
+            title = "Show extra info in description"
+            summary = "Display year, chapter count, favorites and ratings"
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_TAGS
-            title = "Show tags in details"
-            summary = "List the title's tags after the genres in its description"
+            title = "Show tags in genre chips"
+            summary = "Include the title's tags in the genre field"
             setDefaultValue(true)
+        }.let(screen::addPreference)
+
+        EditTextPreference(screen.context).apply {
+            key = PREF_BLOCKED_GENRES
+            title = "Blocked genres"
+            summary = "Comma-separated genre names to hide from the genre field"
+            setDefaultValue("")
+        }.let(screen::addPreference)
+
+        ListPreference(screen.context).apply {
+            key = PREF_SCORE_POSITION
+            title = "Score display position"
+            summary = "Where to display the manga score"
+            entries = arrayOf("Don't show", "Top of description", "End of description")
+            entryValues = arrayOf("none", "top", "end")
+            setDefaultValue("end")
         }.let(screen::addPreference)
     }
 
@@ -725,6 +902,9 @@ abstract class ProComic :
         const val CATALOG_QUERY = "e"
 
         const val PREF_SHOW_TAGS = "pref_show_tags"
+        const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
+        const val PREF_BLOCKED_GENRES = "pref_blocked_genres"
+        const val PREF_SCORE_POSITION = "pref_score_position"
 
         val GENRE_FALLBACK = listOf(
             "Action", "Adventure", "Comedy", "Doujinshi", "Drama", "Ecchi",
