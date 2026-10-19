@@ -37,9 +37,9 @@ import java.util.concurrent.TimeUnit
  *
  * React SPA backed by a clean JSON API. Every protected endpoint requires a
  * `vrf` protection token computed by the site's own obfuscated script — this
- * extension runs that exact script offline in an embedded QuickJS engine
- * (WebView fallback — see [VrfGenerator]) and signs each request the way the
- * site does:
+ * extension runs that exact script offline inside an app WebView (see
+ * [VrfGenerator] for why the WebView is the only engine that can sign here)
+ * and signs each request the way the site does:
  *
  *   canonical = path + "?" + sorted("k=v"; arrays k[0]=v, objects k[key]=v)
  *   request   = path + "?" + url-encoded params + "&vrf=" + token
@@ -69,9 +69,9 @@ abstract class MangaFire :
         .addInterceptor(CloudflareSolverInterceptor(setOf("mangafire.to")))
         .rateLimit(3)
         // v75 self-heal: when the API rejects a carried token (site rotated
-        // its keys, stale cache entry, engine quirk), drop every cached token,
-        // re-sign THE SAME canonical through the WebView engine and replay
-        // the request once.
+        // its keys, stale cache entry), drop every cached token, re-sign THE
+        // SAME canonical fresh through the WebView engine and replay the
+        // request once.
         .addInterceptor(::selfHealInvalidToken)
         .build()
 

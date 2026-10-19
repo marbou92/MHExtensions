@@ -5,7 +5,6 @@ import android.os.Handler
 import android.os.Looper
 import android.webkit.WebView
 import android.webkit.WebViewClient
-import app.cash.quickjs.QuickJs
 import keiyoushi.utils.applicationContext
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonNull
@@ -35,12 +34,30 @@ import java.util.concurrent.atomic.AtomicReference
  * (`extendClient(instance)` registers the site's own request interceptor),
  * and asks that interceptor for the token — the site's code does the signing.
  *
- * v75: the asset runs in an embedded QuickJS engine first (no WebView
- * lifecycle, works on any thread); the WebView is the fallback engine and
- * stays warm for it. The glue expects the params as a JSON *string* (it
- * `JSON.parse()`s its input) — the object literal v74 passed made that parse
- * throw, the canonical silently collapse to the bare path, and every signed
- * listing come back 403 "Invalid token.".
+ * v78 (WebView-only): the v75 build preferred an embedded QuickJS engine.
+ * Live probes proved that path can NEVER produce a server-valid token here —
+ * the site's VM resolves `document`, timers, TextEncoder and atob at init
+ * (QuickJS throws on every one of them, so the engine was permanently
+ * self-disabling), and once fed shims it still minted tokens the API rejects
+ * with 403 "Invalid token." while the identical input signed through a V8
+ * (Chromium/WebView) engine returns 200. The site's verification is
+ * V8-compatible, so the only correct engine is a real WebView. Removing
+ * QuickJS also removes the poisoned fast path that made every request pay a
+ * 403 round-trip before the self-heal could recover it.
+ *
+ * v78 also fixes the WebView bridge itself: `evaluateJavascript` returns the
+ * glue result as a JSON *object* text (`{"ok":true,"vrf":...}`), and the old
+ * bridge called `.jsonPrimitive` on it — which always throws, so every sign
+ * attempt failed and surfaced as "could not sign the request (the site's
+ * protection script failed to initialize)" no matter how healthy the page
+ * was. The bridge now parses the object directly, probes the page for real
+ * readiness (`typeof window.__mfVrf === "function"`), reports page-side
+ * diagnostics in failures, and rebuilds a suspect WebView instead of
+ * hammering a dead renderer.
+ *
+ * The glue expects the params as a JSON *string* (it `JSON.parse()`s its
+ * input) — an object literal makes that parse throw, the canonical collapses
+ * to the bare path, and every signed listing comes back 403 "Invalid token.".
  *
  * For a call with path P and params K→V the interceptor computes:
  *
@@ -60,6 +77,9 @@ import java.util.concurrent.atomic.AtomicReference
 internal object VrfGenerator {
 
     private const val READY_TIMEOUT_MS = 15_000L
+    private const val READY_POLL_INTERVAL_MS = 250L
+    private const val READY_POLL_ATTEMPTS = 40
+    private const val EVAL_TIMEOUT_MS = 10_000L
 
     private val mainHandler = Handler(Looper.getMainLooper())
 
@@ -69,18 +89,16 @@ internal object VrfGenerator {
     /** Set once the WebView has loaded the asset and `window.__mfVrf` exists. */
     private var readyLatch: CountDownLatch? = null
 
+    /** Why the last initialization attempt failed, for error messages. */
+    private var initError: Throwable? = null
+
+    /** Last readiness probe detail (`typeof __mfVrf`, glue error, ...). */
+    private var lastProbe: String? = null
+
     /** canonical request string -> vrf token (the algorithm is pure). */
     private val cache = object : LinkedHashMap<String, String>(64, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, String>): Boolean = size > 400
     }
-
-    // --- QuickJS engine (primary) ----------------------------------------
-
-    private val quickJsLock = Any()
-    private var quickJsEngine: QuickJs? = null
-
-    /** Set when the QuickJS engine failed structurally; the WebView takes over. */
-    private var quickJsBroken = false
 
     /** Raw (unencoded) parameter value. */
     internal sealed class Param {
@@ -95,8 +113,8 @@ internal object VrfGenerator {
 
     /**
      * Computes the `vrf` token for [path] with [params]. Blocks the caller —
-     * call from a worker thread only. Set [forceWebView] to bypass QuickJS
-     * and the token cache (the 403 self-heal path re-signs this way).
+     * call from a worker thread only. Set [forceWebView] (the 403 self-heal
+     * re-sign path) to bypass the token cache and mint a fresh token.
      */
     fun token(
         path: String,
@@ -117,30 +135,33 @@ internal object VrfGenerator {
         val paramsJson = JsonPrimitive(buildParamsJson(params).toString())
         val script = "window.__mfVrf($pathJson, $paramsJson)"
 
-        var token: String? = null
-        if (!forceWebView) {
-            // QuickJS first: pure JS, no network, no WebView lifecycle.
-            token = tokenViaQuickJs(script)
-        }
-        if (token == null) {
-            awaitReady()
+        awaitReady()
 
-            // The machine is initialized; a single evaluation is enough. Retry
-            // only for transient evaluate failures, briefly.
-            for (attempt in 1..3) {
-                token = evaluate(script)
-                if (token != null) break
-                Thread.sleep(150L * attempt)
+        // The machine is initialized; a single evaluation is enough. Retry
+        // only for transient evaluate failures, briefly.
+        for (attempt in 1..3) {
+            evaluate(script)?.let { token ->
+                synchronized(lock) { cache[canonical] = token }
+                return token
             }
-            token ?: throw IOException(
-                "MangaFire: could not sign the request (the site's protection script failed to initialize)",
-            )
+            Thread.sleep(150L * attempt)
         }
 
-        synchronized(lock) {
-            cache[canonical] = token
+        // Three null results in a row means the WebView itself is suspect
+        // (dead renderer, crashed page). Rebuild it once and try again —
+        // this is what recovers a signing machine that died mid-session.
+        resetWebView()
+        awaitReady()
+        evaluate(script)?.let { token ->
+            synchronized(lock) { cache[canonical] = token }
+            return token
         }
-        return token
+
+        throw IOException(
+            "MangaFire: could not sign the request (the site's protection script failed to initialize" +
+                detailSuffix() +
+                ")",
+        )
     }
 
     /** Drops every cached token — used by the 403 self-heal before a re-sign. */
@@ -159,25 +180,48 @@ internal object VrfGenerator {
         runCatching { awaitReady() }
     }
 
+    /**
+     * Destroys the current WebView (if any) so the next [awaitReady] builds a
+     * fresh one. Called after repeated evaluation failures — a dead renderer
+     * never answers `evaluateJavascript`, and only a rebuild un-sticks it.
+     */
+    private fun resetWebView() {
+        synchronized(lock) {
+            runCatching { webView?.destroy() }
+            webView = null
+            readyLatch = null
+            initError = null
+        }
+    }
+
     /** Blocks until the WebView has loaded the signing asset, or throws. */
     private fun awaitReady() {
         val latch = synchronized(lock) {
             readyLatch ?: run {
                 val new = CountDownLatch(1)
                 readyLatch = new
+                initError = null
                 mainHandler.post { initialize() }
                 new
             }
         }
         if (!latch.await(READY_TIMEOUT_MS, TimeUnit.MILLISECONDS)) {
             throw IOException(
-                "MangaFire: the signing WebView did not initialize in time — try again",
+                "MangaFire: the signing WebView did not initialize in time" + detailSuffix(),
+            )
+        }
+        // initialize() releases the latch early on failure too — with the
+        // reason recorded. surface it instead of signing against nothing.
+        synchronized(lock) { initError }?.let { error ->
+            throw IOException(
+                "MangaFire: the signing WebView failed to initialize" + detailSuffix(),
+                error,
             )
         }
     }
 
     /** Runs on the main thread. Creates the WebView, loads the asset, and
-     * waits for the page's own `__mfVrfReady` flag before releasing callers. */
+     * waits for the page's `__mfVrf` function before releasing callers. */
     @SuppressLint("SetJavaScriptEnabled")
     private fun initialize() {
         val latch = synchronized(lock) { readyLatch } ?: return
@@ -196,11 +240,34 @@ internal object VrfGenerator {
             wv.webViewClient = object : WebViewClient() {
                 override fun onPageFinished(view: WebView, url: String) {
                     fun poll(attempt: Int) {
-                        view.evaluateJavascript("!!window.__mfVrfReady") { value ->
-                            if (value?.contains("true") == true) {
+                        // Probe the real signing entry point, and carry back
+                        // the glue's own error string when it is not there.
+                        view.evaluateJavascript(READY_PROBE) { value ->
+                            val probe = parseProbe(value)
+                            synchronized(lock) { lastProbe = probe?.toString() }
+                            if (probe?.function == "function") {
                                 latch.countDown()
-                            } else if (attempt < 25) {
-                                mainHandler.postDelayed({ poll(attempt + 1) }, 200)
+                            } else if (attempt < READY_POLL_ATTEMPTS) {
+                                mainHandler.postDelayed({ poll(attempt + 1) }, READY_POLL_INTERVAL_MS)
+                            } else {
+                                // Poll exhausted: never leave waiters hanging —
+                                // fail them now with what the page reported,
+                                // and drop the machine so the NEXT request
+                                // rebuilds a fresh WebView instead of
+                                // inheriting this failure forever. (The
+                                // destroy is deferred out of this callback —
+                                // destroying a view from inside its own
+                                // client callback is not safe.)
+                                val stale = view
+                                mainHandler.post { runCatching { stale.destroy() } }
+                                synchronized(lock) {
+                                    webView = null
+                                    readyLatch = null
+                                    initError = IllegalStateException(
+                                        "ready flag never appeared (probe: " + (probe?.toString() ?: "no answer") + ")",
+                                    )
+                                }
+                                latch.countDown()
                             }
                         }
                     }
@@ -208,44 +275,100 @@ internal object VrfGenerator {
                 }
             }
             wv.loadDataWithBaseURL("https://mangafire.to/", assetHtml(), "text/html", "UTF-8", null)
-        } catch (_: Throwable) {
-            // Let awaitReady() time out with a clear IOException instead of
+        } catch (t: Throwable) {
+            // Let awaitReady() fail fast with the real cause instead of
             // leaving callers blocked forever.
+            synchronized(lock) {
+                initError = t
+            }
             latch.countDown()
         }
     }
 
-    /** Runs the signing script through the embedded QuickJS engine, or null. */
-    private fun tokenViaQuickJs(script: String): String? {
-        synchronized(quickJsLock) {
-            if (quickJsBroken) return null
-            try {
-                val engine = quickJsEngine ?: QuickJs.create().also { engine ->
-                    engine.evaluate(QUICKJS_BOOTSTRAP)
-                    assetScripts().forEach(engine::evaluate)
-                    quickJsEngine = engine
-                }
-                // The glue returns an object; stringify it so it crosses the
-                // JNI boundary as a plain string.
-                val raw = engine.evaluate("JSON.stringify(($script) || {})") as? String
-                return parseVrfResult(raw)
-            } catch (_: Throwable) {
-                // Structural failure (engine API, OOM, asset parse): give up on
-                // QuickJS for the process lifetime — the WebView path is the
-                // proven fallback and is kept warm.
-                runCatching { quickJsEngine?.close() }
-                quickJsEngine = null
-                quickJsBroken = true
-                return null
+    /** Assembles the failure detail appended to IOException messages. */
+    private fun detailSuffix(): String {
+        val parts = buildList {
+            synchronized(lock) {
+                initError?.let { add("init=" + (it.message ?: it::class.java.simpleName)) }
+                lastProbe?.let { add("probe=" + it) }
             }
         }
+        return if (parts.isEmpty()) "" else ": " + parts.joinToString(", ")
     }
 
-    /** The asset's `<script>` bodies, in document order (config, VM, glue). */
-    private fun assetScripts(): List<String> = Regex("<script>(.*?)</script>", RegexOption.DOT_MATCHES_ALL)
-        .findAll(assetHtml())
-        .map { it.groupValues[1] }
-        .toList()
+    /**
+     * Runs [script] on the WebView and returns `out.vrf`, or null when it
+     * did not sign.
+     */
+    private fun evaluate(script: String): String? {
+        val latch = CountDownLatch(1)
+        val result = AtomicReference<String?>(null)
+
+        mainHandler.post {
+            try {
+                val wv = webView
+                if (wv == null) {
+                    latch.countDown()
+                    return@post
+                }
+                wv.evaluateJavascript(script) { value ->
+                    try {
+                        // evaluateJavascript hands back the result object
+                        // serialized as JSON text (`{"ok":true,"vrf":"..."}`).
+                        // Parse it AS AN OBJECT — unwrapping it through
+                        // `.jsonPrimitive` (as v75 did) throws on every
+                        // successful sign and made the whole bridge look dead.
+                        parseVrfResult(value)?.let(result::set)
+                    } finally {
+                        latch.countDown()
+                    }
+                }
+            } catch (_: Throwable) {
+                latch.countDown()
+            }
+        }
+        latch.await(EVAL_TIMEOUT_MS, TimeUnit.SECONDS)
+        return result.get()
+    }
+
+    /**
+     * The readiness probe: returns a JSON STRING (so it crosses
+     * `evaluateJavascript` as a quoted string literal, not an object).
+     */
+    private const val READY_PROBE =
+        """JSON.stringify({fn: typeof window.__mfVrf, ready: !!window.__mfVrfReady, err: window.__mfVrfError || null})"""
+
+    private class Probe(val function: String?, val error: String?) {
+        override fun toString(): String = "fn=" + (function ?: "?") + (error?.let { ", err=" + it } ?: "")
+    }
+
+    /** Unwraps the quoted-string probe result, or null when unparseable. */
+    private fun parseProbe(value: String?): Probe? {
+        val text = value ?: return null
+        return runCatching {
+            val inner = Json.parseToJsonElement(text).jsonPrimitive.content
+            val obj = Json.parseToJsonElement(inner).jsonObject
+            val fn = obj["fn"]?.jsonPrimitive?.takeIf { it !is JsonNull }?.content
+            val err = obj["err"]?.jsonPrimitive?.takeIf { it !is JsonNull }?.content
+            Probe(fn, err)
+        }.getOrNull()
+    }
+
+    /** Parses the glue's `{ok, vrf}` result, or null when it did not sign. */
+    private fun parseVrfResult(raw: String?): String? {
+        raw ?: return null
+        return runCatching {
+            val parsed = Json.parseToJsonElement(raw).jsonObject
+            val vrf = parsed["vrf"]
+            if (parsed["ok"]?.jsonPrimitive?.content == "true" && vrf != null && vrf !is JsonNull) {
+                vrf.jsonPrimitive.content.takeIf(String::isNotEmpty)
+            } else {
+                null
+            }
+        }.getOrNull()
+    }
+
+    private fun assetHtml(): String = applicationContext.assets.open("mfvrf.html").bufferedReader().use { it.readText() }
 
     /** Same ordering rule the site's interceptor applies to its own input. */
     private fun canonicalKey(path: String, params: Map<String, Param>): String {
@@ -275,59 +398,4 @@ internal object VrfGenerator {
             }
         }
     }
-
-    /** Runs [script] on the WebView and returns `out.vrf`, or null. */
-    private fun evaluate(script: String): String? {
-        val latch = CountDownLatch(1)
-        val result = AtomicReference<String?>(null)
-
-        mainHandler.post {
-            try {
-                val wv = webView
-                if (wv == null) {
-                    latch.countDown()
-                    return@post
-                }
-                wv.evaluateJavascript(script) { value ->
-                    try {
-                        // evaluateJavascript returns a quote-wrapped JSON string.
-                        val payload = Json.parseToJsonElement(value).jsonPrimitive.content
-                        parseVrfResult(payload)?.let(result::set)
-                    } catch (_: Throwable) {
-                    } finally {
-                        latch.countDown()
-                    }
-                }
-            } catch (_: Throwable) {
-                latch.countDown()
-            }
-        }
-        latch.await(10, TimeUnit.SECONDS)
-        return result.get()
-    }
-
-    /** Parses the glue's `{ok, vrf}` result, or null when it did not sign. */
-    private fun parseVrfResult(raw: String?): String? {
-        raw ?: return null
-        return runCatching {
-            val parsed = Json.parseToJsonElement(raw).jsonObject
-            val vrf = parsed["vrf"]
-            if (parsed["ok"]?.jsonPrimitive?.content == "true" && vrf != null && vrf !is JsonNull) {
-                vrf.jsonPrimitive.content.takeIf(String::isNotEmpty)
-            } else {
-                null
-            }
-        }.getOrNull()
-    }
-
-    private fun assetHtml(): String = applicationContext.assets.open("mfvrf.html").bufferedReader().use { it.readText() }
-
-    /** Shims the globals the asset expects from a browser before the
-     * site's scripts run in QuickJS. `navigator.appCodeName` is part of
-     * the VM's static key material and is "Mozilla" in every engine. */
-    private val QUICKJS_BOOTSTRAP = """
-        var window = globalThis;
-        var console = { log: function() {}, warn: function() {}, error: function() {}, info: function() {}, debug: function() {}, trace: function() {} };
-        var navigator = { appCodeName: "Mozilla", userAgent: "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36" };
-    """.trimIndent()
 }
