@@ -66,8 +66,10 @@ import kotlin.math.roundToInt
  *     Series that render client-side get their full TOC from the public
  *     chapters API (/api/public/chapters?contentId=...) instead.
  *   - pages: reader SSR exposes a few direct CDN images plus a
- *     `deferredMedia` JWT; ProtectedPageInterceptor stitches the remaining
- *     pages through /chapter-deferred-media + /chapter-map-proxy-plan.
+ *     `deferredMedia` JWT; the remaining pages are served by a loopback
+ *     stitch server (ProtectedPageServer) through /chapter-deferred-media
+ *     + /chapter-map-proxy-plan, because host apps cannot be relied on to
+ *     run source interceptors on image requests.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -87,17 +89,16 @@ abstract class ProComic :
 
     private val mapCache = MapCache()
 
-    // lazy: the interceptor reads baseUrl, which the @Source-generated
+    // lazy: the server reads baseUrl and headers, which the @Source-generated
     // subclass supplies via computed getters (safe at any phase) — lazy
     // keeps the construction order a non-issue either way.
-    private val protectedPageInterceptor by lazy { ProtectedPageInterceptor(baseUrl, mapCache) { client } }
+    private val protectedPageServer by lazy { ProtectedPageServer(baseUrl, mapCache, headers) }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
         connectTimeout(30, TimeUnit.SECONDS)
         readTimeout(60, TimeUnit.SECONDS)
         writeTimeout(30, TimeUnit.SECONDS)
         addInterceptor(::originSanitizerInterceptor)
-        addInterceptor(protectedPageInterceptor)
         addInterceptor(CloudflareSolverInterceptor(setOf(baseUrl.toHttpUrl().host)))
         rateLimit(3)
     }
@@ -760,7 +761,9 @@ abstract class ProComic :
                             Page(
                                 index = pages.size,
                                 url = readerUrl,
-                                imageUrl = "$baseUrl/.protected-page/$chapterIdStr/$idx",
+                                // Plain loopback URL: works in every host app
+                                // because it needs no source interceptors.
+                                imageUrl = protectedPageServer.pageUrl(chapterIdStr, idx),
                             ),
                         )
                     }
