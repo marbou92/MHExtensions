@@ -59,6 +59,14 @@ import kotlin.math.roundToInt
  * whichever gateway answered. The failover can be forced from the source
  * settings.
  *
+ * Covers and reader pages live on the content.* subdomains, which sit
+ * behind the same WAF but are NOT covered by the gateway rewrite — they
+ * get their own identical failover, and cover/page URLs are normalized
+ * onto the active content host when mapping API data. Without it a
+ * blocked network browses fine but every image stays dead (403 / reset
+ * connections on content.mangatek.com while content.mangatuk.com serves
+ * the same paths).
+ *
  * Details follow the MangaDot description layout: star rating header, a meta
  * info line, the synopsis, a Links section and the alternative names.
  */
@@ -76,6 +84,7 @@ abstract class MangaTek :
         readTimeout(60, TimeUnit.SECONDS)
         writeTimeout(30, TimeUnit.SECONDS)
         addInterceptor(::gatewayFailoverInterceptor)
+        addInterceptor(::contentFailoverInterceptor)
         addInterceptor(CloudflareSolverInterceptor(knownSiteHosts))
         rateLimit(3)
     }
@@ -90,8 +99,10 @@ abstract class MangaTek :
 
     private val primarySite = "https://mangatek.com"
     private val primaryGateway = "https://api.mangatek.com"
+    private val primaryContent = "https://content.mangatek.com"
     private val twinSite = "https://mangatuk.com"
     private val twinGateway = "https://api.mangatuk.com"
+    private val twinContent = "https://content.mangatuk.com"
 
     private val knownSiteHosts = setOf(
         "mangatek.com",
@@ -106,6 +117,7 @@ abstract class MangaTek :
 
     private val siteHosts = setOf(primarySite, twinSite)
     private val gatewayHosts = setOf(primaryGateway, twinGateway)
+    private val contentHosts = setOf(primaryContent, twinContent)
 
     private fun gatewayMode(): String = preferences.getString(PREF_GATEWAY, PREF_GATEWAY_AUTO) ?: PREF_GATEWAY_AUTO
 
@@ -198,6 +210,100 @@ abstract class MangaTek :
             builder.header("Referer", "https://$newHost/")
         }
         return builder.build()
+    }
+
+    // ============================ Content hosts ===========================
+    //
+    // Covers and reader pages live on the content.* subdomains — separate
+    // hosts the gateway failover never rewrites. They sit behind the same
+    // aggressive Cloudflare WAF as the primary site, so a network that is
+    // hard-blocked there keeps getting dead covers and dead pages even
+    // while browsing works on the twin. This mirrors the gateway failover
+    // for the two content hosts: WAF hard blocks, origin errors (521/523)
+    // and connect failures are retried on the twin content host with the
+    // same path, and in auto mode the winner is persisted. Forced modes
+    // pin the matching content host and never rewrite.
+
+    private fun currentContentHost(): String = when (gatewayMode()) {
+        PREF_GATEWAY_PRIMARY -> primaryContent
+        PREF_GATEWAY_TWIN -> twinContent
+        else -> {
+            val pinned = preferences.getString(PREF_ACTIVE_CONTENT, null)
+            if (pinned != null && pinned in contentHosts) pinned else primaryContent
+        }
+    }
+
+    private fun contentFailoverInterceptor(chain: Interceptor.Chain): Response {
+        val originalUrl = chain.request().url
+        val contentHostStrings = contentHosts.map { it.toHttpUrl().host }
+        if (originalUrl.host !in contentHostStrings || gatewayMode() != PREF_GATEWAY_AUTO) {
+            return chain.proceed(chain.request())
+        }
+
+        var request = chain.request()
+        val tried = mutableSetOf(originalUrl.host)
+
+        while (true) {
+            val response = try {
+                chain.proceed(request)
+            } catch (e: IOException) {
+                val next = nextContentHost(tried) ?: throw e
+                request = request.withContentHost(next)
+                tried += next.toHttpUrl().host
+                continue
+            }
+
+            val hardBlocked = response.code == 403 &&
+                response.header("content-type")?.contains("text/html") == true
+            if (hardBlocked || response.code == 521 || response.code == 523) {
+                response.close()
+                val next = nextContentHost(tried)
+                    ?: throw IOException("MangaTek: both content hosts are unreachable")
+                Log.i(TAG, "Content host ${request.url.host} blocked, failing over to ${next.toHttpUrl().host}")
+                request = request.withContentHost(next)
+                tried += next.toHttpUrl().host
+                continue
+            }
+
+            if (request.url.host != originalUrl.host) {
+                synchronized(gatewayLock) {
+                    preferences.edit()
+                        .putString(PREF_ACTIVE_CONTENT, "https://" + request.url.host)
+                        .apply()
+                }
+            }
+            return response
+        }
+    }
+
+    private fun nextContentHost(excludeHosts: Set<String>): String? = contentHosts
+        .firstOrNull { it.toHttpUrl().host !in excludeHosts }
+
+    private fun Request.withContentHost(contentUrl: String): Request {
+        val newHost = contentUrl.toHttpUrl().host
+        val builder = newBuilder().url(
+            url.newBuilder().scheme("https").host(newHost).build(),
+        )
+        if (!header("Referer").isNullOrBlank()) {
+            builder.header("Referer", "https://$newHost/")
+        }
+        return builder.build()
+    }
+
+    /**
+     * Rewrites known content hosts onto the currently active one, so cover
+     * and page URLs recorded against a dead content host (library entries
+     * from before a failover, or twin API responses that still reference
+     * primary storage) are served by whichever host answers. Unknown hosts
+     * pass through untouched.
+     */
+    private fun withActiveContentHost(url: String): String {
+        val parsed = runCatching { url.toHttpUrl() }.getOrNull() ?: return url
+        val contentHostStrings = contentHosts.map { it.toHttpUrl().host }
+        if (parsed.host !in contentHostStrings) return url
+        val active = currentContentHost().toHttpUrl().host
+        if (parsed.host == active) return url
+        return parsed.newBuilder().host(active).build().toString()
     }
 
     // ============================ Formatting =============================
@@ -385,6 +491,7 @@ abstract class MangaTek :
             val detail = it.parseAs<ChapterDetailDto>()
             return detail.pages
                 .mapNotNull { page -> page.imageUrl?.takeIf(String::isNotBlank) }
+                .map(::withActiveContentHost)
                 .mapIndexed { index, imageUrl ->
                     Page(index = index, url = getChapterUrl(chapter), imageUrl = imageUrl)
                 }
@@ -406,7 +513,9 @@ abstract class MangaTek :
     private fun SeriesDto.toSManga() = SManga.create().apply {
         url = this@toSManga.slug
         title = this@toSManga.title
-        thumbnail_url = this@toSManga.coverImage?.takeIf { it.startsWith("http") }
+        thumbnail_url = this@toSManga.coverImage
+            ?.takeIf { it.startsWith("http") }
+            ?.let(::withActiveContentHost)
         author = this@toSManga.authorText()
         artist = this@toSManga.artistText()
         status = when (this@toSManga.status?.lowercase()) {
@@ -535,6 +644,7 @@ abstract class MangaTek :
         const val PREF_GATEWAY_TWIN = "twin"
         const val PREF_ACTIVE_GATEWAY = "pref_active_gateway"
         const val PREF_ACTIVE_SITE = "pref_active_site"
+        const val PREF_ACTIVE_CONTENT = "pref_active_content"
         const val PREF_SHOW_GENRES = "pref_show_genres"
     }
 }
