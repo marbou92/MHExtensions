@@ -870,6 +870,28 @@ abstract class ProComic :
         return urls.distinct()
     }
 
+    /**
+     * Reads the storage generation ("cdnPath" / legacy "cdn_path") that the
+     * deferred map tokens are bound to, searching backwards from [searchLimit]
+     * so hydration noise after the chapter payload cannot win. Public so the
+     * JVM harness exercises the exact extraction the source ships.
+     */
+    fun extractCdnPath(flight: String, searchLimit: Int = flight.length): String? {
+        val newIndex = flight.lastIndexOf("\"cdnPath\":", searchLimit)
+        val legacyIndex = flight.lastIndexOf("\"cdn_path\":", searchLimit)
+        val index = maxOf(newIndex, legacyIndex)
+        if (index < 0) return null
+        val key = if (index == newIndex) "\"cdnPath\":" else "\"cdn_path\":"
+        var cursor = index + key.length
+        while (cursor < flight.length && flight[cursor].isWhitespace()) cursor++
+        // A JSON null / missing string is no generation — refusing here keeps
+        // a garbage value (e.g. the next key's name) out of the plan request.
+        if (cursor >= flight.length || flight[cursor] != '"') return null
+        val end = flight.indexOf('"', cursor + 1)
+        if (end < 0) return null
+        return flight.substring(cursor + 1, end).takeIf { it.isNotEmpty() }
+    }
+
     private class DeferredWithCdn(
         val images: List<String>,
         val maps: List<DeferredMapDto>,
@@ -886,15 +908,13 @@ abstract class ProComic :
             json.decodeFromString(DeferredMediaDto.serializer(), mediaJson)
         }.getOrNull() ?: return null
 
-        // The chapter object around deferredMedia carries cdn_path.
-        val cdnKey = "\"cdn_path\":"
-        val cdnIndex = flight.lastIndexOf(cdnKey, mediaIndex)
-        var cdnPath: String? = null
-        if (cdnIndex >= 0) {
-            val start = flight.indexOf('"', cdnIndex + cdnKey.length)
-            val end = flight.indexOf('"', start + 1)
-            if (start >= 0 && end > start) cdnPath = flight.substring(start + 1, end)
-        }
+        // The deferred payload carries the storage generation its map tokens
+        // are bound to: "cdnPath" since the site's flight rework (verified
+        // live: "cdnPath":"cdn2"), "cdn_path" on legacy chapters. Sending a
+        // stale/null generation makes the proxy plan bind the piece tokens
+        // to a dead one — every piece then answers 404 {"error":"not_found"}
+        // and the stitch server surfaces that as HTTP 502 ("pages 4+ fail").
+        val cdnPath = extractCdnPath(flight, mediaIndex)
 
         if (media.requireTurnstile == true) {
             Log.i(TAG, "deferred media requires Turnstile; serving public pages only")
