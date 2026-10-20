@@ -6,7 +6,7 @@ import android.graphics.Canvas
 import android.graphics.Color
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
-import okhttp3.Headers
+import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -25,20 +25,31 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * Serves ProComic's "protected" reader pages from a loopback HTTP server.
+ * Serves ProComic reader images from a loopback HTTP server.
  *
- * The reader SSR exposes the first few pages as plain CDN URLs; the rest
- * arrive as encrypted reconstruction "maps". The site's own client decrypts
- * each map into a plan `{dim, mode, pieces, order, rects}` where every piece
- * is a short-lived `/i/{token}` image on the CDN, and draws the pieces onto a
- * canvas at their rects. The server decrypts on our behalf through
- * `POST /chapter-map-proxy-plan/{chapterId}` (the client-side session-key
- * path answers `use_proxy_plan`), so the flow here is:
+ * Two routes:
  *
- *   getPageList -> deferred-media (map tokens, cached in memory)
- *               -> loopback `http://127.0.0.1:{port}/.protected-page/{chapterId}/{index}` URLs
- *   server      -> proxy-plan POST (server-decrypted plan)
- *               -> download pieces -> stitch at rects -> JPEG response
+ * 1. `/.protected-page/{chapterId}/{index}` — "protected" pages. The reader
+ *    SSR exposes the first few pages as plain CDN URLs; the rest arrive as
+ *    encrypted reconstruction "maps". The site's own client decrypts each
+ *    map into a plan `{dim, mode, pieces, order, rects}` where every piece
+ *    is a short-lived `/i/{token}` image on the CDN, and draws the pieces
+ *    onto a canvas at their rects. The server decrypts on our behalf through
+ *    `POST /chapter-map-proxy-plan/{chapterId}` (the client-side session-key
+ *    path answers `use_proxy_plan`), so the flow here is:
+ *
+ *      getPageList -> deferred-media (map tokens, cached in memory)
+ *                  -> loopback `http://127.0.0.1:{port}/.protected-page/{chapterId}/{index}` URLs
+ *      server      -> proxy-plan POST (server-decrypted plan)
+ *                  -> download pieces -> stitch at rects -> JPEG response
+ *
+ * 2. `/.image-proxy/{base64url}` — plain CDN images, proxied byte-for-byte.
+ *    Host apps fetch image URLs with THEIR OWN client, and the site's WAF
+ *    answers 403 to non-browser User-Agents (Kotatsu's app UA among them —
+ *    verified live), so direct CDN URLs break in those readers while the
+ *    browser works fine. Proxying through the extension's process (browser
+ *    UA, site Referer) makes every page image host-app-proof, exactly like
+ *    the protected-page route above.
  *
  * Why a loopback server instead of a client interceptor: host apps differ in
  * how they execute image requests. Several Mihon-compatible readers (Kotatsu's
@@ -49,12 +60,12 @@ import java.util.concurrent.atomic.AtomicReference
  * every reader and in downloaders.
  *
  * Piece images are AVIF: decoding requires Android 12 (API 31)+, matching
- * the site's own format choice.
+ * the site's own format choice. The image-proxy route streams bytes without
+ * decoding, so it has no API-level requirement.
  */
 class ProtectedPageServer(
     private val baseUrl: String,
     private val mapCache: MapCache,
-    private val requestHeaders: Headers,
 ) {
 
     private class Machine(val socket: ServerSocket)
@@ -62,6 +73,7 @@ class ProtectedPageServer(
     private val machine = AtomicReference<Machine?>()
     private val startLock = Any()
     private val stitchPermits = Semaphore(MAX_CONCURRENT_STITCHES)
+    private val proxyPermits = Semaphore(MAX_CONCURRENT_IMAGE_PROXIES)
 
     /** One inner client for plan + piece traffic, independent of the host
      * app's client (no source interceptors, no rate limiter contention, no
@@ -83,6 +95,19 @@ class ProtectedPageServer(
 
     /** Loopback URL for the protected page at [pageIndex] of [chapterId]. */
     fun pageUrl(chapterId: String, pageIndex: Int): String = "http://127.0.0.1:${ensureStarted()}/$PROTECTED_PATH_PREFIX/$chapterId/$pageIndex"
+
+    /**
+     * Loopback URL that serves [imageUrl] through the extension's own client
+     * (browser User-Agent + site Referer), so host apps that would get 403
+     * from the CDN with their own headers can still load the image.
+     */
+    fun imageProxyUrl(imageUrl: String): String {
+        val encoded = android.util.Base64.encodeToString(
+            imageUrl.toByteArray(Charsets.UTF_8),
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+        )
+        return "http://127.0.0.1:${ensureStarted()}/$IMAGE_PROXY_PATH_PREFIX/$encoded"
+    }
 
     /** Starts (or restarts) the loopback server and returns its port. */
     private fun ensureStarted(): Int {
@@ -148,12 +173,15 @@ class ProtectedPageServer(
     }
 
     private fun serve(path: String, output: java.io.OutputStream) {
-        val prefix = "/$PROTECTED_PATH_PREFIX/"
-        if (!path.startsWith(prefix)) {
-            writeResponse(output, 404, "Not Found", "text/plain", "unknown path".toByteArray())
-            return
+        when {
+            path.startsWith("/$PROTECTED_PATH_PREFIX/") -> serveProtectedPage(path, output)
+            path.startsWith("/$IMAGE_PROXY_PATH_PREFIX/") -> serveImageProxy(path, output)
+            else -> writeResponse(output, 404, "Not Found", "text/plain", "unknown path".toByteArray())
         }
+    }
 
+    private fun serveProtectedPage(path: String, output: java.io.OutputStream) {
+        val prefix = "/$PROTECTED_PATH_PREFIX/"
         val segments = path.removePrefix(prefix).split('/')
         val chapterId = segments.getOrNull(0).orEmpty()
         val pageIndex = segments.getOrNull(1)?.toIntOrNull()
@@ -201,6 +229,97 @@ class ProtectedPageServer(
         }
     }
 
+    /**
+     * Streams the CDN image behind the loopback proxy URL. The caller's own
+     * headers are irrelevant by design (that is the whole point of the
+     * route): the upstream request always goes out with the browser UA and
+     * the site Referer. Bytes pass through untouched, Content-Length is
+     * forwarded when the upstream provides one.
+     */
+    private fun serveImageProxy(path: String, output: java.io.OutputStream) {
+        val encoded = path.removePrefix("/$IMAGE_PROXY_PATH_PREFIX/")
+        val decoded = encoded.takeIf { it.isNotEmpty() }?.let {
+            runCatching {
+                String(
+                    android.util.Base64.decode(
+                        it,
+                        android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+                    ),
+                    Charsets.UTF_8,
+                )
+            }.getOrNull()
+        }
+        if (decoded == null || !isAllowedImageUrl(decoded)) {
+            writeResponse(output, 400, "Bad Request", "text/plain", "unusable image url".toByteArray())
+            return
+        }
+
+        proxyPermits.acquire()
+        try {
+            val request = Request.Builder()
+                .url(decoded)
+                .header("Accept", "image/avif,image/webp,image/*,*/*;q=0.8")
+                .header("Referer", "$baseUrl/")
+                .header("User-Agent", BROWSER_UA)
+                .build()
+            innerClient.newCall(request).execute().use { response ->
+                if (!response.isSuccessful) {
+                    writeResponse(
+                        output,
+                        502,
+                        "Bad Gateway",
+                        "text/plain",
+                        "image fetch failed with HTTP ${response.code}".toByteArray(),
+                        stage = "image",
+                    )
+                    return
+                }
+                writeImageHead(
+                    output,
+                    response.header("Content-Type") ?: "application/octet-stream",
+                    response.header("Content-Length"),
+                )
+                response.body.source().inputStream().use { input ->
+                    input.copyTo(output, COPY_BUFFER_BYTES)
+                }
+                output.flush()
+            }
+        } catch (t: Throwable) {
+            runCatching {
+                writeResponse(
+                    output,
+                    502,
+                    "Bad Gateway",
+                    "text/plain",
+                    "image fetch failed (${t.javaClass.simpleName})".toByteArray(),
+                    stage = "image",
+                )
+            }
+        } finally {
+            proxyPermits.release()
+        }
+    }
+
+    /** Only site-owned image hosts, https only — the proxy is not a general
+     * purpose fetcher. */
+    private fun isAllowedImageUrl(url: String): Boolean = runCatching {
+        val httpUrl = url.toHttpUrl()
+        httpUrl.isHttps && (httpUrl.host == "app.procomic.pro" || httpUrl.host.endsWith(".procomic.pro"))
+    }.getOrDefault(false)
+
+    /** Response head for a streamed body: Content-Length when known, else
+     * the body ends at EOF ("Connection: close" is always set). */
+    private fun writeImageHead(output: java.io.OutputStream, contentType: String, contentLength: String?) {
+        val head = buildString {
+            append("HTTP/1.1 200 OK\r\n")
+            append("Content-Type: ").append(contentType).append("\r\n")
+            if (contentLength != null) append("Content-Length: ").append(contentLength).append("\r\n")
+            append("Connection: close\r\n\r\n")
+        }
+        output.write(head.toByteArray(Charsets.US_ASCII))
+        output.flush()
+    }
+
     private fun writeResponse(
         output: java.io.OutputStream,
         code: Int,
@@ -229,12 +348,16 @@ class ProtectedPageServer(
             pageIndex = entry.pageIndex,
         ).toJsonString().toRequestBody(JSON_MEDIA_TYPE)
 
+        // BROWSER_UA, not the host-supplied headers: the site's WAF 403s
+        // non-browser User-Agents, and the JWT's uah claim binds the token
+        // to the UA that fetched the reader page — one constant everywhere
+        // keeps the whole chain consistent.
         val request = Request.Builder()
             .url("$baseUrl/chapter-map-proxy-plan/$chapterId")
             .post(payload)
             .header("Accept", "application/json")
             .header("Referer", "$baseUrl/")
-            .header("User-Agent", requestHeaders["User-Agent"] ?: DEFAULT_UA)
+            .header("User-Agent", BROWSER_UA)
             .build()
 
         innerClient.newCall(request).execute().use { response ->
@@ -296,7 +419,7 @@ class ProtectedPageServer(
             .url(pieceUrl)
             .header("Accept", "image/avif,image/webp,image/*,*/*;q=0.8")
             .header("Referer", "$baseUrl/")
-            .header("User-Agent", requestHeaders["User-Agent"] ?: DEFAULT_UA)
+            .header("User-Agent", BROWSER_UA)
             .build()
         innerClient.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
@@ -346,17 +469,28 @@ class ProtectedPageServer(
 
     companion object {
         const val PROTECTED_PATH_PREFIX = ".protected-page"
+        const val IMAGE_PROXY_PATH_PREFIX = ".image-proxy"
         const val JPEG_QUALITY = 88
+
+        /**
+         * The one User-Agent the site accepts on every path (verified live:
+         * its WAF answers 403 to app UAs like "Kotatsu/1.0" on both the
+         * reader page and the image CDN, while browser and okhttp UAs
+         * pass). Used by the extension's client interceptor and by this
+         * server's inner client so the JWT's uah claim stays consistent
+         * across the whole chain.
+         */
+        const val BROWSER_UA =
+            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
 
         private const val BACKLOG = 64
         private const val SOCKET_TIMEOUT_MS = 30_000
         private const val MAX_HEADER_BYTES = 16_384
         private const val MAX_CONCURRENT_STITCHES = 2
+        private const val MAX_CONCURRENT_IMAGE_PROXIES = 4
+        private const val COPY_BUFFER_BYTES = 64 * 1024
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
-
-        private const val DEFAULT_UA =
-            "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Mobile Safari/537.36"
     }
 }
 

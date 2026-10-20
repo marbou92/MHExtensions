@@ -143,6 +143,10 @@ abstract class MangaTek :
 
     private val gatewayLock = Any()
 
+    private val contentProbeLock = Any()
+
+    private var contentProbedAtMs = 0L
+
     private fun persistActive(gateway: String) {
         synchronized(gatewayLock) {
             preferences.edit()
@@ -278,6 +282,35 @@ abstract class MangaTek :
 
     private fun nextContentHost(excludeHosts: Set<String>): String? = contentHosts
         .firstOrNull { it.toHttpUrl().host !in excludeHosts }
+
+    /**
+     * Verifies the active content host through the SOURCE client before any
+     * content URL is handed to the host app. The site removed its primary
+     * content host entirely (content.mangatek.com is NXDOMAIN since 2026-10),
+     * and the host apps that fetch images with their own client (Kotatsu's
+     * Mihon-compat layer) never run this source's failover interceptor — a
+     * stale pinned host or the dead default would stay broken there forever.
+     * One HEAD per interval through `client` is enough: the content failover
+     * interceptor rewrites the request onto the twin when the pinned host is
+     * unreachable or hard-blocked, and re-persists the winner, so every
+     * withActiveContentHost() rewrite below lands on a host that answers.
+     */
+    private fun ensureActiveContentHostLive() {
+        if (gatewayMode() != PREF_GATEWAY_AUTO) return
+        synchronized(contentProbeLock) {
+            val now = System.currentTimeMillis()
+            if (now - contentProbedAtMs < CONTENT_PROBE_INTERVAL_MS) return
+            contentProbedAtMs = now
+        }
+        runCatching {
+            client.newCall(Request.Builder().url(currentContentHost()).head().build()).execute().use { response ->
+                // Any HTTP answer proves liveness of whoever responded; the
+                // failover interceptor has already persisted the winner when
+                // this request needed one.
+                response.code
+            }
+        }
+    }
 
     private fun Request.withContentHost(contentUrl: String): Request {
         val newHost = contentUrl.toHttpUrl().host
@@ -438,6 +471,7 @@ abstract class MangaTek :
     }
 
     private suspend fun fetchSeriesDetails(manga: SManga): SManga {
+        ensureActiveContentHostLive()
         val url = "${currentGateway()}/api/catalog/series/by-slug/${manga.url}".toHttpUrl()
         val response = client.newCall(GET(url, headers)).execute()
         response.use {
@@ -483,6 +517,7 @@ abstract class MangaTek :
     }
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
+        ensureActiveContentHostLive()
         val ref = chapter.url.parseAs<ChapterRef>()
         val url = "${currentGateway()}/api/catalog/chapters/by-slug/${ref.seriesSlug}/${ref.chapterSlug}".toHttpUrl()
         val response = client.newCall(GET(url, headers)).execute()
@@ -646,5 +681,7 @@ abstract class MangaTek :
         const val PREF_ACTIVE_SITE = "pref_active_site"
         const val PREF_ACTIVE_CONTENT = "pref_active_content"
         const val PREF_SHOW_GENRES = "pref_show_genres"
+
+        private const val CONTENT_PROBE_INTERVAL_MS = 10 * 60 * 1000L
     }
 }

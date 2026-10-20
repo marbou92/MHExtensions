@@ -40,6 +40,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+import java.util.regex.Pattern
 import kotlin.math.roundToInt
 
 /**
@@ -69,7 +70,11 @@ import kotlin.math.roundToInt
  *     `deferredMedia` JWT; the remaining pages are served by a loopback
  *     stitch server (ProtectedPageServer) through /chapter-deferred-media
  *     + /chapter-map-proxy-plan, because host apps cannot be relied on to
- *     run source interceptors on image requests.
+ *     run source interceptors on image requests. The direct CDN images go
+ *     through the same server's /.image-proxy route, because the site's WAF
+ *     403s the app User-Agents that host apps stamp onto their own image
+ *     requests; every page image is a loopback URL with the browser UA
+ *     applied inside the extension process.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -89,18 +94,36 @@ abstract class ProComic :
 
     private val mapCache = MapCache()
 
-    // lazy: the server reads baseUrl and headers, which the @Source-generated
-    // subclass supplies via computed getters (safe at any phase) — lazy
-    // keeps the construction order a non-issue either way.
-    private val protectedPageServer by lazy { ProtectedPageServer(baseUrl, mapCache, headers) }
+    // lazy: the server reads baseUrl, which the @Source-generated subclass
+    // supplies via computed getters (safe at any phase) — lazy keeps the
+    // construction order a non-issue either way.
+    private val protectedPageServer by lazy { ProtectedPageServer(baseUrl, mapCache) }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
         connectTimeout(30, TimeUnit.SECONDS)
         readTimeout(60, TimeUnit.SECONDS)
         writeTimeout(30, TimeUnit.SECONDS)
+        addInterceptor(::userAgentOverrideInterceptor)
         addInterceptor(::originSanitizerInterceptor)
         addInterceptor(CloudflareSolverInterceptor(setOf(baseUrl.toHttpUrl().host)))
         rateLimit(3)
+    }
+
+    /**
+     * The site's WAF answers 403 to non-browser User-Agents — including the
+     * app UA some hosts stamp onto every request (Kotatsu's Mihon-compat
+     * layer among them, verified live: "Kotatsu/1.0" gets 403 on the reader
+     * page AND on the image CDN while browser UAs pass). One forced browser
+     * UA across the whole chain also keeps the deferred-media JWT's uah
+     * (user-agent hash) claim consistent, since the loopback server's inner
+     * client uses the exact same string (ProtectedPageServer.BROWSER_UA).
+     */
+    private fun userAgentOverrideInterceptor(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.header("User-Agent") == ProtectedPageServer.BROWSER_UA) {
+            return chain.proceed(request)
+        }
+        return chain.proceed(request.newBuilder().header("User-Agent", ProtectedPageServer.BROWSER_UA).build())
     }
 
     /**
@@ -622,7 +645,7 @@ abstract class ProComic :
         }
 
         val rowsById = recent.associateBy { it.id }
-        return entries
+        val chapters = entries
             .sortedByDescending { it.chapterNumber?.toFloatOrNull() ?: 0f }
             .map { entry ->
                 val row = rowsById[entry.id]
@@ -650,6 +673,58 @@ abstract class ProComic :
                     date_upload = parseDate(row?.published_at ?: entry.publishedAt)
                 }
             }
+        return combineDuplicateChapters(chapters)
+    }
+
+    /**
+     * Optional "combine duplicate chapters" (same option the MangaDot source
+     * ships): the site re-uploads the same chapter under several teams, so
+     * the TOC can carry multiple entries per chapter number. When enabled,
+     * one entry per non-zero chapter number survives — the first team in
+     * the user's priority list wins, otherwise the first (newest) upload.
+     * The zero-width scanlator filler matches MangaDot's behavior of keeping
+     * the scanlator row uniform across entries.
+     */
+    private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> {
+        val hasScanlator = chapters.any { it.scanlator != null }
+        val result = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
+            // UNICODE_CHARACTER_CLASS: team names here are usually Arabic, and
+            // \b is ASCII-only without that flag (MangaDot's priority list is
+            // all-Latin, so it never hits the difference).
+            val priorityPatterns = preferences.getString(PREF_PREFERRED_SCANLATORS, "")
+                ?.split(",")
+                ?.map { it.trim() }
+                ?.filter { it.isNotBlank() }
+                ?.map {
+                    Pattern.compile(
+                        "\\b${Regex.escape(it)}\\b",
+                        Pattern.UNICODE_CHARACTER_CLASS or Pattern.CASE_INSENSITIVE,
+                    )
+                }
+                .orEmpty()
+
+            mutableListOf<SChapter>().apply {
+                for ((_, group) in chapters.groupBy { it.chapter_number }) {
+                    if (group.first().chapter_number <= 0f || group.size == 1) {
+                        addAll(group)
+                        continue
+                    }
+                    val selected = priorityPatterns.firstNotNullOfOrNull { pattern ->
+                        group.firstOrNull { chapter ->
+                            chapter.scanlator?.let { name -> pattern.matcher(name).find() } == true
+                        }
+                    } ?: group.first()
+                    add(selected)
+                }
+            }
+        } else {
+            chapters
+        }
+
+        if (hasScanlator) {
+            result.forEach { it.scanlator = it.scanlator ?: "\u200B" }
+        }
+        return result
     }
 
     /**
@@ -736,12 +811,12 @@ abstract class ProComic :
 
             val pages = mutableListOf<Page>()
             images.forEach { imageUrl ->
-                pages.add(Page(index = pages.size, url = readerUrl, imageUrl = imageUrl))
+                pages.add(Page(index = pages.size, url = readerUrl, imageUrl = protectedPageServer.imageProxyUrl(imageUrl)))
             }
 
             if (media != null) {
                 media.images.forEach { imageUrl ->
-                    pages.add(Page(index = pages.size, url = readerUrl, imageUrl = imageUrl))
+                    pages.add(Page(index = pages.size, url = readerUrl, imageUrl = protectedPageServer.imageProxyUrl(imageUrl)))
                 }
                 if (media.maps.isNotEmpty()) {
                     val chapterIdStr = ref.chapterId.toString()
@@ -894,6 +969,31 @@ abstract class ProComic :
             entryValues = arrayOf("none", "top", "end")
             setDefaultValue("end")
         }.let(screen::addPreference)
+
+        // ---- Chapter list (the duplicate-combining option) ----
+        val dedupeSwitch = SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_DEDUPLICATE_CHAPTERS
+            title = "Combine duplicate chapters"
+            summary = "Keep one entry per chapter number — the site re-uploads " +
+                "the same chapter under several teams"
+            setDefaultValue(false)
+        }
+        screen.addPreference(dedupeSwitch)
+
+        val priorityPref = EditTextPreference(screen.context).apply {
+            key = PREF_PREFERRED_SCANLATORS
+            title = "Team priority"
+            summary = "Comma-separated team names, most preferred first; the first " +
+                "match wins when combining duplicates. Empty = keep the newest upload"
+            setDefaultValue("")
+            setEnabled(preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false))
+        }
+        screen.addPreference(priorityPref)
+
+        dedupeSwitch.setOnPreferenceChangeListener { _, newValue ->
+            priorityPref.setEnabled(newValue as Boolean)
+            true
+        }
     }
 
     private companion object {
@@ -908,6 +1008,8 @@ abstract class ProComic :
         const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
         const val PREF_BLOCKED_GENRES = "pref_blocked_genres"
         const val PREF_SCORE_POSITION = "pref_score_position"
+        const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
+        const val PREF_PREFERRED_SCANLATORS = "pref_preferred_scanlators"
 
         val GENRE_FALLBACK = listOf(
             "Action", "Adventure", "Comedy", "Doujinshi", "Drama", "Ecchi",
