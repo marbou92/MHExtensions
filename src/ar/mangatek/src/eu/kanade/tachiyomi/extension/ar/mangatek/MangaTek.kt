@@ -233,7 +233,14 @@ abstract class MangaTek :
         PREF_GATEWAY_TWIN -> twinContent
         else -> {
             val pinned = preferences.getString(PREF_ACTIVE_CONTENT, null)
-            if (pinned != null && pinned in contentHosts) pinned else primaryContent
+            // The primary content host is gone entirely (NXDOMAIN since
+            // 2026-10): the unpinned default must not hand out URLs on it.
+            // Host apps that fetch images with their own client (Kotatsu's
+            // Mihon-compat layer) never run the failover interceptor, and
+            // Cloudflare answers requests for a removed hostname with
+            // HTTP 404 (error 1001) when stale DNS still resolves it —
+            // exactly the "HTTP 404 on every cover and page" report.
+            if (pinned != null && pinned in contentHosts) pinned else twinContent
         }
     }
 
@@ -259,7 +266,13 @@ abstract class MangaTek :
 
             val hardBlocked = response.code == 403 &&
                 response.header("content-type")?.contains("text/html") == true
-            if (hardBlocked || response.code == 521 || response.code == 523) {
+            // Cloudflare's error-1001 page (stale DNS for a removed host)
+            // is a text/html 404 — a real missing file never looks like
+            // that, and failing over once costs a single request when it
+            // is a genuine miss.
+            val staleDns404 = response.code == 404 &&
+                response.header("content-type")?.contains("text/html") == true
+            if (hardBlocked || staleDns404 || response.code == 521 || response.code == 523) {
                 response.close()
                 val next = nextContentHost(tried)
                     ?: throw IOException("MangaTek: both content hosts are unreachable")
@@ -284,16 +297,16 @@ abstract class MangaTek :
         .firstOrNull { it.toHttpUrl().host !in excludeHosts }
 
     /**
-     * Verifies the active content host through the SOURCE client before any
-     * content URL is handed to the host app. The site removed its primary
-     * content host entirely (content.mangatek.com is NXDOMAIN since 2026-10),
-     * and the host apps that fetch images with their own client (Kotatsu's
-     * Mihon-compat layer) never run this source's failover interceptor — a
-     * stale pinned host or the dead default would stay broken there forever.
-     * One HEAD per interval through `client` is enough: the content failover
-     * interceptor rewrites the request onto the twin when the pinned host is
-     * unreachable or hard-blocked, and re-persists the winner, so every
-     * withActiveContentHost() rewrite below lands on a host that answers.
+     * Verifies the active content host before any content URL is handed to
+     * the host app, and re-pins the liveness winner when the pinned host is
+     * dead. This replaced the 2026-10 probe that went through the source
+     * client: it could NEVER heal a pin, because the rewritten request hit
+     * the twin's WAF root 403 (text/html), the interceptor classified that
+     * as "both content hosts unreachable" and threw — so covers and pages
+     * kept pointing at whichever host the pin (or the NXDOMAIN default)
+     * named. The probe now runs on a bare client against BOTH hosts and
+     * counts ANY HTTP answer as alive — including the WAF's root 403 —
+     * while a dead host (NXDOMAIN) answers nothing at all.
      */
     private fun ensureActiveContentHostLive() {
         if (gatewayMode() != PREF_GATEWAY_AUTO) return
@@ -302,14 +315,32 @@ abstract class MangaTek :
             if (now - contentProbedAtMs < CONTENT_PROBE_INTERVAL_MS) return
             contentProbedAtMs = now
         }
-        runCatching {
-            client.newCall(Request.Builder().url(currentContentHost()).head().build()).execute().use { response ->
-                // Any HTTP answer proves liveness of whoever responded; the
-                // failover interceptor has already persisted the winner when
-                // this request needed one.
-                response.code
-            }
+        val active = currentContentHost()
+        if (probeHostAlive(active)) return
+        val fallback = contentHosts.firstOrNull { it != active } ?: return
+        if (probeHostAlive(fallback)) {
+            Log.i(TAG, "content host $active dead, pinning $fallback")
+            preferences.edit().putString(PREF_ACTIVE_CONTENT, fallback).apply()
         }
+    }
+
+    /** True when the host answers with ANY status (a WAF 403 still proves the host exists). */
+    private fun probeHostAlive(host: String): Boolean = runCatching {
+        probeClient.newCall(Request.Builder().url(host).head().build()).execute().use { response ->
+            response.code
+        }
+    }.isSuccess
+
+    /**
+     * Bare client for the liveness probe: deliberately WITHOUT the source
+     * interceptors, so a dead host surfaces as a connect failure instead of
+     * being silently rewritten (and then misjudged) by the failover loop.
+     */
+    private val probeClient: OkHttpClient by lazy {
+        OkHttpClient.Builder()
+            .connectTimeout(8, TimeUnit.SECONDS)
+            .readTimeout(8, TimeUnit.SECONDS)
+            .build()
     }
 
     private fun Request.withContentHost(contentUrl: String): Request {

@@ -4,6 +4,7 @@ import android.graphics.Bitmap
 import android.graphics.BitmapFactory
 import android.graphics.Canvas
 import android.graphics.Color
+import android.util.Log
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -205,9 +206,9 @@ class ProtectedPageServer(
         stitchPermits.acquire()
         var stage = "plan"
         try {
-            val plan = fetchPlan(chapterId, entry)
+            val plan = planWithHeal(chapterId, entry)
             stage = "stitch"
-            val bytes = stitchToJpeg(plan)
+            val bytes = stitchWithHeal(chapterId, entry, plan)
             if (bytes != null) {
                 writeResponse(output, 200, "OK", "image/jpeg", bytes)
             } else {
@@ -228,6 +229,40 @@ class ProtectedPageServer(
             stitchPermits.release()
         }
     }
+
+    /**
+     * The storage generation the plan binds its piece tokens to. Live
+     * chapters carry it in the flight (extractCdnPath reads it); a flight
+     * without the key, a token minted across the site's generation migrations,
+     * or a race between the two leaves the plan bound to a DEAD generation —
+     * every piece then answers 404 {"error":"not_found"} and the reader
+     * shows HTTP 502 on the pages after the public ones. The current live
+     * generation is the value the site's own reader hardcodes today.
+     */
+    private fun planWithHeal(chapterId: String, entry: MapCache.Entry): PlanDto = try {
+        fetchPlan(chapterId, entry)
+    } catch (t: IOException) {
+        if (entry.cdnPath == HEAL_CDN_PATH) throw t
+        Log.i(TAG, "plan failed for generation ${entry.cdnPath} (${t.message}); re-planning with $HEAL_CDN_PATH")
+        val healed = fetchPlan(chapterId, entry.withCdnPath(HEAL_CDN_PATH))
+        mapCache.rebindGeneration(chapterId, HEAL_CDN_PATH)
+        healed
+    }
+
+    /** One re-plan + re-stitch when the plan's pieces turn out dead (404 not_found). */
+    private fun stitchWithHeal(chapterId: String, entry: MapCache.Entry, plan: PlanDto): ByteArray? = try {
+        stitchToJpeg(plan)
+    } catch (t: IOException) {
+        if (!isDeadGeneration(t) || entry.cdnPath == HEAL_CDN_PATH) throw t
+        Log.i(TAG, "pieces dead for generation ${entry.cdnPath}; re-planning with $HEAL_CDN_PATH")
+        val healed = fetchPlan(chapterId, entry.withCdnPath(HEAL_CDN_PATH))
+        mapCache.rebindGeneration(chapterId, HEAL_CDN_PATH)
+        stitchToJpeg(healed)
+    }
+
+    private fun isDeadGeneration(t: IOException): Boolean = t.message?.contains("piece download failed with HTTP 404") == true
+
+    private fun MapCache.Entry.withCdnPath(cdnPath: String) = MapCache.Entry(token, method, cdnPath, pageIndex)
 
     /**
      * Streams the CDN image behind the loopback proxy URL. The caller's own
@@ -379,17 +414,23 @@ class ProtectedPageServer(
             ?: computeGridRects(plan.mode, dimW, dimH, plan.order.size)
             ?: return null
 
+        val pieceUrls = plan.order.mapNotNull { plan.pieces.getOrNull(it) }
+        if (pieceUrls.isEmpty()) return null
+
+        // Download and validate EVERY piece before any graphics work: a dead
+        // generation surfaces here as the piece-404 IOException the caller
+        // heals with a re-plan — and no bitmap is allocated for a page that
+        // cannot be assembled.
+        val pieceData = pieceUrls.map { pieceUrl -> fetchPieceBytes(pieceUrl) }
+
         val result = Bitmap.createBitmap(dimW, dimH, Bitmap.Config.ARGB_8888)
         val canvas = Canvas(result)
         canvas.drawColor(Color.WHITE)
 
-        val pieceUrls = plan.order.mapNotNull { plan.pieces.getOrNull(it) }
-        if (pieceUrls.isEmpty()) return null
-
         try {
-            pieceUrls.forEachIndexed { index, pieceUrl ->
+            pieceData.forEachIndexed { index, bytes ->
                 val rect = rects.getOrNull(index) ?: return@forEachIndexed
-                val piece = decodePiece(pieceUrl)
+                val piece = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                     ?: throw IOException("ProComic: piece $index failed to decode")
                 piece.density = Bitmap.DENSITY_NONE
                 canvas.drawBitmap(
@@ -414,7 +455,7 @@ class ProtectedPageServer(
         }
     }
 
-    private fun decodePiece(pieceUrl: String): Bitmap? {
+    private fun fetchPieceBytes(pieceUrl: String): ByteArray {
         val request = Request.Builder()
             .url(pieceUrl)
             .header("Accept", "image/avif,image/webp,image/*,*/*;q=0.8")
@@ -425,8 +466,7 @@ class ProtectedPageServer(
             if (!response.isSuccessful) {
                 throw IOException("ProComic: piece download failed with HTTP ${response.code}")
             }
-            val bytes = response.body.bytes()
-            return BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
+            return response.body.bytes()
         }
     }
 
@@ -490,6 +530,10 @@ class ProtectedPageServer(
         private const val MAX_CONCURRENT_IMAGE_PROXIES = 4
         private const val COPY_BUFFER_BYTES = 64 * 1024
 
+        /** See planWithHeal / stitchWithHeal. */
+        private const val HEAL_CDN_PATH = "cdn2"
+        private const val TAG = "ProComic"
+
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
 }
@@ -528,6 +572,19 @@ class MapCache {
 
     fun get(chapterId: String, pageIndex: Int): Entry? = synchronized(lock) {
         cache[chapterId]?.getOrNull(pageIndex)
+    }
+
+    /**
+     * Rewrites the storage generation of every cached entry of [chapterId].
+     * The dead-generation self-heal calls this after a successful re-plan so
+     * the remaining pages of the chapter skip the failed attempt entirely.
+     */
+    fun rebindGeneration(chapterId: String, cdnPath: String) {
+        synchronized(lock) {
+            val entries = cache[chapterId] ?: return
+            if (entries.all { it.cdnPath == cdnPath }) return
+            cache[chapterId] = entries.map { Entry(it.token, it.method, cdnPath, it.pageIndex) }
+        }
     }
 
     private companion object {
