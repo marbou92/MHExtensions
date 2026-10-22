@@ -2,6 +2,7 @@ package eu.kanade.tachiyomi.extension.ar.mangatek
 
 import android.content.SharedPreferences
 import android.util.Log
+import androidx.preference.EditTextPreference
 import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
@@ -37,6 +38,7 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
+import java.util.regex.Pattern
 import kotlin.math.roundToInt
 
 /**
@@ -536,7 +538,7 @@ abstract class MangaTek :
         response.use {
             if (!it.isSuccessful) throw IOException("HTTP ${it.code} while loading chapters")
             val data = it.parseAs<ChapterListDto>().data
-            return data
+            val sorted = data
                 .map { chapter ->
                     chapter.toSChapter(manga.url).apply {
                         date_upload = parseDate(chapter.publishedAt ?: chapter.updatedAt)
@@ -544,7 +546,58 @@ abstract class MangaTek :
                 }
                 // Mihon expects newest-first; the gateway returns oldest-first.
                 .sortedByDescending { it.chapter_number }
+            return combineDuplicateChapters(sorted)
         }
+    }
+
+    /**
+     * Optional "combine duplicate chapters" — the same option the MangaDot
+     * source (and this repo's ProComic) ships: the site re-uploads the same
+     * chapter under several teams, so the TOC can carry multiple entries
+     * per chapter number. When enabled, one entry per non-zero chapter
+     * number survives — the first team in the user's priority list wins,
+     * otherwise the first (newest) upload. The zero-width scanlator filler
+     * keeps the chapter rows uniform, exactly like MangaDot's behavior.
+     */
+    private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> {
+        val hasScanlator = chapters.any { it.scanlator != null }
+        val result = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
+            // UNICODE_CHARACTER_CLASS: team names here are Arabic, and \b is
+            // ASCII-only without that flag.
+            val priorityPatterns = preferences.getString(PREF_PREFERRED_SCANLATORS, "")
+                ?.split(",")
+                ?.map { it.trim() }
+                ?.filter { it.isNotBlank() }
+                ?.map {
+                    Pattern.compile(
+                        "\\b${Regex.escape(it)}\\b",
+                        Pattern.UNICODE_CHARACTER_CLASS or Pattern.CASE_INSENSITIVE,
+                    )
+                }
+                .orEmpty()
+
+            mutableListOf<SChapter>().apply {
+                for ((_, group) in chapters.groupBy { it.chapter_number }) {
+                    if (group.first().chapter_number <= 0f || group.size == 1) {
+                        addAll(group)
+                        continue
+                    }
+                    val selected = priorityPatterns.firstNotNullOfOrNull { pattern ->
+                        group.firstOrNull { chapter ->
+                            chapter.scanlator?.let { name -> pattern.matcher(name).find() } == true
+                        }
+                    } ?: group.first()
+                    add(selected)
+                }
+            }
+        } else {
+            chapters
+        }
+
+        if (hasScanlator) {
+            result.forEach { it.scanlator = it.scanlator ?: "\u200B" }
+        }
+        return result
     }
 
     private suspend fun fetchSeriesId(slug: String): String {
@@ -714,6 +767,31 @@ abstract class MangaTek :
             summary = "List the title's genres in its description"
             setDefaultValue(true)
         }.let(screen::addPreference)
+
+        // ---- Chapter list (the duplicate-combining option) ----
+        val dedupeSwitch = SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_DEDUPLICATE_CHAPTERS
+            title = "Combine duplicate chapters"
+            summary = "Keep one entry per chapter number — the site re-uploads " +
+                "the same chapter under several teams"
+            setDefaultValue(false)
+        }
+        screen.addPreference(dedupeSwitch)
+
+        val priorityPref = EditTextPreference(screen.context).apply {
+            key = PREF_PREFERRED_SCANLATORS
+            title = "Team priority"
+            summary = "Comma-separated team names, most preferred first; the first " +
+                "match wins when combining duplicates. Empty = keep the newest upload"
+            setDefaultValue("")
+            setEnabled(preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false))
+        }
+        screen.addPreference(priorityPref)
+
+        dedupeSwitch.setOnPreferenceChangeListener { _, newValue ->
+            priorityPref.setEnabled(newValue as Boolean)
+            true
+        }
     }
 
     private companion object {
@@ -728,6 +806,8 @@ abstract class MangaTek :
         const val PREF_ACTIVE_SITE = "pref_active_site"
         const val PREF_ACTIVE_CONTENT = "pref_active_content"
         const val PREF_SHOW_GENRES = "pref_show_genres"
+        const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
+        const val PREF_PREFERRED_SCANLATORS = "pref_preferred_scanlators"
 
         private const val CONTENT_PROBE_INTERVAL_MS = 10 * 60 * 1000L
 

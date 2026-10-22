@@ -36,8 +36,13 @@ class SeriesDto(
     // "8.00" on rated series, plain number 0 on unrated ones.
     val ratingAvg: JsonPrimitive? = null,
     val chapterCount: JsonPrimitive? = null,
-    // Details carry slug strings, search rows carry {id, slug, name} objects.
+    // Shapes as of 2026-10: details carry full genre objects
+    // ({id, name, slug, description}) while browse/search rows carry the
+    // genres split into the parallel `genreIds`/`genreNames` arrays with
+    // `genres` null — genreLabels() absorbs both so every entry point keeps
+    // its genre chips.
     val genres: List<JsonElement> = emptyList(),
+    val genreNames: List<String>? = null,
 ) {
     fun coverUrl(): String? = coverImage?.takeIf { it.startsWith("http") }
 
@@ -54,16 +59,21 @@ class SeriesDto(
         ?.content
         ?.takeIf { it.isNotBlank() && it != "null" }
 
-    fun genreLabels(): List<String> = genres.mapNotNull { element ->
-        when (element) {
-            is JsonPrimitive -> element.content.takeIf(String::isNotBlank)
-            is kotlinx.serialization.json.JsonObject ->
-                (
-                    (element["name"] as? JsonPrimitive)?.content
-                        ?: (element["slug"] as? JsonPrimitive)?.content
-                    )?.takeIf(String::isNotBlank)
-            else -> null
+    fun genreLabels(): List<String> {
+        val fromObjects = genres.mapNotNull { element ->
+            when (element) {
+                is JsonPrimitive -> element.content.takeIf(String::isNotBlank)
+                is kotlinx.serialization.json.JsonObject ->
+                    (
+                        (element["name"] as? JsonPrimitive)?.content
+                            ?: (element["slug"] as? JsonPrimitive)?.content
+                        )?.takeIf(String::isNotBlank)
+                else -> null
+            }
         }
+        if (fromObjects.isNotEmpty()) return fromObjects
+        // Search rows (2026-10 wire): parallel genreNames array, genres null.
+        return genreNames.orEmpty().filter { it.isNotBlank() }
     }
 
     companion object {

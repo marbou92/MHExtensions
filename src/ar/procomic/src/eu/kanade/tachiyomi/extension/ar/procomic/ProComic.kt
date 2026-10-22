@@ -22,6 +22,7 @@ import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
+import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -96,8 +97,39 @@ abstract class ProComic :
 
     // lazy: the server reads baseUrl, which the @Source-generated subclass
     // supplies via computed getters (safe at any phase) — lazy keeps the
-    // construction order a non-issue either way.
-    private val protectedPageServer by lazy { ProtectedPageServer(baseUrl, mapCache) }
+    // construction order a non-issue either way. internal: the JVM harness
+    // drives the verification probes on it; harmless in the shipped build.
+    // The flight-rebuild lambda is the server's final plan recovery: it
+    // re-fetches the chapter's reader page for a fresh set of map tokens
+    // (the site's session-key endpoint now 403s use_proxy_plan, so a stale
+    // token can no longer be salvaged any other way).
+    internal val protectedPageServer by lazy {
+        ProtectedPageServer(baseUrl, mapCache) { readerUrl, chapterId ->
+            runBlocking { rebuildFlight(readerUrl, chapterId) }
+        }
+    }
+
+    /** Re-fetches the reader page and extracts a fresh deferred-media map
+     * set for [chapterId]; null when the page or the maps are unavailable
+     * (the caller surfaces that as the plan failure it already has). */
+    private suspend fun rebuildFlight(readerUrl: String, chapterId: String): RebuiltFlight? {
+        return try {
+            val response = client.newCall(GET(readerUrl, headers)).execute()
+            response.use {
+                if (!it.isSuccessful) return null
+                val flight = RscFlight.extract(it.body.string())
+                val media = parseDeferredMedia(flight, chapterId.toInt()) ?: return null
+                if (media.maps.isEmpty()) return null
+                RebuiltFlight(
+                    cdnPath = media.cdnPath,
+                    maps = media.maps.map { map -> RebuiltMap(map.token, map.method) },
+                )
+            }
+        } catch (t: Exception) {
+            Log.w(TAG, "flight rebuild from $readerUrl failed: ${t.message}")
+            null
+        }
+    }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
         connectTimeout(30, TimeUnit.SECONDS)
@@ -828,6 +860,7 @@ abstract class ProComic :
                                 method = map.method,
                                 cdnPath = media.cdnPath,
                                 pageIndex = idx,
+                                readerUrl = readerUrl,
                             )
                         },
                     )

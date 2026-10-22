@@ -71,9 +71,26 @@ import javax.crypto.spec.SecretKeySpec
 class ProtectedPageServer(
     private val baseUrl: String,
     private val mapCache: MapCache,
+    private val flightRebuild: ((readerUrl: String, chapterId: String) -> RebuiltFlight?)? = null,
 ) {
 
     private class Machine(val socket: ServerSocket)
+
+    /** Verification probes (JVM harness): force the two last-resort plan
+     * paths for one cached page so they are exercised against live data —
+     * the proxy-plan path otherwise always wins. The server itself never
+     * calls these. */
+    internal fun debugLocalPlanFor(chapterId: String, pageIndex: Int): PlanDto {
+        val entry = mapCache.get(chapterId, pageIndex)
+            ?: throw IOException("ProComic: no cached map for $chapterId/$pageIndex")
+        return localPlan(chapterId, entry)
+    }
+
+    internal fun debugRebuildPlanFor(chapterId: String, pageIndex: Int): PlanDto {
+        val entry = mapCache.get(chapterId, pageIndex)
+            ?: throw IOException("ProComic: no cached map for $chapterId/$pageIndex")
+        return rebuildPlan(chapterId, entry)
+    }
 
     private val machine = AtomicReference<Machine?>()
     private val startLock = Any()
@@ -226,8 +243,13 @@ class ProtectedPageServer(
                 )
             }
         } catch (t: Throwable) {
-            val message = (t as? IOException)?.message
-                ?: "page preparation failed (${t.javaClass.simpleName})"
+            val message = when (t) {
+                is IOException -> t.message ?: "page preparation failed (IOException)"
+                is OutOfMemoryError ->
+                    "device ran out of memory assembling the page bitmap (OutOfMemoryError)"
+                else -> "page preparation failed (${t.javaClass.simpleName})"
+            }
+            Log.w(TAG, "protected page $chapterId/$pageIndex failed at stage=$stage: $message")
             writeResponse(output, 502, "Bad Gateway", "text/plain", message.toByteArray(), stage = stage)
         } finally {
             stitchPermits.release()
@@ -275,8 +297,13 @@ class ProtectedPageServer(
         }
         try {
             return PlannedPage(localPlan(chapterId, entry), entry.cdnPath)
-        } catch (_: IOException) {
-            // every recovery path failed — the original failure says why
+        } catch (t: IOException) {
+            Log.i(TAG, "local decrypt unavailable (${t.message})")
+        }
+        try {
+            return PlannedPage(rebuildPlan(chapterId, entry), entry.cdnPath)
+        } catch (t: IOException) {
+            Log.i(TAG, "flight rebuild failed (${t.message})")
         }
         throw firstFailure
     }
@@ -315,7 +342,7 @@ class ProtectedPageServer(
         return code == 403 || code == 404 || code in 500..599
     }
 
-    private fun MapCache.Entry.withCdnPath(cdnPath: String) = MapCache.Entry(token, method, cdnPath, pageIndex)
+    private fun MapCache.Entry.withCdnPath(cdnPath: String) = MapCache.Entry(token, method, cdnPath, pageIndex, readerUrl)
 
     /**
      * Last-resort plan recovery, used only when every proxy-plan attempt
@@ -357,6 +384,36 @@ class ProtectedPageServer(
             throw IOException("ProComic: map decrypt failed (${t.javaClass.simpleName})")
         }
         return plaintext.decodeToString().parseAs<PlanDto>()
+    }
+
+    /**
+     * Final recovery tier: rebuild the reader flight for a fresh set of map
+     * tokens. The site disabled the client-side session-key endpoint (the
+     * v3 key path now answers 403 `use_proxy_plan` — verified live
+     * 2026-10-22), so when the proxy-plan endpoint rejects a token there is
+     * no way to salvage it: the only source of a usable token is the reader
+     * page itself. A fresh flight rebinds the whole chapter cache, then the
+     * plan is retried with the caller's page token.
+     */
+    private fun rebuildPlan(chapterId: String, entry: MapCache.Entry): PlanDto {
+        val rebuild = flightRebuild
+            ?: throw IOException("ProComic: no flight rebuild available")
+        val readerUrl = entry.readerUrl
+            ?: throw IOException("ProComic: no reader url cached for the flight rebuild")
+        val fresh = rebuild(readerUrl, chapterId)
+            ?: throw IOException("ProComic: flight rebuild returned nothing")
+        if (fresh.maps.isEmpty()) {
+            throw IOException("ProComic: flight rebuild carried no maps (chapter may be Turnstile-gated)")
+        }
+        mapCache.putAll(
+            chapterId,
+            fresh.maps.mapIndexed { idx, map ->
+                MapCache.Entry(map.token, map.method, fresh.cdnPath, idx, readerUrl)
+            },
+        )
+        val mine = fresh.maps.getOrNull(entry.pageIndex)
+            ?: throw IOException("ProComic: flight rebuild lost page ${entry.pageIndex}")
+        return fetchPlan(chapterId, MapCache.Entry(mine.token, mine.method, fresh.cdnPath, entry.pageIndex, readerUrl))
     }
 
     /** The v3 session key for a chapter, cached until its server-provided
@@ -574,8 +631,7 @@ class ProtectedPageServer(
         try {
             pieceData.forEachIndexed { index, bytes ->
                 val rect = rects.getOrNull(index) ?: return@forEachIndexed
-                val piece = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                    ?: throw IOException("ProComic: piece $index failed to decode")
+                val piece = decodePiece(bytes, index)
                 piece.density = Bitmap.DENSITY_NONE
                 canvas.drawBitmap(
                     piece,
@@ -597,6 +653,31 @@ class ProtectedPageServer(
         } finally {
             if (!result.isRecycled) result.recycle()
         }
+    }
+
+    /**
+     * Piece decode with a fallback path: BitmapFactory answers null for
+     * AVIF on OEM builds whose platform decoder is missing or disabled
+     * even on Android 12+, which surfaced as an HTTP 502 on every page
+     * after the public ones. ImageDecoder (API 28+) uses a different
+     * entry into the same codecs and succeeds where BitmapFactory fails;
+     * it is asked for a SOFTWARE ARGB_8888 bitmap because the stitch
+     * canvas is a software bitmap and hardware bitmaps cannot be drawn
+     * onto one.
+     */
+    private fun decodePiece(bytes: ByteArray, index: Int): Bitmap {
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            try {
+                val source = android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))
+                return android.graphics.ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                    decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+                }
+            } catch (t: Throwable) {
+                throw IOException("ProComic: piece $index failed to decode (${t.javaClass.simpleName})")
+            }
+        }
+        throw IOException("ProComic: piece $index failed to decode (Android 12+ required for AVIF pages)")
     }
 
     private fun fetchPieceBytes(pieceUrl: String): ByteArray {
@@ -693,7 +774,13 @@ class ProtectedPageServer(
         private const val BACKLOG = 64
         private const val SOCKET_TIMEOUT_MS = 30_000
         private const val MAX_HEADER_BYTES = 16_384
-        private const val MAX_CONCURRENT_STITCHES = 2
+
+        /** One stitch at a time: the assembled canvas is a tall ARGB_8888
+         * bitmap (16 MB at 800x5000), and two of those at once can OOM on
+         * constrained devices — the reader then shows HTTP 502 on every
+         * protected page. Serializing stitches caps the peak graphics
+         * memory; pieces are downloaded before any bitmap exists anyway. */
+        private const val MAX_CONCURRENT_STITCHES = 1
         private const val MAX_CONCURRENT_IMAGE_PROXIES = 4
         private const val COPY_BUFFER_BYTES = 64 * 1024
 
@@ -712,6 +799,22 @@ class ProtectedPageServer(
 }
 
 /**
+ * A rebuilt set of deferred-media map tokens (the flight-rebuild recovery).
+ * The source produces these by re-fetching the chapter's reader page; the
+ * server rebinds its chapter cache with them when every plan attempt on the
+ * original tokens failed.
+ */
+class RebuiltFlight(
+    val cdnPath: String?,
+    val maps: List<RebuiltMap>,
+)
+
+class RebuiltMap(
+    val token: String,
+    val method: String?,
+)
+
+/**
  * In-memory store for the deferred-media map tokens fetched while building
  * the page list. Keys are chapter ids; entries preserve the deferred order so
  * `pageIndex` indexes directly into the list. App process death clears the
@@ -723,6 +826,9 @@ class MapCache {
         val method: String?,
         val cdnPath: String?,
         val pageIndex: Int,
+        /** The chapter's site reader page — the flight-rebuild recovery
+         * re-fetches it for fresh tokens when every plan attempt failed. */
+        val readerUrl: String? = null,
     )
 
     private val cache = HashMap<String, List<Entry>>()
@@ -756,7 +862,7 @@ class MapCache {
         synchronized(lock) {
             val entries = cache[chapterId] ?: return
             if (entries.all { it.cdnPath == cdnPath }) return
-            cache[chapterId] = entries.map { Entry(it.token, it.method, cdnPath, it.pageIndex) }
+            cache[chapterId] = entries.map { Entry(it.token, it.method, cdnPath, it.pageIndex, it.readerUrl) }
         }
     }
 
