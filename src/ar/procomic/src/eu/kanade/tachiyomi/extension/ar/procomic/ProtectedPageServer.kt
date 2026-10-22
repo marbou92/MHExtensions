@@ -20,10 +20,14 @@ import java.io.InputStreamReader
 import java.net.InetAddress
 import java.net.ServerSocket
 import java.net.Socket
+import java.security.MessageDigest
 import java.util.concurrent.Executors
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
+import javax.crypto.Cipher
+import javax.crypto.spec.GCMParameterSpec
+import javax.crypto.spec.SecretKeySpec
 
 /**
  * Serves ProComic reader images from a loopback HTTP server.
@@ -206,9 +210,9 @@ class ProtectedPageServer(
         stitchPermits.acquire()
         var stage = "plan"
         try {
-            val plan = planWithHeal(chapterId, entry)
+            val planned = planWithHeal(chapterId, entry)
             stage = "stitch"
-            val bytes = stitchWithHeal(chapterId, entry, plan)
+            val bytes = stitchWithHeal(chapterId, entry, planned)
             if (bytes != null) {
                 writeResponse(output, 200, "OK", "image/jpeg", bytes)
             } else {
@@ -230,39 +234,179 @@ class ProtectedPageServer(
         }
     }
 
+    /** A plan plus the generation its pieces were bound to when it was
+     * fetched, so the stitch-stage heal retries the generations that have
+     * not failed yet. */
+    private class PlannedPage(val plan: PlanDto, val cdnPath: String?)
+
     /**
      * The storage generation the plan binds its piece tokens to. Live
      * chapters carry it in the flight (extractCdnPath reads it); a flight
      * without the key, a token minted across the site's generation migrations,
      * or a race between the two leaves the plan bound to a DEAD generation —
      * every piece then answers 404 {"error":"not_found"} and the reader
-     * shows HTTP 502 on the pages after the public ones. The current live
-     * generation is the value the site's own reader hardcodes today.
+     * shows HTTP 502 on the pages after the public ones.
+     *
+     * The site is mid-migration between generations — the search API and
+     * reader flights carry "cdn2" AND "cdn3" for different series (verified
+     * live) — so a single hardcoded heal target can never cover the catalog.
+     * The ladder tries every known generation, rebinds the chapter cache
+     * only after one actually serves a plan, and — when the proxy endpoint
+     * itself is failing (per-POP decryptor lag was observed live as 400
+     * map_proxy_plan_failed) — falls back to decrypting the map token
+     * locally, exactly like the site's own reader does.
      */
-    private fun planWithHeal(chapterId: String, entry: MapCache.Entry): PlanDto = try {
-        fetchPlan(chapterId, entry)
-    } catch (t: IOException) {
-        if (entry.cdnPath == HEAL_CDN_PATH) throw t
-        Log.i(TAG, "plan failed for generation ${entry.cdnPath} (${t.message}); re-planning with $HEAL_CDN_PATH")
-        val healed = fetchPlan(chapterId, entry.withCdnPath(HEAL_CDN_PATH))
-        mapCache.rebindGeneration(chapterId, HEAL_CDN_PATH)
-        healed
+    private fun planWithHeal(chapterId: String, entry: MapCache.Entry): PlannedPage {
+        val firstFailure: IOException = try {
+            return PlannedPage(fetchPlan(chapterId, entry), entry.cdnPath)
+        } catch (t: IOException) {
+            t
+        }
+        Log.i(TAG, "plan failed for generation ${entry.cdnPath} (${firstFailure.message}); trying the generation ladder")
+        for (candidate in healGenerations(entry.cdnPath)) {
+            try {
+                val healed = fetchPlan(chapterId, entry.withCdnPath(candidate))
+                mapCache.rebindGeneration(chapterId, candidate)
+                Log.i(TAG, "plan healed with generation $candidate")
+                return PlannedPage(healed, candidate)
+            } catch (_: IOException) {
+                // the ladder falls through to the next candidate
+            }
+        }
+        try {
+            return PlannedPage(localPlan(chapterId, entry), entry.cdnPath)
+        } catch (_: IOException) {
+            // every recovery path failed — the original failure says why
+        }
+        throw firstFailure
     }
 
-    /** One re-plan + re-stitch when the plan's pieces turn out dead (404 not_found). */
-    private fun stitchWithHeal(chapterId: String, entry: MapCache.Entry, plan: PlanDto): ByteArray? = try {
-        stitchToJpeg(plan)
+    /** One re-plan + re-stitch when the plan's pieces turn out dead.
+     * Reuses the plan-stage ladder (skipping the generation whose pieces
+     * just proved dead) before giving up. */
+    private fun stitchWithHeal(chapterId: String, entry: MapCache.Entry, planned: PlannedPage): ByteArray? = try {
+        stitchToJpeg(planned.plan)
     } catch (t: IOException) {
-        if (!isDeadGeneration(t) || entry.cdnPath == HEAL_CDN_PATH) throw t
-        Log.i(TAG, "pieces dead for generation ${entry.cdnPath}; re-planning with $HEAL_CDN_PATH")
-        val healed = fetchPlan(chapterId, entry.withCdnPath(HEAL_CDN_PATH))
-        mapCache.rebindGeneration(chapterId, HEAL_CDN_PATH)
-        stitchToJpeg(healed)
+        if (!isDeadGeneration(t)) throw t
+        Log.i(TAG, "pieces dead for generation ${planned.cdnPath} (${t.message}); re-planning")
+        for (candidate in healGenerations(planned.cdnPath)) {
+            try {
+                val healed = fetchPlan(chapterId, entry.withCdnPath(candidate))
+                mapCache.rebindGeneration(chapterId, candidate)
+                return stitchToJpeg(healed)
+            } catch (_: IOException) {
+                // the ladder falls through to the next candidate
+            }
+        }
+        throw t
     }
 
-    private fun isDeadGeneration(t: IOException): Boolean = t.message?.contains("piece download failed with HTTP 404") == true
+    /** Generations to try when the entry's own one failed: every generation
+     * the site currently issues, skipping the one that just failed. */
+    private fun healGenerations(current: String?): List<String> = listOf("cdn2", "cdn3").filter { it != current }
+
+    private val deadPieceCodePattern = Regex("piece download failed with HTTP (\\d{3})")
+
+    /** A piece 404 (removed generation), 403 (revoked token) or 5xx (edge
+     * lost the origin) all mean this plan's piece set is unusable and a
+     * re-plan with a different generation is worth one more round. */
+    private fun isDeadGeneration(t: IOException): Boolean {
+        val code = deadPieceCodePattern.find(t.message.orEmpty())?.groupValues?.get(1)?.toIntOrNull() ?: return false
+        return code == 403 || code == 404 || code in 500..599
+    }
 
     private fun MapCache.Entry.withCdnPath(cdnPath: String) = MapCache.Entry(token, method, cdnPath, pageIndex)
+
+    /**
+     * Last-resort plan recovery, used only when every proxy-plan attempt
+     * failed: decrypt the map token the way the site's own reader does.
+     *
+     * Tokens are base64url JSON `{v, m, cid, iv, tag, data}`. The v3
+     * "browser_session" key comes from `GET /chapter-map-session-key/
+     * {chapterId}?legacy=1` (the non-legacy variant answers 403
+     * use_proxy_plan — verified live); the v2 "browser" key is derived as
+     * SHA-256("prochan-browser-map:$KEY_SEED:$chapterId"). Both strings
+     * were lifted from the site's own reader bundle. The plaintext is the
+     * plan JSON ({dim, mode, pieces, order, rects}) the stitcher already
+     * consumes.
+     */
+    private fun localPlan(chapterId: String, entry: MapCache.Entry): PlanDto {
+        val token = try {
+            b64UrlDecode(entry.token).decodeToString().parseAs<MapTokenDto>()
+        } catch (t: Throwable) {
+            throw IOException("ProComic: unreadable map token (${t.javaClass.simpleName})")
+        }
+        val iv = token.iv?.takeIf { it.isNotEmpty() }?.let(::b64UrlDecode)
+            ?: throw IOException("ProComic: map token missing iv")
+        val tag = token.tag?.takeIf { it.isNotEmpty() }?.let(::b64UrlDecode)
+            ?: throw IOException("ProComic: map token missing tag")
+        val data = token.data?.takeIf { it.isNotEmpty() }?.let(::b64UrlDecode)
+            ?: throw IOException("ProComic: map token missing data")
+
+        val key = when (token.m) {
+            "browser_session" -> sessionKey(chapterId)
+            "browser" -> sha256("prochan-browser-map:$KEY_SEED:$chapterId".toByteArray(Charsets.UTF_8))
+            else -> throw IOException("ProComic: unsupported map method ${token.m}")
+        }
+
+        val plaintext = try {
+            val cipher = Cipher.getInstance("AES/GCM/NoPadding")
+            cipher.init(Cipher.DECRYPT_MODE, SecretKeySpec(key, "AES"), GCMParameterSpec(GCM_TAG_BITS, iv))
+            cipher.doFinal(data + tag)
+        } catch (t: Throwable) {
+            throw IOException("ProComic: map decrypt failed (${t.javaClass.simpleName})")
+        }
+        return plaintext.decodeToString().parseAs<PlanDto>()
+    }
+
+    /** The v3 session key for a chapter, cached until its server-provided
+     * expiry (the endpoint rotates keys with ~1h TTLs — refetch after). */
+    private fun sessionKey(chapterId: String): ByteArray {
+        synchronized(sessionKeyLock) {
+            sessionKeyCache[chapterId]?.let { cached ->
+                if (cached.expiresAt > System.currentTimeMillis() + 1_000) return cached.key
+                sessionKeyCache.remove(chapterId)
+            }
+        }
+
+        val request = Request.Builder()
+            .url("$baseUrl/chapter-map-session-key/$chapterId?legacy=1")
+            .header("Accept", "application/json")
+            .header("Referer", "$baseUrl/")
+            .header("User-Agent", BROWSER_UA)
+            .build()
+
+        innerClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) {
+                throw IOException("ProComic: session key failed with HTTP ${response.code}")
+            }
+            val data = response.body.string().parseAs<SessionKeyResponseDto>().data
+                ?: throw IOException("ProComic: empty session key payload")
+            val key = data.key?.takeIf { it.isNotEmpty() }
+                ?: throw IOException("ProComic: session key missing")
+            val decoded = b64UrlDecode(key)
+            synchronized(sessionKeyLock) {
+                if (sessionKeyCache.size >= MAX_SESSION_KEYS) sessionKeyCache.clear()
+                sessionKeyCache[chapterId] = CachedSessionKey(decoded, data.expiresAt ?: 0L)
+            }
+            return decoded
+        }
+    }
+
+    /** Base64url that tolerates missing padding (token fields carry none). */
+    private fun b64UrlDecode(value: String): ByteArray {
+        val normalized = value.replace('-', '+').replace('_', '/')
+        val padded = normalized + "=".repeat((4 - normalized.length % 4) % 4)
+        return android.util.Base64.decode(padded, android.util.Base64.NO_WRAP)
+    }
+
+    private fun sha256(bytes: ByteArray): ByteArray = MessageDigest.getInstance("SHA-256").digest(bytes)
+
+    private class CachedSessionKey(val key: ByteArray, val expiresAt: Long)
+
+    private val sessionKeyCache = HashMap<String, CachedSessionKey>()
+
+    private val sessionKeyLock = Any()
 
     /**
      * Streams the CDN image behind the loopback proxy URL. The caller's own
@@ -507,6 +651,29 @@ class ProtectedPageServer(
         val pageIndex: Int,
     )
 
+    /** Payload of a deferred map token (base64url JSON). */
+    @kotlinx.serialization.Serializable
+    private class MapTokenDto(
+        val v: Int? = null,
+        val m: String? = null,
+        val cid: Long? = null,
+        val iv: String? = null,
+        val tag: String? = null,
+        val data: String? = null,
+    )
+
+    @kotlinx.serialization.Serializable
+    private class SessionKeyDto(
+        val key: String? = null,
+        val expiresAt: Long? = null,
+    )
+
+    @kotlinx.serialization.Serializable
+    private class SessionKeyResponseDto(
+        val success: Boolean? = null,
+        val data: SessionKeyDto? = null,
+    )
+
     companion object {
         const val PROTECTED_PATH_PREFIX = ".protected-page"
         const val IMAGE_PROXY_PATH_PREFIX = ".image-proxy"
@@ -530,8 +697,14 @@ class ProtectedPageServer(
         private const val MAX_CONCURRENT_IMAGE_PROXIES = 4
         private const val COPY_BUFFER_BYTES = 64 * 1024
 
-        /** See planWithHeal / stitchWithHeal. */
-        private const val HEAL_CDN_PATH = "cdn2"
+        /** AES-GCM tag length in bits (the tokens carry 16-byte tags). */
+        private const val GCM_TAG_BITS = 128
+
+        /** Key-derivation seed for v2 "browser" map tokens — the exact
+         * constant the site's reader bundle ships (see localPlan). */
+        private const val KEY_SEED = "2e6f9a1c4d8b7e3f0a5c9d2b6e1f4a8c7d3b0e6a9f2c5d8b1e4a7c0d3f6b9e2"
+
+        private const val MAX_SESSION_KEYS = 32
         private const val TAG = "ProComic"
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()

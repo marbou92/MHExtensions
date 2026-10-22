@@ -158,10 +158,13 @@ abstract class MangaTek :
 
     /**
      * Rewrites requests between the two gateway hosts and retries on
-     * Cloudflare hard-block responses (403 "Attention Required" pages) and
-     * 521/523 origin errors, exactly like Kagane's mirror failover. Only
-     * requests to the known gateway hosts are touched. In auto mode the
-     * winning gateway is persisted so later requests start there.
+     * Cloudflare hard-block responses (403 "Attention Required" pages),
+     * stale-edge text/html 404s and origin-dead 5xx (502/504/521/522/523),
+     * exactly like Kagane's mirror failover. A 504 was the live "HTTP 504
+     * on every request" report: the edge is up but the origin behind it is
+     * dead, and the twin's origin is a different machine. Only requests to
+     * the known gateway hosts are touched. In auto mode the winning gateway
+     * is persisted so later requests start there.
      */
     private fun gatewayFailoverInterceptor(chain: Interceptor.Chain): Response {
         val originalUrl = chain.request().url
@@ -185,11 +188,16 @@ abstract class MangaTek :
 
             val hardBlocked = response.code == 403 &&
                 response.header("content-type")?.contains("text/html") == true
-            if (hardBlocked || response.code == 521 || response.code == 523) {
+            // A text/html 404 on an API host is a misrouted or stale edge
+            // (the gateway root answers exactly like that); real API errors
+            // are JSON. The 5xx set is "edge up, origin dead".
+            val staleEdge404 = response.code == 404 &&
+                response.header("content-type")?.contains("text/html") == true
+            if (hardBlocked || staleEdge404 || response.code in ORIGIN_DEAD_CODES) {
                 response.close()
                 val next = nextGateway(tried)
                     ?: throw IOException("MangaTek: both gateways are unreachable")
-                Log.i(TAG, "Gateway ${request.url.host} blocked, failing over to ${next.toHttpUrl().host}")
+                Log.i(TAG, "Gateway ${request.url.host} dead (${response.code}), failing over to ${next.toHttpUrl().host}")
                 request = request.withGatewayHost(next)
                 tried += next.toHttpUrl().host
                 continue
@@ -223,10 +231,11 @@ abstract class MangaTek :
     // aggressive Cloudflare WAF as the primary site, so a network that is
     // hard-blocked there keeps getting dead covers and dead pages even
     // while browsing works on the twin. This mirrors the gateway failover
-    // for the two content hosts: WAF hard blocks, origin errors (521/523)
-    // and connect failures are retried on the twin content host with the
-    // same path, and in auto mode the winner is persisted. Forced modes
-    // pin the matching content host and never rewrite.
+    // for the two content hosts: WAF hard blocks, stale-edge text/html
+    // 404s and origin-dead 5xx (502/504/521/522/523) are retried on the
+    // twin content host with the same path, and in auto mode the winner is
+    // persisted. Forced modes pin the matching content host and never
+    // rewrite.
 
     private fun currentContentHost(): String = when (gatewayMode()) {
         PREF_GATEWAY_PRIMARY -> primaryContent
@@ -269,14 +278,16 @@ abstract class MangaTek :
             // Cloudflare's error-1001 page (stale DNS for a removed host)
             // is a text/html 404 — a real missing file never looks like
             // that, and failing over once costs a single request when it
-            // is a genuine miss.
-            val staleDns404 = response.code == 404 &&
+            // is a genuine miss. Origin-dead 5xx (a 504 was the live
+            // "HTTP 504" report) means the edge is up but the origin is
+            // gone; the twin's origin is a different machine.
+            val staleEdge404 = response.code == 404 &&
                 response.header("content-type")?.contains("text/html") == true
-            if (hardBlocked || staleDns404 || response.code == 521 || response.code == 523) {
+            if (hardBlocked || staleEdge404 || response.code in ORIGIN_DEAD_CODES) {
                 response.close()
                 val next = nextContentHost(tried)
                     ?: throw IOException("MangaTek: both content hosts are unreachable")
-                Log.i(TAG, "Content host ${request.url.host} blocked, failing over to ${next.toHttpUrl().host}")
+                Log.i(TAG, "Content host ${request.url.host} dead (${response.code}), failing over to ${next.toHttpUrl().host}")
                 request = request.withContentHost(next)
                 tried += next.toHttpUrl().host
                 continue
@@ -305,8 +316,11 @@ abstract class MangaTek :
      * as "both content hosts unreachable" and threw — so covers and pages
      * kept pointing at whichever host the pin (or the NXDOMAIN default)
      * named. The probe now runs on a bare client against BOTH hosts and
-     * counts ANY HTTP answer as alive — including the WAF's root 403 —
-     * while a dead host (NXDOMAIN) answers nothing at all.
+     * counts any NON-ORIGIN-ERROR answer as alive — including the WAF's
+     * root 403, which proves the host exists — while a 5xx (502/504/521…)
+     * means the edge is up but the origin behind it is dead, exactly the
+     * state that handed out "HTTP 504" covers and pages. A dead host
+     * (NXDOMAIN) answers nothing at all.
      */
     private fun ensureActiveContentHostLive() {
         if (gatewayMode() != PREF_GATEWAY_AUTO) return
@@ -324,12 +338,14 @@ abstract class MangaTek :
         }
     }
 
-    /** True when the host answers with ANY status (a WAF 403 still proves the host exists). */
+    /** True when the host answers with a status an origin can actually be
+     * behind: any 2xx-4xx (a WAF 403 still proves the host exists), never
+     * a 5xx (edge up, origin dead) and never a connect failure. */
     private fun probeHostAlive(host: String): Boolean = runCatching {
         probeClient.newCall(Request.Builder().url(host).head().build()).execute().use { response ->
-            response.code
+            response.code < 500
         }
-    }.isSuccess
+    }.getOrDefault(false)
 
     /**
      * Bare client for the liveness probe: deliberately WITHOUT the source
@@ -714,5 +730,11 @@ abstract class MangaTek :
         const val PREF_SHOW_GENRES = "pref_show_genres"
 
         private const val CONTENT_PROBE_INTERVAL_MS = 10 * 60 * 1000L
+
+        /** Edge-up-origin-dead 5xx codes: Cloudflare answers these itself
+         * when the origin behind it is down (504 gateway timeout was the
+         * live report), so a response with one of them is retryable on the
+         * twin host whose origin is a different machine. */
+        private val ORIGIN_DEAD_CODES = setOf(502, 504, 521, 522, 523)
     }
 }
