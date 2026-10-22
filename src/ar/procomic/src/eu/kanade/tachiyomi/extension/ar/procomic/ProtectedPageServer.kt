@@ -64,8 +64,10 @@ import javax.crypto.spec.SecretKeySpec
  * that any HTTP client can fetch works everywhere, with identical behavior in
  * every reader and in downloaders.
  *
- * Piece images are AVIF: decoding requires Android 12 (API 31)+, matching
- * the site's own format choice. The image-proxy route streams bytes without
+ * Piece images are AVIF: the platform codec only exists on Android 12+ and
+ * some OEM builds lack it even after that, so decodePiece falls back to the
+ * bundled software decoder (libavif/dav1d, every ABI) and then ImageDecoder
+ * before surfacing an error. The image-proxy route streams bytes without
  * decoding, so it has no API-level requirement.
  */
 class ProtectedPageServer(
@@ -280,14 +282,14 @@ class ProtectedPageServer(
      */
     private fun planWithHeal(chapterId: String, entry: MapCache.Entry): PlannedPage {
         val firstFailure: IOException = try {
-            return PlannedPage(fetchPlan(chapterId, entry), entry.cdnPath)
+            return PlannedPage(fetchPlanWithRetry(chapterId, entry), entry.cdnPath)
         } catch (t: IOException) {
             t
         }
         Log.i(TAG, "plan failed for generation ${entry.cdnPath} (${firstFailure.message}); trying the generation ladder")
         for (candidate in healGenerations(entry.cdnPath)) {
             try {
-                val healed = fetchPlan(chapterId, entry.withCdnPath(candidate))
+                val healed = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate))
                 mapCache.rebindGeneration(chapterId, candidate)
                 Log.i(TAG, "plan healed with generation $candidate")
                 return PlannedPage(healed, candidate)
@@ -318,7 +320,7 @@ class ProtectedPageServer(
         Log.i(TAG, "pieces dead for generation ${planned.cdnPath} (${t.message}); re-planning")
         for (candidate in healGenerations(planned.cdnPath)) {
             try {
-                val healed = fetchPlan(chapterId, entry.withCdnPath(candidate))
+                val healed = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate))
                 mapCache.rebindGeneration(chapterId, candidate)
                 return stitchToJpeg(healed)
             } catch (_: IOException) {
@@ -576,6 +578,31 @@ class ProtectedPageServer(
         output.flush()
     }
 
+    /**
+     * One plan fetch with a single retry for TRANSIENT proxy failures — the
+     * site's decryptor lags per-POP (observed live as 400
+     * map_proxy_plan_failed) and edges occasionally answer 5xx/429; those
+     * recover on a second attempt seconds later, while revoked tokens (401
+     * /403) do not and are left to the caller's generation ladder.
+     */
+    private fun fetchPlanWithRetry(chapterId: String, entry: MapCache.Entry): PlanDto {
+        try {
+            return fetchPlan(chapterId, entry)
+        } catch (first: IOException) {
+            if (!isTransientPlanFailure(first)) throw first
+            Log.i(TAG, "plan attempt failed transiently (${first.message}); retrying once")
+        }
+        Thread.sleep(PLAN_RETRY_DELAY_MS)
+        return fetchPlan(chapterId, entry)
+    }
+
+    private val planFailureCode = Regex("page plan failed with HTTP (\\d{3})")
+
+    private fun isTransientPlanFailure(t: IOException): Boolean {
+        val code = planFailureCode.find(t.message.orEmpty())?.groupValues?.get(1)?.toIntOrNull() ?: return false
+        return code == 400 || code == 408 || code == 429 || code in 500..599
+    }
+
     private fun fetchPlan(chapterId: String, entry: MapCache.Entry): PlanDto {
         val payload = PlanRequestDto(
             token = entry.token,
@@ -624,7 +651,7 @@ class ProtectedPageServer(
         // cannot be assembled.
         val pieceData = pieceUrls.map { pieceUrl -> fetchPieceBytes(pieceUrl) }
 
-        val result = Bitmap.createBitmap(dimW, dimH, Bitmap.Config.ARGB_8888)
+        val result = createStitchBitmap(dimW, dimH)
         val canvas = Canvas(result)
         canvas.drawColor(Color.WHITE)
 
@@ -656,17 +683,45 @@ class ProtectedPageServer(
     }
 
     /**
-     * Piece decode with a fallback path: BitmapFactory answers null for
-     * AVIF on OEM builds whose platform decoder is missing or disabled
-     * even on Android 12+, which surfaced as an HTTP 502 on every page
-     * after the public ones. ImageDecoder (API 28+) uses a different
-     * entry into the same codecs and succeeds where BitmapFactory fails;
-     * it is asked for a SOFTWARE ARGB_8888 bitmap because the stitch
-     * canvas is a software bitmap and hardware bitmaps cannot be drawn
-     * onto one.
+     * The stitch canvas at 800x5000 is a 16 MB ARGB_8888 allocation; on
+     * memory-constrained devices that single allocation OOMs and every
+     * protected page answers 502 regardless of the plan being healthy.
+     * RGB_565 halves the memory (manga pages are opaque — no alpha channel
+     * is needed) and only kicks in when the full-quality canvas cannot be
+     * allocated at all.
+     */
+    private fun createStitchBitmap(width: Int, height: Int): Bitmap = try {
+        Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+    } catch (t: OutOfMemoryError) {
+        Log.w(TAG, "ARGB_8888 stitch canvas OOM (${width}x$height); falling back to RGB_565")
+        Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
+    }
+
+    /**
+     * Piece decode, three steps: BitmapFactory (the fast path, and the only
+     * one for non-AVIF pieces), the bundled SOFTWARE AVIF decoder — the
+     * platform AVIF codec only ships on Android 12+ and is missing on some
+     * OEM builds even after that, so libavif/dav1d carries every device the
+     * host app runs on — and finally ImageDecoder (API 28+) for whatever the
+     * software decoder refuses. All guarded: any decoder failure surfaces as
+     * the explicit IOException the caller turns into the 502 body.
      */
     private fun decodePiece(bytes: ByteArray, index: Int): Bitmap {
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
+        val software = runCatching {
+            if (!org.aomedia.avif.android.AvifDecoder.isAvifImage(java.nio.ByteBuffer.wrap(bytes))) return@runCatching null
+            val buffer = java.nio.ByteBuffer.wrap(bytes)
+            val info = org.aomedia.avif.android.AvifDecoder.Info()
+            if (!org.aomedia.avif.android.AvifDecoder.getInfo(buffer, bytes.size, info)) return@runCatching null
+            val bitmap = Bitmap.createBitmap(info.width, info.height, Bitmap.Config.ARGB_8888)
+            if (org.aomedia.avif.android.AvifDecoder.decode(java.nio.ByteBuffer.wrap(bytes), bytes.size, bitmap)) {
+                bitmap
+            } else {
+                bitmap.recycle()
+                null
+            }
+        }.getOrNull()
+        if (software != null) return software
         if (android.os.Build.VERSION.SDK_INT >= 28) {
             try {
                 val source = android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))
@@ -681,6 +736,16 @@ class ProtectedPageServer(
     }
 
     private fun fetchPieceBytes(pieceUrl: String): ByteArray {
+        try {
+            return fetchPieceBytesOnce(pieceUrl)
+        } catch (first: IOException) {
+            Log.i(TAG, "piece attempt failed (${first.message}); retrying once")
+        }
+        Thread.sleep(PIECE_RETRY_DELAY_MS)
+        return fetchPieceBytesOnce(pieceUrl)
+    }
+
+    private fun fetchPieceBytesOnce(pieceUrl: String): ByteArray {
         val request = Request.Builder()
             .url(pieceUrl)
             .header("Accept", "image/avif,image/webp,image/*,*/*;q=0.8")
@@ -793,6 +858,10 @@ class ProtectedPageServer(
 
         private const val MAX_SESSION_KEYS = 32
         private const val TAG = "ProComic"
+
+        /** Backoff between the transient plan retry and the piece retry. */
+        private const val PLAN_RETRY_DELAY_MS = 600L
+        private const val PIECE_RETRY_DELAY_MS = 400L
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }

@@ -660,7 +660,9 @@ abstract class MangaTek :
             "cancelled" -> SManga.CANCELLED
             else -> SManga.UNKNOWN
         }
-        genre = this@toSManga.genreLabels().joinToString(",") { genresLabel(it) }
+        // Mihon splits the genre string on ", " (comma + space) into the
+        // details-screen chips — a bare "," merges every genre into ONE chip.
+        genre = this@toSManga.genreLabels().joinToString(", ") { genresLabel(it) }
 
         val showGenres = preferences.getBoolean(PREF_SHOW_GENRES, true)
         description = buildString {
