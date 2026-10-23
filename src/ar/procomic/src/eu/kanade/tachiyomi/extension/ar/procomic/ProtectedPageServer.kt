@@ -96,7 +96,22 @@ class ProtectedPageServer(
 
     private val machine = AtomicReference<Machine?>()
     private val startLock = Any()
-    private val stitchPermits = Semaphore(MAX_CONCURRENT_STITCHES)
+
+    /** Fair 2-wide semaphore over the BITMAP stage only (decode + draw +
+     * JPEG encode). Fairness is the point: a reader preloads the next
+     * several pages while the user is still looking at the current one, and
+     * a non-fair semaphore would let late requests barge ahead of pages the
+     * user is about to reach, starving them past the host's image-fetch
+     * timeout. Plan and piece downloads run OUTSIDE this semaphore —
+     * serializing those (the pre-v87 shape) put a whole preload window
+     * behind one page's full pipeline latency, which is exactly the
+     * "first ~4 pages load, every page after that fails" report: with a
+     * software AVIF decode per piece the serialized pipeline ran 8-12s per
+     * page, so the fifth preloaded page crossed the reader's ~30s fetch
+     * timeout while still queued. Two concurrent stitches peak at two
+     * canvases (~32 MB with the RGB_565 fallback below), transient, with
+     * piece bitmaps recycled inside the loop. */
+    private val stitchPermits = Semaphore(MAX_CONCURRENT_STITCHES, true)
     private val proxyPermits = Semaphore(MAX_CONCURRENT_IMAGE_PROXIES)
 
     /** One inner client for plan + piece traffic, independent of the host
@@ -214,6 +229,15 @@ class ProtectedPageServer(
             return
         }
 
+        // Fast path: this page was already assembled for this chapter — a
+        // retry after a reader-side image-fetch timeout (routine while the
+        // preload queue drains) answers instantly instead of re-running
+        // the whole plan/download/stitch pipeline.
+        cachedPageResult(chapterId, pageIndex)?.let {
+            writeResponse(output, 200, "OK", "image/jpeg", it)
+            return
+        }
+
         val entry = mapCache.get(chapterId, pageIndex)
         if (entry == null) {
             writeResponse(
@@ -226,13 +250,23 @@ class ProtectedPageServer(
             return
         }
 
-        stitchPermits.acquire()
+        // Pipeline layout (the pre-serialization used to put plan + piece
+        // downloads + stitch ALL behind one permit, which serialized a
+        // reader's whole preload window behind a single page's latency and
+        // pushed every queued page past the host's image-fetch timeout —
+        // the device-visible "first ~4 pages load, the rest fail"):
+        //   plan    -> network only, concurrent across pages, 90s result cache
+        //   pieces  -> network only, concurrent across pages
+        //   stitch  -> bitmap work only, fair 2-wide semaphore
         var stage = "plan"
         try {
-            val planned = planWithHeal(chapterId, entry)
+            val planned = planForPage(chapterId, entry)
+            stage = "pieces"
+            val staged = downloadPiecesWithHeal(chapterId, entry, planned)
             stage = "stitch"
-            val bytes = stitchWithHeal(chapterId, entry, planned)
+            val bytes = stitchUnderPermit(staged.planned.plan, staged.pieceData)
             if (bytes != null) {
+                cachePageResult(chapterId, pageIndex, bytes)
                 writeResponse(output, 200, "OK", "image/jpeg", bytes)
             } else {
                 writeResponse(
@@ -253,8 +287,6 @@ class ProtectedPageServer(
             }
             Log.w(TAG, "protected page $chapterId/$pageIndex failed at stage=$stage: $message")
             writeResponse(output, 502, "Bad Gateway", "text/plain", message.toByteArray(), stage = stage)
-        } finally {
-            stitchPermits.release()
         }
     }
 
@@ -262,6 +294,120 @@ class ProtectedPageServer(
      * fetched, so the stitch-stage heal retries the generations that have
      * not failed yet. */
     private class PlannedPage(val plan: PlanDto, val cdnPath: String?)
+
+    /** Downloaded-and-validated pieces for a page, alongside the plan they
+     * came from (the heal ladder may have replaced the original). */
+    private class StagedPieces(val planned: PlannedPage, val pieceData: List<ByteArray>)
+
+    /** The page's plan, served from the 90s cache when possible so reader
+     * re-fetches (preload + visible-page double loads, retries) never
+     * re-POST the proxy-plan endpoint. */
+    private fun planForPage(chapterId: String, entry: MapCache.Entry): PlannedPage {
+        cachedPlan(chapterId, entry.pageIndex)?.let { return it }
+        val planned = planWithHeal(chapterId, entry)
+        cachePlan(chapterId, entry.pageIndex, planned)
+        return planned
+    }
+
+    /** Piece download + the dead-generation heal (a piece 403/404/5xx means
+     * this plan's piece set is unusable — re-plan once on another generation
+     * exactly like the old stitch-stage heal). Network only, no permits. */
+    private fun downloadPiecesWithHeal(
+        chapterId: String,
+        entry: MapCache.Entry,
+        planned: PlannedPage,
+    ): StagedPieces {
+        try {
+            return StagedPieces(planned, fetchPlanPieces(planned.plan))
+        } catch (t: IOException) {
+            if (!isDeadGeneration(t)) throw t
+            Log.i(TAG, "pieces dead for generation ${planned.cdnPath} (${t.message}); re-planning")
+            var lastError = t
+            for (candidate in healGenerations(planned.cdnPath)) {
+                try {
+                    val healedPlan = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate))
+                    mapCache.rebindGeneration(chapterId, candidate)
+                    val healed = PlannedPage(healedPlan, candidate)
+                    cachePlan(chapterId, entry.pageIndex, healed)
+                    return StagedPieces(healed, fetchPlanPieces(healed.plan))
+                } catch (e: IOException) {
+                    lastError = e
+                }
+            }
+            throw lastError
+        }
+    }
+
+    /** The bitmap stage under the fair stitch semaphore: decode + draw +
+     * JPEG encode. Piece bytes are already in memory — no network happens
+     * while the permit is held. */
+    private fun stitchUnderPermit(plan: PlanDto, pieceData: List<ByteArray>): ByteArray? {
+        stitchPermits.acquire()
+        try {
+            return stitchToJpeg(plan, pieceData)
+        } finally {
+            stitchPermits.release()
+        }
+    }
+
+    // ======================= per-page result cache =======================
+
+    /** Finished JPEGs keyed "chapterId/pageIndex". Bounded to a handful of
+     * pages (~1 MB each): enough that every page of a reader's preload
+     * window that timed out on the wire is instantly available on retry,
+     * without holding a chapter's worth of bitmaps-as-JPEG in memory. */
+    private val pageResults = object : LinkedHashMap<String, ByteArray>(16, 0.75f, true) {
+        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, ByteArray>): Boolean = size > MAX_CACHED_PAGE_RESULTS
+    }
+
+    private val pageResultsLock = Any()
+
+    private fun cachedPageResult(chapterId: String, pageIndex: Int): ByteArray? = synchronized(pageResultsLock) {
+        pageResults["$chapterId/$pageIndex"]
+    }
+
+    private fun cachePageResult(chapterId: String, pageIndex: Int, bytes: ByteArray) {
+        synchronized(pageResultsLock) {
+            pageResults["$chapterId/$pageIndex"] = bytes
+        }
+    }
+
+    // ========================= per-page plan cache =======================
+
+    private class CachedPlan(val planned: PlannedPage, val cachedAt: Long)
+
+    private val planCache = HashMap<String, CachedPlan>()
+
+    private val planCacheLock = Any()
+
+    private fun cachedPlan(chapterId: String, pageIndex: Int): PlannedPage? = synchronized(planCacheLock) {
+        val key = "$chapterId/$pageIndex"
+        val cached = planCache[key] ?: return null
+        if (System.currentTimeMillis() - cached.cachedAt > PLAN_CACHE_TTL_MS) {
+            planCache.remove(key)
+            return null
+        }
+        cached.planned
+    }
+
+    private fun cachePlan(chapterId: String, pageIndex: Int, planned: PlannedPage) {
+        synchronized(planCacheLock) {
+            if (planCache.size >= MAX_PLAN_CACHE) {
+                val cutoff = System.currentTimeMillis() - PLAN_CACHE_TTL_MS
+                planCache.entries.removeAll { it.value.cachedAt < cutoff }
+                if (planCache.size >= MAX_PLAN_CACHE) planCache.clear()
+            }
+            planCache["$chapterId/$pageIndex"] = CachedPlan(planned, System.currentTimeMillis())
+        }
+    }
+
+    /** Fresh map tokens (flight rebuild) invalidate every cached plan of the
+     * chapter — the old plans reference dead tokens. */
+    private fun invalidatePlans(chapterId: String) {
+        synchronized(planCacheLock) {
+            planCache.keys.removeAll { it.startsWith("$chapterId/") }
+        }
+    }
 
     /**
      * The storage generation the plan binds its piece tokens to. Live
@@ -308,26 +454,6 @@ class ProtectedPageServer(
             Log.i(TAG, "flight rebuild failed (${t.message})")
         }
         throw firstFailure
-    }
-
-    /** One re-plan + re-stitch when the plan's pieces turn out dead.
-     * Reuses the plan-stage ladder (skipping the generation whose pieces
-     * just proved dead) before giving up. */
-    private fun stitchWithHeal(chapterId: String, entry: MapCache.Entry, planned: PlannedPage): ByteArray? = try {
-        stitchToJpeg(planned.plan)
-    } catch (t: IOException) {
-        if (!isDeadGeneration(t)) throw t
-        Log.i(TAG, "pieces dead for generation ${planned.cdnPath} (${t.message}); re-planning")
-        for (candidate in healGenerations(planned.cdnPath)) {
-            try {
-                val healed = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate))
-                mapCache.rebindGeneration(chapterId, candidate)
-                return stitchToJpeg(healed)
-            } catch (_: IOException) {
-                // the ladder falls through to the next candidate
-            }
-        }
-        throw t
     }
 
     /** Generations to try when the entry's own one failed: every generation
@@ -413,6 +539,7 @@ class ProtectedPageServer(
                 MapCache.Entry(map.token, map.method, fresh.cdnPath, idx, readerUrl)
             },
         )
+        invalidatePlans(chapterId)
         val mine = fresh.maps.getOrNull(entry.pageIndex)
             ?: throw IOException("ProComic: flight rebuild lost page ${entry.pageIndex}")
         return fetchPlan(chapterId, MapCache.Entry(mine.token, mine.method, fresh.cdnPath, entry.pageIndex, readerUrl))
@@ -633,7 +760,26 @@ class ProtectedPageServer(
         }
     }
 
-    private fun stitchToJpeg(plan: PlanDto): ByteArray? {
+    /**
+     * Network-only half of the stitch: downloads every piece of [plan], in
+     * order, and validates them all before any graphics work — a dead
+     * generation surfaces here as the piece-404 IOException the caller
+     * heals with a re-plan, and no bitmap is ever allocated for a page
+     * that cannot be assembled. No bitmaps and no permits here: many pages
+     * download their pieces at the same time.
+     */
+    private fun fetchPlanPieces(plan: PlanDto): List<ByteArray> {
+        val pieceUrls = plan.order.mapNotNull { plan.pieces.getOrNull(it) }
+        if (pieceUrls.isEmpty()) return emptyList()
+        return pieceUrls.map { pieceUrl -> fetchPieceBytes(pieceUrl) }
+    }
+
+    /**
+     * Bitmap half of the stitch: decode + draw + JPEG encode. Runs under the
+     * stitch semaphore (see MAX_CONCURRENT_STITCHES); piece bytes were
+     * downloaded and validated before it is acquired.
+     */
+    private fun stitchToJpeg(plan: PlanDto, pieceData: List<ByteArray>): ByteArray? {
         val dimW = plan.dim.getOrNull(0)?.takeIf { it > 0 } ?: return null
         val dimH = plan.dim.getOrNull(1)?.takeIf { it > 0 } ?: return null
 
@@ -642,14 +788,7 @@ class ProtectedPageServer(
             ?: computeGridRects(plan.mode, dimW, dimH, plan.order.size)
             ?: return null
 
-        val pieceUrls = plan.order.mapNotNull { plan.pieces.getOrNull(it) }
-        if (pieceUrls.isEmpty()) return null
-
-        // Download and validate EVERY piece before any graphics work: a dead
-        // generation surfaces here as the piece-404 IOException the caller
-        // heals with a re-plan — and no bitmap is allocated for a page that
-        // cannot be assembled.
-        val pieceData = pieceUrls.map { pieceUrl -> fetchPieceBytes(pieceUrl) }
+        if (pieceData.isEmpty()) return null
 
         val result = createStitchBitmap(dimW, dimH)
         val canvas = Canvas(result)
@@ -840,12 +979,20 @@ class ProtectedPageServer(
         private const val SOCKET_TIMEOUT_MS = 30_000
         private const val MAX_HEADER_BYTES = 16_384
 
-        /** One stitch at a time: the assembled canvas is a tall ARGB_8888
-         * bitmap (16 MB at 800x5000), and two of those at once can OOM on
-         * constrained devices — the reader then shows HTTP 502 on every
-         * protected page. Serializing stitches caps the peak graphics
-         * memory; pieces are downloaded before any bitmap exists anyway. */
-        private const val MAX_CONCURRENT_STITCHES = 1
+        /** Two stitches at a time: the assembled canvas is a tall ARGB_8888
+         * bitmap (16 MB at 800x5000) and the software AVIF decode is CPU
+         * heavy, but the permit now covers ONLY the bitmap stage (see the
+         * field docs) and createStitchBitmap falls back to RGB_565 when the
+         * full-quality canvas cannot be allocated. */
+        private const val MAX_CONCURRENT_STITCHES = 2
+
+        /** Finished-page result cache (bytes) and plan cache (entries). */
+        private const val MAX_CACHED_PAGE_RESULTS = 8
+        private const val MAX_PLAN_CACHE = 48
+
+        /** How long a cached plan may be reused: piece tokens are
+         * short-lived, so beyond this a fresh plan is fetched. */
+        private const val PLAN_CACHE_TTL_MS = 90_000L
         private const val MAX_CONCURRENT_IMAGE_PROXIES = 4
         private const val COPY_BUFFER_BYTES = 64 * 1024
 
