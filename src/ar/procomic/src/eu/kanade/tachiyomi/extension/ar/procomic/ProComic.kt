@@ -104,7 +104,16 @@ abstract class ProComic :
     // (the site's session-key endpoint now 403s use_proxy_plan, so a stale
     // token can no longer be salvaged any other way).
     internal val protectedPageServer by lazy {
-        ProtectedPageServer(baseUrl, mapCache) { readerUrl, chapterId ->
+        ProtectedPageServer(
+            baseUrl = baseUrl,
+            mapCache = mapCache,
+            // The source's own client as the session fallback tier: when
+            // the stitch server's bare inner client cannot get a plan or a
+            // piece through (region-dependent edge behavior), the request
+            // is retried with the session the reader page established —
+            // cookies, CF clearance, the forced browser UA.
+            sessionClient = client,
+        ) { readerUrl, chapterId ->
             runBlocking { rebuildFlight(readerUrl, chapterId) }
         }
     }

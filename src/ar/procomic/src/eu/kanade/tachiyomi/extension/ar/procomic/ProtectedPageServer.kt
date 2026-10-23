@@ -30,6 +30,33 @@ import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
 /**
+ * Compact attempt trail for one page request: every plan/piece attempt is
+ * recorded with the client that ran it, the generation it targeted and the
+ * HTTP code (or error class) it produced. The trail goes into the 502 body
+ * (reader-visible), the X-ProComic-Diag header, logcat and the /.diag route,
+ * so a device-side failure report pinpoints the failing stage WITHOUT a
+ * debugger — the site's plan/piece endpoints behave differently per region
+ * and per POP (per-POP decryptor lag was observed live as HTTP 400), and
+ * the bare inner client can be treated differently by the WAF than a
+ * session-carrying one.
+ */
+internal class PageDiag {
+
+    private val rows = ArrayList<String>(8)
+    private val lock = Any()
+
+    fun add(row: String) {
+        synchronized(lock) {
+            if (rows.size < 12) rows.add(row)
+        }
+    }
+
+    fun summary(): String = synchronized(lock) { rows.joinToString(", ") }
+
+    fun isEmpty(): Boolean = synchronized(lock) { rows.isEmpty() }
+}
+
+/**
  * Serves ProComic reader images from a loopback HTTP server.
  *
  * Two routes:
@@ -73,6 +100,16 @@ import javax.crypto.spec.SecretKeySpec
 class ProtectedPageServer(
     private val baseUrl: String,
     private val mapCache: MapCache,
+    /**
+     * The source's own client (cookie jar, CF solver, browser UA) used as
+     * the SESSION FALLBACK: when the bare inner client cannot get a plan or
+     * a piece through, the same request is retried through this client so
+     * the site sees the browsing session the reader page established
+     * (cookies, any Cloudflare clearance the source holds). Verified live:
+     * the plan/piece endpoints accept unauthenticated traffic, so the inner
+     * client stays primary; the session path only runs after it failed.
+     */
+    private val sessionClient: OkHttpClient? = null,
     private val flightRebuild: ((readerUrl: String, chapterId: String) -> RebuiltFlight?)? = null,
 ) {
 
@@ -96,6 +133,8 @@ class ProtectedPageServer(
 
     private val machine = AtomicReference<Machine?>()
     private val startLock = Any()
+
+    private val startedAtMs = System.currentTimeMillis()
 
     /** Fair 2-wide semaphore over the BITMAP stage only (decode + draw +
      * JPEG encode). Fairness is the point: a reader preloads the next
@@ -213,10 +252,100 @@ class ProtectedPageServer(
 
     private fun serve(path: String, output: java.io.OutputStream) {
         when {
+            path.startsWith("/$DIAG_PATH_PREFIX") -> serveDiag(path, output)
             path.startsWith("/$PROTECTED_PATH_PREFIX/") -> serveProtectedPage(path, output)
             path.startsWith("/$IMAGE_PROXY_PATH_PREFIX/") -> serveImageProxy(path, output)
             else -> writeResponse(output, 404, "Not Found", "text/plain", "unknown path".toByteArray())
         }
+    }
+
+    /** Failure ring buffer feeding /.diag — the last [MAX_FAILURE_RECORDS]
+     * page failures across all chapters, newest last. */
+    private class FailureRecord(
+        val chapterId: String,
+        val pageIndex: Int,
+        val stage: String,
+        val attempts: String,
+        val at: Long,
+    )
+
+    private val failures = ArrayDeque<FailureRecord>()
+
+    private val failuresLock = Any()
+
+    private fun recordFailure(chapterId: String, pageIndex: Int, stage: String, diag: PageDiag) {
+        if (diag.isEmpty()) return
+        synchronized(failuresLock) {
+            if (failures.size >= MAX_FAILURE_RECORDS) failures.removeFirst()
+            failures.addLast(FailureRecord(chapterId, pageIndex, stage, diag.summary(), System.currentTimeMillis()))
+        }
+    }
+
+    /**
+     * `/.diag` — JSON state of the stitch server for remote diagnosis:
+     * which chapters carry cached maps (method/generation/token size per
+     * page, never the tokens themselves), the plan cache size and the last
+     * failures with their full attempt trails. `/.diag/{chapterId}` scopes
+     * to one chapter. Plain JSON on purpose: the user can paste it as-is.
+     */
+    private fun serveDiag(path: String, output: java.io.OutputStream) {
+        val scopedId = path.removePrefix("/$DIAG_PATH_PREFIX").trimStart('/')
+        val body = try {
+            buildDiagJson(scopedId)
+        } catch (t: Throwable) {
+            "{\"error\":\"diag failed: ${t.javaClass.simpleName}\"}"
+        }
+        writeResponse(output, 200, "OK", "application/json", body.toByteArray())
+    }
+
+    private fun buildDiagJson(scopedChapterId: String): String {
+        val sb = StringBuilder(2048)
+        sb.append('{')
+        sb.append("\"server\":\"procomic-stitch/v88\"")
+        sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
+        val scoped = scopedChapterId.takeIf { it.isNotEmpty() }
+        val chapterIds = scoped?.let { listOf(it) } ?: mapCache.chapterIds()
+        sb.append(",\"chapters\":[")
+        chapterIds.forEachIndexed { ci, chapterId ->
+            if (ci > 0) sb.append(',')
+            sb.append('{')
+            sb.append("\"id\":\"").append(chapterId).append('"')
+            val entries = mapCache.describe(chapterId).orEmpty()
+            sb.append(",\"maps\":").append(entries.size)
+            val method = entries.firstOrNull()?.get("method")
+            val cdnPath = entries.firstOrNull()?.get("cdnPath")
+            if (method != null) sb.append(",\"method\":\"").append(method).append('"')
+            if (cdnPath != null) sb.append(",\"cdnPath\":\"").append(cdnPath).append('"')
+            if (entries.isNotEmpty()) {
+                sb.append(",\"pages\":[")
+                entries.forEachIndexed { pi, e ->
+                    if (pi > 0) sb.append(',')
+                    sb.append("{\"page\":").append(e["page"])
+                        .append(",\"tokenBytes\":").append(e["tokenBytes"])
+                        .append(",\"hasReaderUrl\":").append(e["hasReaderUrl"])
+                        .append('}')
+                }
+                sb.append(']')
+            }
+            sb.append('}')
+        }
+        sb.append(']')
+        synchronized(planCacheLock) { sb.append(",\"planCacheEntries\":").append(planCache.size) }
+        sb.append(",\"recentFailures\":[")
+        val records = synchronized(failuresLock) { failures.toList() }
+            .filter { scoped == null || it.chapterId == scoped }
+        records.forEachIndexed { fi, f ->
+            if (fi > 0) sb.append(',')
+            sb.append("{\"at\":").append(f.at)
+                .append(",\"chapterId\":\"").append(f.chapterId).append('\"')
+                .append(",\"page\":").append(f.pageIndex)
+                .append(",\"stage\":\"").append(f.stage).append('\"')
+                .append(",\"attempts\":\"").append(f.attempts.replace("\"", "'")).append('\"')
+                .append('}')
+        }
+        sb.append(']')
+        sb.append('}')
+        return sb.toString()
     }
 
     private fun serveProtectedPage(path: String, output: java.io.OutputStream) {
@@ -258,25 +387,24 @@ class ProtectedPageServer(
         //   plan    -> network only, concurrent across pages, 90s result cache
         //   pieces  -> network only, concurrent across pages
         //   stitch  -> bitmap work only, fair 2-wide semaphore
+        val diag = PageDiag()
         var stage = "plan"
         try {
-            val planned = planForPage(chapterId, entry)
+            val planned = planForPage(chapterId, entry, diag)
             stage = "pieces"
-            val staged = downloadPiecesWithHeal(chapterId, entry, planned)
+            val staged = downloadPiecesWithHeal(chapterId, entry, planned, diag)
             stage = "stitch"
-            val bytes = stitchUnderPermit(staged.planned.plan, staged.pieceData)
+            val bytes = stitchUnderPermit(staged.planned.plan, staged.pieceData, diag)
             if (bytes != null) {
                 cachePageResult(chapterId, pageIndex, bytes)
                 writeResponse(output, 200, "OK", "image/jpeg", bytes)
             } else {
-                writeResponse(
-                    output,
-                    502,
-                    "Bad Gateway",
-                    "text/plain",
-                    "could not assemble page (Android 12+ required for AVIF pages)".toByteArray(),
-                    stage = "stitch",
-                )
+                diag.add("stitch returned no bitmap")
+                val message = "could not assemble page (Android 12+ required for AVIF pages)"
+                val body = diagBody(message, diag)
+                recordFailure(chapterId, pageIndex, stage, diag)
+                Log.w(TAG, "protected page $chapterId/$pageIndex failed at stage=$stage: $body")
+                writeResponse(output, 502, "Bad Gateway", "text/plain", body.toByteArray(), stage = stage, diag = diag)
             }
         } catch (t: Throwable) {
             val message = when (t) {
@@ -285,9 +413,20 @@ class ProtectedPageServer(
                     "device ran out of memory assembling the page bitmap (OutOfMemoryError)"
                 else -> "page preparation failed (${t.javaClass.simpleName})"
             }
-            Log.w(TAG, "protected page $chapterId/$pageIndex failed at stage=$stage: $message")
-            writeResponse(output, 502, "Bad Gateway", "text/plain", message.toByteArray(), stage = stage)
+            val body = diagBody(message, diag)
+            recordFailure(chapterId, pageIndex, stage, diag)
+            Log.w(TAG, "protected page $chapterId/$pageIndex failed at stage=$stage: $body")
+            writeResponse(output, 502, "Bad Gateway", "text/plain", body.toByteArray(), stage = stage, diag = diag)
         }
+    }
+
+    /** The reader-visible failure line: the cause message first (readers
+     * surface the body text), then the compact attempt trail and the diag
+     * route pointer. Single line, capped so no reader UI chokes on it. */
+    private fun diagBody(message: String, diag: PageDiag): String {
+        val trail = diag.summary()
+        val line = if (trail.isEmpty()) message else "$message [$trail; diag=/.diag]"
+        return if (line.length > MAX_DIAG_BODY) line.take(MAX_DIAG_BODY - 1) + "\u2026" else line
     }
 
     /** A plan plus the generation its pieces were bound to when it was
@@ -302,9 +441,9 @@ class ProtectedPageServer(
     /** The page's plan, served from the 90s cache when possible so reader
      * re-fetches (preload + visible-page double loads, retries) never
      * re-POST the proxy-plan endpoint. */
-    private fun planForPage(chapterId: String, entry: MapCache.Entry): PlannedPage {
+    private fun planForPage(chapterId: String, entry: MapCache.Entry, diag: PageDiag): PlannedPage {
         cachedPlan(chapterId, entry.pageIndex)?.let { return it }
-        val planned = planWithHeal(chapterId, entry)
+        val planned = planWithHeal(chapterId, entry, diag)
         cachePlan(chapterId, entry.pageIndex, planned)
         return planned
     }
@@ -316,20 +455,21 @@ class ProtectedPageServer(
         chapterId: String,
         entry: MapCache.Entry,
         planned: PlannedPage,
+        diag: PageDiag,
     ): StagedPieces {
         try {
-            return StagedPieces(planned, fetchPlanPieces(planned.plan))
+            return StagedPieces(planned, fetchPlanPieces(planned.plan, diag))
         } catch (t: IOException) {
             if (!isDeadGeneration(t)) throw t
             Log.i(TAG, "pieces dead for generation ${planned.cdnPath} (${t.message}); re-planning")
             var lastError = t
             for (candidate in healGenerations(planned.cdnPath)) {
                 try {
-                    val healedPlan = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate))
+                    val healedPlan = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate), diag)
                     mapCache.rebindGeneration(chapterId, candidate)
                     val healed = PlannedPage(healedPlan, candidate)
                     cachePlan(chapterId, entry.pageIndex, healed)
-                    return StagedPieces(healed, fetchPlanPieces(healed.plan))
+                    return StagedPieces(healed, fetchPlanPieces(healed.plan, diag))
                 } catch (e: IOException) {
                     lastError = e
                 }
@@ -341,10 +481,13 @@ class ProtectedPageServer(
     /** The bitmap stage under the fair stitch semaphore: decode + draw +
      * JPEG encode. Piece bytes are already in memory — no network happens
      * while the permit is held. */
-    private fun stitchUnderPermit(plan: PlanDto, pieceData: List<ByteArray>): ByteArray? {
+    private fun stitchUnderPermit(plan: PlanDto, pieceData: List<ByteArray>, diag: PageDiag): ByteArray? {
         stitchPermits.acquire()
         try {
             return stitchToJpeg(plan, pieceData)
+        } catch (t: Throwable) {
+            diag.add("stitch threw ${t.javaClass.simpleName}")
+            throw t
         } finally {
             stitchPermits.release()
         }
@@ -426,35 +569,41 @@ class ProtectedPageServer(
      * map_proxy_plan_failed) — falls back to decrypting the map token
      * locally, exactly like the site's own reader does.
      */
-    private fun planWithHeal(chapterId: String, entry: MapCache.Entry): PlannedPage {
+    private fun planWithHeal(chapterId: String, entry: MapCache.Entry, diag: PageDiag): PlannedPage {
         val firstFailure: IOException = try {
-            return PlannedPage(fetchPlanWithRetry(chapterId, entry), entry.cdnPath)
+            return PlannedPage(fetchPlanWithRetry(chapterId, entry, diag), entry.cdnPath)
         } catch (t: IOException) {
             t
         }
         Log.i(TAG, "plan failed for generation ${entry.cdnPath} (${firstFailure.message}); trying the generation ladder")
         for (candidate in healGenerations(entry.cdnPath)) {
             try {
-                val healed = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate))
+                val healed = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate), diag)
                 mapCache.rebindGeneration(chapterId, candidate)
                 Log.i(TAG, "plan healed with generation $candidate")
                 return PlannedPage(healed, candidate)
-            } catch (_: IOException) {
-                // the ladder falls through to the next candidate
+            } catch (e: IOException) {
+                diag.add("plan gen=$candidate failed (${describe(e)})")
             }
         }
         try {
             return PlannedPage(localPlan(chapterId, entry), entry.cdnPath)
         } catch (t: IOException) {
+            diag.add("local decrypt n/a (${describe(t)})")
             Log.i(TAG, "local decrypt unavailable (${t.message})")
         }
         try {
             return PlannedPage(rebuildPlan(chapterId, entry), entry.cdnPath)
         } catch (t: IOException) {
+            diag.add("rebuild n/a (${describe(t)})")
             Log.i(TAG, "flight rebuild failed (${t.message})")
         }
         throw firstFailure
     }
+
+    /** Short exception description for the diag trail: HTTP codes over
+     * class names when the message carries them. */
+    private fun describe(t: IOException): String = t.message?.substringAfter("ProComic: ") ?: t.javaClass.simpleName
 
     /** Generations to try when the entry's own one failed: every generation
      * the site currently issues, skipping the one that just failed. */
@@ -542,7 +691,7 @@ class ProtectedPageServer(
         invalidatePlans(chapterId)
         val mine = fresh.maps.getOrNull(entry.pageIndex)
             ?: throw IOException("ProComic: flight rebuild lost page ${entry.pageIndex}")
-        return fetchPlan(chapterId, MapCache.Entry(mine.token, mine.method, fresh.cdnPath, entry.pageIndex, readerUrl))
+        return fetchPlan(chapterId, MapCache.Entry(mine.token, mine.method, fresh.cdnPath, entry.pageIndex, readerUrl), VIA_INNER)
     }
 
     /** The v3 session key for a chapter, cached until its server-provided
@@ -692,12 +841,18 @@ class ProtectedPageServer(
         contentType: String,
         body: ByteArray,
         stage: String? = null,
+        diag: PageDiag? = null,
     ) {
         val head = buildString {
             append("HTTP/1.1 ").append(code).append(' ').append(reason).append("\r\n")
             append("Content-Type: ").append(contentType).append("\r\n")
             append("Content-Length: ").append(body.size).append("\r\n")
             if (stage != null) append("X-ProComic-Stage: ").append(stage).append("\r\n")
+            if (diag != null && !diag.isEmpty()) {
+                append("X-ProComic-Diag: ")
+                    .append(diag.summary().replace("\r", " ").replace("\n", " "))
+                    .append("\r\n")
+            }
             append("Connection: close\r\n\r\n")
         }
         output.write(head.toByteArray(Charsets.US_ASCII))
@@ -711,16 +866,41 @@ class ProtectedPageServer(
      * map_proxy_plan_failed) and edges occasionally answer 5xx/429; those
      * recover on a second attempt seconds later, while revoked tokens (401
      * /403) do not and are left to the caller's generation ladder.
+     *
+     * SESSION FALLBACK: when the bare inner client cannot get the plan
+     * through at all, the same request runs through the source's session
+     * client (cookies + CF clearance + browser UA) before the failure
+     * propagates to the generation ladder — the site's edge may treat the
+     * two clients differently per region.
      */
-    private fun fetchPlanWithRetry(chapterId: String, entry: MapCache.Entry): PlanDto {
-        try {
-            return fetchPlan(chapterId, entry)
+    private fun fetchPlanWithRetry(chapterId: String, entry: MapCache.Entry, diag: PageDiag? = null): PlanDto {
+        val innerError = try {
+            return fetchPlan(chapterId, entry, VIA_INNER, diag)
         } catch (first: IOException) {
-            if (!isTransientPlanFailure(first)) throw first
-            Log.i(TAG, "plan attempt failed transiently (${first.message}); retrying once")
+            diag?.add("plan ${label(entry.cdnPath)}/${clientLabel(VIA_INNER)} ${describe(first)}")
+            if (!isTransientPlanFailure(first)) {
+                if (sessionClient == null) throw first
+                first
+            } else {
+                Log.i(TAG, "plan attempt failed transiently (${first.message}); retrying once")
+                Thread.sleep(PLAN_RETRY_DELAY_MS)
+                try {
+                    return fetchPlan(chapterId, entry, VIA_INNER, diag)
+                } catch (retry: IOException) {
+                    diag?.add("plan ${label(entry.cdnPath)}/${clientLabel(VIA_INNER)} retry ${describe(retry)}")
+                    if (sessionClient == null) throw retry
+                    retry
+                }
+            }
         }
-        Thread.sleep(PLAN_RETRY_DELAY_MS)
-        return fetchPlan(chapterId, entry)
+        // The session fallback — only reached when the inner client is
+        // exhausted and a session client was provided.
+        try {
+            return fetchPlan(chapterId, entry, VIA_SESSION, diag)
+        } catch (sessionError: IOException) {
+            diag?.add("plan ${label(entry.cdnPath)}/${clientLabel(VIA_SESSION)} ${describe(sessionError)}")
+            throw sessionError
+        }
     }
 
     private val planFailureCode = Regex("page plan failed with HTTP (\\d{3})")
@@ -730,7 +910,7 @@ class ProtectedPageServer(
         return code == 400 || code == 408 || code == 429 || code in 500..599
     }
 
-    private fun fetchPlan(chapterId: String, entry: MapCache.Entry): PlanDto {
+    private fun fetchPlan(chapterId: String, entry: MapCache.Entry, via: Int, diag: PageDiag? = null): PlanDto {
         val payload = PlanRequestDto(
             token = entry.token,
             method = entry.method,
@@ -750,7 +930,7 @@ class ProtectedPageServer(
             .header("User-Agent", BROWSER_UA)
             .build()
 
-        innerClient.newCall(request).execute().use { response ->
+        clientFor(via).newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IOException("ProComic: page plan failed with HTTP ${response.code}")
             }
@@ -760,6 +940,21 @@ class ProtectedPageServer(
         }
     }
 
+    /** Client selectors for the two-tier fetch: VIA_INNER is the bare
+     * inner client, VIA_SESSION the source's own client (cookies + CF
+     * solver). The session client is only consulted after the inner one
+     * failed; with none provided the plan/piece calls are inner-only. */
+    private fun clientFor(via: Int): OkHttpClient = if (via == VIA_SESSION) {
+        sessionClient ?: innerClient
+    } else {
+        innerClient
+    }
+
+    private fun clientLabel(via: Int): String = if (via == VIA_SESSION) "session" else "inner"
+
+    /** Generation label for the diag trail. */
+    private fun label(cdnPath: String?): String = "gen=${cdnPath ?: "null"}"
+
     /**
      * Network-only half of the stitch: downloads every piece of [plan], in
      * order, and validates them all before any graphics work — a dead
@@ -768,10 +963,10 @@ class ProtectedPageServer(
      * that cannot be assembled. No bitmaps and no permits here: many pages
      * download their pieces at the same time.
      */
-    private fun fetchPlanPieces(plan: PlanDto): List<ByteArray> {
+    private fun fetchPlanPieces(plan: PlanDto, diag: PageDiag? = null): List<ByteArray> {
         val pieceUrls = plan.order.mapNotNull { plan.pieces.getOrNull(it) }
         if (pieceUrls.isEmpty()) return emptyList()
-        return pieceUrls.map { pieceUrl -> fetchPieceBytes(pieceUrl) }
+        return pieceUrls.mapIndexed { index, pieceUrl -> fetchPieceBytes(pieceUrl, index, diag) }
     }
 
     /**
@@ -874,24 +1069,43 @@ class ProtectedPageServer(
         throw IOException("ProComic: piece $index failed to decode (Android 12+ required for AVIF pages)")
     }
 
-    private fun fetchPieceBytes(pieceUrl: String): ByteArray {
+    /**
+     * Piece fetch with the same shape as the plan fetch: one inner retry
+     * for transient edge hiccups, then the session client as the fallback
+     * tier. The thrown message keeps the canonical
+     * "piece download failed with HTTP xxx" tail (the dead-generation heal
+     * pattern-matches it) — the full trail lands in the diag record.
+     */
+    private fun fetchPieceBytes(pieceUrl: String, pieceIndex: Int, diag: PageDiag? = null): ByteArray {
+        val host = pieceUrl.toHttpUrl().host
         try {
-            return fetchPieceBytesOnce(pieceUrl)
+            return fetchPieceBytesOnce(pieceUrl, VIA_INNER)
         } catch (first: IOException) {
-            Log.i(TAG, "piece attempt failed (${first.message}); retrying once")
+            diag?.add("piece#$pieceIndex/$host ${describe(first)}")
+            try {
+                return fetchPieceBytesOnce(pieceUrl, VIA_INNER)
+            } catch (second: IOException) {
+                diag?.add("piece#$pieceIndex/$host retry ${describe(second)}")
+                val sessionClient = this.sessionClient ?: throw second
+                Thread.sleep(PIECE_RETRY_DELAY_MS)
+                try {
+                    return fetchPieceBytesOnce(pieceUrl, VIA_SESSION)
+                } catch (third: IOException) {
+                    diag?.add("piece#$pieceIndex/$host session ${describe(third)}")
+                    throw third
+                }
+            }
         }
-        Thread.sleep(PIECE_RETRY_DELAY_MS)
-        return fetchPieceBytesOnce(pieceUrl)
     }
 
-    private fun fetchPieceBytesOnce(pieceUrl: String): ByteArray {
+    private fun fetchPieceBytesOnce(pieceUrl: String, via: Int): ByteArray {
         val request = Request.Builder()
             .url(pieceUrl)
             .header("Accept", "image/avif,image/webp,image/*,*/*;q=0.8")
             .header("Referer", "$baseUrl/")
             .header("User-Agent", BROWSER_UA)
             .build()
-        innerClient.newCall(request).execute().use { response ->
+        clientFor(via).newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IOException("ProComic: piece download failed with HTTP ${response.code}")
             }
@@ -962,6 +1176,7 @@ class ProtectedPageServer(
     companion object {
         const val PROTECTED_PATH_PREFIX = ".protected-page"
         const val IMAGE_PROXY_PATH_PREFIX = ".image-proxy"
+        const val DIAG_PATH_PREFIX = ".diag"
         const val JPEG_QUALITY = 88
 
         /**
@@ -1009,6 +1224,16 @@ class ProtectedPageServer(
         /** Backoff between the transient plan retry and the piece retry. */
         private const val PLAN_RETRY_DELAY_MS = 600L
         private const val PIECE_RETRY_DELAY_MS = 400L
+
+        /** Cap on the reader-visible 502 body line. */
+        private const val MAX_DIAG_BODY = 700
+
+        /** Failure ring buffer size behind /.diag. */
+        private const val MAX_FAILURE_RECORDS = 64
+
+        /** Client selectors for the two-tier fetch. */
+        private const val VIA_INNER = 0
+        private const val VIA_SESSION = 1
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
@@ -1067,6 +1292,22 @@ class MapCache {
 
     fun get(chapterId: String, pageIndex: Int): Entry? = synchronized(lock) {
         cache[chapterId]?.getOrNull(pageIndex)
+    }
+
+    /** Chapter ids currently holding cached maps (for /.diag). */
+    fun chapterIds(): List<String> = synchronized(lock) { cache.keys.toList() }
+
+    /** Per-page metadata for /.diag — sizes only, never the tokens. */
+    fun describe(chapterId: String): List<Map<String, Any?>>? = synchronized(lock) {
+        cache[chapterId]?.map { entry ->
+            mapOf(
+                "page" to entry.pageIndex,
+                "method" to (entry.method ?: "?"),
+                "cdnPath" to (entry.cdnPath ?: "?"),
+                "tokenBytes" to entry.token.length,
+                "hasReaderUrl" to (entry.readerUrl != null),
+            )
+        }
     }
 
     /**
