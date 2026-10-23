@@ -263,11 +263,11 @@
       "langs": [
         "en"
       ],
-      "version": "1.4.5",
-      "versionCode": 5,
+      "version": "1.4.6",
+      "versionCode": 6,
       "baseUrl": "https://mangataro.org",
-      "apk": "tachiyomi-en.mangataro-v1.4.5-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangataro-v1.4.5-release.apk",
+      "apk": "tachiyomi-en.mangataro-v1.4.6-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangataro-v1.4.6-release.apk",
       "icon": "../icons/mangataro.png",
       "note": "WordPress manga/v1 JSON API with double-encoded filters",
       "description": "WordPress manga/v1 JSON API with the theme's double-encoded filters and MD5 chapter tokens; curated TriState genre list."
@@ -331,11 +331,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.10",
-      "versionCode": 10,
+      "version": "1.6.11",
+      "versionCode": 11,
       "baseUrl": "https://procomic.pro",
-      "apk": "tachiyomi-ar.procomic-v1.6.10-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.10-release.apk",
+      "apk": "tachiyomi-ar.procomic-v1.6.11-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.11-release.apk",
       "icon": "../icons/procomic.png",
       "note": "",
       "description": ""
