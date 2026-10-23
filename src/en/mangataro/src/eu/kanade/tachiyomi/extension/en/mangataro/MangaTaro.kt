@@ -25,6 +25,7 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
@@ -699,7 +700,7 @@ internal class SearchResponse(
             .filter { it.type != "Novel" }
             .map {
                 SManga.create().apply {
-                    url = MangaUrl(id = it.id, slug = it.slug).toJsonString()
+                    url = MangaUrl(id = it.id.content, slug = it.slug).toJsonString()
                     title = it.title.htmlUnescape()
                     thumbnail_url = it.thumbnail
                     description = it.description?.htmlUnescape()
@@ -716,7 +717,13 @@ internal class SearchResponse(
 
 @Serializable
 internal class SearchResult(
-    val id: String,
+    // The quick-search endpoint switched its ids from JSON strings to JSON
+    // numbers (verified live 2026-10-23: "id":47) — strict kotlinx parsing
+    // of a String field then dies with "Expected quotation mark, but had
+    // '5' instead at path $.results[0].id" and EVERY search fails. A
+    // JsonPrimitive absorbs both shapes and .content hands the id down as
+    // the same string the details/chapters endpoints expect.
+    val id: JsonPrimitive,
     val title: String,
     val slug: String,
     val thumbnail: String? = null,
