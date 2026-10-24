@@ -301,7 +301,7 @@ class ProtectedPageServer(
     private fun buildDiagJson(scopedChapterId: String): String {
         val sb = StringBuilder(2048)
         sb.append('{')
-        sb.append("\"server\":\"procomic-stitch/v88\"")
+        sb.append("\"server\":\"procomic-stitch/v90\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         val scoped = scopedChapterId.takeIf { it.isNotEmpty() }
         val chapterIds = scoped?.let { listOf(it) } ?: mapCache.chapterIds()
@@ -385,8 +385,37 @@ class ProtectedPageServer(
         // pushed every queued page past the host's image-fetch timeout —
         // the device-visible "first ~4 pages load, the rest fail"):
         //   plan    -> network only, concurrent across pages, 90s result cache
-        //   pieces  -> network only, concurrent across pages
+        //   pieces  -> network only, concurrent across pages (3-wide pool)
         //   stitch  -> bitmap work only, fair 2-wide semaphore
+        // Identical concurrent requests (host preload window + visible page
+        // + its own prefetch) share ONE build through buildPageCoalesced.
+        try {
+            val bytes = buildPageCoalesced(chapterId, pageIndex) {
+                buildPageBytes(chapterId, pageIndex, entry)
+            }
+            writeResponse(output, 200, "OK", "image/jpeg", bytes)
+        } catch (failure: PageBuildFailure) {
+            Log.w(TAG, "protected page $chapterId/$pageIndex failed at stage=${failure.stage}: ${failure.readerBody}")
+            // Deterministic device-side failures (decode/stitch) render a
+            // legible JPEG — most hosts surface only the HTTP code, which
+            // made every earlier diagnosis trail invisible to the user.
+            val image = if (failure.stage == "stitch") errorPageJpeg(failure) else null
+            if (image != null) {
+                writeResponse(output, 200, "OK", "image/jpeg", image)
+            } else {
+                writeResponse(output, 502, "Bad Gateway", "text/plain", failure.readerBody.toByteArray(), stage = failure.stage, diag = failure.diag)
+            }
+        } catch (t: Throwable) {
+            Log.w(TAG, "protected page $chapterId/$pageIndex dispatch failed: ${t.javaClass.simpleName}")
+            writeResponse(output, 502, "Bad Gateway", "text/plain", "page preparation failed (${t.javaClass.simpleName})".toByteArray())
+        }
+    }
+
+    /** The full plan -> pieces -> stitch pipeline for one page, throwing
+     * [PageBuildFailure] with the reader-visible body. Shared by the
+     * request path and the background preloader; runs ONCE per (chapter,
+     * page) even under concurrent host fetches. */
+    private fun buildPageBytes(chapterId: String, pageIndex: Int, entry: MapCache.Entry): ByteArray {
         val diag = PageDiag()
         var stage = "plan"
         try {
@@ -397,15 +426,17 @@ class ProtectedPageServer(
             val bytes = stitchUnderPermit(staged.planned.plan, staged.pieceData, diag)
             if (bytes != null) {
                 cachePageResult(chapterId, pageIndex, bytes)
-                writeResponse(output, 200, "OK", "image/jpeg", bytes)
-            } else {
-                diag.add("stitch returned no bitmap")
-                val message = "could not assemble page (Android 12+ required for AVIF pages)"
-                val body = diagBody(message, diag)
-                recordFailure(chapterId, pageIndex, stage, diag)
-                Log.w(TAG, "protected page $chapterId/$pageIndex failed at stage=$stage: $body")
-                writeResponse(output, 502, "Bad Gateway", "text/plain", body.toByteArray(), stage = stage, diag = diag)
+                return bytes
             }
+            diag.add("stitch returned no bitmap")
+            throw PageBuildFailure(
+                "stitch",
+                diagBody("could not assemble page (Android 12+ required for AVIF pages)", diag),
+                diag,
+            )
+        } catch (failure: PageBuildFailure) {
+            recordFailure(chapterId, pageIndex, failure.stage, failure.diag)
+            throw failure
         } catch (t: Throwable) {
             val message = when (t) {
                 is IOException -> t.message ?: "page preparation failed (IOException)"
@@ -413,12 +444,189 @@ class ProtectedPageServer(
                     "device ran out of memory assembling the page bitmap (OutOfMemoryError)"
                 else -> "page preparation failed (${t.javaClass.simpleName})"
             }
-            val body = diagBody(message, diag)
             recordFailure(chapterId, pageIndex, stage, diag)
-            Log.w(TAG, "protected page $chapterId/$pageIndex failed at stage=$stage: $body")
-            writeResponse(output, 502, "Bad Gateway", "text/plain", body.toByteArray(), stage = stage, diag = diag)
+            throw PageBuildFailure(stage, diagBody(message, diag), diag, t)
         }
     }
+
+    /** Carries everything a request (or the preloader) needs to report one
+     * failed page build: the stage it died at, the capped reader-visible
+     * body line and the diag trail for the header + /.diag. */
+    private class PageBuildFailure(
+        val stage: String,
+        val readerBody: String,
+        val diag: PageDiag,
+        cause: Throwable? = null,
+    ) : Exception(readerBody, cause)
+
+    // ==================== in-flight page build dedup ====================
+
+    /** The host app fires several concurrent fetches for the same page
+     * (preload window + visible page + its own prefetch) and every one of
+     * them used to run its own plan POST and piece downloads — a stampede
+     * the plan endpoint throttles and the reader experiences as timeouts.
+     * Identical concurrent requests now share one build; late joiners get
+     * the finished bytes (or the same failure) without re-running anything.
+     * Slots linger [INFLIGHT_GRACE_MS] after completion so stampede joiners
+     * still land, then free themselves. */
+    private class InFlightBuild {
+        @Volatile var done = false
+        var bytes: ByteArray? = null
+        var failure: Throwable? = null
+    }
+
+    private val inFlightBuilds = HashMap<String, InFlightBuild>()
+
+    private val inFlightLock = Any()
+
+    // Kotlin does not surface Object.wait/notifyAll on Any — go through
+    // java.lang.Object explicitly for the builder/joiner handshake.
+    private fun Any.monitorWait(ms: Long) = (this as java.lang.Object).wait(ms)
+
+    private fun Any.monitorNotifyAll() = (this as java.lang.Object).notifyAll()
+
+    private fun buildPageCoalesced(chapterId: String, pageIndex: Int, build: () -> ByteArray): ByteArray {
+        val key = "$chapterId/$pageIndex"
+        val created = synchronized(inFlightLock) {
+            val existing = inFlightBuilds[key]
+            if (existing != null) return existing.join()
+            val slot = InFlightBuild()
+            inFlightBuilds[key] = slot
+            slot
+        }
+        // Builder path: the monitor is NOT held while the pipeline runs.
+        try {
+            val bytes = build()
+            synchronized(inFlightLock) {
+                created.bytes = bytes
+                created.done = true
+                inFlightLock.monitorNotifyAll()
+            }
+            scheduleInFlightCleanup(key, created)
+            return bytes
+        } catch (t: Throwable) {
+            synchronized(inFlightLock) {
+                created.failure = t
+                created.done = true
+                inFlightLock.monitorNotifyAll()
+            }
+            scheduleInFlightCleanup(key, created)
+            throw t
+        }
+    }
+
+    private fun InFlightBuild.join(): ByteArray {
+        while (!done) inFlightLock.monitorWait(1000L)
+        bytes?.let { return it }
+        throw failure ?: IOException("ProComic: page build failed")
+    }
+
+    private fun scheduleInFlightCleanup(key: String, slot: InFlightBuild) {
+        executor.execute {
+            try {
+                Thread.sleep(INFLIGHT_GRACE_MS)
+            } catch (_: InterruptedException) {
+                // daemon pool shutting down with the process — nothing to do
+            }
+            synchronized(inFlightLock) {
+                if (inFlightBuilds[key] === slot && slot.done) inFlightBuilds.remove(key)
+            }
+        }
+    }
+
+    // ====================== background pre-assembly ======================
+
+    /** Chapters whose background pre-assembly already started (bounded). */
+    private val preloadStarted = HashSet<String>()
+
+    private val preloadLock = Any()
+
+    /**
+     * Kicked when a chapter's page list is served: builds every protected
+     * page of the chapter in the background (index order, one at a time,
+     * gently paced) so the finished JPEGs are sitting in the result cache
+     * BEFORE the reader asks for them. The host's preload stampede then
+     * hits instant 200s (or joins an in-flight build) instead of queueing
+     * behind full plan+piece+stitch pipelines — the failure mode where the
+     * first few pages render and every later one crosses the host's image
+     * fetch timeout. Reader requests for skipped-ahead pages still build
+     * concurrently: coalescing keeps everyone honest.
+     */
+    fun preloadChapter(chapterId: String) {
+        synchronized(preloadLock) {
+            if (preloadStarted.size > 64) preloadStarted.clear()
+            if (!preloadStarted.add(chapterId)) return
+        }
+        executor.execute {
+            try {
+                for (index in mapCache.pageIndexes(chapterId)) {
+                    if (cachedPageResult(chapterId, index) != null) continue
+                    val entry = mapCache.get(chapterId, index) ?: break // chapter evicted
+                    try {
+                        buildPageCoalesced(chapterId, index) {
+                            buildPageBytes(chapterId, index, entry)
+                        }
+                    } catch (t: PageBuildFailure) {
+                        Log.i(TAG, "preload $chapterId/$index failed at ${t.stage}")
+                    } catch (t: IOException) {
+                        Log.i(TAG, "preload $chapterId/$index failed: ${t.message?.substringAfter("ProComic: ")}")
+                    }
+                    try {
+                        Thread.sleep(PRELOAD_PAGE_PAUSE_MS)
+                    } catch (_: InterruptedException) {
+                        Thread.currentThread().interrupt()
+                        return@execute
+                    }
+                }
+            } finally {
+                synchronized(preloadLock) { preloadStarted.remove(chapterId) }
+            }
+        }
+    }
+
+    /**
+     * Deterministic device-side failures (decode/stitch) get a legible JPEG
+     * instead of a bare 502: most hosts surface only the HTTP code, which
+     * left every earlier diagnosis trail invisible in the reader. The drawn
+     * page carries the failure reason, the attempt trail, the device build
+     * and the /.diag pointer so a screenshot alone is an actionable report.
+     * Never cached (a transient OOM must not stick) and JVM-safe: graphics
+     * are unavailable there, runCatching returns null and the 502 path stays.
+     */
+    private fun errorPageJpeg(failure: PageBuildFailure): ByteArray? = runCatching {
+        val width = 800
+        val height = 1280
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.RGB_565)
+        try {
+            val canvas = Canvas(bitmap)
+            canvas.drawColor(Color.WHITE)
+            val paint = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG)
+            paint.color = 0xFF8B1A1A.toInt()
+            paint.textSize = 34f
+            var y = 90f
+            val lines = buildList {
+                add("ProComic — this page failed to assemble")
+                add("")
+                failure.readerBody.split("; ").forEach { add(it) }
+                add("")
+                add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
+                add("Server build: procomic-stitch/v90")
+                add("More: /${DIAG_PATH_PREFIX} in the app logs")
+            }.flatMap { line ->
+                if (line.length <= 46) listOf(line) else line.chunked(46)
+            }
+            for (line in lines) {
+                if (y > height - 60f) break
+                canvas.drawText(line, 44f, y, paint)
+                y += 46f
+            }
+            val output = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 80, output)
+            output.toByteArray()
+        } finally {
+            bitmap.recycle()
+        }
+    }.getOrNull()
 
     /** The reader-visible failure line: the cause message first (readers
      * surface the body text), then the compact attempt trail and the diag
@@ -956,17 +1164,48 @@ class ProtectedPageServer(
     private fun label(cdnPath: String?): String = "gen=${cdnPath ?: "null"}"
 
     /**
-     * Network-only half of the stitch: downloads every piece of [plan], in
-     * order, and validates them all before any graphics work — a dead
-     * generation surfaces here as the piece-404 IOException the caller
-     * heals with a re-plan, and no bitmap is ever allocated for a page
-     * that cannot be assembled. No bitmaps and no permits here: many pages
-     * download their pieces at the same time.
+     * Network-only half of the stitch: downloads every piece of [plan] and
+     * validates them all before any graphics work — a dead generation
+     * surfaces here as the piece-404 IOException the caller heals with a
+     * re-plan, and no bitmap is ever allocated for a page that cannot be
+     * assembled. No bitmaps and no permits here: many pages download their
+     * pieces at the same time. Pieces run through a small fixed pool (3
+     * wide): six serial downloads cost 6-15s per page — with the host's
+     * image-fetch timeout on top that alone could fail the tail of a
+     * preload window; three-wide cuts the wall time to ~2-5s while keeping
+     * the CDN pressure polite.
      */
+    private val piecePool by lazy {
+        Executors.newFixedThreadPool(PIECE_PARALLELISM) { runnable ->
+            Thread(runnable, "ProComicPieces").apply { isDaemon = true }
+        }
+    }
+
     private fun fetchPlanPieces(plan: PlanDto, diag: PageDiag? = null): List<ByteArray> {
         val pieceUrls = plan.order.mapNotNull { plan.pieces.getOrNull(it) }
         if (pieceUrls.isEmpty()) return emptyList()
-        return pieceUrls.mapIndexed { index, pieceUrl -> fetchPieceBytes(pieceUrl, index, diag) }
+        if (pieceUrls.size == 1) return listOf(fetchPieceBytes(pieceUrls[0], 0, diag))
+        val futures = pieceUrls.mapIndexed { index, pieceUrl ->
+            piecePool.submit(java.util.concurrent.Callable { fetchPieceBytes(pieceUrl, index, diag) })
+        }
+        // Join IN ORDER: rect mapping is positional. The original IOException
+        // is rethrown as-is — its canonical message drives the dead-generation
+        // heal pattern-match.
+        return futures.mapIndexed { index, future ->
+            try {
+                future.get()
+            } catch (e: java.util.concurrent.ExecutionException) {
+                val cause = e.cause
+                throw when (cause) {
+                    is IOException -> cause
+                    is OutOfMemoryError -> cause
+                    else -> IOException("ProComic: piece $index failed (${cause?.javaClass?.simpleName ?: e.javaClass.simpleName})", cause)
+                }
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                throw IOException("ProComic: piece $index interrupted", e)
+            }
+        }
     }
 
     /**
@@ -1202,8 +1441,17 @@ class ProtectedPageServer(
         private const val MAX_CONCURRENT_STITCHES = 2
 
         /** Finished-page result cache (bytes) and plan cache (entries). */
-        private const val MAX_CACHED_PAGE_RESULTS = 8
+        private const val MAX_CACHED_PAGE_RESULTS = 16
         private const val MAX_PLAN_CACHE = 48
+
+        /** Parallel piece downloads per plan (pool width). */
+        private const val PIECE_PARALLELISM = 3
+
+        /** Pause between background pre-assembled pages (gentle pacing). */
+        private const val PRELOAD_PAGE_PAUSE_MS = 250L
+
+        /** How long a finished in-flight build slot stays joinable. */
+        private const val INFLIGHT_GRACE_MS = 10_000L
 
         /** How long a cached plan may be reused: piece tokens are
          * short-lived, so beyond this a fresh plan is fetched. */
@@ -1292,6 +1540,11 @@ class MapCache {
 
     fun get(chapterId: String, pageIndex: Int): Entry? = synchronized(lock) {
         cache[chapterId]?.getOrNull(pageIndex)
+    }
+
+    /** Page indexes held for [chapterId] (background pre-assembly order). */
+    fun pageIndexes(chapterId: String): List<Int> = synchronized(lock) {
+        cache[chapterId]?.map { it.pageIndex } ?: emptyList()
     }
 
     /** Chapter ids currently holding cached maps (for /.diag). */

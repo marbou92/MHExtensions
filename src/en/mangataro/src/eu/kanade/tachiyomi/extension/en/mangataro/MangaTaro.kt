@@ -25,6 +25,7 @@ import keiyoushi.utils.getPreferencesLazy
 import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonPrimitive
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
@@ -285,6 +286,16 @@ abstract class MangaTaro :
 
     private fun mangaDetailsParse(document: Document, requestUrl: HttpUrl, id: String): SManga {
         // --- JSON-LD block: status, type, author, episode count, dates ----
+        // Parsed with the source's OWN lenient Json, never the Injekt-provided
+        // one: the JSON-LD block and the WP REST response below carry dozens of
+        // fields outside these DTOs, and a host that registers a strict Json
+        // (ignoreUnknownKeys=false) made both parses throw inside the
+        // runCatching — silently degrading details to "no genres, unknown
+        // status, meta-description synopsis" with nothing in any log.
+        val detailJson = Json {
+            ignoreUnknownKeys = true
+            isLenient = true
+        }
         val ldJson = document.select("script[type=application/ld+json]")
             .map(Element::data)
             .firstOrNull { it.contains("\"@type\":\"Manga\"") || it.contains("numberOfEpisodes") }
@@ -295,7 +306,7 @@ abstract class MangaTaro :
         var ldYear: Int? = null
         if (ldJson != null) {
             runCatching {
-                val ld = ldJson.parseAs<SchemaOrgManga>()
+                val ld = ldJson.parseAs<SchemaOrgManga>(detailJson)
                 ldAuthor = ld.author?.name?.takeIf(String::isNotBlank)
                 ldGenre = ld.genre?.takeIf(String::isNotBlank)
                 ldStatus = ld.status?.takeIf(String::isNotBlank)
@@ -308,7 +319,7 @@ abstract class MangaTaro :
         val wp = runCatching {
             client.newCall(GET("$baseUrl/wp-json/wp/v2/manga/$id?_embed", headers))
                 .execute()
-                .use { it.parseAs<WpManga>() }
+                .use { it.parseAs<WpManga>(detailJson) }
         }.getOrNull()
 
         val title = document.selectFirst("h1")?.text()?.trim().orEmpty()
@@ -753,6 +764,11 @@ internal class WpManga(
     val slug: String,
     val title: WpTitle,
     val content: WpContent,
+    // The WP REST API keys this field "_embedded" — without the SerialName
+    // the property parsed the nonexistent "embedded" key and was ALWAYS
+    // null (v60-v89): no term genres, no WP synopsis, no featured cover and
+    // no WP author terms, every details screen silently degraded.
+    @kotlinx.serialization.SerialName("_embedded")
     val embedded: WpEmbedded? = null,
 )
 

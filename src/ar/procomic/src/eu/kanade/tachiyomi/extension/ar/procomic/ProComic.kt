@@ -884,6 +884,11 @@ abstract class ProComic :
                             ),
                         )
                     }
+                    // v90: pre-assemble every protected page in the background
+                    // so the reader's own fetches land on finished JPEGs — the
+                    // on-device "first pages load, the rest time out" failure
+                    // was the host's preload stampede racing full pipelines.
+                    protectedPageServer.preloadChapter(chapterIdStr)
                 }
             }
 
