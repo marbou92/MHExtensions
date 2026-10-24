@@ -52,6 +52,8 @@ loadIndividualExtension("en", "mangago")
 loadIndividualExtension("all", "mangafire")
 loadIndividualExtension("ar", "mangatek")
 loadIndividualExtension("ar", "procomic")
+loadIndividualExtension("ar", "mangatime")
+loadIndividualExtension("ar", "mangadar")
 // loadAllIndividualExtensions()
 
 /**

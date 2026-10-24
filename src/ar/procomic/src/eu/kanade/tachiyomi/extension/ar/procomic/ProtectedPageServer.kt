@@ -113,6 +113,20 @@ class ProtectedPageServer(
     private val flightRebuild: ((readerUrl: String, chapterId: String) -> RebuiltFlight?)? = null,
 ) {
 
+    init {
+        // The WebView plan tier hands every cookie it earns (Cloudflare
+        // clearance in particular) back to the session client, so the two
+        // never present different "browsers" to the edge. Reflection: the
+        // client class touches android.webkit and is excluded from the JVM
+        // harness build, where this field simply stays unset.
+        runCatching {
+            Class.forName("eu.kanade.tachiyomi.extension.ar.procomic.ProComicWebViewPlanClient")
+                .getDeclaredField("cookieSink")
+                .apply { isAccessible = true }
+                .set(null, sessionClient)
+        }
+    }
+
     private class Machine(val socket: ServerSocket)
 
     /** Verification probes (JVM harness): force the two last-resort plan
@@ -301,7 +315,7 @@ class ProtectedPageServer(
     private fun buildDiagJson(scopedChapterId: String): String {
         val sb = StringBuilder(2048)
         sb.append('{')
-        sb.append("\"server\":\"procomic-stitch/v91\"")
+        sb.append("\"server\":\"procomic-stitch/v93\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         val scoped = scopedChapterId.takeIf { it.isNotEmpty() }
         val chapterIds = scoped?.let { listOf(it) } ?: mapCache.chapterIds()
@@ -610,7 +624,7 @@ class ProtectedPageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-stitch/v91")
+                add("Server build: procomic-stitch/v93")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -1105,15 +1119,27 @@ class ProtectedPageServer(
         diag: PageDiag? = null,
         preferSession: Boolean = true,
     ): PlanDto {
-        val tiers = if (preferSession && sessionClient != null) {
+        // The WebView tier rides FIRST on device: it performs the plan POST
+        // inside a real browser engine, which is the one request shape the
+        // device's edge accepts where both OkHttp tiers answer 502. The JVM
+        // harness never loads it (Class.forName gate) and keeps the old
+        // two-tier behavior the suites assert on.
+        val webviewTier = if (isWebViewAvailable()) listOf(VIA_WEBVIEW) else emptyList()
+        val clientTiers = if (preferSession && sessionClient != null) {
             listOf(VIA_SESSION, VIA_INNER)
         } else {
             listOf(VIA_INNER, VIA_SESSION)
         }
+        val tiers = webviewTier + clientTiers
         var lastError: IOException? = null
         for (tier in tiers) {
             if (tier == VIA_SESSION && sessionClient == null) continue
             for (attempt in 0..PLAN_RETRY_DELAYS_MS.size) {
+                // The WebView tier does its own bounded retry (Cloudflare
+                // challenge settle) inside one attempt — the [400,1200]
+                // loop below would only stack more multi-second waits on
+                // top of a tier that is already the slowest one.
+                if (tier == VIA_WEBVIEW && attempt > 0) break
                 try {
                     return fetchPlan(chapterId, entry, tier, diag)
                 } catch (e: IOException) {
@@ -1130,6 +1156,20 @@ class ProtectedPageServer(
         throw lastError ?: IOException("ProComic: page plan failed (no client tier available)")
     }
 
+    /** Reflection bridge to the WebView plan client: the class touches
+     * android.webkit and is EXCLUDED from the JVM harness build — there
+     * Class.forName answers null and the tier stays unavailable. On device
+     * the method is the @JvmStatic Pair<Int,String> post(url, body, origin). */
+    private val webviewPostMethod by lazy {
+        runCatching {
+            Class.forName("eu.kanade.tachiyomi.extension.ar.procomic.ProComicWebViewPlanClient")
+                .getDeclaredMethod("post", String::class.java, String::class.java, String::class.java)
+                .apply { isAccessible = true }
+        }.getOrNull()
+    }
+
+    private fun isWebViewAvailable(): Boolean = webviewPostMethod != null
+
     private val planFailureCode = Regex("page plan failed with HTTP (\\d{3})")
 
     private fun isTransientPlanFailure(t: IOException): Boolean {
@@ -1138,12 +1178,37 @@ class ProtectedPageServer(
     }
 
     private fun fetchPlan(chapterId: String, entry: MapCache.Entry, via: Int, diag: PageDiag? = null): PlanDto {
-        val payload = PlanRequestDto(
+        val payloadJson = PlanRequestDto(
             token = entry.token,
             method = entry.method,
             cdnPath = entry.cdnPath,
             pageIndex = entry.pageIndex,
-        ).toJsonString().toRequestBody(JSON_MEDIA_TYPE)
+        ).toJsonString()
+
+        if (via == VIA_WEBVIEW) {
+            // The plan POST the way the site's own browser runs it: a real
+            // WebView performs the fetch with credentials included, so the
+            // request carries the genuine TLS fingerprint / client hints /
+            // cleared-cookie jar that this device's edge accepts where both
+            // OkHttp tiers answer 502. Response handling is identical to
+            // the network path from here on.
+            val post = webviewPostMethod
+                ?: throw IOException("ProComic: page plan failed with HTTP 0")
+            val result = post.invoke(
+                null,
+                "$baseUrl/chapter-map-proxy-plan/$chapterId",
+                payloadJson,
+                baseUrl,
+            ) as Pair<*, *>
+            val status = result.first as Int
+            val body = result.second as String
+            diag?.add("plan ${label(entry.cdnPath)}/webview status=$status")
+            if (status in 200..299) {
+                return body.parseAs<PlanResponseDto>().data?.map
+                    ?: throw IOException("ProComic: empty page plan")
+            }
+            throw IOException("ProComic: page plan failed with HTTP ${status.coerceAtLeast(0)}")
+        }
 
         // The exact header shape of the site's own reader XHR (page-chapter
         // bundle, fetch to /chapter-map-proxy-plan): cookies come from the
@@ -1152,6 +1217,7 @@ class ProtectedPageServer(
         // constant across flight fetch and plan POST keeps the chain
         // consistent), and the sec-*/Origin headers close the gap a bare
         // client leaves that the WAF treats differently per region.
+        val payload = payloadJson.toRequestBody(JSON_MEDIA_TYPE)
         val request = Request.Builder()
             .url("$baseUrl/chapter-map-proxy-plan/$chapterId")
             .post(payload)
@@ -1175,17 +1241,23 @@ class ProtectedPageServer(
         }
     }
 
-    /** Client selectors for the two-tier fetch: VIA_INNER is the bare
-     * inner client, VIA_SESSION the source's own client (cookies + CF
-     * solver). The session client is only consulted after the inner one
-     * failed; with none provided the plan/piece calls are inner-only. */
+    /** Client selectors for the plan tiers: VIA_WEBVIEW runs the POST in a
+     * real WebView (device only), VIA_INNER the bare inner client,
+     * VIA_SESSION the source's own client (cookies + CF solver). The
+     * WebView tier precedes both; the session client is consulted after
+     * the inner one failed; with none provided the plan/piece calls are
+     * inner-only. */
     private fun clientFor(via: Int): OkHttpClient = if (via == VIA_SESSION) {
         sessionClient ?: innerClient
     } else {
         innerClient
     }
 
-    private fun clientLabel(via: Int): String = if (via == VIA_SESSION) "session" else "inner"
+    private fun clientLabel(via: Int): String = when (via) {
+        VIA_WEBVIEW -> "webview"
+        VIA_SESSION -> "session"
+        else -> "inner"
+    }
 
     /** Generation label for the diag trail. */
     private fun label(cdnPath: String?): String = "gen=${cdnPath ?: "null"}"
@@ -1515,9 +1587,10 @@ class ProtectedPageServer(
         /** Failure ring buffer size behind /.diag. */
         private const val MAX_FAILURE_RECORDS = 64
 
-        /** Client selectors for the two-tier fetch. */
+        /** Client selectors for the plan fetch ladder. */
         private const val VIA_INNER = 0
         private const val VIA_SESSION = 1
+        private const val VIA_WEBVIEW = 2
 
         private val JSON_MEDIA_TYPE = "application/json; charset=utf-8".toMediaType()
     }
