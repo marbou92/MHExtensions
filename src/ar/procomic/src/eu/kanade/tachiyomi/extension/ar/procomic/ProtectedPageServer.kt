@@ -301,7 +301,7 @@ class ProtectedPageServer(
     private fun buildDiagJson(scopedChapterId: String): String {
         val sb = StringBuilder(2048)
         sb.append('{')
-        sb.append("\"server\":\"procomic-stitch/v90\"")
+        sb.append("\"server\":\"procomic-stitch/v91\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         val scoped = scopedChapterId.takeIf { it.isNotEmpty() }
         val chapterIds = scoped?.let { listOf(it) } ?: mapCache.chapterIds()
@@ -610,7 +610,7 @@ class ProtectedPageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-stitch/v90")
+                add("Server build: procomic-stitch/v91")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -673,7 +673,7 @@ class ProtectedPageServer(
             var lastError = t
             for (candidate in healGenerations(planned.cdnPath)) {
                 try {
-                    val healedPlan = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate), diag)
+                    val healedPlan = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate), diag, preferSession = true)
                     mapCache.rebindGeneration(chapterId, candidate)
                     val healed = PlannedPage(healedPlan, candidate)
                     cachePlan(chapterId, entry.pageIndex, healed)
@@ -779,14 +779,14 @@ class ProtectedPageServer(
      */
     private fun planWithHeal(chapterId: String, entry: MapCache.Entry, diag: PageDiag): PlannedPage {
         val firstFailure: IOException = try {
-            return PlannedPage(fetchPlanWithRetry(chapterId, entry, diag), entry.cdnPath)
+            return PlannedPage(fetchPlanWithRetry(chapterId, entry, diag, preferSession = true), entry.cdnPath)
         } catch (t: IOException) {
             t
         }
         Log.i(TAG, "plan failed for generation ${entry.cdnPath} (${firstFailure.message}); trying the generation ladder")
         for (candidate in healGenerations(entry.cdnPath)) {
             try {
-                val healed = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate), diag)
+                val healed = fetchPlanWithRetry(chapterId, entry.withCdnPath(candidate), diag, preferSession = true)
                 mapCache.rebindGeneration(chapterId, candidate)
                 Log.i(TAG, "plan healed with generation $candidate")
                 return PlannedPage(healed, candidate)
@@ -899,11 +899,18 @@ class ProtectedPageServer(
         invalidatePlans(chapterId)
         val mine = fresh.maps.getOrNull(entry.pageIndex)
             ?: throw IOException("ProComic: flight rebuild lost page ${entry.pageIndex}")
-        return fetchPlan(chapterId, MapCache.Entry(mine.token, mine.method, fresh.cdnPath, entry.pageIndex, readerUrl), VIA_INNER)
+        return fetchPlanWithRetry(
+            chapterId,
+            MapCache.Entry(mine.token, mine.method, fresh.cdnPath, entry.pageIndex, readerUrl),
+            preferSession = true,
+        )
     }
 
     /** The v3 session key for a chapter, cached until its server-provided
-     * expiry (the endpoint rotates keys with ~1h TTLs — refetch after). */
+     * expiry (the endpoint rotates keys with ~1h TTLs — refetch after).
+     * Session client first: the endpoint 403s `use_proxy_plan` for
+     * cookie-less clients (verified live 2026-10-25), and only the
+     * session tier can carry the cookies the site's own reader sends. */
     private fun sessionKey(chapterId: String): ByteArray {
         synchronized(sessionKeyLock) {
             sessionKeyCache[chapterId]?.let { cached ->
@@ -919,7 +926,8 @@ class ProtectedPageServer(
             .header("User-Agent", BROWSER_UA)
             .build()
 
-        innerClient.newCall(request).execute().use { response ->
+        val client = sessionClient ?: innerClient
+        client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
                 throw IOException("ProComic: session key failed with HTTP ${response.code}")
             }
@@ -1069,46 +1077,57 @@ class ProtectedPageServer(
     }
 
     /**
-     * One plan fetch with a single retry for TRANSIENT proxy failures — the
-     * site's decryptor lags per-POP (observed live as 400
-     * map_proxy_plan_failed) and edges occasionally answer 5xx/429; those
-     * recover on a second attempt seconds later, while revoked tokens (401
-     * /403) do not and are left to the caller's generation ladder.
+     * One plan fetch, retried exactly the way the site's own reader does:
+     * its plan runner loops the POST with sleep delays [400, 1200] and only
+     * re-attempts transient failures (429 / 5xx — matching our
+     * isTransientPlanFailure). We mirror that cadence, then fall through
+     * to the other client tier.
      *
-     * SESSION FALLBACK: when the bare inner client cannot get the plan
-     * through at all, the same request runs through the source's session
-     * client (cookies + CF clearance + browser UA) before the failure
-     * propagates to the generation ladder — the site's edge may treat the
-     * two clients differently per region.
+     * TIER ORDER — session client FIRST by default: the site's reader
+     * sends every plan POST with credentials:"include" (cookies), an
+     * Origin header and full sec-fetch/client-hint headers (verified in
+     * the reader bundle 2026-10-25). The bare inner client sends none of
+     * that and works from some regions while failing deterministically
+     * from others (the device-side "pages after the public ones 502"
+     * report) — the session client carries the browsing context the WAF
+     * expects, plus the challenge solver for the region-dependent edge
+     * behavior. preferSession=false keeps the fast bare tier first for
+     * callers that already know it works (JVM harness).
+     *
+     * SESSION FALLBACK (preferSession=false): when the bare inner client
+     * cannot get the plan through at all, the same request runs through
+     * the source's session client before the failure propagates to the
+     * generation ladder.
      */
-    private fun fetchPlanWithRetry(chapterId: String, entry: MapCache.Entry, diag: PageDiag? = null): PlanDto {
-        val innerError = try {
-            return fetchPlan(chapterId, entry, VIA_INNER, diag)
-        } catch (first: IOException) {
-            diag?.add("plan ${label(entry.cdnPath)}/${clientLabel(VIA_INNER)} ${describe(first)}")
-            if (!isTransientPlanFailure(first)) {
-                if (sessionClient == null) throw first
-                first
-            } else {
-                Log.i(TAG, "plan attempt failed transiently (${first.message}); retrying once")
-                Thread.sleep(PLAN_RETRY_DELAY_MS)
+    private fun fetchPlanWithRetry(
+        chapterId: String,
+        entry: MapCache.Entry,
+        diag: PageDiag? = null,
+        preferSession: Boolean = true,
+    ): PlanDto {
+        val tiers = if (preferSession && sessionClient != null) {
+            listOf(VIA_SESSION, VIA_INNER)
+        } else {
+            listOf(VIA_INNER, VIA_SESSION)
+        }
+        var lastError: IOException? = null
+        for (tier in tiers) {
+            if (tier == VIA_SESSION && sessionClient == null) continue
+            for (attempt in 0..PLAN_RETRY_DELAYS_MS.size) {
                 try {
-                    return fetchPlan(chapterId, entry, VIA_INNER, diag)
-                } catch (retry: IOException) {
-                    diag?.add("plan ${label(entry.cdnPath)}/${clientLabel(VIA_INNER)} retry ${describe(retry)}")
-                    if (sessionClient == null) throw retry
-                    retry
+                    return fetchPlan(chapterId, entry, tier, diag)
+                } catch (e: IOException) {
+                    lastError = e
+                    diag?.add("plan ${label(entry.cdnPath)}/${clientLabel(tier)} attempt${attempt + 1} ${describe(e)}")
+                    if (!isTransientPlanFailure(e)) break // revoked token etc. — next tier
+                    if (attempt < PLAN_RETRY_DELAYS_MS.size) {
+                        Log.i(TAG, "plan attempt failed transiently (${e.message}); retrying")
+                        Thread.sleep(PLAN_RETRY_DELAYS_MS[attempt])
+                    }
                 }
             }
         }
-        // The session fallback — only reached when the inner client is
-        // exhausted and a session client was provided.
-        try {
-            return fetchPlan(chapterId, entry, VIA_SESSION, diag)
-        } catch (sessionError: IOException) {
-            diag?.add("plan ${label(entry.cdnPath)}/${clientLabel(VIA_SESSION)} ${describe(sessionError)}")
-            throw sessionError
-        }
+        throw lastError ?: IOException("ProComic: page plan failed (no client tier available)")
     }
 
     private val planFailureCode = Regex("page plan failed with HTTP (\\d{3})")
@@ -1126,16 +1145,24 @@ class ProtectedPageServer(
             pageIndex = entry.pageIndex,
         ).toJsonString().toRequestBody(JSON_MEDIA_TYPE)
 
-        // BROWSER_UA, not the host-supplied headers: the site's WAF 403s
-        // non-browser User-Agents, and the JWT's uah claim binds the token
-        // to the UA that fetched the reader page — one constant everywhere
-        // keeps the whole chain consistent.
+        // The exact header shape of the site's own reader XHR (page-chapter
+        // bundle, fetch to /chapter-map-proxy-plan): cookies come from the
+        // client tier's jar (the browser sends credentials:"include"), the
+        // UA is BROWSER_UA (the JWT's uah claim binds the token to it — one
+        // constant across flight fetch and plan POST keeps the chain
+        // consistent), and the sec-*/Origin headers close the gap a bare
+        // client leaves that the WAF treats differently per region.
         val request = Request.Builder()
             .url("$baseUrl/chapter-map-proxy-plan/$chapterId")
             .post(payload)
             .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("Origin", baseUrl)
             .header("Referer", "$baseUrl/")
             .header("User-Agent", BROWSER_UA)
+            .header("sec-fetch-dest", "empty")
+            .header("sec-fetch-mode", "cors")
+            .header("sec-fetch-site", "same-origin")
             .build()
 
         clientFor(via).newCall(request).execute().use { response ->
@@ -1340,9 +1367,15 @@ class ProtectedPageServer(
     private fun fetchPieceBytesOnce(pieceUrl: String, via: Int): ByteArray {
         val request = Request.Builder()
             .url(pieceUrl)
-            .header("Accept", "image/avif,image/webp,image/*,*/*;q=0.8")
+            .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
             .header("Referer", "$baseUrl/")
             .header("User-Agent", BROWSER_UA)
+            // What a browser <img> sends for these pieces (the reader loads
+            // them as Image() elements from the chapter page — img hosts are
+            // a different subdomain, hence same-site, not same-origin).
+            .header("sec-fetch-dest", "image")
+            .header("sec-fetch-mode", "no-cors")
+            .header("sec-fetch-site", "same-site")
             .build()
         clientFor(via).newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
@@ -1447,8 +1480,10 @@ class ProtectedPageServer(
         /** Parallel piece downloads per plan (pool width). */
         private const val PIECE_PARALLELISM = 3
 
-        /** Pause between background pre-assembled pages (gentle pacing). */
-        private const val PRELOAD_PAGE_PAUSE_MS = 250L
+        /** Pause between background pre-assembled pages (gentle pacing —
+         * 400ms keeps the plan POST rate friendly to the site's edge while
+         * a full chapter still prebuilds in well under a minute). */
+        private const val PRELOAD_PAGE_PAUSE_MS = 400L
 
         /** How long a finished in-flight build slot stays joinable. */
         private const val INFLIGHT_GRACE_MS = 10_000L
@@ -1469,8 +1504,9 @@ class ProtectedPageServer(
         private const val MAX_SESSION_KEYS = 32
         private const val TAG = "ProComic"
 
-        /** Backoff between the transient plan retry and the piece retry. */
-        private const val PLAN_RETRY_DELAY_MS = 600L
+        /** Backoff schedule between transient plan retries — mirrors the
+         * site reader's own [400, 1200] sleep loop. */
+        private val PLAN_RETRY_DELAYS_MS = longArrayOf(400L, 1200L)
         private const val PIECE_RETRY_DELAY_MS = 400L
 
         /** Cap on the reader-visible 502 body line. */
