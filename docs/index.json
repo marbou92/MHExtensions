@@ -92,6 +92,23 @@
       "description": "all-languages source."
     },
     {
+      "name": "MangaDar",
+      "pkg": "ar.mangadar",
+      "dirname": "mangadar",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.1",
+      "versionCode": 1,
+      "baseUrl": "https://mangadar.com",
+      "apk": "tachiyomi-ar.mangadar-v1.6.1-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.1-release.apk",
+      "icon": null,
+      "note": "",
+      "description": ""
+    },
+    {
       "name": "MangaDot",
       "pkg": "all.mangadot",
       "dirname": "mangadot",
@@ -290,6 +307,23 @@
       "description": ""
     },
     {
+      "name": "MangaTime",
+      "pkg": "ar.mangatime",
+      "dirname": "mangatime",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.1",
+      "versionCode": 1,
+      "baseUrl": "https://mangatime.org",
+      "apk": "tachiyomi-ar.mangatime-v1.6.1-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatime-v1.6.1-release.apk",
+      "icon": null,
+      "note": "",
+      "description": ""
+    },
+    {
       "name": "ManhuaRMTL",
       "pkg": "all.manhuarmtl",
       "dirname": "manhuarmtl",
@@ -331,11 +365,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.13",
-      "versionCode": 13,
+      "version": "1.6.14",
+      "versionCode": 14,
       "baseUrl": "https://procomic.pro",
-      "apk": "tachiyomi-ar.procomic-v1.6.13-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.13-release.apk",
+      "apk": "tachiyomi-ar.procomic-v1.6.14-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.14-release.apk",
       "icon": "../icons/procomic.png",
       "note": "",
       "description": ""
