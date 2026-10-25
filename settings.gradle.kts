@@ -54,6 +54,7 @@ loadIndividualExtension("ar", "mangatek")
 loadIndividualExtension("ar", "procomic")
 loadIndividualExtension("ar", "mangatime")
 loadIndividualExtension("ar", "mangadar")
+loadIndividualExtension("ar", "kawaiimanga")
 // loadAllIndividualExtensions()
 
 /**
