@@ -30,11 +30,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.29",
-      "versionCode": 29,
+      "version": "1.6.30",
+      "versionCode": 30,
       "baseUrl": "https://azorafly.com",
-      "apk": "tachiyomi-ar.azora-v1.6.29-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.azora-v1.6.29-release.apk",
+      "apk": "tachiyomi-ar.azora-v1.6.30-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.azora-v1.6.30-release.apk",
       "icon": "../icons/azora.png",
       "note": "",
       "description": ""
@@ -64,11 +64,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.1",
-      "versionCode": 1,
+      "version": "1.6.2",
+      "versionCode": 2,
       "baseUrl": "https://hijala.com",
-      "apk": "tachiyomi-ar.hijala-v1.6.1-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.hijala-v1.6.1-release.apk",
+      "apk": "tachiyomi-ar.hijala-v1.6.2-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.hijala-v1.6.2-release.apk",
       "icon": "../icons/hijala.png",
       "note": "",
       "description": ""
@@ -331,11 +331,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.56",
-      "versionCode": 56,
+      "version": "1.6.57",
+      "versionCode": 57,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.mangalek-v1.6.56-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.56-release.apk",
+      "apk": "tachiyomi-ar.mangalek-v1.6.57-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.57-release.apk",
       "icon": "../icons/mangalek.png",
       "note": "",
       "description": ""
@@ -348,11 +348,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.1",
-      "versionCode": 1,
+      "version": "1.6.2",
+      "versionCode": 2,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.mangaswat-v1.6.1-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangaswat-v1.6.1-release.apk",
+      "apk": "tachiyomi-ar.mangaswat-v1.6.2-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangaswat-v1.6.2-release.apk",
       "icon": "../icons/mangaswat.png",
       "note": "",
       "description": ""
@@ -498,11 +498,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.1",
-      "versionCode": 1,
+      "version": "1.6.2",
+      "versionCode": 2,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.teamx-v1.6.1-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.teamx-v1.6.1-release.apk",
+      "apk": "tachiyomi-ar.teamx-v1.6.2-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.teamx-v1.6.2-release.apk",
       "icon": "../icons/teamx.png",
       "note": "",
       "description": ""
