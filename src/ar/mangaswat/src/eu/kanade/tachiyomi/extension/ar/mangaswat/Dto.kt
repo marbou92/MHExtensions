@@ -30,15 +30,27 @@ class MangaDto(
     }
 }
 
+/**
+ * The series endpoint carries everything the Comix/MangaDot description
+ * block needs: the 0..5 `rating` (with `ratings_count`), `views_count`,
+ * `chapters_count`, `type`/`status` and the `alternative` names.
+ */
 @Serializable
 internal class MangaDetailsDto(
-    private val title: String,
-    private val poster: PosterDto,
-    private val genres: List<AttributesDto> = emptyList(),
-    private val story: String? = null,
-    private val author: AttributesDto? = null,
-    private val artist: AttributesDto? = null,
-    private val status: AttributesDto? = null,
+    val slug: String? = null,
+    val title: String,
+    val poster: PosterDto,
+    val genres: List<AttributesDto> = emptyList(),
+    val story: String? = null,
+    val alternative: String? = null,
+    val author: AttributesDto? = null,
+    val artist: AttributesDto? = null,
+    val type: AttributesDto? = null,
+    val status: AttributesDto? = null,
+    val rating: String? = null,
+    @SerialName("ratings_count") val ratingsCount: Int? = null,
+    @SerialName("views_count") val viewsCount: Long? = null,
+    @SerialName("chapters_count") val chaptersCount: Int? = null,
 ) {
     fun toSManga(): SManga = SManga.create().apply {
         title = this@MangaDetailsDto.title
@@ -87,6 +99,7 @@ class ChapterDto(
         name = chapter
         url = "/chapters/$id/$slug/"
         date_upload = Instant.parseOrNull(createdAt)?.toEpochMilliseconds() ?: 0L
+        chapter_number = chapter.toFloatOrNull() ?: 0f
 
         // Not used
         memo = buildJsonObject {
