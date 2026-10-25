@@ -57,6 +57,23 @@
       "description": "Komga-fork <code>/api/v2</code> with short-lived integrity tokens for chapter manifests; transparent page-token refresh; data saver."
     },
     {
+      "name": "Kawaiimanga",
+      "pkg": "ar.kawaiimanga",
+      "dirname": "kawaiimanga",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.1",
+      "versionCode": 1,
+      "baseUrl": "https://kawaiimanga.org",
+      "apk": "tachiyomi-ar.kawaiimanga-v1.6.1-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.kawaiimanga-v1.6.1-release.apk",
+      "icon": "../icons/kawaiimanga.png",
+      "note": "",
+      "description": ""
+    },
+    {
       "name": "MangaBall",
       "pkg": "all.mangaball",
       "dirname": "mangaball",
@@ -99,12 +116,12 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.1",
-      "versionCode": 1,
+      "version": "1.6.2",
+      "versionCode": 2,
       "baseUrl": "https://mangadar.com",
-      "apk": "tachiyomi-ar.mangadar-v1.6.1-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.1-release.apk",
-      "icon": null,
+      "apk": "tachiyomi-ar.mangadar-v1.6.2-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.2-release.apk",
+      "icon": "../icons/mangadar.png",
       "note": "",
       "description": ""
     },
@@ -314,12 +331,12 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.1",
-      "versionCode": 1,
+      "version": "1.6.2",
+      "versionCode": 2,
       "baseUrl": "https://mangatime.org",
-      "apk": "tachiyomi-ar.mangatime-v1.6.1-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatime-v1.6.1-release.apk",
-      "icon": null,
+      "apk": "tachiyomi-ar.mangatime-v1.6.2-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatime-v1.6.2-release.apk",
+      "icon": "../icons/mangatime.png",
       "note": "",
       "description": ""
     },
@@ -365,11 +382,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.14",
-      "versionCode": 14,
+      "version": "1.6.15",
+      "versionCode": 15,
       "baseUrl": "https://procomic.pro",
-      "apk": "tachiyomi-ar.procomic-v1.6.14-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.14-release.apk",
+      "apk": "tachiyomi-ar.procomic-v1.6.15-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.15-release.apk",
       "icon": "../icons/procomic.png",
       "note": "",
       "description": ""
