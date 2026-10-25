@@ -63,16 +63,23 @@ internal class PageDiag {
  *
  * 1. `/.protected-page/{chapterId}/{index}` — "protected" pages. The reader
  *    SSR exposes the first few pages as plain CDN URLs; the rest arrive as
- *    encrypted reconstruction "maps". The site's own client decrypts each
+ *    encrypted reconstruction "maps". The site's own reader decrypts each
  *    map into a plan `{dim, mode, pieces, order, rects}` where every piece
  *    is a short-lived `/i/{token}` image on the CDN, and draws the pieces
- *    onto a canvas at their rects. The server decrypts on our behalf through
- *    `POST /chapter-map-proxy-plan/{chapterId}` (the client-side session-key
- *    path answers `use_proxy_plan`), so the flow here is:
+ *    onto a canvas at their rects. Since v1.6.15 the server decrypts
+ *    LOCALLY, exactly like the reader does: v2 "browser" tokens derive
+ *    their AES key from a seed constant (no network), v3
+ *    "browser_session" tokens fetch ONE session key per chapter via
+ *    `GET /chapter-map-session-key/{chapterId}?legacy=1` (cached until its
+ *    expiry; a real WebView fetches the key when the edge 403s OkHttp's
+ *    TLS fingerprint), then decrypt with AES-GCM. The proxy-plan POST
+ *    (`POST /chapter-map-proxy-plan/{chapterId}`) remains only as the
+ *    legacy fallback — the per-page POSTs it needed are what the device
+ *    edge answered 502 from page ~4 onward. The flow here is:
  *
  *      getPageList -> deferred-media (map tokens, cached in memory)
  *                  -> loopback `http://127.0.0.1:{port}/.protected-page/{chapterId}/{index}` URLs
- *      server      -> proxy-plan POST (server-decrypted plan)
+ *      server      -> local decrypt (session key, cached)
  *                  -> download pieces -> stitch at rects -> JPEG response
  *
  * 2. `/.image-proxy/{base64url}` — plain CDN images, proxied byte-for-byte.
@@ -315,7 +322,7 @@ class ProtectedPageServer(
     private fun buildDiagJson(scopedChapterId: String): String {
         val sb = StringBuilder(2048)
         sb.append('{')
-        sb.append("\"server\":\"procomic-stitch/v93\"")
+        sb.append("\"server\":\"procomic-stitch/v94\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         val scoped = scopedChapterId.takeIf { it.isNotEmpty() }
         val chapterIds = scoped?.let { listOf(it) } ?: mapCache.chapterIds()
@@ -624,7 +631,7 @@ class ProtectedPageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-stitch/v93")
+                add("Server build: procomic-stitch/v94")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -662,7 +669,7 @@ class ProtectedPageServer(
 
     /** The page's plan, served from the 90s cache when possible so reader
      * re-fetches (preload + visible-page double loads, retries) never
-     * re-POST the proxy-plan endpoint. */
+     * re-run the plan ladder. */
     private fun planForPage(chapterId: String, entry: MapCache.Entry, diag: PageDiag): PlannedPage {
         cachedPlan(chapterId, entry.pageIndex)?.let { return it }
         val planned = planWithHeal(chapterId, entry, diag)
@@ -809,12 +816,6 @@ class ProtectedPageServer(
             }
         }
         try {
-            return PlannedPage(localPlan(chapterId, entry), entry.cdnPath)
-        } catch (t: IOException) {
-            diag.add("local decrypt n/a (${describe(t)})")
-            Log.i(TAG, "local decrypt unavailable (${t.message})")
-        }
-        try {
             return PlannedPage(rebuildPlan(chapterId, entry), entry.cdnPath)
         } catch (t: IOException) {
             diag.add("rebuild n/a (${describe(t)})")
@@ -922,9 +923,11 @@ class ProtectedPageServer(
 
     /** The v3 session key for a chapter, cached until its server-provided
      * expiry (the endpoint rotates keys with ~1h TTLs — refetch after).
-     * Session client first: the endpoint 403s `use_proxy_plan` for
-     * cookie-less clients (verified live 2026-10-25), and only the
-     * session tier can carry the cookies the site's own reader sends. */
+     * ONE GET per chapter is the replacement method's only key network
+     * cost. The edge 403s it (`use_proxy_plan`) to OkHttp TLS fingerprints
+     * in some regions/POPs (verified live 2026-10-26) while plain browser
+     * clients pass — those devices get the key through the WebView tier
+     * (webviewSessionKey) instead. */
     private fun sessionKey(chapterId: String): ByteArray {
         synchronized(sessionKeyLock) {
             sessionKeyCache[chapterId]?.let { cached ->
@@ -1119,27 +1122,32 @@ class ProtectedPageServer(
         diag: PageDiag? = null,
         preferSession: Boolean = true,
     ): PlanDto {
-        // The WebView tier rides FIRST on device: it performs the plan POST
-        // inside a real browser engine, which is the one request shape the
-        // device's edge accepts where both OkHttp tiers answer 502. The JVM
-        // harness never loads it (Class.forName gate) and keeps the old
-        // two-tier behavior the suites assert on.
-        val webviewTier = if (isWebViewAvailable()) listOf(VIA_WEBVIEW) else emptyList()
+        // v1.6.15 REPLACED METHOD — LOCAL DECRYPT FIRST. The site's own
+        // reader bundle decrypts browser_session (v3) map tokens locally with
+        // a session key from `GET /chapter-map-session-key/{id}?legacy=1`
+        // (ONE cached call per chapter) and only POSTs proxy plans for
+        // protectionV2 chapters. The v93-per-page plan POST ladder burned
+        // the device's edge goodwill: pages 4+ answered 502 exactly while
+        // the real reader (which never POSTs) kept working. So the plan now
+        // comes from the local AES-GCM decrypt (the code that used to be the
+        // last resort), with the WebView fetching the session key as a real
+        // browser when OkHttp's TLS fingerprint gets 403 use_proxy_plan'd,
+        // and the POST ladder demoted to the legacy fallback it is.
+        try {
+            return localPlanWithKeyRecovery(chapterId, entry, diag)
+        } catch (e: IOException) {
+            diag?.add("local ${label(entry.cdnPath)} ${describe(e)}")
+            Log.i(TAG, "local plan unavailable (${e.message}); falling back to the POST ladder")
+        }
         val clientTiers = if (preferSession && sessionClient != null) {
             listOf(VIA_SESSION, VIA_INNER)
         } else {
             listOf(VIA_INNER, VIA_SESSION)
         }
-        val tiers = webviewTier + clientTiers
         var lastError: IOException? = null
-        for (tier in tiers) {
+        for (tier in clientTiers) {
             if (tier == VIA_SESSION && sessionClient == null) continue
             for (attempt in 0..PLAN_RETRY_DELAYS_MS.size) {
-                // The WebView tier does its own bounded retry (Cloudflare
-                // challenge settle) inside one attempt — the [400,1200]
-                // loop below would only stack more multi-second waits on
-                // top of a tier that is already the slowest one.
-                if (tier == VIA_WEBVIEW && attempt > 0) break
                 try {
                     return fetchPlan(chapterId, entry, tier, diag)
                 } catch (e: IOException) {
@@ -1156,10 +1164,31 @@ class ProtectedPageServer(
         throw lastError ?: IOException("ProComic: page plan failed (no client tier available)")
     }
 
-    /** Reflection bridge to the WebView plan client: the class touches
+    /**
+     * The local decrypt with its key recovery: v2 "browser" tokens derive
+     * their AES key with zero network; v3 "browser_session" tokens need the
+     * session-key GET, which the edge 403s (`use_proxy_plan`) to OkHttp TLS
+     * fingerprints on some regions/POPs. When that happens and a real
+     * WebView is available, ONE session-key GET runs inside the WebView —
+     * where the request IS the browser's own — and the answer lands in the
+     * shared key cache before the decrypt is retried. The key is cached per
+     * chapter until its server expiry (~1h), so the WebView cost amortizes
+     * across every page of the chapter instead of running per page.
+     */
+    private fun localPlanWithKeyRecovery(chapterId: String, entry: MapCache.Entry, diag: PageDiag?): PlanDto = try {
+        localPlan(chapterId, entry)
+    } catch (e: IOException) {
+        if (!isWebViewAvailable()) throw e
+        diag?.add("skey webview fallback (${describe(e)})")
+        val key = webviewSessionKey(chapterId, diag) ?: throw e
+        Log.i(TAG, "webview session key earned (${key.size}B) for $chapterId; re-decrypting")
+        localPlan(chapterId, entry)
+    }
+
+    /** Reflection bridges to the WebView client: the class touches
      * android.webkit and is EXCLUDED from the JVM harness build — there
-     * Class.forName answers null and the tier stays unavailable. On device
-     * the method is the @JvmStatic Pair<Int,String> post(url, body, origin). */
+     * Class.forName answers null and the tiers stay unavailable. On device
+     * the methods are the @JvmStatic Pair<Int,String> post/get. */
     private val webviewPostMethod by lazy {
         runCatching {
             Class.forName("eu.kanade.tachiyomi.extension.ar.procomic.ProComicWebViewPlanClient")
@@ -1168,7 +1197,43 @@ class ProtectedPageServer(
         }.getOrNull()
     }
 
+    private val webviewGetMethod by lazy {
+        runCatching {
+            Class.forName("eu.kanade.tachiyomi.extension.ar.procomic.ProComicWebViewPlanClient")
+                .getDeclaredMethod("get", String::class.java, String::class.java)
+                .apply { isAccessible = true }
+        }.getOrNull()
+    }
+
     private fun isWebViewAvailable(): Boolean = webviewPostMethod != null
+
+    /**
+     * One session-key GET inside the real browser engine; fills the shared
+     * per-chapter key cache on success. Null on any failure (the caller
+     * falls back to the POST ladder). The WebView's cookies flow back into
+     * the session client jar, so the lower tiers inherit the clearance.
+     */
+    private fun webviewSessionKey(chapterId: String, diag: PageDiag?): ByteArray? {
+        val get = webviewGetMethod ?: return null
+        return try {
+            val result = get.invoke(null, "$baseUrl/chapter-map-session-key/$chapterId?legacy=1", baseUrl) as Pair<*, *>
+            val status = result.first as Int
+            val body = result.second as String
+            diag?.add("skey webview status=$status")
+            if (status !in 200..299) return null
+            val data = body.parseAs<SessionKeyResponseDto>().data ?: return null
+            val key = data.key?.takeIf(String::isNotEmpty) ?: return null
+            val decoded = b64UrlDecode(key)
+            synchronized(sessionKeyLock) {
+                if (sessionKeyCache.size >= MAX_SESSION_KEYS) sessionKeyCache.clear()
+                sessionKeyCache[chapterId] = CachedSessionKey(decoded, data.expiresAt ?: 0L)
+            }
+            decoded
+        } catch (t: Throwable) {
+            diag?.add("skey webview threw ${t.javaClass.simpleName}")
+            null
+        }
+    }
 
     private val planFailureCode = Regex("page plan failed with HTTP (\\d{3})")
 
@@ -1186,12 +1251,10 @@ class ProtectedPageServer(
         ).toJsonString()
 
         if (via == VIA_WEBVIEW) {
-            // The plan POST the way the site's own browser runs it: a real
-            // WebView performs the fetch with credentials included, so the
-            // request carries the genuine TLS fingerprint / client hints /
-            // cleared-cookie jar that this device's edge accepts where both
-            // OkHttp tiers answer 502. Response handling is identical to
-            // the network path from here on.
+            // Legacy shape kept for the VIA_WEBVIEW constant's only remaining
+            // caller (the debug probes); the live ladder no longer posts
+            // plans through the WebView — it GETs session keys instead
+            // (localPlanWithKeyRecovery).
             val post = webviewPostMethod
                 ?: throw IOException("ProComic: page plan failed with HTTP 0")
             val result = post.invoke(
@@ -1553,9 +1616,11 @@ class ProtectedPageServer(
         private const val PIECE_PARALLELISM = 3
 
         /** Pause between background pre-assembled pages (gentle pacing —
-         * 400ms keeps the plan POST rate friendly to the site's edge while
-         * a full chapter still prebuilds in well under a minute). */
-        private const val PRELOAD_PAGE_PAUSE_MS = 400L
+         * with the per-page plan POST gone (v1.6.15: local decrypt first)
+         * the only per-page traffic is the piece CDN, so 250ms keeps the
+         * preload window quick and polite; a full chapter still prebuilds
+         * in well under a minute). */
+        private const val PRELOAD_PAGE_PAUSE_MS = 250L
 
         /** How long a finished in-flight build slot stays joinable. */
         private const val INFLIGHT_GRACE_MS = 10_000L

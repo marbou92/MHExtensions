@@ -145,6 +145,18 @@ class DeferredResponseDto(
     val data: DeferredDataDto? = null,
 )
 
+/** Body of POST /chapter-deferred-media/{id}/refresh (the reader's own
+ * JWT renewal endpoint): the expired token in, a fresh token out. */
+@Serializable
+class RenewMediaTokenDto(
+    val token: String,
+)
+
+@Serializable
+class RefreshedMediaTokenDto(
+    val token: String? = null,
+)
+
 // ============================ Protection map ============================
 
 @Serializable

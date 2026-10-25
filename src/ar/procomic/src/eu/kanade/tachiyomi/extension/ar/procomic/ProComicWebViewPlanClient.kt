@@ -17,7 +17,8 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * The ProComic plan POST, executed inside a real offscreen Android WebView.
+ * ProComic requests that must look like the site's own browser, executed
+ * inside a real offscreen Android WebView.
  *
  * WHY THIS EXISTS (2026-10-25): every OkHttp tier of the plan POST — the
  * bare inner client AND the session client with the full browser XHR header
@@ -26,11 +27,15 @@ import java.util.concurrent.atomic.AtomicReference
  * browser. The one difference left is not headers or cookies, it is the
  * CLIENT ITSELF: a real browser engine (its TLS fingerprint, its client
  * hints, a cookie jar that genuinely cleared the Cloudflare challenge).
- * So the top tier of the plan ladder performs the exact POST the site's
- * reader performs — `POST /chapter-map-proxy-plan/{id}` with
- * `credentials:"include"` — inside a WebView, where it IS a browser
- * request, and hands the raw response body back. Everything after that
- * (decrypt, pieces, stitch) is untouched.
+ *
+ * v1.6.15 RE-ROLE: the reader bundle's own protocol decrypts browser_session
+ * map tokens LOCALLY with a session key from `GET
+ * /chapter-map-session-key/{id}?legacy=1` (one call per chapter, cached) and
+ * only POSTs proxy plans for protectionV2 chapters. The edge answers the
+ * same GET to plain-curl clients but 403s `use_proxy_plan` to OkHttp's TLS
+ * fingerprint — so the WebView's primary job now is THAT session-key GET
+ * (one per chapter), not a per-page plan POST. `get(url, origin)` serves it;
+ * the plan POST (`post`, the v93 method) stays as the legacy fallback tier.
  *
  * Isolation contract with the JVM harness: this object only loads when
  * `android.webkit.WebView` is a real class (gated in ProtectedPageServer
@@ -72,7 +77,7 @@ internal object ProComicWebViewPlanClient {
      */
     @JvmStatic
     fun post(url: String, bodyJson: String, origin: String): Pair<Int, String> {
-        val first = attempt(url, bodyJson, origin, timeoutMs = 15_000L)
+        val first = attemptPost(url, bodyJson, origin, timeoutMs = 15_000L)
         if (first.status in 200..299) {
             syncCookies(origin)
             return Pair(first.status, first.body)
@@ -81,7 +86,7 @@ internal object ProComicWebViewPlanClient {
             // Likely the challenge page; give its JS a moment, re-warm, retry.
             Thread.sleep(2_500L)
             synchronized(lock) { warmedOrigin = null }
-            val second = attempt(url, bodyJson, origin, timeoutMs = 12_000L)
+            val second = attemptPost(url, bodyJson, origin, timeoutMs = 12_000L)
             if (second.status in 200..299) {
                 syncCookies(origin)
                 return Pair(second.status, second.body)
@@ -91,13 +96,54 @@ internal object ProComicWebViewPlanClient {
         return Pair(first.status, first.body)
     }
 
-    private fun attempt(url: String, bodyJson: String, origin: String, timeoutMs: Long): WebViewResult {
+    /**
+     * Runs `GET [url]` inside the WebView against [origin] — the session-key
+     * fetch the way the site's own browser performs it (real TLS stack, real
+     * cookie jar, credentials included). Returns (status, body); status <= 0
+     * on non-HTTP failures. One automatic retry after a Cloudflare challenge
+     * response, exactly like [post]. The JVM harness never loads this object
+     * (Class.forName gate), so the surface can stay @JvmStatic-simple.
+     */
+    @JvmStatic
+    fun get(url: String, origin: String): Pair<Int, String> {
+        val first = attemptGet(url, origin, timeoutMs = 15_000L)
+        if (first.status in 200..299) {
+            syncCookies(origin)
+            return Pair(first.status, first.body)
+        }
+        if (first.status == 403) {
+            Thread.sleep(2_500L)
+            synchronized(lock) { warmedOrigin = null }
+            val second = attemptGet(url, origin, timeoutMs = 12_000L)
+            if (second.status in 200..299) {
+                syncCookies(origin)
+                return Pair(second.status, second.body)
+            }
+            return Pair(second.status, second.body)
+        }
+        return Pair(first.status, first.body)
+    }
+
+    private fun attemptPost(url: String, bodyJson: String, origin: String, timeoutMs: Long): WebViewResult = attempt(url, origin, timeoutMs) { result, latch -> runFetchPost(url, bodyJson, origin, timeoutMs, result, latch) }
+
+    private fun attemptGet(url: String, origin: String, timeoutMs: Long): WebViewResult = attempt(url, origin, timeoutMs) { result, latch -> runFetchGet(url, origin, timeoutMs, result, latch) }
+
+    /** Scaffolding shared by both fetch shapes: off-handler invoke, latch,
+     * bounded wait, error mapping. The lambda runs on the WebView handler
+     * thread; the bridge fills [result] and counts [latch] down (and the
+     * finally guarantees the latch lands even on a throw). */
+    private inline fun attempt(
+        url: String,
+        origin: String,
+        timeoutMs: Long,
+        crossinline run: (result: AtomicReference<WebViewResult?>, latch: CountDownLatch) -> Unit,
+    ): WebViewResult {
         val latch = CountDownLatch(1)
         val result = AtomicReference<WebViewResult?>(null)
         val h = synchronized(lock) { ensureHandler() } ?: return WebViewResult(-1, "no webview handler")
         h.post {
             try {
-                runFetch(url, bodyJson, origin, timeoutMs, result)
+                run(result, latch)
             } catch (t: Throwable) {
                 result.compareAndSet(null, WebViewResult(-1, t.message ?: t.javaClass.simpleName))
             } finally {
@@ -111,15 +157,15 @@ internal object ProComicWebViewPlanClient {
     }
 
     /** Runs on the WebView handler thread; blocks until the bridge answers. */
-    private fun runFetch(
+    private fun runFetchPost(
         url: String,
         bodyJson: String,
         origin: String,
         timeoutMs: Long,
         result: AtomicReference<WebViewResult?>,
+        latch: CountDownLatch,
     ) {
         val wv = ensureWebView(origin)
-        val latch = CountDownLatch(1)
         val bridge = PlanBridge(result, latch)
         wv.addJavascriptInterface(bridge, "__pcPlan")
 
@@ -141,6 +187,42 @@ internal object ProComicWebViewPlanClient {
                   cache: "no-store",
                   headers: { "content-type": "application/json", "accept": "application/json" },
                   body: bodyText
+                })
+                  .then(function(r){ return r.text().then(function(t){ done(r.status, t); }); })
+                  .catch(function(e){ done(0, String(e)); });
+                return "started";
+              } catch (e) { done(-1, String(e)); }
+            })()
+        """.trimIndent()
+        wv.evaluateJavascript(js, null)
+        latch.await(timeoutMs, TimeUnit.MILLISECONDS)
+    }
+
+    /** The GET shape the session-key endpoint expects: same-origin fetch with
+     * credentials included and an accept header, mirroring the reader's own
+     * B() function (which runs `fetch(url, {credentials:"include",
+     * cache:"no-store", headers:{accept:"application/json"}}`). */
+    private fun runFetchGet(
+        url: String,
+        origin: String,
+        timeoutMs: Long,
+        result: AtomicReference<WebViewResult?>,
+        latch: CountDownLatch,
+    ) {
+        val wv = ensureWebView(origin)
+        val bridge = PlanBridge(result, latch)
+        wv.addJavascriptInterface(bridge, "__pcPlan")
+
+        val urlB64 = Base64.encodeToString(url.toByteArray(Charsets.UTF_8), Base64.NO_WRAP)
+        val js = """
+            (function(){
+              function done(s, b){ window.__pcPlan.onResult(String(s), b == null ? "" : String(b)); }
+              try {
+                fetch(atob("$urlB64"), {
+                  method: "GET",
+                  credentials: "include",
+                  cache: "no-store",
+                  headers: { "accept": "application/json" }
                 })
                   .then(function(r){ return r.text().then(function(t){ done(r.status, t); }); })
                   .catch(function(e){ done(0, String(e)); });

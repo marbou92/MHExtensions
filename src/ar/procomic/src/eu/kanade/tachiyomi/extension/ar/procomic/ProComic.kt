@@ -20,6 +20,7 @@ import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
+import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
 import kotlinx.coroutines.runBlocking
@@ -33,8 +34,10 @@ import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -978,30 +981,77 @@ abstract class ProComic :
 
     /**
      * GET /chapter-deferred-media/{chapterId}?token={jwt}&split={n} ->
-     * the remaining pages' reconstruction map tokens.
+     * the remaining pages' reconstruction map tokens. An expired/revoked
+     * JWT (the tokens live ~30 minutes) gets ONE renewal round-trip first —
+     * `POST /chapter-deferred-media/{chapterId}/refresh` with the old token,
+     * the same flow the site reader's DeferredTokenRenewalError handler
+     * runs — and the fetch is retried with the fresh JWT before giving up
+     * and serving the public pages only.
      */
     private suspend fun fetchDeferredMaps(chapterId: Int, media: DeferredMediaDto): DeferredDataDto? {
         val token = media.token ?: return null
+        var currentToken = token
+        repeat(2) { attempt ->
+            val response = client.newCall(deferredMediaRequest(chapterId, currentToken, media.splitIndex)).execute()
+            response.use {
+                if (it.isSuccessful) {
+                    return json.decodeFromString(DeferredResponseDto.serializer(), it.body.string()).data
+                }
+                // Only the auth/expiry class of failure is worth a renewal;
+                // 404 (unknown chapter) etc. go straight to the fallback.
+                if (it.code != 401 && it.code != 403) {
+                    Log.w(TAG, "deferred media failed with HTTP ${it.code}; serving public pages only")
+                    return null
+                }
+                if (attempt > 0) {
+                    Log.w(TAG, "deferred media still unauthorized after refresh; serving public pages only")
+                    return null
+                }
+            }
+            currentToken = refreshToken(chapterId, currentToken) ?: return null
+        }
+        return null
+    }
+
+    private fun deferredMediaRequest(chapterId: Int, token: String, splitIndex: Int?): Request = Request.Builder()
+        .url(
+            "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
+                .addQueryParameter("token", token)
+                .addQueryParameter("split", (splitIndex ?: 0).toString())
+                .build(),
+        )
+        .header("Accept", "application/json")
+        .header("Referer", "$baseUrl/")
+        .build()
+
+    /** POST /chapter-deferred-media/{chapterId}/refresh {token} -> {token} —
+     * the reader's own renewal endpoint; null when the site refuses. */
+    private fun refreshToken(chapterId: Int, expiredToken: String): String? {
         val request = Request.Builder()
-            .url(
-                "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
-                    .addQueryParameter("token", token)
-                    .addQueryParameter("split", (media.splitIndex ?: 0).toString())
-                    .build(),
-            )
+            .url("$baseUrl/chapter-deferred-media/$chapterId/refresh")
+            .post(RenewMediaTokenDto(expiredToken).toJsonString().toRequestBody(jsonMedia))
             .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
             .header("Referer", "$baseUrl/")
             .build()
-
-        val response = client.newCall(request).execute()
-        response.use {
-            if (!it.isSuccessful) {
-                Log.w(TAG, "deferred media failed with HTTP ${it.code}; serving public pages only")
+        val response = try {
+            client.newCall(request).execute()
+        } catch (t: IOException) {
+            Log.w(TAG, "deferred-media refresh threw ${t.javaClass.simpleName}")
+            return null
+        }
+        response.use { res ->
+            if (!res.isSuccessful) {
+                Log.w(TAG, "deferred-media refresh failed with HTTP ${res.code}")
                 return null
             }
-            return json.decodeFromString(DeferredResponseDto.serializer(), it.body.string()).data
+            val body = res.body.string()
+            val data = runCatching { body.parseAs<RefreshedMediaTokenDto>() }.getOrNull()
+            return data?.token?.takeIf { token -> token.isNotEmpty() }
         }
     }
+
+    private val jsonMedia by lazy { "application/json; charset=utf-8".toMediaType() }
 
     // ========================= Preference screen =========================
 
