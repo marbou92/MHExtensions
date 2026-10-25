@@ -23,6 +23,23 @@
       "description": "<code>home2</code> browse endpoints + Typesense search; full filter set."
     },
     {
+      "name": "Azora",
+      "pkg": "ar.azora",
+      "dirname": "azora",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.29",
+      "versionCode": 29,
+      "baseUrl": "https://azorafly.com",
+      "apk": "tachiyomi-ar.azora-v1.6.29-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.azora-v1.6.29-release.apk",
+      "icon": "../icons/azora.png",
+      "note": "",
+      "description": ""
+    },
+    {
       "name": "Comix",
       "pkg": "all.comixto",
       "dirname": "comixto",
@@ -38,6 +55,23 @@
       "icon": "../icons/comixto.png",
       "note": "Signed+encrypted API via the WebView signing bridge; Cloudflare bypass; image descrambling",
       "description": "signed+encrypted JSON API. The site's VM-protected signer means every <code>/api/v1</code> call runs through a WebView bridge that boots the site's own chunk graph and lets the site sign/decrypt in-JS; frozen native constants stay as the fast path. Cloudflare bypass, tile descrambling, 10 settings."
+    },
+    {
+      "name": "Hijala",
+      "pkg": "ar.hijala",
+      "dirname": "hijala",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.1",
+      "versionCode": 1,
+      "baseUrl": "https://hijala.com",
+      "apk": "tachiyomi-ar.hijala-v1.6.1-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.hijala-v1.6.1-release.apk",
+      "icon": "../icons/hijala.png",
+      "note": "",
+      "description": ""
     },
     {
       "name": "Kagane",
@@ -64,11 +98,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.2",
-      "versionCode": 2,
+      "version": "1.6.3",
+      "versionCode": 3,
       "baseUrl": "https://kawaiimanga.org",
-      "apk": "tachiyomi-ar.kawaiimanga-v1.6.2-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.kawaiimanga-v1.6.2-release.apk",
+      "apk": "tachiyomi-ar.kawaiimanga-v1.6.3-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.kawaiimanga-v1.6.3-release.apk",
       "icon": "../icons/kawaiimanga.png",
       "note": "",
       "description": ""
@@ -116,11 +150,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.3",
-      "versionCode": 3,
+      "version": "1.6.4",
+      "versionCode": 4,
       "baseUrl": "https://mangadar.com",
-      "apk": "tachiyomi-ar.mangadar-v1.6.3-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.3-release.apk",
+      "apk": "tachiyomi-ar.mangadar-v1.6.4-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.4-release.apk",
       "icon": "../icons/mangadar.png",
       "note": "",
       "description": ""
@@ -290,6 +324,40 @@
       "description": "classic HTML browse/search; reader images harvested from the window-attached WebView; route-level CF solving."
     },
     {
+      "name": "Mangalek",
+      "pkg": "ar.mangalek",
+      "dirname": "mangalek",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.56",
+      "versionCode": 56,
+      "baseUrl": "",
+      "apk": "tachiyomi-ar.mangalek-v1.6.56-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.56-release.apk",
+      "icon": "../icons/mangalek.png",
+      "note": "",
+      "description": ""
+    },
+    {
+      "name": "MangaSwat",
+      "pkg": "ar.mangaswat",
+      "dirname": "mangaswat",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.1",
+      "versionCode": 1,
+      "baseUrl": "",
+      "apk": "tachiyomi-ar.mangaswat-v1.6.1-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangaswat-v1.6.1-release.apk",
+      "icon": "../icons/mangaswat.png",
+      "note": "",
+      "description": ""
+    },
+    {
       "name": "MangaTaro",
       "pkg": "en.mangataro",
       "dirname": "mangataro",
@@ -331,11 +399,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.3",
-      "versionCode": 3,
+      "version": "1.6.4",
+      "versionCode": 4,
       "baseUrl": "https://mangatime.org",
-      "apk": "tachiyomi-ar.mangatime-v1.6.3-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatime-v1.6.3-release.apk",
+      "apk": "tachiyomi-ar.mangatime-v1.6.4-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatime-v1.6.4-release.apk",
       "icon": "../icons/mangatime.png",
       "note": "",
       "description": ""
@@ -421,6 +489,23 @@
       "icon": "../icons/swarm.png",
       "note": "",
       "description": "swarm sites."
+    },
+    {
+      "name": "Team X",
+      "pkg": "ar.teamx",
+      "dirname": "teamx",
+      "langDir": "ar",
+      "langs": [
+        "ar"
+      ],
+      "version": "1.6.1",
+      "versionCode": 1,
+      "baseUrl": "",
+      "apk": "tachiyomi-ar.teamx-v1.6.1-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.teamx-v1.6.1-release.apk",
+      "icon": "../icons/teamx.png",
+      "note": "",
+      "description": ""
     },
     {
       "name": "Toonz",
