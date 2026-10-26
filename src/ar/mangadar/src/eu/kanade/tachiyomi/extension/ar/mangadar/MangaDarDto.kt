@@ -164,8 +164,10 @@ class ChapterListDto(
 class ChapterDto(
     val id: String,
     val seriesId: String? = null,
-    // Fractional numbers exist (364.5) — always a JSON number.
-    val number: Float,
+    // Fractional numbers exist (364.5) — a JSON number when present. Rows
+    // without one (preview/placeholder slots) must not nuke the whole
+    // listing parse, so the field stays nullable and maps to 0f.
+    val number: Float? = null,
     val title: String? = null,
     val pageCount: Int? = null,
     val language: String? = null,
@@ -217,8 +219,9 @@ class ChapterRef(
 )
 
 fun ChapterDto.toSChapter(seriesSlug: String): SChapter = SChapter.create().apply {
-    url = ChapterRef(s = seriesSlug, n = this@toSChapter.number).toJsonString()
-    val numberText = trimNumber(this@toSChapter.number)
+    val number = this@toSChapter.number ?: 0f
+    url = ChapterRef(s = seriesSlug, n = number).toJsonString()
+    val numberText = trimNumber(number)
     name = buildString {
         append("الفصل ").append(numberText)
         val title = this@toSChapter.title.orEmpty().trim()
@@ -229,7 +232,7 @@ fun ChapterDto.toSChapter(seriesSlug: String): SChapter = SChapter.create().appl
             append(" 🔒")
         }
     }
-    chapter_number = this@toSChapter.number
+    chapter_number = number
     scanlator = null // the platform has no upload teams
     date_upload = 0L // the source fills this from publishedAt
 }

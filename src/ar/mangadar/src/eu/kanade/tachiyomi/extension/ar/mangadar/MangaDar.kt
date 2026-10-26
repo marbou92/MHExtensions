@@ -14,6 +14,7 @@ import eu.kanade.tachiyomi.source.model.SChapter
 import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
+import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.firstInstanceOrNull
@@ -81,6 +82,11 @@ abstract class MangaDar :
         connectTimeout(30, TimeUnit.SECONDS)
         readTimeout(60, TimeUnit.SECONDS)
         writeTimeout(30, TimeUnit.SECONDS)
+        // The platform sits behind Cloudflare and the edge 403s some client
+        // populations (region/POP dependent — the device-side "chapter
+        // listing fails while the browser works" class). Solve challenges
+        // in-app the same way ProComic does instead of failing the call.
+        addInterceptor(CloudflareSolverInterceptor(setOf(apiBase.toHttpUrl().host)))
         // The SPA runs crawler telemetry (/api/track/*, CrawlerFailureBeacon);
         // keep the request pace civil like the site's own traffic.
         rateLimit(3)
@@ -384,11 +390,21 @@ abstract class MangaDar :
     }
 
     private suspend fun fetchSeriesDetails(manga: SManga): SManga {
+        // Entries whose url holds the platform's mongo id instead of the slug
+        // (older library writes / host-app migrations) 404 on getSeriesBySlug:
+        // recover the slug from the browse API by matching the id, then load
+        // details by slug — the healed slug flows back so every later refresh
+        // is a plain slug lookup again.
+        val slug = if (isSeriesId(manga.url)) {
+            healSlugById(manga.url, manga.title)
+        } else {
+            manga.url
+        }
         val input = buildJsonObject {
             put(
                 "0",
                 buildJsonObject {
-                    put("json", buildJsonObject { put("slug", JsonPrimitive(manga.url)) })
+                    put("json", buildJsonObject { put("slug", JsonPrimitive(slug)) })
                 },
             )
         }.toString()
@@ -401,7 +417,33 @@ abstract class MangaDar :
             // The details payload omits its own slug: keep the slug the
             // lookup was made with, otherwise SManga.url degrades to the
             // mongo id and every later refresh 404s.
-            return data.toSManga().apply { url = manga.url }
+            return data.toSManga().apply { url = slug }
+        }
+    }
+
+    /** A 24-char lowercase-hex string — the platform's mongo series id shape. */
+    private fun isSeriesId(raw: String): Boolean = raw.length == 24 && raw.all { it.isDigit() || it in 'a'..'f' }
+
+    /** Recovers the slug for a series known only by its mongo id, via the
+     * browse API matched on the id. Throws with an actionable message when
+     * the series cannot be found (removed from the platform). */
+    private suspend fun healSlugById(id: String, knownTitle: String?): String {
+        val title = knownTitle?.trim().orEmpty()
+        if (title.isEmpty()) {
+            throw IOException("MangaDar: this entry lost its series slug — remove it and open it again from the source")
+        }
+        val response = client.newCall(trpc("search.searchSeries", buildSearchInput(query = title, page = 1, sortBy = "relevance", status = null, type = null, genres = emptyList()))).execute()
+        response.use {
+            if (!it.isSuccessful) {
+                throw IOException("MangaDar: could not recover this entry's series slug (HTTP ${it.code}) — remove it and open it again from the source")
+            }
+            val data = it.parseAs<List<TrpcBatch<SearchSeriesResponseDto>>>()
+                .firstOrNull()?.result?.data?.json
+            val slug = data?.results
+                ?.firstOrNull { row -> row.id == id }
+                ?.slug
+            return slug
+                ?: throw IOException("MangaDar: this entry's series moved or was removed — remove it and open it again from the source")
         }
     }
 
@@ -426,31 +468,59 @@ abstract class MangaDar :
                 },
             )
         }.toString()
-        val response = client.newCall(trpc("content.getChapters", input)).execute()
-        response.use {
-            if (!it.isSuccessful) throw IOException("HTTP ${it.code} while loading chapters")
-            val data = it.parseAs<List<TrpcBatch<ChapterListDto>>>()
-                .firstOrNull()?.result?.data?.json
-                ?: throw IOException("Unexpected MangaDar chapters answer")
-            val mapped = data.chapters
-                .filter { chapter -> chapter.isBlocked != true }
-                .map { chapter ->
-                    chapter.toSChapter(manga.url).apply {
-                        date_upload = parseDate(chapter.publishedAt ?: chapter.createdAt)
-                    }
-                }
-                // Mihon expects newest-first; the API answers newest-first already.
-                .sortedByDescending { it.chapter_number }
-            return combineDuplicateChapters(mapped)
+        // One retry for the transient class (timeouts, 429/5xx) — a library
+        // refresh that loses a single chapter call to an edge hiccup used to
+        // surface as a broken listing.
+        val chapters = retryTransient {
+            val response = client.newCall(trpc("content.getChapters", input)).execute()
+            response.use {
+                if (!it.isSuccessful) throw IOException("HTTP ${it.code} while loading chapters")
+                it.parseAs<List<TrpcBatch<ChapterListDto>>>()
+                    .firstOrNull()?.result?.data?.json
+                    ?: throw IOException("Unexpected MangaDar chapters answer")
+            }
         }
+        val mapped = chapters.chapters
+            .filter { chapter -> chapter.isBlocked != true }
+            .map { chapter ->
+                chapter.toSChapter(manga.url).apply {
+                    date_upload = parseDate(chapter.publishedAt ?: chapter.createdAt)
+                }
+            }
+            // Mihon expects newest-first; the API answers newest-first already.
+            .sortedByDescending { it.chapter_number }
+        return combineDuplicateChapters(mapped)
     }
 
-    private suspend fun resolveSeriesId(slug: String): String {
+    /** Runs [block] once more when it fails transiently (no HTTP code =
+     * connect/read timeout; 429 and 5xx = edge pressure). A deterministic
+     * failure (404, parse shape) propagates immediately. */
+    private suspend fun <T> retryTransient(block: () -> T): T {
+        val httpCode = Regex("HTTP (\\d{3})")
+        var lastError: IOException? = null
+        repeat(2) { attempt ->
+            try {
+                return block()
+            } catch (e: IOException) {
+                lastError = e
+                val code = httpCode.find(e.message.orEmpty())?.groupValues?.get(1)?.toIntOrNull()
+                val transient = code == null || code == 429 || code in 500..599
+                if (!transient || attempt == 1) throw e
+            }
+        }
+        throw lastError ?: IOException("MangaDar: request failed")
+    }
+
+    private suspend fun resolveSeriesId(slugOrId: String): String {
+        // Entries whose url already IS the platform id skip the lookup —
+        // getChapters takes the id directly (only getSeriesBySlug insists
+        // on the slug).
+        if (isSeriesId(slugOrId)) return slugOrId
         val input = buildJsonObject {
             put(
                 "0",
                 buildJsonObject {
-                    put("json", buildJsonObject { put("slug", JsonPrimitive(slug)) })
+                    put("json", buildJsonObject { put("slug", JsonPrimitive(slugOrId)) })
                 },
             )
         }.toString()

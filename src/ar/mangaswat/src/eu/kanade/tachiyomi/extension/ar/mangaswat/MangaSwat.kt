@@ -23,6 +23,7 @@ import kotlinx.coroutines.coroutineScope
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.OkHttpClient
 import okhttp3.Response
+import java.io.IOException
 import java.util.Locale
 import kotlin.math.roundToInt
 
@@ -106,6 +107,12 @@ abstract class MangaSwat :
                 .parseAs<MangaDetailsDto>()
                 .let { dto ->
                     dto.toSManga().apply {
+                        // The details payload carries no usable self-reference:
+                        // keep the id the lookup was made with, otherwise the
+                        // returned manga degrades to url="" and every later
+                        // chapter fetch sends serie= (the param is then IGNORED
+                        // and the API answers with the whole site's chapters).
+                        url = manga.url
                         genre = genreField(dto.genres.map { it.name })
                         description = buildDescription(
                             rating = dto.rating?.toDoubleOrNull(),
@@ -263,6 +270,13 @@ abstract class MangaSwat :
     // ============================= Chapters ==============================
 
     private suspend fun getChapterList(manga: SManga): List<SChapter> {
+        // An empty id would make the API ignore the serie filter entirely and
+        // answer with the whole site's chapter table (113k+ rows) — surface a
+        // clear, actionable error instead of an endless garbage list.
+        if (manga.url.isBlank()) {
+            throw IOException("MangaSwat: this entry lost its series id — remove it and open it again from the source")
+        }
+
         val url = "$apiUrl/chapters/".toHttpUrl().newBuilder().apply {
             addQueryParameter("serie", manga.url)
             addQueryParameter("order_by", "-order")

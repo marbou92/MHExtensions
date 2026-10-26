@@ -895,30 +895,55 @@ abstract class ProComic :
                 }
             }
 
-            if (pages.isEmpty()) throw IOException("ProComic: no pages found (chapter may be paywalled)")
+            if (pages.isEmpty()) {
+                throw IOException(
+                    "ProComic: no pages found — the chapter is locked on the site (unlock with coins or the shortlink there first)",
+                )
+            }
             return pages
         }
     }
 
-    /** Direct CDN images embedded in the reader flight (public pages). */
+    /** Direct page images embedded in the reader flight (public pages).
+     *
+     * The 2026-10 reader rework went client-side and moved the direct CDN
+     * files from `…/chapters/…` paths to `cdn{1,2,3,4}.procomic.pro/{content}
+     * /{chapter}/{file}.avif` — the old `/chapters/` substring filter
+     * silently dropped every image and the reader surfaced "no pages found".
+     * The payload now carries its own page list as `"images":[…]` arrays
+     * (the exact props the site's reader component consumes), so those are
+     * parsed directly, keeping any https URL on a site-owned host. */
     private fun parseReaderImages(flight: String): List<String> {
         val urls = mutableListOf<String>()
-        val key = "\"desktop\":"
+        val key = "\"images\":["
         var index = 0
         while (true) {
             index = flight.indexOf(key, index)
             if (index < 0) break
-            val start = flight.indexOf('"', index + key.length)
-            val end = flight.indexOf('"', start + 1)
-            if (start < 0 || end < 0) break
-            val imageUrl = flight.substring(start + 1, end)
-            if (imageUrl.startsWith("http") && imageUrl.contains("/chapters/")) {
-                urls.add(imageUrl)
+            val arrayStart = index + key.length
+            val arrayJson = RscFlight.balancedArray(flight, arrayStart) ?: run {
+                index += key.length
+                continue
             }
-            index = end
+            runCatching {
+                json.parseToJsonElement(arrayJson).jsonArray.forEach { element ->
+                    val imageUrl = (element as? JsonPrimitive)?.content ?: return@forEach
+                    if (isReaderImageUrl(imageUrl)) urls.add(imageUrl)
+                }
+            }
+            index = arrayStart + arrayJson.length
         }
         return urls.distinct()
     }
+
+    private fun isReaderImageUrl(url: String): Boolean = runCatching {
+        val httpUrl = url.toHttpUrl()
+        httpUrl.isHttps && (
+            httpUrl.host == "procomic.pro" ||
+                httpUrl.host == "www.procomic.pro" ||
+                httpUrl.host.endsWith(".procomic.pro")
+            )
+    }.getOrDefault(false)
 
     /**
      * Reads the storage generation ("cdnPath" / legacy "cdn_path") that the

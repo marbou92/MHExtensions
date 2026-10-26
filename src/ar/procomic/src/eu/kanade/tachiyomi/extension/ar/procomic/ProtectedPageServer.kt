@@ -12,6 +12,7 @@ import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 import java.io.BufferedReader
 import java.io.ByteArrayOutputStream
 import java.io.IOException
@@ -1011,14 +1012,49 @@ class ProtectedPageServer(
                 .build()
             innerClient.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) {
-                    writeResponse(
-                        output,
-                        502,
-                        "Bad Gateway",
-                        "text/plain",
-                        "image fetch failed with HTTP ${response.code}".toByteArray(),
-                        stage = "image",
-                    )
+                    // The 2026-10 image rework moved the page files onto
+                    // cdn{1,2,3,4}.procomic.pro, whose edge answers a bare
+                    // nginx 403 to non-browser TLS fingerprints — the direct
+                    // fetch that used to pass now fails for whole client
+                    // populations. The site's own reader survives because it
+                    // re-loads every image through its same-origin signed
+                    // proxy (POST /api/cdn-image/sign → /api/cdn-image?url=…
+                    // &token=…&expires=…), which serves the bytes to any
+                    // client. Retry through exactly that path before 502ing.
+                    val upstream = runCatching { fetchSignedCdnImage(decoded) }.getOrNull()
+                    if (upstream == null) {
+                        writeResponse(
+                            output,
+                            502,
+                            "Bad Gateway",
+                            "text/plain",
+                            "image fetch failed with HTTP ${response.code}".toByteArray(),
+                            stage = "image",
+                        )
+                        return
+                    }
+                    upstream.use { signed ->
+                        if (!signed.isSuccessful) {
+                            writeResponse(
+                                output,
+                                502,
+                                "Bad Gateway",
+                                "text/plain",
+                                "image fetch failed with HTTP ${signed.code} (signed)".toByteArray(),
+                                stage = "image",
+                            )
+                            return
+                        }
+                        writeImageHead(
+                            output,
+                            signed.header("Content-Type") ?: "application/octet-stream",
+                            signed.header("Content-Length"),
+                        )
+                        signed.body.source().inputStream().use { input ->
+                            input.copyTo(output, COPY_BUFFER_BYTES)
+                        }
+                        output.flush()
+                    }
                     return
                 }
                 writeImageHead(
@@ -1047,11 +1083,51 @@ class ProtectedPageServer(
         }
     }
 
+    /** Signs [imageUrl] with the site's own `POST /api/cdn-image/sign` and
+     * opens the signed same-origin proxy response — null when the sign step
+     * refuses (unknown host, edge hiccup); the caller keeps the 502. */
+    private fun fetchSignedCdnImage(imageUrl: String): Response? {
+        if (!isAllowedImageUrl(imageUrl)) return null
+        val signRequest = Request.Builder()
+            .url("$baseUrl/api/cdn-image/sign")
+            .post(SignedImageUrlRequestDto(imageUrl).toJsonString().toRequestBody(JSON_MEDIA_TYPE))
+            .header("Accept", "application/json")
+            .header("Content-Type", "application/json")
+            .header("Referer", "$baseUrl/")
+            .header("User-Agent", BROWSER_UA)
+            .build()
+        innerClient.newCall(signRequest).execute().use { signResponse ->
+            if (!signResponse.isSuccessful) return null
+            val signature = runCatching {
+                signResponse.body.string().parseAs<CdnImageSignatureDto>()
+            }.getOrNull() ?: return null
+            val url = "$baseUrl/api/cdn-image".toHttpUrl().newBuilder().apply {
+                addQueryParameter("url", imageUrl)
+                addQueryParameter("token", signature.token)
+                addQueryParameter("expires", signature.expires.toString())
+                if (!signature.es.isNullOrBlank()) addQueryParameter("es", signature.es)
+                if (!signature.host.isNullOrBlank()) addQueryParameter("host", signature.host)
+            }.build()
+            val request = Request.Builder()
+                .url(url)
+                .header("Accept", "image/avif,image/webp,image/*,*/*;q=0.8")
+                .header("Referer", "$baseUrl/")
+                .header("User-Agent", BROWSER_UA)
+                .build()
+            return innerClient.newCall(request).execute()
+        }
+    }
+
     /** Only site-owned image hosts, https only — the proxy is not a general
-     * purpose fetcher. */
+     * purpose fetcher. The bare and www hosts carry /uploads/ files too. */
     private fun isAllowedImageUrl(url: String): Boolean = runCatching {
         val httpUrl = url.toHttpUrl()
-        httpUrl.isHttps && (httpUrl.host == "app.procomic.pro" || httpUrl.host.endsWith(".procomic.pro"))
+        httpUrl.isHttps && (
+            httpUrl.host == "procomic.pro" ||
+                httpUrl.host == "www.procomic.pro" ||
+                httpUrl.host == "app.procomic.pro" ||
+                httpUrl.host.endsWith(".procomic.pro")
+            )
     }.getOrDefault(false)
 
     /** Response head for a streamed body: Content-Length when known, else
@@ -1578,6 +1654,22 @@ class ProtectedPageServer(
     private class SessionKeyResponseDto(
         val success: Boolean? = null,
         val data: SessionKeyDto? = null,
+    )
+
+    /** Body of `POST /api/cdn-image/sign` — the site's own image signing
+     * step; the signed fetch appends token/expires (plus es/host when the
+     * server sends them) to the same-origin /api/cdn-image route. */
+    @kotlinx.serialization.Serializable
+    private class SignedImageUrlRequestDto(
+        val url: String,
+    )
+
+    @kotlinx.serialization.Serializable
+    private class CdnImageSignatureDto(
+        val token: String,
+        val expires: Long,
+        val es: String? = null,
+        val host: String? = null,
     )
 
     companion object {
