@@ -91,6 +91,16 @@ import kotlin.math.roundToInt
  *     403 app clients) + AVIF→JPEG transcode (Android 10/11 cannot decode
  *     AVIF) + the result cache. The proxy binds a FIXED preferred port so
  *     persisted thumbnail_url values survive process restarts.
+ *   - covers/pages v106: the bundled software decoder (libavif/dav1d) is
+ *     CRASH-LOOP-GATED — a native crash inside the JNI takes the whole host
+ *     app down (1.6.19 crashed at chapter load, 1.6.20 at cover load, both
+ *     on Android 10 arm64), so every native decode writes an attempt marker
+ *     first and a stale marker at process start disables the tier (this
+ *     session, permanently after two). Native output is ARGB_8888 only
+ *     (the RGBA_F16 10-bit path was the crash surface) and images over ~25
+ *     MP are refused before allocation. Covers additionally request a
+ *     downscaled variant (?e=1280) so an "originals" cover never becomes a
+ *     ~90 MB bitmap, and the result cache is byte-budgeted (32 MB).
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -309,7 +319,7 @@ abstract class ProComic :
      * server cannot start; the server's fixed preferred port keeps the
      * persisted thumbnail_url values valid across app restarts.
      */
-    private fun coverProxyUrl(resolved: String): String = runCatching { imageServer.imageProxyUrl(resolved) }.getOrDefault(resolved)
+    private fun coverProxyUrl(resolved: String): String = runCatching { imageServer.imageProxyUrl(resolved, ProComicImageServer.COVER_PROXY_MAX_EDGE) }.getOrDefault(resolved)
 
     // ============================== Search ===============================
 
@@ -958,7 +968,14 @@ abstract class ProComic :
         }
 
         val pages = upstreams.mapIndexed { index, upstream ->
-            Page(index = index, url = "$baseUrl$readerPath", imageUrl = imageServer.imageProxyUrl(upstream))
+            Page(
+                index = index,
+                url = "$baseUrl$readerPath",
+                // v106: if the loopback server cannot start at all, fall
+                // back to the raw upstream URL rather than failing the
+                // chapter — the app hosts serve plain clients fine.
+                imageUrl = runCatching { imageServer.imageProxyUrl(upstream) }.getOrDefault(upstream),
+            )
         }
 
         // v101: warm the transcode cache in the background so the

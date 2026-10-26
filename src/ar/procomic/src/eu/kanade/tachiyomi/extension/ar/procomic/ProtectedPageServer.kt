@@ -143,6 +143,22 @@ class ProComicImageServer(
         return "http://127.0.0.1:${ensureStarted()}/$IMAGE_PROXY_PATH_PREFIX/$encoded"
     }
 
+    /** Loopback URL that serves [imageUrl] through the extension's own
+     * client. [maxEdge] > 0 asks the transcoder to downscale the decoded
+     * image so its long edge fits — covers (v106) request 1280 so a
+     * 4000x6000 "originals" AVIF never turns into a ~90 MB ARGB bitmap on
+     * a phone; pages keep the full resolution (0). The parameter rides the
+     * URL query (?e=) so one route serves both shapes and the cache keys
+     * stay distinct. */
+    fun imageProxyUrl(imageUrl: String, maxEdge: Int = 0): String {
+        val encoded = android.util.Base64.encodeToString(
+            imageUrl.toByteArray(Charsets.UTF_8),
+            android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
+        )
+        val query = if (maxEdge > 0) "?e=$maxEdge" else ""
+        return "http://127.0.0.1:${ensureStarted()}/$IMAGE_PROXY_PATH_PREFIX/$encoded$query"
+    }
+
     /** Starts (or restarts) the loopback server and returns its port.
      *
      * v105: a FIXED preferred port is tried first so proxy URLs embedded in
@@ -162,9 +178,14 @@ class ProComicImageServer(
                 startAcceptor(socket)
             }.onSuccess { return PREFERRED_PORT }
             if (familyServerListening(PREFERRED_PORT)) return PREFERRED_PORT
-            val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
-            startAcceptor(socket)
-            return socket.localPort
+            // v106: the fallback bind is guarded too — an unguarded bind
+            // throw here escapes into whatever thread asked for a cover
+            // URL first.
+            runCatching {
+                val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
+                startAcceptor(socket)
+                return socket.localPort
+            }.getOrElse { throw java.io.IOException("ProComic: image server could not bind any loopback port", it) }
         }
     }
 
@@ -209,16 +230,19 @@ class ProComicImageServer(
                 val request = readRequestLine(input) ?: return
                 val (method, rawPath) = request
                 val path = rawPath.substringBefore('?')
+                val query = rawPath.substringAfter('?', "")
                 val output = socket.getOutputStream()
 
                 when (method) {
-                    "GET" -> serve(path, output)
+                    "GET" -> serve(path, query, output)
                     else -> writeResponse(output, 405, "Method Not Allowed", "text/plain", "method not allowed".toByteArray())
                 }
             }
-        } catch (_: Exception) {
-            // connection-level failure: the client went away or the socket
-            // died mid-response; nothing sensible to reply with
+        } catch (_: Throwable) {
+            // v106: Throwable, not Exception — an Error escaping this worker
+            // thread reaches the default uncaught-exception handler and the
+            // HOST APP PROCESS DIES (exactly the 1.6.19/1.6.20 field crash
+            // shape). Nothing on this thread is allowed to kill the app.
         }
     }
 
@@ -239,10 +263,10 @@ class ProComicImageServer(
         return parts[0] to parts[1]
     }
 
-    private fun serve(path: String, output: java.io.OutputStream) {
+    private fun serve(path: String, query: String, output: java.io.OutputStream) {
         when {
             path.startsWith("/$DIAG_PATH_PREFIX") -> serveDiag(path, output)
-            path.startsWith("/$IMAGE_PROXY_PATH_PREFIX/") -> serveImageProxy(path, output)
+            path.startsWith("/$IMAGE_PROXY_PATH_PREFIX/") -> serveImageProxy(path, query, output)
             else -> writeResponse(output, 404, "Not Found", "text/plain", "unknown path".toByteArray())
         }
     }
@@ -255,8 +279,13 @@ class ProComicImageServer(
      * caller's own headers are irrelevant by design (that is the whole
      * point of the route).
      */
-    private fun serveImageProxy(path: String, output: java.io.OutputStream) {
+    private fun serveImageProxy(path: String, query: String, output: java.io.OutputStream) {
         val encoded = path.removePrefix("/$IMAGE_PROXY_PATH_PREFIX/")
+        // ?e=<edge> — the cover-downscale variant (v106). Out-of-range or
+        // malformed values fall back to 0 (full resolution) silently.
+        val maxEdge = query.substringAfter("e=", "").substringBefore('&').toIntOrNull()
+            ?.takeIf { it in MIN_DOWNSCALE_EDGE..MAX_DOWNSCALE_EDGE }
+            ?: 0
         val decoded = encoded.takeIf { it.isNotEmpty() }?.let {
             runCatching {
                 String(
@@ -273,7 +302,7 @@ class ProComicImageServer(
             return
         }
 
-        val key = cacheKey(decoded)
+        val key = cacheKey(decoded) + if (maxEdge > 0) "#e$maxEdge" else ""
         cachedResult(key)?.let {
             writeImageBytes(output, it.first, it.second)
             return
@@ -281,7 +310,7 @@ class ProComicImageServer(
 
         val diag = ProxyDiag()
         try {
-            val (contentType, bytes) = buildImageCoalesced(key, decoded, diag)
+            val (contentType, bytes) = buildImageCoalesced(key, decoded, diag, maxEdge)
             writeImageBytes(output, contentType, bytes)
         } catch (failure: ImageBuildFailure) {
             Log.w(TAG, "image $decoded failed at stage=${failure.stage}: ${failure.readerBody}")
@@ -320,13 +349,13 @@ class ProComicImageServer(
      * with the reader-visible body. Shared by the request path and the
      * background preloader; runs ONCE per URL even under concurrent host
      * fetches (coalesced by [buildImageCoalesced]). */
-    private fun buildImageBytes(imageUrl: String, diag: ProxyDiag): Pair<String, ByteArray> {
+    private fun buildImageBytes(imageUrl: String, diag: ProxyDiag, maxEdge: Int = 0): Pair<String, ByteArray> {
         var stage = "fetch"
         try {
             val (contentType, raw) = fetchUpstreamWithRetry(imageUrl, diag)
             stage = "decode"
             val bytes = if (isAvif(contentType, raw)) {
-                transcodeUnderPermit(raw, diag)
+                transcodeUnderPermit(raw, diag, maxEdge)
             } else {
                 // JPEG/PNG/WebP pass through untouched — no decode cost.
                 raw
@@ -351,10 +380,10 @@ class ProComicImageServer(
 
     /** The transcode stage under the fair semaphore: decode + JPEG encode.
      * Raw bytes are already in memory — no network happens while it's held. */
-    private fun transcodeUnderPermit(raw: ByteArray, diag: ProxyDiag): ByteArray {
+    private fun transcodeUnderPermit(raw: ByteArray, diag: ProxyDiag, maxEdge: Int): ByteArray {
         transcodePermits.acquire()
         try {
-            return avifToJpeg(raw, diag)
+            return avifToJpeg(raw, diag, maxEdge)
         } finally {
             transcodePermits.release()
         }
@@ -442,11 +471,12 @@ class ProComicImageServer(
      * IOException the caller turns into the 502 body (or the legible error
      * JPEG).
      */
-    private fun avifToJpeg(bytes: ByteArray, diag: ProxyDiag): ByteArray {
-        val bitmap = decodeAvif(bytes, diag)
+    private fun avifToJpeg(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): ByteArray {
+        val bitmap = decodeAvif(bytes, diag, maxEdge)
         try {
             val output = ByteArrayOutputStream(bytes.size / 2)
-            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, output)) {
+            val quality = if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY
+            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
                 throw IOException("ProComic: page JPEG encode failed")
             }
             return output.toByteArray()
@@ -455,15 +485,66 @@ class ProComicImageServer(
         }
     }
 
-    private fun decodeAvif(bytes: ByteArray, diag: ProxyDiag): Bitmap {
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
+    /** Largest power-of-two inSampleSize whose resulting long edge still
+     * covers [maxEdge] (the decode keeps >= maxEdge pixels, halving memory
+     * per step). Only used on the platform-decode path. */
+    private fun sampleSizeFor(width: Int, height: Int, maxEdge: Int): Int {
+        var sample = 1
+        var longEdge = maxOf(width, height)
+        while (longEdge / 2 >= maxEdge) {
+            sample *= 2
+            longEdge /= 2
+        }
+        return sample
+    }
+
+    /** Proportional max-edge downscale for decoders that cannot subsample
+     * (the software AVIF path decodes full-size first). Recycles the
+     * source when a new bitmap was produced. */
+    private fun downscaleTo(bitmap: Bitmap, maxEdge: Int, diag: ProxyDiag): Bitmap {
+        val longEdge = maxOf(bitmap.width, bitmap.height)
+        if (longEdge <= maxEdge) return bitmap
+        val scale = maxEdge.toFloat() / longEdge
+        val width = (bitmap.width * scale).toInt().coerceIn(1, bitmap.width)
+        val height = (bitmap.height * scale).toInt().coerceIn(1, bitmap.height)
+        val scaled = try {
+            Bitmap.createScaledBitmap(bitmap, width, height, true)
+        } catch (t: Throwable) {
+            diag.add("downscale ${t.javaClass.simpleName}")
+            return bitmap
+        }
+        if (scaled !== bitmap) bitmap.recycle()
+        return scaled
+    }
+
+    private fun decodeAvif(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap {
+        // Platform decode first, subsampled when a max edge is requested.
+        // The bounds probe also avoids a second full decode attempt when
+        // the platform has no codec for the container at all.
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+            val options = BitmapFactory.Options()
+            if (maxEdge > 0) options.inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxEdge)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.let { return it }
+        }
         diag.add("bitmapfactory null (platform has no avif codec)")
-        decodeWithLibavif(bytes, diag)?.let { return it }
+        decodeWithLibavif(bytes, diag, maxEdge)?.let { return it }
         if (android.os.Build.VERSION.SDK_INT >= 28) {
             try {
                 val source = android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))
-                return android.graphics.ImageDecoder.decodeBitmap(source) { decoder, _, _ ->
+                return android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
                     decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+                    if (maxEdge > 0) {
+                        val longEdge = maxOf(info.size.width, info.size.height)
+                        if (longEdge > maxEdge) {
+                            val scale = maxEdge.toFloat() / longEdge
+                            decoder.setTargetSize(
+                                (info.size.width * scale).toInt().coerceAtLeast(1),
+                                (info.size.height * scale).toInt().coerceAtLeast(1),
+                            )
+                        }
+                    }
                 }
             } catch (t: Throwable) {
                 diag.add("imagedecoder ${t.javaClass.simpleName}")
@@ -479,11 +560,29 @@ class ProComicImageServer(
      * previous bare runCatching swallowed the one fact that mattered (the
      * JNI library never loaded), leaving "bitmapfactory+libavif decode
      * failed" as the only clue.
+     *
+     * v106 — the tier is now CRASH-LOOP-GATED. A native crash inside the
+     * JNI (dav1d/decoder bug, exotic bitstream, OEM-specific abort) cannot
+     * be caught in Java and takes the whole host-app process down — that
+     * was the 1.6.19 chapter-load crash and the 1.6.20 cover-load crash on
+     * Android 10 arm64. Defense: a marker file is written before every
+     * native decode and deleted right after it returns; a marker found at
+     * process start means the PREVIOUS process died mid-decode, so the
+     * native tier is disabled for this session (and permanently after the
+     * second death) — the app stays alive and the platform tiers keep the
+     * pipeline functional. Also: ARGB_8888 output only (the RGBA_F16 path
+     * for 10-bit content is a native-crash surface) and oversized images
+     * are refused before any bitmap allocation.
      */
-    private fun decodeWithLibavif(bytes: ByteArray, diag: ProxyDiag): Bitmap? {
+    private fun decodeWithLibavif(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap? {
         val nativeState = avifNativeState
         diag.add("avif native: $nativeState")
         if (nativeState != "system" && !nativeState.startsWith("loaded")) return null
+        val crashState = nativeCrashState
+        if (!crashState.startsWith("ok")) {
+            diag.add("native tier gated: $crashState")
+            return null
+        }
         return try {
             val buffer = java.nio.ByteBuffer.wrap(bytes)
             if (!org.aomedia.avif.android.AvifDecoder.isAvifImage(buffer)) {
@@ -496,19 +595,37 @@ class ProComicImageServer(
                     null
                 } else {
                     diag.add("libavif: ${info.width}x${info.height} depth=${info.depth}")
-                    val config = if (info.depth > 8) Bitmap.Config.RGBA_F16 else Bitmap.Config.ARGB_8888
-                    val bitmap = try {
-                        Bitmap.createBitmap(info.width, info.height, config)
-                    } catch (_: OutOfMemoryError) {
-                        diag.add("libavif: OOM at $config")
+                    val pixels = info.width.toLong() * info.height
+                    if (pixels > MAX_NATIVE_DECODE_PIXELS) {
+                        diag.add("libavif: refused (" + pixels + " px exceeds the software-decode budget)")
                         null
-                    } ?: return null
-                    if (org.aomedia.avif.android.AvifDecoder.decode(java.nio.ByteBuffer.wrap(bytes), bytes.size, bitmap)) {
-                        bitmap
                     } else {
-                        bitmap.recycle()
-                        diag.add("libavif: decode returned false")
-                        null
+                        // ARGB_8888 ALWAYS — never RGBA_F16. The F16 path
+                        // for >8-bit content was the native-crash suspect
+                        // on the field device; 10-bit input decodes into
+                        // 8-bit output (tone-truncated) instead of dying.
+                        val bitmap = try {
+                            Bitmap.createBitmap(info.width, info.height, Bitmap.Config.ARGB_8888)
+                        } catch (_: OutOfMemoryError) {
+                            diag.add("libavif: OOM at ARGB_8888")
+                            null
+                        } ?: return null
+                        val marker = attemptMarker()
+                        val decoded: Boolean = try {
+                            marker?.writeText(System.currentTimeMillis().toString())
+                            org.aomedia.avif.android.AvifDecoder.decode(java.nio.ByteBuffer.wrap(bytes), bytes.size, bitmap)
+                        } finally {
+                            // Deleted on every HANDLED outcome; only a native
+                            // crash (which skips this finally) leaves it stale.
+                            runCatching { marker?.delete() }
+                        }
+                        if (decoded) {
+                            if (maxEdge > 0) downscaleTo(bitmap, maxEdge, diag) else bitmap
+                        } else {
+                            bitmap.recycle()
+                            diag.add("libavif: decode returned false")
+                            null
+                        }
                     }
                 }
             }
@@ -516,6 +633,53 @@ class ProComicImageServer(
             diag.add("libavif threw ${t.javaClass.simpleName}: ${t.message?.take(60)}")
             null
         }
+    }
+
+    /**
+     * Crash-loop breaker state, evaluated ONCE per process on the first
+     * software-decode attempt. Files live next to the extracted .so:
+     *
+     * - `decode.attempt` — written right before a native decode, deleted
+     *   right after it returns. Stale marker = the previous process died
+     *   INSIDE the decoder.
+     * - `decode.crashes` — how many stale markers were consumed.
+     *
+     * One stale marker disables the native tier for this session; two
+     * disable it permanently (until the user clears the app's cache).
+     * That bounds a worst-case native crash loop to two process deaths
+     * per install while tolerating one false positive (an OOM kill of the
+     * process mid-decode looks identical to a native crash).
+     */
+    internal fun evaluateNativeCrashState(): String {
+        val dir = nativeCacheDir?.let { java.io.File(it, "procomic_native") }
+            ?: return "ok (no tracking dir)"
+        val attempt = java.io.File(dir, "decode.attempt")
+        val counter = java.io.File(dir, "decode.crashes")
+        if (!attempt.exists()) return "ok"
+        val previous = runCatching { counter.readText().trim().toIntOrNull() ?: 0 }.getOrDefault(0)
+        val count = previous + 1
+        runCatching {
+            counter.writeText(count.toString())
+            attempt.delete()
+        }
+        return if (count >= MAX_NATIVE_CRASHES) {
+            "disabled after $count native decode crashes (clear the source's cache to re-enable)"
+        } else {
+            "disabled this session after a native decode crash (crashes=$count)"
+        }
+    }
+
+    private val nativeCrashState: String by lazy { evaluateNativeCrashState() }
+
+    /** The before-decode marker file, or null when there is nowhere to
+     * track (harness / restricted storage) — tracking is best-effort. */
+    private fun attemptMarker(): java.io.File? {
+        val base = nativeCacheDir ?: return null
+        return runCatching {
+            val dir = java.io.File(base, "procomic_native")
+            dir.mkdirs()
+            java.io.File(dir, "decode.attempt")
+        }.getOrNull()
     }
 
     /**
@@ -592,7 +756,7 @@ class ProComicImageServer(
 
     private fun Any.monitorNotifyAll() = (this as java.lang.Object).notifyAll()
 
-    private fun buildImageCoalesced(key: String, imageUrl: String, diag: ProxyDiag): Pair<String, ByteArray> {
+    private fun buildImageCoalesced(key: String, imageUrl: String, diag: ProxyDiag, maxEdge: Int = 0): Pair<String, ByteArray> {
         val created = synchronized(inFlightLock) {
             val existing = inFlightBuilds[key]
             if (existing != null) return existing.join()
@@ -602,7 +766,7 @@ class ProComicImageServer(
         }
         // Builder path: the monitor is NOT held while the pipeline runs.
         try {
-            val result = buildImageBytes(imageUrl, diag)
+            val result = buildImageBytes(imageUrl, diag, maxEdge)
             synchronized(inFlightLock) {
                 created.result = result
                 created.done = true
@@ -687,14 +851,15 @@ class ProComicImageServer(
 
     // ======================== result cache ===============================
 
-    /** Finished results keyed by the sha256 of the upstream URL. Bounded to
-     * a handful of pages (tall JPEGs can reach ~2 MB each): enough that
-     * every page of a reader's preload window that timed out on the wire is
-     * instantly available on retry, without holding a chapter's worth of
-     * bitmaps-as-JPEG in memory. */
-    private val results = object : LinkedHashMap<String, Pair<String, ByteArray>>(16, 0.75f, true) {
-        override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, Pair<String, ByteArray>>): Boolean = size > MAX_CACHED_RESULTS
-    }
+    /** Finished results keyed by the sha256 of the upstream URL (+#e<edge>
+     * for downscaled cover variants). Bounded by COUNT and by BYTES: tall
+     * page JPEGs reach ~2 MB each, so a count-only bound could hold ~48 MB
+     * of dead bytes forever (v106 budget: 32 MB) — a real memory-pressure
+     * contributor on the devices this source serves. */
+    private val results = LinkedHashMap<String, Pair<String, ByteArray>>(16, 0.75f, true)
+
+    /** Total bytes held in [results]; accessed only under [resultsLock]. */
+    private var cachedBytes = 0L
 
     private val resultsLock = Any()
 
@@ -706,7 +871,15 @@ class ProComicImageServer(
 
     private fun cacheResult(key: String, contentType: String, bytes: ByteArray) {
         synchronized(resultsLock) {
+            results[key]?.let { existing -> cachedBytes -= existing.second.size }
             results[key] = contentType to bytes
+            cachedBytes += bytes.size
+            // Evict least-recently-used entries while over either bound.
+            val iterator = results.entries.iterator()
+            while (iterator.hasNext() && (results.size > MAX_CACHED_RESULTS || cachedBytes > MAX_CACHED_BYTES)) {
+                cachedBytes -= iterator.next().value.second.size
+                iterator.remove()
+            }
         }
     }
 
@@ -750,9 +923,14 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v105\"")
+        sb.append("\"server\":\"procomic-image/v106\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
-        synchronized(resultsLock) { sb.append(",\"cachedResults\":").append(results.size) }
+        synchronized(resultsLock) {
+            sb.append(",\"cachedResults\":").append(results.size)
+            sb.append(",\"cachedBytes\":").append(cachedBytes)
+        }
+        sb.append(",\"nativeTier\":\"").append(avifNativeState.replace("\"", "'"))
+        sb.append(",\"nativeCrashState\":\"").append(nativeCrashState.replace("\"", "'")).append('\"')
         sb.append(",\"recentFailures\":[")
         val records = synchronized(failuresLock) { failures.toList() }
         records.forEachIndexed { fi, f ->
@@ -794,7 +972,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v105")
+                add("Server build: procomic-image/v106")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -872,6 +1050,11 @@ class ProComicImageServer(
 
     internal fun debugCachedCount(): Int = synchronized(resultsLock) { results.size }
 
+    internal fun debugCachedBytes(): Long = synchronized(resultsLock) { cachedBytes }
+
+    /** Harness access to the crash-loop breaker state machine. */
+    internal fun debugCrashLoopState(): String = evaluateNativeCrashState()
+
     companion object {
         const val IMAGE_PROXY_PATH_PREFIX = ".image-proxy"
         const val DIAG_PATH_PREFIX = ".diag"
@@ -915,6 +1098,29 @@ class ProComicImageServer(
          * heavy tail) — 24 keeps a catalog page's covers plus the reader's
          * preload window resident at once. */
         private const val MAX_CACHED_RESULTS = 24
+
+        /** v106: byte budget on top of the count — 24 entries x 2 MB tall
+         * pages could pin ~48 MB forever. 32 MB keeps the same hit-rate
+         * behavior while capping the resident cost. */
+        private const val MAX_CACHED_BYTES = 32L * 1024 * 1024
+
+        /** Covers (v106) request the proxy with ?e=1280: decoded long edge
+         * capped at 1280 px (~6 MB ARGB at 16:9 worst case instead of a
+         * 90 MB full "originals" decode) and JPEG-encoded at cover quality. */
+        const val COVER_PROXY_MAX_EDGE = 1280
+        private const val MIN_DOWNSCALE_EDGE = 64
+        private const val MAX_DOWNSCALE_EDGE = 4096
+        private const val COVER_JPEG_QUALITY = 82
+
+        /** Software-decode pixel budget: ~25 MP (~100 MB ARGB_8888) is the
+         * largest allocation the native tier will even attempt; larger
+         * "originals" fall through to the platform tiers or the error JPEG
+         * instead of OOM-killing a phone. */
+        private const val MAX_NATIVE_DECODE_PIXELS = 25_000_000L
+
+        /** Stale decode-attempt markers tolerated before the native tier is
+         * disabled permanently (bounds the native crash loop). */
+        private const val MAX_NATIVE_CRASHES = 2
 
         /** Pause between background pre-transcoded pages (gentle pacing —
          * with one GET per page a full chapter prebuilds in seconds). */

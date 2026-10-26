@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 20
+    versionCode = 21
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -31,6 +31,12 @@ keiyoushi {
     // native lib paths, so AvifDecoder's static loadLibrary never found it).
     // v105 note: versionCode 20 = the dual-homed reader fallback + the cover
     // pipeline (resolver + loopback proxy + fixed preferred port).
+    // v106 note: versionCode 21 = the host-app crash fix — the native decoder
+    // is crash-loop-gated (attempt marker + session/permanent disable),
+    // ARGB_8888-only output, a 25 MP allocation budget, covers request a
+    // downscaled ?e=1280 variant, the result cache is byte-budgeted, and
+    // the connection handler swallows Throwable so no Error can kill the
+    // host app process.
 
     deeplink {
         host("procomic.net")
