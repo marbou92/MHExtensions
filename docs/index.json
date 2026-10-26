@@ -382,11 +382,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.8",
-      "versionCode": 8,
+      "version": "1.6.9",
+      "versionCode": 9,
       "baseUrl": "https://mangatek.com",
-      "apk": "tachiyomi-ar.mangatek-v1.6.8-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatek-v1.6.8-release.apk",
+      "apk": "tachiyomi-ar.mangatek-v1.6.9-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatek-v1.6.9-release.apk",
       "icon": "../icons/mangatek.png",
       "note": "",
       "description": ""
