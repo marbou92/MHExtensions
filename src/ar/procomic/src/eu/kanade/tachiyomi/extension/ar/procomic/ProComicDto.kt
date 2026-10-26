@@ -111,80 +111,13 @@ class TocChapterDto(
 
 // =============================== Reader ================================
 
+/** The reader's own `<img>` sources: `"appImages":[{mobile,desktop}]` —
+ * signed-filename AVIF URLs on `app.<host>` that fetch directly from any
+ * client (the signature rides in the file name). */
 @Serializable
 class ReaderImageDto(
     val mobile: String? = null,
     val desktop: String? = null,
-)
-
-@Serializable
-class DeferredMediaDto(
-    val token: String? = null,
-    val triggerAfterImageIndex: Int? = null,
-    val splitIndex: Int? = null,
-    val requireTurnstile: Boolean? = null,
-)
-
-@Serializable
-class DeferredMapDto(
-    val token: String,
-    val method: String? = null,
-)
-
-@Serializable
-class DeferredDataDto(
-    val chapterId: Int? = null,
-    val splitIndex: Int? = null,
-    val images: List<String> = emptyList(),
-    val maps: List<DeferredMapDto> = emptyList(),
-)
-
-@Serializable
-class DeferredResponseDto(
-    val success: Boolean? = null,
-    val data: DeferredDataDto? = null,
-)
-
-/** Body of POST /chapter-deferred-media/{id}/refresh (the reader's own
- * JWT renewal endpoint): the expired token in, a fresh token out. */
-@Serializable
-class RenewMediaTokenDto(
-    val token: String,
-)
-
-@Serializable
-class RefreshedMediaTokenDto(
-    val token: String? = null,
-)
-
-// ============================ Protection map ============================
-
-@Serializable
-class PlanRectDto(
-    val left: Int = 0,
-    val top: Int = 0,
-    val width: Int = 1,
-    val height: Int = 1,
-)
-
-@Serializable
-class PlanDto(
-    val dim: List<Int> = emptyList(),
-    val mode: String = "",
-    val pieces: List<String> = emptyList(),
-    val order: List<Int> = emptyList(),
-    val rects: List<PlanRectDto>? = null,
-)
-
-@Serializable
-class PlanDataDto(
-    val map: PlanDto? = null,
-)
-
-@Serializable
-class PlanResponseDto(
-    val success: Boolean? = null,
-    val data: PlanDataDto? = null,
 )
 
 // ============================== Chapters API ============================

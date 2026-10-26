@@ -6,26 +6,46 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 16
+    versionCode = 17
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
     source {
         lang = "ar"
-        baseUrl = "https://procomic.pro"
+        // v101: the site moved to procomic.net — .pro now serves "moved"
+        // notices for reader/series routes and its image-signing stack is
+        // decommissioned (403 forbidden), which is where the device-side
+        // HTTP 502 wave came from.
+        baseUrl = "https://procomic.net"
     }
 
     deeplink {
+        host("procomic.net")
+        host("www.procomic.net")
+        // Keep the .pro hosts: older library entries carry them.
         host("procomic.pro")
         host("www.procomic.pro")
         path("/ar/..*")
     }
 }
 
+android {
+    packaging {
+        // AGP 9 removed ndk.abiFilters — the packaging excludes strip the
+        // emulator-only ABIs of the software AVIF decoder (libavif + dav1d
+        // below) at packaging time. The x86/x86_64 builds only matter to
+        // emulators (which run Android 12+ with the platform codec anyway)
+        // and were 3.1 MB of the APK; real devices are ARM. Cuts the APK
+        // from ~4.8 MB to ~1.7 MB.
+        excludes += listOf("lib/x86/**", "lib/x86_64/**", "lib/mips/**", "lib/mips64/**")
+    }
+}
+
 dependencies {
-    // Software AVIF decode (libavif + dav1d, native libs for all 4 ABIs):
-    // the site's page pieces are AVIF tiles and the platform AVIF codec only
-    // ships on Android 12+ (and is missing on some OEM builds after that) —
-    // without this, every protected page 502s on the devices that need it.
+    // Software AVIF decode (libavif + dav1d, native libs for the ARM ABIs):
+    // the site's page files are AVIF (tall long-strip pages) and the
+    // platform codec only ships on Android 12+ (and is missing on some OEM
+    // builds after that). The image proxy transcodes every AVIF page to
+    // JPEG with it, so pages render on every device and every host app.
     implementation("org.aomedia.avif.android:avif:1.1.1.14d8e3c4")
 }

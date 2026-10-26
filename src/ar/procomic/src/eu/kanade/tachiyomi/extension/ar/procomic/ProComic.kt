@@ -20,10 +20,8 @@ import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
-import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import keiyoushi.utils.tryParse
-import kotlinx.coroutines.runBlocking
 import kotlinx.serialization.json.Json
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
@@ -34,10 +32,8 @@ import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
-import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
-import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -70,15 +66,16 @@ import kotlin.math.roundToInt
  *     page only carries the latest 30 (with dates), which are merged in.
  *     Series that render client-side get their full TOC from the public
  *     chapters API (/api/public/chapters?contentId=...) instead.
- *   - pages: reader SSR exposes a few direct CDN images plus a
- *     `deferredMedia` JWT; the remaining pages are served by a loopback
- *     stitch server (ProtectedPageServer) through /chapter-deferred-media
- *     + /chapter-map-proxy-plan, because host apps cannot be relied on to
- *     run source interceptors on image requests. The direct CDN images go
- *     through the same server's /.image-proxy route, because the site's WAF
- *     403s the app User-Agents that host apps stamp onto their own image
- *     requests; every page image is a loopback URL with the browser UA
- *     applied inside the extension process.
+ *   - pages (v101): the site moved to procomic.net and reworked the reader
+ *     payload — every page now ships as a plain signed-filename AVIF in
+ *     `appImages` (app.<host>), fetchable directly, and the old map-token
+ *     protection (deferredMedia maps, /chapter-map-proxy-plan, session
+ *     keys, the stitch server) is gone from the payload (`maps:[]`,
+ *     `protectionV2:null`) and dead server-side (the .pro signing stack
+ *     answers 403 forbidden — the device-side HTTP 502 wave). Pages are
+ *     served through the loopback image server's /.image-proxy route
+ *     (browser UA + AVIF→JPEG transcode) because host apps cannot be
+ *     relied on to send browser headers or decode AVIF below Android 12.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -96,51 +93,20 @@ abstract class ProComic :
 
     private val json = Json { ignoreUnknownKeys = true }
 
-    private val mapCache = MapCache()
-
     // lazy: the server reads baseUrl, which the @Source-generated subclass
     // supplies via computed getters (safe at any phase) — lazy keeps the
     // construction order a non-issue either way. internal: the JVM harness
     // drives the verification probes on it; harmless in the shipped build.
-    // The flight-rebuild lambda is the server's final plan recovery: it
-    // re-fetches the chapter's reader page for a fresh set of map tokens
-    // (the site's session-key endpoint now 403s use_proxy_plan, so a stale
-    // token can no longer be salvaged any other way).
-    internal val protectedPageServer by lazy {
-        ProtectedPageServer(
+    internal val imageServer by lazy {
+        ProComicImageServer(
             baseUrl = baseUrl,
-            mapCache = mapCache,
-            // The source's own client as the session fallback tier: when
-            // the stitch server's bare inner client cannot get a plan or a
-            // piece through (region-dependent edge behavior), the request
-            // is retried with the session the reader page established —
-            // cookies, CF clearance, the forced browser UA.
+            // The source's own client as the retry tier: when the server's
+            // bare inner client cannot get an image through (region-
+            // dependent edge behavior), the fetch is retried with the
+            // session the reader page established — cookies, CF clearance,
+            // the forced browser UA.
             sessionClient = client,
-        ) { readerUrl, chapterId ->
-            runBlocking { rebuildFlight(readerUrl, chapterId) }
-        }
-    }
-
-    /** Re-fetches the reader page and extracts a fresh deferred-media map
-     * set for [chapterId]; null when the page or the maps are unavailable
-     * (the caller surfaces that as the plan failure it already has). */
-    private suspend fun rebuildFlight(readerUrl: String, chapterId: String): RebuiltFlight? {
-        return try {
-            val response = client.newCall(GET(readerUrl, headers)).execute()
-            response.use {
-                if (!it.isSuccessful) return null
-                val flight = RscFlight.extract(it.body.string())
-                val media = parseDeferredMedia(flight, chapterId.toInt()) ?: return null
-                if (media.maps.isEmpty()) return null
-                RebuiltFlight(
-                    cdnPath = media.cdnPath,
-                    maps = media.maps.map { map -> RebuiltMap(map.token, map.method) },
-                )
-            }
-        } catch (t: Exception) {
-            Log.w(TAG, "flight rebuild from $readerUrl failed: ${t.message}")
-            null
-        }
+        )
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
@@ -160,14 +126,14 @@ abstract class ProComic :
      * page AND on the image CDN while browser UAs pass). One forced browser
      * UA across the whole chain also keeps the deferred-media JWT's uah
      * (user-agent hash) claim consistent, since the loopback server's inner
-     * client uses the exact same string (ProtectedPageServer.BROWSER_UA).
+     * client uses the exact same string (ProComicImageServer.BROWSER_UA).
      */
     private fun userAgentOverrideInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
-        if (request.header("User-Agent") == ProtectedPageServer.BROWSER_UA) {
+        if (request.header("User-Agent") == ProComicImageServer.BROWSER_UA) {
             return chain.proceed(request)
         }
-        return chain.proceed(request.newBuilder().header("User-Agent", ProtectedPageServer.BROWSER_UA).build())
+        return chain.proceed(request.newBuilder().header("User-Agent", ProComicImageServer.BROWSER_UA).build())
     }
 
     /**
@@ -195,7 +161,7 @@ abstract class ProComic :
 
     private fun parseDate(raw: String?): Long = dateFormat.tryParse(raw?.substringBefore('.')?.take(19))
 
-    private fun seriesPageUrl(mangaUrl: String): String = "$baseUrl/ar/$mangaUrl"
+    private fun seriesPageUrl(mangaUrl: String): String = "$baseUrl/ar/series/$mangaUrl"
 
     private fun chapterPageUrl(ref: ChapterRef): String = "$baseUrl/ar/chapter/${ref.seriesSlug}-${ref.chapterNumber}-${ref.chapterId}"
 
@@ -381,18 +347,35 @@ abstract class ProComic :
 
     // ============================== Details ==============================
 
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/ar/${manga.url}"
+    override fun getMangaUrl(manga: SManga): String = "$baseUrl/ar/series/${manga.url}"
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        if (url.host !in setOf(baseUrl.toHttpUrl().host, "www.procomic.pro")) return null
+        // Both apexes (and their www forms) — the site migrated .pro → .net
+        // and older library entries still carry .pro links.
+        if (url.host !in setOf(
+                "procomic.net",
+                "www.procomic.net",
+                "procomic.pro",
+                "www.procomic.pro",
+            )
+        ) {
+            return null
+        }
         val segments = url.pathSegments
         if (segments.size < 2 || segments[0] != "ar") return null
 
-        val mangaUrl = if (segments.size >= 3 && segments[1] == "chapter") {
-            // /ar/chapter/{seriesSlug}-{number}-{id}
-            resolveSeriesUrlFromChapterPage(segments[2]) ?: return null
-        } else {
-            segments[1]
+        val mangaUrl = when {
+            segments.size >= 3 && segments[1] == "chapter" -> {
+                // /ar/chapter/{seriesSlug}-{number}-{id}
+                resolveSeriesUrlFromChapterPage(segments[2]) ?: return null
+            }
+            segments.size >= 3 && segments[1] == "series" -> {
+                // /ar/series/{seriesSlug}-{id} — the canonical series path
+                // since the .net migration (the bare /ar/{slug}-{id} only
+                // 308s there now).
+                segments[2]
+            }
+            else -> segments[1]
         }
 
         val tmpManga = SManga.create().apply { this.url = mangaUrl }
@@ -850,69 +833,45 @@ abstract class ProComic :
         response.use {
             if (!it.isSuccessful) throw IOException("HTTP ${it.code} on reader page")
             val flight = RscFlight.extract(it.body.string())
+            // images[] is the site's own page list (cdn.<host> raw files);
+            // appImages[] mirrors it with the signed-filename app.<host>
+            // variants the reader actually loads — the only URLs the edge
+            // serves to non-browser clients since the .net migration.
             val images = parseReaderImages(flight)
-            val media = parseDeferredMedia(flight, ref.chapterId)
+            val appImages = parseAppImages(flight)
 
-            val pages = mutableListOf<Page>()
-            images.forEach { imageUrl ->
-                pages.add(Page(index = pages.size, url = readerUrl, imageUrl = protectedPageServer.imageProxyUrl(imageUrl)))
-            }
-
-            if (media != null) {
-                media.images.forEach { imageUrl ->
-                    pages.add(Page(index = pages.size, url = readerUrl, imageUrl = protectedPageServer.imageProxyUrl(imageUrl)))
-                }
-                if (media.maps.isNotEmpty()) {
-                    val chapterIdStr = ref.chapterId.toString()
-                    mapCache.putAll(
-                        chapterIdStr,
-                        media.maps.mapIndexed { idx, map ->
-                            MapCache.Entry(
-                                token = map.token,
-                                method = map.method,
-                                cdnPath = media.cdnPath,
-                                pageIndex = idx,
-                                readerUrl = readerUrl,
-                            )
-                        },
-                    )
-                    media.maps.forEachIndexed { idx, _ ->
-                        pages.add(
-                            Page(
-                                index = pages.size,
-                                url = readerUrl,
-                                // Plain loopback URL: works in every host app
-                                // because it needs no source interceptors.
-                                imageUrl = protectedPageServer.pageUrl(chapterIdStr, idx),
-                            ),
-                        )
-                    }
-                    // v90: pre-assemble every protected page in the background
-                    // so the reader's own fetches land on finished JPEGs — the
-                    // on-device "first pages load, the rest time out" failure
-                    // was the host's preload stampede racing full pipelines.
-                    protectedPageServer.preloadChapter(chapterIdStr)
-                }
-            }
-
-            if (pages.isEmpty()) {
+            if (images.isEmpty() && appImages.isEmpty()) {
                 throw IOException(
-                    "ProComic: no pages found — the chapter is locked on the site (unlock with coins or the shortlink there first)",
+                    "ProComic: no pages found \u2014 the chapter is locked or unavailable on the site " +
+                        "(unlock with coins or the shortlink there first)",
                 )
             }
+
+            // Prefer the app variant per page (verified live: 200 for plain
+            // clients, the signature rides in the file name); the raw CDN
+            // URL is the fallback (the proxy's session retry is its last
+            // chance, the edge 403s bare TLS on those hosts).
+            val upstreams = List(maxOf(images.size, appImages.size)) { index ->
+                appImages.getOrNull(index) ?: images[index]
+            }
+            val pages = upstreams.mapIndexed { index, upstream ->
+                Page(index = index, url = readerUrl, imageUrl = imageServer.imageProxyUrl(upstream))
+            }
+
+            // v101: warm the transcode cache in the background so the
+            // reader's own fetches land on finished JPEGs (the old
+            // protected-page preloader, re-targeted at direct app images).
+            imageServer.preloadImages(ref.chapterId.toString(), upstreams)
             return pages
         }
     }
 
-    /** Direct page images embedded in the reader flight (public pages).
-     *
-     * The 2026-10 reader rework went client-side and moved the direct CDN
-     * files from `…/chapters/…` paths to `cdn{1,2,3,4}.procomic.pro/{content}
-     * /{chapter}/{file}.avif` — the old `/chapters/` substring filter
-     * silently dropped every image and the reader surfaced "no pages found".
-     * The payload now carries its own page list as `"images":[…]` arrays
-     * (the exact props the site's reader component consumes), so those are
-     * parsed directly, keeping any https URL on a site-owned host. */
+    /** The page list embedded in the reader flight: `"images":[…]` arrays
+     * (the exact props the site's reader component consumes) with any
+     * https URL on a site-owned host kept. Since the .net migration these
+     * are `cdn{1..4}.procomic.net/{series}/{chapter}/{file}.avif` raw
+     * files — 403 to non-browser clients, so they only feed the appImages
+     * fallback below. */
     private fun parseReaderImages(flight: String): List<String> {
         val urls = mutableListOf<String>()
         val key = "\"images\":["
@@ -920,15 +879,29 @@ abstract class ProComic :
         while (true) {
             index = flight.indexOf(key, index)
             if (index < 0) break
-            val arrayStart = index + key.length
+            // arrayStart must point AT the '[' — balancedArray refuses to
+            // scan otherwise. (The pre-v101 code pointed one past it, which
+            // only ever matched the old nested per-page shape and silently
+            // dropped the flat page list the .net flight ships.)
+            val arrayStart = index + key.length - 1
             val arrayJson = RscFlight.balancedArray(flight, arrayStart) ?: run {
                 index += key.length
                 continue
             }
             runCatching {
                 json.parseToJsonElement(arrayJson).jsonArray.forEach { element ->
-                    val imageUrl = (element as? JsonPrimitive)?.content ?: return@forEach
-                    if (isReaderImageUrl(imageUrl)) urls.add(imageUrl)
+                    when (element) {
+                        // Flat page list (the current .net shape): strings.
+                        is JsonPrimitive ->
+                            if (isReaderImageUrl(element.content)) urls.add(element.content)
+                        // Legacy nested per-page shape: an array of piece
+                        // URLs per page — flatten, order preserved.
+                        is JsonArray -> element.forEach { inner ->
+                            val imageUrl = (inner as? JsonPrimitive)?.content ?: return@forEach
+                            if (isReaderImageUrl(imageUrl)) urls.add(imageUrl)
+                        }
+                        else -> Unit
+                    }
                 }
             }
             index = arrayStart + arrayJson.length
@@ -939,144 +912,36 @@ abstract class ProComic :
     private fun isReaderImageUrl(url: String): Boolean = runCatching {
         val httpUrl = url.toHttpUrl()
         httpUrl.isHttps && (
-            httpUrl.host == "procomic.pro" ||
+            httpUrl.host == "procomic.net" ||
+                httpUrl.host == "www.procomic.net" ||
+                httpUrl.host == "procomic.pro" ||
                 httpUrl.host == "www.procomic.pro" ||
+                httpUrl.host.endsWith(".procomic.net") ||
                 httpUrl.host.endsWith(".procomic.pro")
             )
     }.getOrDefault(false)
 
-    /**
-     * Reads the storage generation ("cdnPath" / legacy "cdn_path") that the
-     * deferred map tokens are bound to, searching backwards from [searchLimit]
-     * so hydration noise after the chapter payload cannot win. Public so the
-     * JVM harness exercises the exact extraction the source ships.
-     */
-    fun extractCdnPath(flight: String, searchLimit: Int = flight.length): String? {
-        val newIndex = flight.lastIndexOf("\"cdnPath\":", searchLimit)
-        val legacyIndex = flight.lastIndexOf("\"cdn_path\":", searchLimit)
-        val index = maxOf(newIndex, legacyIndex)
-        if (index < 0) return null
-        val key = if (index == newIndex) "\"cdnPath\":" else "\"cdn_path\":"
-        var cursor = index + key.length
-        while (cursor < flight.length && flight[cursor].isWhitespace()) cursor++
-        // A JSON null / missing string is no generation — refusing here keeps
-        // a garbage value (e.g. the next key's name) out of the plan request.
-        if (cursor >= flight.length || flight[cursor] != '"') return null
-        val end = flight.indexOf('"', cursor + 1)
-        if (end < 0) return null
-        return flight.substring(cursor + 1, end).takeIf { it.isNotEmpty() }
-    }
-
-    private class DeferredWithCdn(
-        val images: List<String>,
-        val maps: List<DeferredMapDto>,
-        val cdnPath: String?,
-    )
-
-    private suspend fun parseDeferredMedia(flight: String, chapterId: Int): DeferredWithCdn? {
-        val mediaKey = "\"deferredMedia\":{"
-        val mediaIndex = flight.indexOf(mediaKey)
-        if (mediaIndex < 0) return null
-        val mediaStart = mediaIndex + "\"deferredMedia\":".length
-        val mediaJson = RscFlight.balancedObject(flight, mediaStart) ?: return null
-        val media = runCatching {
-            json.decodeFromString(DeferredMediaDto.serializer(), mediaJson)
-        }.getOrNull() ?: return null
-
-        // The deferred payload carries the storage generation its map tokens
-        // are bound to: "cdnPath" since the site's flight rework (verified
-        // live: "cdnPath":"cdn2"), "cdn_path" on legacy chapters. Sending a
-        // stale/null generation makes the proxy plan bind the piece tokens
-        // to a dead one — every piece then answers 404 {"error":"not_found"}
-        // and the stitch server surfaces that as HTTP 502 ("pages 4+ fail").
-        val cdnPath = extractCdnPath(flight, mediaIndex)
-
-        if (media.requireTurnstile == true) {
-            Log.i(TAG, "deferred media requires Turnstile; serving public pages only")
-            return DeferredWithCdn(images = emptyList(), maps = emptyList(), cdnPath = cdnPath)
-        }
-
-        val data = fetchDeferredMaps(chapterId, media)
-        return DeferredWithCdn(
-            images = data?.images.orEmpty(),
-            maps = data?.maps.orEmpty(),
-            cdnPath = cdnPath,
-        )
-    }
-
-    /**
-     * GET /chapter-deferred-media/{chapterId}?token={jwt}&split={n} ->
-     * the remaining pages' reconstruction map tokens. An expired/revoked
-     * JWT (the tokens live ~30 minutes) gets ONE renewal round-trip first —
-     * `POST /chapter-deferred-media/{chapterId}/refresh` with the old token,
-     * the same flow the site reader's DeferredTokenRenewalError handler
-     * runs — and the fetch is retried with the fresh JWT before giving up
-     * and serving the public pages only.
-     */
-    private suspend fun fetchDeferredMaps(chapterId: Int, media: DeferredMediaDto): DeferredDataDto? {
-        val token = media.token ?: return null
-        var currentToken = token
-        repeat(2) { attempt ->
-            val response = client.newCall(deferredMediaRequest(chapterId, currentToken, media.splitIndex)).execute()
-            response.use {
-                if (it.isSuccessful) {
-                    return json.decodeFromString(DeferredResponseDto.serializer(), it.body.string()).data
-                }
-                // Only the auth/expiry class of failure is worth a renewal;
-                // 404 (unknown chapter) etc. go straight to the fallback.
-                if (it.code != 401 && it.code != 403) {
-                    Log.w(TAG, "deferred media failed with HTTP ${it.code}; serving public pages only")
-                    return null
-                }
-                if (attempt > 0) {
-                    Log.w(TAG, "deferred media still unauthorized after refresh; serving public pages only")
-                    return null
-                }
+    /** The reader's own `<img>` sources: `"appImages":[{mobile,desktop}]` —
+     * signed-filename AVIF URLs on `app.<host>` that fetch directly from
+     * any client (verified live: 200 for plain okhttp/curl TLS on every
+     * probed chapter, the signature carried in the file name; mobile and
+     * desktop are identical). desktop wins, mobile is the fallback. */
+    private fun parseAppImages(flight: String): List<String> {
+        val key = "\"appImages\":["
+        val index = flight.indexOf(key)
+        if (index < 0) return emptyList()
+        // arrayStart points AT the '[' (see parseReaderImages).
+        val arrayStart = index + key.length - 1
+        val arrayJson = RscFlight.balancedArray(flight, arrayStart) ?: return emptyList()
+        return runCatching {
+            json.parseToJsonElement(arrayJson).jsonArray.mapNotNull { element ->
+                val obj = element.jsonObject
+                ((obj["desktop"] ?: obj["mobile"]) as? JsonPrimitive)
+                    ?.content
+                    ?.takeIf { it.startsWith("https://") && isReaderImageUrl(it) }
             }
-            currentToken = refreshToken(chapterId, currentToken) ?: return null
-        }
-        return null
+        }.getOrDefault(emptyList())
     }
-
-    private fun deferredMediaRequest(chapterId: Int, token: String, splitIndex: Int?): Request = Request.Builder()
-        .url(
-            "$baseUrl/chapter-deferred-media/$chapterId".toHttpUrl().newBuilder()
-                .addQueryParameter("token", token)
-                .addQueryParameter("split", (splitIndex ?: 0).toString())
-                .build(),
-        )
-        .header("Accept", "application/json")
-        .header("Referer", "$baseUrl/")
-        .build()
-
-    /** POST /chapter-deferred-media/{chapterId}/refresh {token} -> {token} —
-     * the reader's own renewal endpoint; null when the site refuses. */
-    private fun refreshToken(chapterId: Int, expiredToken: String): String? {
-        val request = Request.Builder()
-            .url("$baseUrl/chapter-deferred-media/$chapterId/refresh")
-            .post(RenewMediaTokenDto(expiredToken).toJsonString().toRequestBody(jsonMedia))
-            .header("Accept", "application/json")
-            .header("Content-Type", "application/json")
-            .header("Referer", "$baseUrl/")
-            .build()
-        val response = try {
-            client.newCall(request).execute()
-        } catch (t: IOException) {
-            Log.w(TAG, "deferred-media refresh threw ${t.javaClass.simpleName}")
-            return null
-        }
-        response.use { res ->
-            if (!res.isSuccessful) {
-                Log.w(TAG, "deferred-media refresh failed with HTTP ${res.code}")
-                return null
-            }
-            val body = res.body.string()
-            val data = runCatching { body.parseAs<RefreshedMediaTokenDto>() }.getOrNull()
-            return data?.token?.takeIf { token -> token.isNotEmpty() }
-        }
-    }
-
-    private val jsonMedia by lazy { "application/json; charset=utf-8".toMediaType() }
 
     // ========================= Preference screen =========================
 
