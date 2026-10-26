@@ -1,46 +1,58 @@
 package eu.kanade.tachiyomi.extension.ar.mangatek
 
 import eu.kanade.tachiyomi.source.model.Filter
-import eu.kanade.tachiyomi.source.model.FilterList
+import okhttp3.HttpUrl
 
-internal val sortOptions = listOf(
-    "الأحدث سلاسل" to "latest",
-    "الأكثر صلة" to "relevance",
-    "الأكثر شعبية" to "popular",
-    "الرائج" to "trending",
-    "الأعلى تقييماً" to "rating",
-    "أبجدي" to "alphabetical",
-)
-
-internal val statusOptions = listOf(
-    "الكل" to "",
-    "مستمرة" to "ongoing",
-    "مكتملة" to "completed",
-    "متوقفة مؤقتاً" to "hiatus",
-    "ملغاة" to "cancelled",
-)
-
-internal class SortFilter : Filter.Select<String>("Sort", sortOptions.map { it.first }.toTypedArray()) {
-    val selected: String get() = sortOptions[state].second
+interface UrlPartFilter {
+    fun addUrlParameter(url: HttpUrl.Builder)
 }
 
-internal class StatusFilter : Filter.Select<String>("الحالة", statusOptions.map { it.first }.toTypedArray()) {
-    val selected: String get() = statusOptions[state].second
+abstract class SelectFilter(
+    name: String,
+    private val urlParameter: String,
+    private val options: Array<Pair<String, String>>,
+    defaultIndex: Int = 0,
+) : Filter.Select<String>(
+    name,
+    options.map { it.first }.toTypedArray(),
+    defaultIndex,
+),
+    UrlPartFilter {
+    override fun addUrlParameter(url: HttpUrl.Builder) {
+        val value = options[state].second
+        if (value.isNotEmpty()) {
+            url.addQueryParameter(urlParameter, value)
+        }
+    }
 }
 
-internal class TriStateFilter(name: String, val id: String) : Filter.TriState(name)
+class SortFilter :
+    SelectFilter(
+        "ترتيب حسب",
+        "sort",
+        arrayOf(
+            Pair("الافتراضي", ""),
+            Pair("الأكثر مشاهدة", "views"),
+            Pair("آخر التحديثات", "latest"),
+            Pair("الأعلى تقييماً", "rating"),
+            Pair("الأحدث إضافة", "created_at"),
+        ),
+    )
 
-internal class GenreFilter(genres: List<Pair<String, String>>) : Filter.Group<TriStateFilter>("التصنيفات", genres.map { (label, id) -> TriStateFilter(label, id) }) {
-    val included: List<String>
-        get() = state.filter { it.isIncluded() }.map { it.id }
-}
+class StatusFilter :
+    SelectFilter(
+        "الحالة",
+        "status",
+        arrayOf(
+            Pair("الكل", ""),
+            Pair("مستمر", "ongoing"),
+            Pair("مكتمل", "completed"),
+        ),
+    )
 
-internal fun getFilterListInternal(genres: List<Pair<String, String>>?): FilterList = FilterList(
-    SortFilter(),
-    StatusFilter(),
-    if (genres != null && genres.isNotEmpty()) {
-        GenreFilter(genres)
-    } else {
-        Filter.Header("اضغط «إعادة تعيين» لتحميل التصنيفات")
-    },
-)
+class GenreFilter(genres: List<String>) :
+    SelectFilter(
+        "التصنيف",
+        "tags",
+        arrayOf(Pair("الكل", "")) + genres.map { Pair(it, it) }.toTypedArray(),
+    )
