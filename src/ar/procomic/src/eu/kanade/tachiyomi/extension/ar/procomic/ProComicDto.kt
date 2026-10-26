@@ -45,6 +45,24 @@ class SeriesMetaDto(
     }
 }
 
+/** The site's app-CDN cover variants (v105): `coverImageApp` on the search
+ * rows and series payloads — the `app.<host>` signed-filename AVIFs the
+ * site's own cards load. Hosts observed live: app.procomic.net,
+ * app.procomic.pro and app.prochan.net (the parent brand serves a share of
+ * the catalog's covers). */
+@Serializable
+class CoverAppDto(
+    val desktop: String? = null,
+    val mobile: String? = null,
+    val card: CoverCardDto? = null,
+)
+
+@Serializable
+class CoverCardDto(
+    val desktop: String? = null,
+    val mobile: String? = null,
+)
+
 @Serializable
 class SeriesSearchDto(
     val id: Int,
@@ -55,6 +73,9 @@ class SeriesSearchDto(
     val progress: String? = null,
     val thumbnail: String? = null,
     val updated_at: String? = null,
+    val cdn_path: String? = null,
+    val coverImage: String? = null,
+    val coverImageApp: CoverAppDto? = null,
     val metadata: SeriesMetaDto? = null,
 )
 
@@ -79,6 +100,8 @@ class SeriesDetailsDto(
     val chaptersCount: Int? = null,
     val thumbnail: String? = null,
     val cdn_path: String? = null,
+    val coverImage: String? = null,
+    val coverImageApp: CoverAppDto? = null,
     val metadata: SeriesMetaDto? = null,
 )
 
@@ -168,6 +191,47 @@ class UpdateRowDto(
     val status: String? = null,
     val chapters: List<UpdateChapterDto> = emptyList(),
 )
+
+/**
+ * Resolves one fetchable cover URL out of the field mix the site now ships
+ * (v105). Preference order, each branch verified live:
+ *
+ * 1. `coverImageApp.desktop` / `card.desktop` / `card.mobile` / `mobile` —
+ *    absolute `app.<host>` signed-filename AVIFs (app.procomic.net,
+ *    app.procomic.pro, app.prochan.net — all 200 to plain clients);
+ * 2. absolute `coverImage` — `cdn{N}.procomic.net` raw (200 with a browser
+ *    UA, 403 otherwise — the loopback proxy sends the browser UA);
+ * 3. absolute `thumbnail`;
+ * 4. RELATIVE `coverImage`/`thumbnail` (`/224/image_series/...avif`) joined
+ *    onto the row's `cdn_path` host (`cdn2` -> https://cdn2.procomic.net).
+ *    The search API switched a wave of series to this shape and the bare
+ *    apexes 404 those paths — only the numbered CDN hosts serve them.
+ *
+ * Returns null when nothing usable is present (the caller keeps the old
+ * blank-cover behavior).
+ */
+internal fun resolveCoverUrl(
+    coverImageApp: CoverAppDto?,
+    coverImage: String?,
+    thumbnail: String?,
+    cdnPath: String?,
+): String? {
+    val absolute = listOf(
+        coverImageApp?.desktop,
+        coverImageApp?.card?.desktop,
+        coverImageApp?.card?.mobile,
+        coverImageApp?.mobile,
+        coverImage,
+        thumbnail,
+    ).firstOrNull { !it.isNullOrBlank() && it.startsWith("http") }
+    if (absolute != null) return absolute
+
+    val relative = listOf(coverImage, thumbnail)
+        .firstOrNull { !it.isNullOrBlank() && it.startsWith("/") }
+        ?: return null
+    val host = cdnPath?.takeIf { Regex("cdn[1-9]").matches(it) } ?: return null
+    return "https://$host.procomic.net$relative"
+}
 
 /** Persisted inside SChapter.url: everything the reader flow needs. */
 @Serializable

@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 19
+    versionCode = 20
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -16,6 +16,12 @@ keiyoushi {
         // notices for reader/series routes and its image-signing stack is
         // decommissioned (403 forbidden), which is where the device-side
         // HTTP 502 wave came from.
+        // v105 correction: the site is DUAL-HOMED — most series migrated to
+        // .net but a share of the catalog still lives on .pro (their .net
+        // reader route 308s to the series page). The reader fetch falls
+        // back across both apexes; covers resolve across the app-CDN pool
+        // (app.procomic.net / app.procomic.pro / app.prochan.net /
+        // cdn{1-4}.procomic.net) and ride the loopback JPEG transcoder.
         baseUrl = "https://procomic.net"
     }
 
@@ -23,6 +29,8 @@ keiyoushi {
     // libavif_android.so is now extracted from the extension's own installed
     // APK and System.load-ed explicitly (extension classloaders don't expose
     // native lib paths, so AvifDecoder's static loadLibrary never found it).
+    // v105 note: versionCode 20 = the dual-homed reader fallback + the cover
+    // pipeline (resolver + loopback proxy + fixed preferred port).
 
     deeplink {
         host("procomic.net")

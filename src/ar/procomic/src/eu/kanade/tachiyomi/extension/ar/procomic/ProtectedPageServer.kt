@@ -143,19 +143,52 @@ class ProComicImageServer(
         return "http://127.0.0.1:${ensureStarted()}/$IMAGE_PROXY_PATH_PREFIX/$encoded"
     }
 
-    /** Starts (or restarts) the loopback server and returns its port. */
+    /** Starts (or restarts) the loopback server and returns its port.
+     *
+     * v105: a FIXED preferred port is tried first so proxy URLs embedded in
+     * host-app data (cover thumbnail_url persists in the library DB; page
+     * URLs live in the reader session) stay valid across process restarts.
+     * When the port is taken, a /.diag probe decides: another process of
+     * THIS extension (a second host app) serves the identical stateless
+     * route and is reused as-is; anything else falls back to an ephemeral
+     * port exactly like the pre-v105 behavior.
+     */
     private fun ensureStarted(): Int {
         machine.get()?.takeIf { !it.socket.isClosed }?.let { return it.socket.localPort }
         synchronized(startLock) {
             machine.get()?.takeIf { !it.socket.isClosed }?.let { return it.socket.localPort }
+            runCatching {
+                val socket = ServerSocket(PREFERRED_PORT, BACKLOG, InetAddress.getByName("127.0.0.1"))
+                startAcceptor(socket)
+            }.onSuccess { return PREFERRED_PORT }
+            if (familyServerListening(PREFERRED_PORT)) return PREFERRED_PORT
             val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
-            machine.set(Machine(socket))
-            val acceptor = Thread({ acceptLoop(socket) }, "ProComicImageServer-accept")
-            acceptor.isDaemon = true
-            acceptor.start()
+            startAcceptor(socket)
             return socket.localPort
         }
     }
+
+    private fun startAcceptor(socket: ServerSocket) {
+        machine.set(Machine(socket))
+        val acceptor = Thread({ acceptLoop(socket) }, "ProComicImageServer-accept")
+        acceptor.isDaemon = true
+        acceptor.start()
+    }
+
+    /** True when 127.0.0.1:[port] answers /.diag with THIS extension's
+     * server family (a sibling process of the same extension). Bounded so
+     * an unrelated listener costs at most one short timeout. */
+    private fun familyServerListening(port: Int): Boolean = runCatching {
+        java.net.Socket().use { socket ->
+            socket.connect(java.net.InetSocketAddress("127.0.0.1", port), FAMILY_PROBE_TIMEOUT_MS)
+            socket.soTimeout = FAMILY_PROBE_TIMEOUT_MS
+            val output = socket.getOutputStream()
+            output.write("GET /.diag HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n".toByteArray(Charsets.US_ASCII))
+            output.flush()
+            val input = socket.getInputStream().readBytes()
+            String(input, Charsets.US_ASCII).contains(SERVER_FAMILY_MARKER)
+        }
+    }.getOrDefault(false)
 
     private fun acceptLoop(socket: ServerSocket) {
         while (!socket.isClosed) {
@@ -717,7 +750,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v104\"")
+        sb.append("\"server\":\"procomic-image/v105\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) { sb.append(",\"cachedResults\":").append(results.size) }
         sb.append(",\"recentFailures\":[")
@@ -761,7 +794,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v104")
+                add("Server build: procomic-image/v105")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -798,8 +831,11 @@ class ProComicImageServer(
                 httpUrl.host == "www.procomic.net" ||
                 httpUrl.host == "procomic.pro" ||
                 httpUrl.host == "www.procomic.pro" ||
+                httpUrl.host == "prochan.net" ||
+                httpUrl.host == "www.prochan.net" ||
                 httpUrl.host.endsWith(".procomic.net") ||
-                httpUrl.host.endsWith(".procomic.pro")
+                httpUrl.host.endsWith(".procomic.pro") ||
+                httpUrl.host.endsWith(".prochan.net")
             )
     }.getOrDefault(false)
 
@@ -856,6 +892,17 @@ class ProComicImageServer(
         private const val SOCKET_TIMEOUT_MS = 30_000
         private const val MAX_HEADER_BYTES = 16_384
 
+        /** Fixed loopback port tried first (v105): proxy URLs ride in
+         * persisted host-app data, so the port must survive restarts. An
+         * obscure, IANA-unassigned port on purpose. */
+        private const val PREFERRED_PORT = 44097
+
+        /** The /.diag substring that identifies a sibling process of this
+         * extension's image server (version-agnostic on purpose). */
+        private const val SERVER_FAMILY_MARKER = "procomic-image/"
+
+        private const val FAMILY_PROBE_TIMEOUT_MS = 750
+
         /** Two transcodes at a time: the decode target is a tall ARGB_8888
          * bitmap (up to ~26 MB at 800x8000) and the software AVIF decode is
          * CPU heavy; the permit covers ONLY the bitmap stage and the decode
@@ -863,8 +910,11 @@ class ProComicImageServer(
          * cannot be made. */
         private const val MAX_CONCURRENT_TRANSCODES = 2
 
-        /** Finished-result cache (bytes per entry, URL-keyed). */
-        private const val MAX_CACHED_RESULTS = 12
+        /** Finished-result cache (bytes per entry, URL-keyed). Covers share
+         * this pool with pages since v105 (covers are ~65 KB, pages are the
+         * heavy tail) — 24 keeps a catalog page's covers plus the reader's
+         * preload window resident at once. */
+        private const val MAX_CACHED_RESULTS = 24
 
         /** Pause between background pre-transcoded pages (gentle pacing —
          * with one GET per page a full chapter prebuilds in seconds). */

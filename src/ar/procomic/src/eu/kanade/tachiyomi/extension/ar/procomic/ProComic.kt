@@ -77,6 +77,20 @@ import kotlin.math.roundToInt
  *     served through the loopback image server's /.image-proxy route
  *     (browser UA + AVIF→JPEG transcode) because host apps cannot be
  *     relied on to send browser headers or decode AVIF below Android 12.
+ *   - pages (v105): the site is DUAL-HOMED — most series migrated to
+ *     procomic.net, but a share of the catalog still lives on procomic.pro
+ *     (their .net reader route 308s to the series page with no payload;
+ *     the .pro route carries it, with appImages on app.procomic.pro). The
+ *     reader fetch falls back across both apexes.
+ *   - covers (v105): the search API switched a wave of series to RELATIVE
+ *     thumbnail paths (`/224/image_series/...avif`) that only resolve on
+ *     the row's cdn{N} host, and every cover is AVIF on a widening host
+ *     pool (cdn{1-4}.procomic.net, app.procomic.net, app.procomic.pro,
+ *     app.prochan.net). Covers now resolve through resolveCoverUrl() and
+ *     ride the same loopback proxy as pages: browser UA (the raw cdn hosts
+ *     403 app clients) + AVIF→JPEG transcode (Android 10/11 cannot decode
+ *     AVIF) + the result cache. The proxy binds a FIXED preferred port so
+ *     persisted thumbnail_url values survive process restarts.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -173,6 +187,56 @@ abstract class ProComic :
 
     private fun chapterPageUrl(ref: ChapterRef): String = "$baseUrl/ar/chapter/${ref.seriesSlug}-${ref.chapterNumber}-${ref.chapterId}"
 
+    /**
+     * The reader/series routes exist on BOTH deployments (v105): the site
+     * is dual-homed — most series migrated to procomic.net, but a share of
+     * the catalog (series 224 "On a Deserted Island..." among them) still
+     * lives on procomic.pro, where the .net reader route 308s to the series
+     * page instead of carrying the flight payload. Derived from baseUrl so
+     * it tracks whichever apex the build targets.
+     */
+    private val readerApexes: List<String> by lazy {
+        val base = baseUrl.trimEnd('/')
+        val host = base.substringAfter("//")
+        val alt = when {
+            host.startsWith("www.") -> null
+            host.endsWith(".net") -> host.removeSuffix(".net") + ".pro"
+            host.endsWith(".pro") -> host.removeSuffix(".pro") + ".net"
+            else -> null
+        }
+        listOfNotNull(base, alt?.let { "https://$it" }).distinct()
+    }
+
+    /**
+     * Fetches a reader-side path across both apexes, extracts the RSC
+     * flight payload and parses it with [parse]. A null [parse] result
+     * (redirect-to-series, payload missing) or an unsuccessful response
+     * moves to the next apex; when every apex fails, [emptyPayloadError]
+     * (all returned 200 without a usable payload) or the last transport
+     * error is thrown.
+     */
+    private suspend fun <T> fetchFlightAcrossApexes(
+        path: String,
+        emptyPayloadError: String,
+        parse: (flight: String) -> T?,
+    ): T {
+        var lastError: IOException? = null
+        for (apex in readerApexes) {
+            try {
+                val response = client.newCall(GET("$apex$path", headers)).execute()
+                response.use {
+                    if (!it.isSuccessful) throw IOException("HTTP ${it.code} on $path")
+                    parse(RscFlight.extract(it.body.string()))
+                        ?.let { parsed -> return parsed }
+                    lastError = IOException(emptyPayloadError)
+                }
+            } catch (e: IOException) {
+                lastError = e
+            }
+        }
+        throw lastError ?: IOException("ProComic: reader unreachable for $path")
+    }
+
     // ========================= Popular & Latest ==========================
 
     override suspend fun getPopularManga(page: Int): MangasPage = getSearchPage(query = CATALOG_QUERY, sort = "popular", page = page)
@@ -225,11 +289,27 @@ abstract class ProComic :
     private fun UpdateRowDto.toSManga() = SManga.create().apply {
         url = "$mangaSlug-$mangaId"
         title = mangaTitle
-        thumbnail_url = coverImage?.takeIf { it.startsWith("http") }
+        thumbnail_url = resolveCoverUrl(
+            coverImageApp = null,
+            coverImage = coverImage,
+            thumbnail = null,
+            cdnPath = cdn_path,
+        )?.let(::coverProxyUrl)
         genre = type?.let { it.replaceFirstChar { c -> c.uppercase() } }
         status = this@toSManga.status.toProComicStatus()
         initialized = true
     }
+
+    /**
+     * Covers ride the same loopback transcoder as pages (v105): every cover
+     * the site ships is AVIF — undecodable below Android 12 — and the raw
+     * cdn{N} hosts 403 non-browser clients. The proxy fetches with the
+     * browser UA and serves plain JPEG, so covers render (fast) on every
+     * device and in every host app. Falls back to the raw URL if the local
+     * server cannot start; the server's fixed preferred port keeps the
+     * persisted thumbnail_url values valid across app restarts.
+     */
+    private fun coverProxyUrl(resolved: String): String = runCatching { imageServer.imageProxyUrl(resolved) }.getOrDefault(resolved)
 
     // ============================== Search ===============================
 
@@ -308,7 +388,12 @@ abstract class ProComic :
     private fun SeriesSearchDto.toSManga() = SManga.create().apply {
         url = "$slug-$id"
         title = this@toSManga.title
-        thumbnail_url = this@toSManga.thumbnail?.takeIf { it.startsWith("http") }
+        thumbnail_url = resolveCoverUrl(
+            coverImageApp = this@toSManga.coverImageApp,
+            coverImage = this@toSManga.coverImage,
+            thumbnail = this@toSManga.thumbnail,
+            cdnPath = cdn_path,
+        )?.let(::coverProxyUrl)
         genre = buildList {
             this@toSManga.type?.let { add(it.replaceFirstChar { c -> c.uppercase() }) }
             addAll(this@toSManga.metadata?.genres.orEmpty())
@@ -391,20 +476,20 @@ abstract class ProComic :
     }
 
     /** The reader page flight carries `seriesUrl:"/ar/{slug}-{id}"`. */
-    private suspend fun resolveSeriesUrlFromChapterPage(chapterSlug: String): String? {
-        val response = client.newCall(GET("$baseUrl/ar/chapter/$chapterSlug", headers)).execute()
-        response.use {
-            if (!it.isSuccessful) return null
-            val flight = RscFlight.extract(it.body.string())
+    private suspend fun resolveSeriesUrlFromChapterPage(chapterSlug: String): String? = runCatching {
+        fetchFlightAcrossApexes(
+            path = "/ar/chapter/$chapterSlug",
+            emptyPayloadError = "ProComic: seriesUrl missing on the reader page",
+        ) { flight ->
             val key = "\"seriesUrl\":"
             val index = flight.indexOf(key)
-            if (index < 0) return null
+            if (index < 0) return@fetchFlightAcrossApexes null
             val start = flight.indexOf('"', index + key.length)
             val end = flight.indexOf('"', start + 1)
-            if (start < 0 || end < 0) return null
-            return flight.substring(start + 1, end).substringAfterLast('/')
+            if (start < 0 || end < 0) return@fetchFlightAcrossApexes null
+            flight.substring(start + 1, end).substringAfterLast('/')
         }
-    }
+    }.getOrNull()
 
     override suspend fun fetchMangaUpdate(
         manga: SManga,
@@ -461,6 +546,9 @@ abstract class ProComic :
                     type = row.type,
                     description = row.description,
                     thumbnail = row.thumbnail,
+                    cdn_path = row.cdn_path,
+                    coverImage = row.coverImage,
+                    coverImageApp = row.coverImageApp,
                     metadata = row.metadata,
                 ),
                 recentChapters = emptyList(),
@@ -478,7 +566,12 @@ abstract class ProComic :
         return SManga.create().apply {
             url = manga.url
             title = series.title
-            thumbnail_url = series.thumbnail?.takeIf { it.startsWith("http") }
+            thumbnail_url = resolveCoverUrl(
+                coverImageApp = series.coverImageApp,
+                coverImage = series.coverImage,
+                thumbnail = series.thumbnail,
+                cdnPath = series.cdn_path,
+            )?.let(::coverProxyUrl)
             author = meta?.authorText()
             artist = meta?.artistText()
             genre = buildList {
@@ -653,7 +746,7 @@ abstract class ProComic :
         var toc: List<TocChapterDto> = newestChapter?.let { chapter ->
             val number = chapter.chapter_number ?: ""
             runCatching {
-                fetchReaderToc(chapterPageUrl(ChapterRef(seriesSlug, number, chapter.id)))
+                fetchReaderToc("/ar/chapter/$seriesSlug-$number-${chapter.id}")
             }
                 .onFailure { Log.w(TAG, "reader TOC failed; trying the chapters API", it) }
                 .getOrNull()
@@ -765,25 +858,25 @@ abstract class ProComic :
     /**
      * The reader page flight embeds `chapters:[{id, chapterNumber, group,
      * translator, metadata:{team}}]` right after the "chapterLabel" key.
+     * Either apex may carry the chapter (dual-homed site, v105).
      */
-    private suspend fun fetchReaderToc(readerUrl: String): List<TocChapterDto> {
-        val response = client.newCall(GET(readerUrl, headers)).execute()
-        response.use {
-            if (!it.isSuccessful) throw IOException("HTTP ${it.code} on reader TOC")
-            val flight = RscFlight.extract(it.body.string())
-            val markerIndex = flight.indexOf("\"chapterLabel\":")
-            val arrayIndex = flight.indexOf("\"chapters\":[", if (markerIndex >= 0) markerIndex else 0)
-            if (arrayIndex < 0) throw IOException("TOC array missing")
-            val arrayStart = arrayIndex + "\"chapters\":".length
-            val arrayJson = RscFlight.balancedArray(flight, arrayStart)
-                ?: throw IOException("TOC array unbalanced")
-            return json.parseToJsonElement(arrayJson).jsonArray
-                .mapNotNull { element ->
-                    runCatching {
-                        json.decodeFromString(TocChapterDto.serializer(), element.jsonObject.toString())
-                    }.getOrNull()
-                }
-        }
+    private suspend fun fetchReaderToc(readerPath: String): List<TocChapterDto> = fetchFlightAcrossApexes(
+        path = readerPath,
+        emptyPayloadError =
+        "ProComic: chapter table of contents missing \u2014 the chapter is locked " +
+            "or unavailable on the site",
+    ) { flight ->
+        val markerIndex = flight.indexOf("\"chapterLabel\":")
+        val arrayIndex = flight.indexOf("\"chapters\":[", if (markerIndex >= 0) markerIndex else 0)
+        if (arrayIndex < 0) return@fetchFlightAcrossApexes null
+        val arrayStart = arrayIndex + "\"chapters\":".length
+        val arrayJson = RscFlight.balancedArray(flight, arrayStart)
+            ?: return@fetchFlightAcrossApexes null
+        json.parseToJsonElement(arrayJson).jsonArray.mapNotNull { element ->
+            runCatching {
+                json.decodeFromString(TocChapterDto.serializer(), element.jsonObject.toString())
+            }.getOrNull()
+        }.ifEmpty { null }
     }
 
     /**
@@ -836,42 +929,43 @@ abstract class ProComic :
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         val ref = json.decodeFromString(ChapterRef.serializer(), chapter.url)
-        val readerUrl = chapterPageUrl(ref)
-        val response = client.newCall(GET(readerUrl, headers)).execute()
-        response.use {
-            if (!it.isSuccessful) throw IOException("HTTP ${it.code} on reader page")
-            val flight = RscFlight.extract(it.body.string())
-            // images[] is the site's own page list (cdn.<host> raw files);
-            // appImages[] mirrors it with the signed-filename app.<host>
-            // variants the reader actually loads — the only URLs the edge
-            // serves to non-browser clients since the .net migration.
+        val readerPath = "/ar/chapter/${ref.seriesSlug}-${ref.chapterNumber}-${ref.chapterId}"
+        // images[] is the site's own page list (cdn.<host> raw files);
+        // appImages[] mirrors it with the signed-filename app.<host>
+        // variants the reader actually loads — the only URLs the edge
+        // serves to non-browser clients since the .net migration. Either
+        // apex may carry the chapter: the payload comes from whichever
+        // deployment hosts this series (the other 308s to the series page).
+        val upstreams = fetchFlightAcrossApexes(
+            path = readerPath,
+            emptyPayloadError =
+            "ProComic: no pages found \u2014 the chapter is locked or unavailable on the site " +
+                "(unlock with coins or the shortlink there first)",
+        ) { flight ->
             val images = parseReaderImages(flight)
             val appImages = parseAppImages(flight)
-
             if (images.isEmpty() && appImages.isEmpty()) {
-                throw IOException(
-                    "ProComic: no pages found \u2014 the chapter is locked or unavailable on the site " +
-                        "(unlock with coins or the shortlink there first)",
-                )
+                null
+            } else {
+                // Prefer the app variant per page (verified live: 200 for
+                // plain clients, the signature rides in the file name); the
+                // raw CDN URL is the fallback (the proxy's session retry is
+                // its last chance, the edge 403s bare TLS on those hosts).
+                List(maxOf(images.size, appImages.size)) { index ->
+                    appImages.getOrNull(index) ?: images[index]
+                }
             }
-
-            // Prefer the app variant per page (verified live: 200 for plain
-            // clients, the signature rides in the file name); the raw CDN
-            // URL is the fallback (the proxy's session retry is its last
-            // chance, the edge 403s bare TLS on those hosts).
-            val upstreams = List(maxOf(images.size, appImages.size)) { index ->
-                appImages.getOrNull(index) ?: images[index]
-            }
-            val pages = upstreams.mapIndexed { index, upstream ->
-                Page(index = index, url = readerUrl, imageUrl = imageServer.imageProxyUrl(upstream))
-            }
-
-            // v101: warm the transcode cache in the background so the
-            // reader's own fetches land on finished JPEGs (the old
-            // protected-page preloader, re-targeted at direct app images).
-            imageServer.preloadImages(ref.chapterId.toString(), upstreams)
-            return pages
         }
+
+        val pages = upstreams.mapIndexed { index, upstream ->
+            Page(index = index, url = "$baseUrl$readerPath", imageUrl = imageServer.imageProxyUrl(upstream))
+        }
+
+        // v101: warm the transcode cache in the background so the
+        // reader's own fetches land on finished JPEGs (the old
+        // protected-page preloader, re-targeted at direct app images).
+        imageServer.preloadImages(ref.chapterId.toString(), upstreams)
+        return pages
     }
 
     /** The page list embedded in the reader flight: `"images":[…]` arrays
@@ -917,6 +1011,10 @@ abstract class ProComic :
         return urls.distinct()
     }
 
+    /** Any https URL on a site-owned image host. The app-CDN pool grew in
+     * v105: pages/covers ride app.procomic.net, app.procomic.pro AND
+     * app.prochan.net (the parent brand serves a share of the catalog's
+     * images), with raw files on cdn{1..4}.procomic.net. */
     private fun isReaderImageUrl(url: String): Boolean = runCatching {
         val httpUrl = url.toHttpUrl()
         httpUrl.isHttps && (
@@ -924,8 +1022,11 @@ abstract class ProComic :
                 httpUrl.host == "www.procomic.net" ||
                 httpUrl.host == "procomic.pro" ||
                 httpUrl.host == "www.procomic.pro" ||
+                httpUrl.host == "prochan.net" ||
+                httpUrl.host == "www.prochan.net" ||
                 httpUrl.host.endsWith(".procomic.net") ||
-                httpUrl.host.endsWith(".procomic.pro")
+                httpUrl.host.endsWith(".procomic.pro") ||
+                httpUrl.host.endsWith(".prochan.net")
             )
     }.getOrDefault(false)
 
