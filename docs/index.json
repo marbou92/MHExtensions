@@ -150,11 +150,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.4",
-      "versionCode": 4,
+      "version": "1.6.5",
+      "versionCode": 5,
       "baseUrl": "https://mangadar.com",
-      "apk": "tachiyomi-ar.mangadar-v1.6.4-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.4-release.apk",
+      "apk": "tachiyomi-ar.mangadar-v1.6.5-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.5-release.apk",
       "icon": "../icons/mangadar.png",
       "note": "",
       "description": ""
@@ -348,11 +348,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.2",
-      "versionCode": 2,
+      "version": "1.6.3",
+      "versionCode": 3,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.mangaswat-v1.6.2-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangaswat-v1.6.2-release.apk",
+      "apk": "tachiyomi-ar.mangaswat-v1.6.3-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangaswat-v1.6.3-release.apk",
       "icon": "../icons/mangaswat.png",
       "note": "",
       "description": ""
@@ -450,11 +450,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.15",
-      "versionCode": 15,
+      "version": "1.6.16",
+      "versionCode": 16,
       "baseUrl": "https://procomic.pro",
-      "apk": "tachiyomi-ar.procomic-v1.6.15-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.15-release.apk",
+      "apk": "tachiyomi-ar.procomic-v1.6.16-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.16-release.apk",
       "icon": "../icons/procomic.png",
       "note": "",
       "description": ""
