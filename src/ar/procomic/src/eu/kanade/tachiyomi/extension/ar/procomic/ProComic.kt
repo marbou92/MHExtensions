@@ -101,6 +101,14 @@ import kotlin.math.roundToInt
  *     MP are refused before allocation. Covers additionally request a
  *     downscaled variant (?e=1280) so an "originals" cover never becomes a
  *     ~90 MB bitmap, and the result cache is byte-budgeted (32 MB).
+ *   - pages/covers v107: the loader root cause is fixed — v104–v106 handed
+ *     the server the HOST app's apk (there is no per-extension Context),
+ *     so the bundled libavif_android.so was never actually found on any
+ *     device and Android 10/11 stayed on the error page. The path is now
+ *     the extension's own installed apk from the package manager, the
+ *     loader scans every candidate (pm path + classloader dex paths) for
+ *     the .so entry before loading, and the diag trail names each scanned
+ *     zip with its per-file outcome.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -136,9 +144,40 @@ abstract class ProComic :
             // it explicitly — extension classloaders don't expose native lib
             // paths, which is why Android 10/11 devices (no platform AVIF
             // codec) saw every page fail to decode.
-            apkSourceDir = applicationContext.applicationInfo.sourceDir,
+            // v107 ROOT-CAUSE FIX: keiyoushi.utils.applicationContext is the
+            // HOST APP's Application (Injekt.get<Application>() — a
+            // Tachiyomi-hosted extension has no Context of its own), so
+            // applicationInfo resolved to the HOST APK, which never carries
+            // our .so. The loader scanned the wrong zip on every device and
+            // the native tier stayed dead for good (the field report: "avif
+            // native: unavailable (no libavif_android.so entry)").
+            // Extensions ARE installed packages — the package manager
+            // resolves OUR apk (an app's own package needs no visibility
+            // grant). The server additionally derives candidates from its
+            // own classloader and verifies the .so entry in every zip
+            // before loading, so a wrong candidate can only cost one
+            // wasted scan, never a silent miss.
+            apkSourceDir = ownInstalledApkPath(),
             nativeCacheDir = applicationContext.cacheDir,
         )
+    }
+
+    /**
+     * THIS extension's installed APK path (v107). The extension's own
+     * package is the Kotlin package the generated manifest is built from
+     * (verified: the aapt package id matches exactly). The package manager
+     * resolves it without any visibility grant — an application always sees
+     * its own package. Returns the host application path as a last resort:
+     * the server entry-verifies every candidate, so a wrong last resort
+     * wastes one zip scan instead of loading nothing.
+     */
+    private fun ownInstalledApkPath(): String? {
+        val ownPackage = ProComic::class.java.name.substringBeforeLast('.')
+        val manager = runCatching { applicationContext.packageManager }.getOrNull()
+        val resolved = manager?.let {
+            runCatching { it.getApplicationInfo(ownPackage, 0).sourceDir }.getOrNull()
+        }
+        return resolved ?: runCatching { applicationContext.applicationInfo.sourceDir }.getOrNull()
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {

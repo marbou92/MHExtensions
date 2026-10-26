@@ -101,10 +101,12 @@ class ProComicImageServer(
      */
     private val sessionClient: OkHttpClient? = null,
     /**
-     * Our own installed APK path + a writable cache dir — the raw material
-     * for the explicit native-lib loader (it extracts libavif_android.so from
-     * the APK and System.load-s it). Both optional so the JVM harness can
-     * drive the server without an Android context.
+     * Our own installed APK path (v107: resolved via the package manager
+     * from OUR package — the host application context would hand back the
+     * host app's apk, which is the wrong zip) + a writable cache dir — the
+     * raw material for the explicit native-lib loader (it extracts
+     * libavif_android.so from the APK and System.load-s it). Both optional
+     * so the JVM harness can drive the server without an Android context.
      */
     private val apkSourceDir: String? = null,
     private val nativeCacheDir: java.io.File? = null,
@@ -698,6 +700,19 @@ class ProComicImageServer(
      * OWN installed APK (the installed extension APK is a readable zip) and
      * System.load it by absolute path. That binds the library to THIS classloader; the static initializer's
      * System.loadLibrary then resolves against the already-loaded soname.
+     *
+     * v107 — "our own installed APK" was resolved from the HOST application
+     * context (keiyoushi.utils.applicationContext IS Injekt's Application —
+     * extensions have no Context of their own), so the scan always ran
+     * against the host apk, never found the entry, and the native tier was
+     * dead on every device (the field report: "avif native: unavailable (no
+     * libavif_android.so entry)"). The path now arrives from the package
+     * manager (ProComic.kt, our own package); this loader additionally
+     * derives candidates from its own classloader's dex paths and verifies
+     * the .so entry in EVERY candidate zip before loading — a wrong
+     * candidate costs one wasted scan, never a silent miss. The scanned
+     * zips and their per-file outcomes land in the diag trail so the next
+     * field report names the exact zips seen.
      */
     private val avifNativeState: String by lazy { ensureAvifNative() }
 
@@ -710,14 +725,42 @@ class ProComicImageServer(
         } catch (_: Throwable) {
             // fall through to the explicit loader
         }
-        val apkPath = apkSourceDir ?: return "unavailable (no apk source)"
         val cacheBase = nativeCacheDir ?: return "unavailable (no cache dir)"
+        return nativeCandidateWalk(cacheBase)
+    }
+
+    /** The candidate walk, probe-free: every apk zip that might carry the
+     * bundled .so is scanned in trust order and the first entry-positive
+     * one is extracted + loaded. Probe-independent so the JVM harness can
+     * drive it deterministically (the probe outcome there depends on
+     * whether this particular JVM has an avif_android library reachable,
+     * which is an environment artifact, not a pipeline property). */
+    internal fun nativeCandidateWalk(cacheBase: java.io.File): String {
         if (android.os.Build.SUPPORTED_ABIS.isEmpty()) return "unavailable (unknown abi)"
-        return try {
-            java.util.zip.ZipFile(apkPath).use { zip ->
-                val entry = android.os.Build.SUPPORTED_ABIS.firstNotNullOfOrNull { candidate ->
-                    zip.getEntry("lib/$candidate/libavif_android.so")
-                } ?: return "unavailable (no libavif_android.so entry)"
+        val candidates = apkCandidates()
+        if (candidates.isEmpty()) return "unavailable (no apk source)"
+        val scanned = StringBuilder()
+        for (apkPath in candidates) {
+            val outcome = scanAndLoadFromApk(apkPath, cacheBase)
+            if (outcome.startsWith("loaded")) return outcome
+            scanned.append('[').append(apkPath.substringAfterLast('/').take(40)).append(": ").append(outcome).append("] ")
+        }
+        return "unavailable (no loadable libavif_android.so; scanned $scanned)"
+    }
+
+    /** Extract + System.load the bundled .so out of ONE apk-shaped zip.
+     * Returns "loaded from apk (...)" on success, "no entry" when the zip
+     * carries no ABI-matching libavif_android.so, or "<SimpleName>: <msg>"
+     * for open/extract/load failures. Every outcome except "loaded" lets
+     * the caller move on to the next candidate. */
+    private fun scanAndLoadFromApk(apkPath: String, cacheBase: java.io.File): String = try {
+        java.util.zip.ZipFile(apkPath).use { zip ->
+            val entry = android.os.Build.SUPPORTED_ABIS.firstNotNullOfOrNull { candidate ->
+                zip.getEntry("lib/$candidate/libavif_android.so")
+            }
+            if (entry == null) {
+                "no entry"
+            } else {
                 val dir = java.io.File(cacheBase, "procomic_native").apply { mkdirs() }
                 val target = java.io.File(dir, "libavif_android.so")
                 if (!target.exists() || target.length() != entry.size) {
@@ -728,11 +771,53 @@ class ProComicImageServer(
                 System.load(target.absolutePath)
                 "loaded from apk (${entry.name}, ${entry.size} B)"
             }
-        } catch (t: Throwable) {
-            "unavailable (${t.javaClass.simpleName}: ${t.message?.take(80)})"
         }
+    } catch (t: Throwable) {
+        "${t.javaClass.simpleName}: ${t.message?.take(60)}"
     }
 
+    /** Zips that may carry our bundled .so, in trust order: the caller's
+     * package-manager-resolved path (the EXTENSION's own apk since v107),
+     * then the dex/apk paths this class was actually loaded from (some
+     * hosts copy or relocate extension apks). Deduplicated; each candidate
+     * is entry-verified before its library loads. */
+    private fun apkCandidates(): List<String> = buildList {
+        apkSourceDir?.takeIf { it.isNotBlank() }?.let(::add)
+        addAll(apkPathsFromCallerClassloader())
+    }.distinct()
+
+    /** Best-effort reflection into BaseDexClassLoader.pathList.dexElements
+     * to recover the apk paths of THIS classloader. Bounded and safe: on
+     * the JVM harness (or any host that blocks these hidden fields) the
+     * whole lookup returns an empty list. */
+    private fun apkPathsFromCallerClassloader(): List<String> = runCatching {
+        val loader = this::class.java.classLoader ?: return emptyList()
+        val pathList = loader.javaClass.getDeclaredField("pathList").apply { isAccessible = true }
+            .get(loader) ?: return emptyList()
+        val elements = pathList.javaClass.getDeclaredField("dexElements").apply { isAccessible = true }
+            .get(pathList) as? Array<*> ?: return emptyList()
+        elements.mapNotNull { element ->
+            if (element == null) return@mapNotNull null
+            val field = runCatching {
+                element.javaClass.getDeclaredField("path").apply { isAccessible = true }
+            }.getOrNull() ?: return@mapNotNull null
+            when (val value = runCatching { field.get(element) }.getOrNull()) {
+                is java.io.File -> value.absolutePath
+                is String -> value
+                else -> null
+            }
+        }.filter { it.endsWith(".apk") }
+    }.getOrDefault(emptyList())
+
+    /** Harness hooks for the v107 loader: the resolved candidate list, the
+     * per-zip scan outcome ("loaded..." can only happen on a device — the
+     * JVM cannot dlopen an ARM ELF, so an entry-positive scan ends at a
+     * load-stage failure there), and the fully evaluated native state. */
+    internal fun debugApkCandidates(): List<String> = apkCandidates()
+
+    internal fun debugScanApk(apkPath: String, cacheBase: java.io.File): String = scanAndLoadFromApk(apkPath, cacheBase)
+
+    internal fun debugNativeState(): String = avifNativeState
     // ===================== in-flight build dedup =========================
 
     /** The host app fires several concurrent fetches for the same page
@@ -923,7 +1008,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v106\"")
+        sb.append("\"server\":\"procomic-image/v107\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -972,7 +1057,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v106")
+                add("Server build: procomic-image/v107")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)

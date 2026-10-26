@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 21
+    versionCode = 22
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -37,6 +37,16 @@ keiyoushi {
     // downscaled ?e=1280 variant, the result cache is byte-budgeted, and
     // the connection handler swallows Throwable so no Error can kill the
     // host app process.
+    // v107 note: versionCode 22 = the loader ROOT-CAUSE fix. v104–v106
+    // resolved "our own installed APK" from the HOST application context
+    // (keiyoushi.utils.applicationContext IS Injekt's Application — hosted
+    // extensions have no Context of their own), so the .so scan always ran
+    // against the host apk and the native decoder never loaded on ANY
+    // device (field report: "avif native: unavailable (no
+    // libavif_android.so entry)" on every Android 10 page and cover). The
+    // path now comes from the package manager (our own package); the
+    // loader verifies the .so entry in every candidate zip (pm path +
+    // classloader dex paths) and names each scanned zip in the diag trail.
 
     deeplink {
         host("procomic.net")
