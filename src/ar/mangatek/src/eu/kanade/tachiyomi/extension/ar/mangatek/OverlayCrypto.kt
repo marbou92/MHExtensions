@@ -1,11 +1,8 @@
 package eu.kanade.tachiyomi.extension.ar.mangatek
 
 import android.util.Base64
-import keiyoushi.utils.aesDecrypt
-import keiyoushi.utils.aesGcm
 import keiyoushi.utils.decodeHex
 import keiyoushi.utils.readUShortBigEndian
-import keiyoushi.utils.sha256
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 

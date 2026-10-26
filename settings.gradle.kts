@@ -85,7 +85,10 @@ fun loadAllIndividualExtensions() {
     }
 }
 fun loadIndividualExtension(lang: String, name: String) {
-    include("src:$lang:$name")
+    // v104: existence-guarded — upstream prunes dead extensions from its
+    // tree (kagane was removed from HEAD), and an unconditional include
+    // makes any checkout that tracks the template fail to configure.
+    if (File(rootDir, "src/$lang/$name").exists()) include("src:$lang:$name")
 }
 
 fun File.eachDir(block: (File) -> Unit) {

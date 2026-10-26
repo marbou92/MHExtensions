@@ -18,6 +18,7 @@ import keiyoushi.annotation.Source
 import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
+import keiyoushi.utils.applicationContext
 import keiyoushi.utils.firstInstanceOrNull
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.toJsonString
@@ -106,6 +107,13 @@ abstract class ProComic :
             // session the reader page established — cookies, CF clearance,
             // the forced browser UA.
             sessionClient = client,
+            // v104: our APK path + a cache dir let the server pull its bundled
+            // libavif_android.so out of OUR OWN installed APK and System.load
+            // it explicitly — extension classloaders don't expose native lib
+            // paths, which is why Android 10/11 devices (no platform AVIF
+            // codec) saw every page fail to decode.
+            apkSourceDir = applicationContext.applicationInfo.sourceDir,
+            nativeCacheDir = applicationContext.cacheDir,
         )
     }
 

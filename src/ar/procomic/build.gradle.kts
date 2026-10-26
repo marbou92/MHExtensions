@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 18
+    versionCode = 19
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -18,6 +18,11 @@ keiyoushi {
         // HTTP 502 wave came from.
         baseUrl = "https://procomic.net"
     }
+
+    // v104 note: versionCode 19 = the Android 10/11 decode fix — the bundled
+    // libavif_android.so is now extracted from the extension's own installed
+    // APK and System.load-ed explicitly (extension classloaders don't expose
+    // native lib paths, so AvifDecoder's static loadLibrary never found it).
 
     deeplink {
         host("procomic.net")

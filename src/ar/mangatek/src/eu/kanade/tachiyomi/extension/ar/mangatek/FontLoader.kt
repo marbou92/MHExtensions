@@ -2,7 +2,6 @@ package eu.kanade.tachiyomi.extension.ar.mangatek
 
 import android.graphics.Typeface
 import keiyoushi.utils.applicationContext
-import keiyoushi.utils.sha256
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.Request

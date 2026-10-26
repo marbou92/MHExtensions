@@ -100,6 +100,14 @@ class ProComicImageServer(
      * sees the browsing session the reader page established.
      */
     private val sessionClient: OkHttpClient? = null,
+    /**
+     * Our own installed APK path + a writable cache dir — the raw material
+     * for the explicit native-lib loader (it extracts libavif_android.so from
+     * the APK and System.load-s it). Both optional so the JVM harness can
+     * drive the server without an Android context.
+     */
+    private val apkSourceDir: String? = null,
+    private val nativeCacheDir: java.io.File? = null,
 ) {
 
     private class Machine(val socket: ServerSocket)
@@ -416,26 +424,8 @@ class ProComicImageServer(
 
     private fun decodeAvif(bytes: ByteArray, diag: ProxyDiag): Bitmap {
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size)?.let { return it }
-        val software = runCatching {
-            if (!org.aomedia.avif.android.AvifDecoder.isAvifImage(java.nio.ByteBuffer.wrap(bytes))) return@runCatching null
-            val buffer = java.nio.ByteBuffer.wrap(bytes)
-            val info = org.aomedia.avif.android.AvifDecoder.Info()
-            if (!org.aomedia.avif.android.AvifDecoder.getInfo(buffer, bytes.size, info)) return@runCatching null
-            val bitmap = try {
-                Bitmap.createBitmap(info.width, info.height, Bitmap.Config.ARGB_8888)
-            } catch (_: OutOfMemoryError) {
-                Log.w(TAG, "ARGB_8888 decode target OOM (${info.width}x${info.height}); falling back to RGB_565")
-                Bitmap.createBitmap(info.width, info.height, Bitmap.Config.RGB_565)
-            }
-            if (org.aomedia.avif.android.AvifDecoder.decode(java.nio.ByteBuffer.wrap(bytes), bytes.size, bitmap)) {
-                bitmap
-            } else {
-                bitmap.recycle()
-                null
-            }
-        }.getOrNull()
-        if (software != null) return software
-        diag.add("bitmapfactory+libavif decode failed")
+        diag.add("bitmapfactory null (platform has no avif codec)")
+        decodeWithLibavif(bytes, diag)?.let { return it }
         if (android.os.Build.VERSION.SDK_INT >= 28) {
             try {
                 val source = android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))
@@ -443,10 +433,107 @@ class ProComicImageServer(
                     decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
                 }
             } catch (t: Throwable) {
+                diag.add("imagedecoder ${t.javaClass.simpleName}")
                 throw IOException("ProComic: page failed to decode (${t.javaClass.simpleName})")
             }
         }
         throw IOException("ProComic: page failed to decode (Android 12+ required for AVIF pages)")
+    }
+
+    /**
+     * The bundled software decoder tier. Every failure mode lands in the
+     * diag trail with its ACTUAL reason — the v104 fix exists because the
+     * previous bare runCatching swallowed the one fact that mattered (the
+     * JNI library never loaded), leaving "bitmapfactory+libavif decode
+     * failed" as the only clue.
+     */
+    private fun decodeWithLibavif(bytes: ByteArray, diag: ProxyDiag): Bitmap? {
+        val nativeState = avifNativeState
+        diag.add("avif native: $nativeState")
+        if (nativeState != "system" && !nativeState.startsWith("loaded")) return null
+        return try {
+            val buffer = java.nio.ByteBuffer.wrap(bytes)
+            if (!org.aomedia.avif.android.AvifDecoder.isAvifImage(buffer)) {
+                diag.add("libavif: header refused")
+                null
+            } else {
+                val info = org.aomedia.avif.android.AvifDecoder.Info()
+                if (!org.aomedia.avif.android.AvifDecoder.getInfo(buffer, bytes.size, info)) {
+                    diag.add("libavif: getInfo refused")
+                    null
+                } else {
+                    diag.add("libavif: ${info.width}x${info.height} depth=${info.depth}")
+                    val config = if (info.depth > 8) Bitmap.Config.RGBA_F16 else Bitmap.Config.ARGB_8888
+                    val bitmap = try {
+                        Bitmap.createBitmap(info.width, info.height, config)
+                    } catch (_: OutOfMemoryError) {
+                        diag.add("libavif: OOM at $config")
+                        null
+                    } ?: return null
+                    if (org.aomedia.avif.android.AvifDecoder.decode(java.nio.ByteBuffer.wrap(bytes), bytes.size, bitmap)) {
+                        bitmap
+                    } else {
+                        bitmap.recycle()
+                        diag.add("libavif: decode returned false")
+                        null
+                    }
+                }
+            }
+        } catch (t: Throwable) {
+            diag.add("libavif threw ${t.javaClass.simpleName}: ${t.message?.take(60)}")
+            null
+        }
+    }
+
+    /**
+     * Why the explicit loader exists: the avif-android library opens its JNI
+     * lib in a static initializer via System.loadLibrary, which searches the
+     * CLASSLOADER's native paths. Host apps load extension APKs with a bare
+     * PathClassLoader (dex path only) and extractNativeLibs=false keeps the
+     * .so inside our APK — so the search falls back to the HOST app's native
+     * dirs, never finds libavif_android.so, and AvifDecoder's class init
+     * throws UnsatisfiedLinkError. On an Android 10/11 device there is no
+     * platform AVIF codec behind it either, so every page "failed to decode"
+     * while the old runCatching swallowed the error class — the reader
+     * screenshot that reported this fix showed exactly that dead end.
+     *
+     * Fix: before the first AvifDecoder reference, pull the .so out of OUR
+     * OWN installed APK (the installed extension APK is a readable zip) and
+     * System.load it by absolute path. That binds the library to THIS classloader; the static initializer's
+     * System.loadLibrary then resolves against the already-loaded soname.
+     */
+    private val avifNativeState: String by lazy { ensureAvifNative() }
+
+    private fun ensureAvifNative(): String {
+        // Fast path: some hosts create the extension classloader WITH the
+        // native lib path — the static init just works there.
+        try {
+            org.aomedia.avif.android.AvifDecoder.isAvifImage(java.nio.ByteBuffer.wrap(AVIF_PROBE_BYTES))
+            return "system"
+        } catch (_: Throwable) {
+            // fall through to the explicit loader
+        }
+        val apkPath = apkSourceDir ?: return "unavailable (no apk source)"
+        val cacheBase = nativeCacheDir ?: return "unavailable (no cache dir)"
+        if (android.os.Build.SUPPORTED_ABIS.isEmpty()) return "unavailable (unknown abi)"
+        return try {
+            java.util.zip.ZipFile(apkPath).use { zip ->
+                val entry = android.os.Build.SUPPORTED_ABIS.firstNotNullOfOrNull { candidate ->
+                    zip.getEntry("lib/$candidate/libavif_android.so")
+                } ?: return "unavailable (no libavif_android.so entry)"
+                val dir = java.io.File(cacheBase, "procomic_native").apply { mkdirs() }
+                val target = java.io.File(dir, "libavif_android.so")
+                if (!target.exists() || target.length() != entry.size) {
+                    zip.getInputStream(entry).use { input ->
+                        target.outputStream().use { output -> input.copyTo(output) }
+                    }
+                }
+                System.load(target.absolutePath)
+                "loaded from apk (${entry.name}, ${entry.size} B)"
+            }
+        } catch (t: Throwable) {
+            "unavailable (${t.javaClass.simpleName}: ${t.message?.take(80)})"
+        }
     }
 
     // ===================== in-flight build dedup =========================
@@ -630,7 +717,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v101\"")
+        sb.append("\"server\":\"procomic-image/v104\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) { sb.append(",\"cachedResults\":").append(results.size) }
         sb.append(",\"recentFailures\":[")
@@ -674,7 +761,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v101")
+                add("Server build: procomic-image/v104")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -796,5 +883,11 @@ class ProComicImageServer(
         private const val MAX_FAILURE_RECORDS = 64
 
         private val TAG = "ProComic"
+
+        /** Minimal ftyp/avif header — only exercises AvifDecoder's class
+         * init (the JNI load), never a real decode. */
+        private val AVIF_PROBE_BYTES = byteArrayOf(
+            0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66, 0, 0, 0, 0,
+        )
     }
 }
