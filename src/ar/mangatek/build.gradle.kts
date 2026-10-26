@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "MangaTek"
-    versionCode = 7
+    versionCode = 8
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -18,8 +18,6 @@ keiyoushi {
     deeplink {
         host("mangatek.com")
         host("www.mangatek.com")
-        host("mangatuk.com")
-        host("www.mangatuk.com")
         path("/series/..*")
     }
 }

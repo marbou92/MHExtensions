@@ -1,9 +1,7 @@
 package eu.kanade.tachiyomi.extension.ar.mangatek
 
 import android.content.SharedPreferences
-import android.util.Log
 import androidx.preference.EditTextPreference
-import androidx.preference.ListPreference
 import androidx.preference.PreferenceScreen
 import androidx.preference.SwitchPreferenceCompat
 import eu.kanade.tachiyomi.network.GET
@@ -16,7 +14,6 @@ import eu.kanade.tachiyomi.source.model.SManga
 import eu.kanade.tachiyomi.source.model.SMangaUpdate
 import keiyoushi.annotation.Source
 import keiyoushi.cloudflare.CloudflareSolverInterceptor
-import keiyoushi.network.get
 import keiyoushi.network.rateLimit
 import keiyoushi.source.KeiSource
 import keiyoushi.utils.firstInstanceOrNull
@@ -26,51 +23,41 @@ import keiyoushi.utils.toJsonElement
 import keiyoushi.utils.tryParse
 import kotlinx.coroutines.async
 import kotlinx.coroutines.coroutineScope
-import kotlinx.serialization.Serializable
+import kotlinx.serialization.json.JsonElement
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
-import okhttp3.Interceptor
 import okhttp3.OkHttpClient
-import okhttp3.Request
-import okhttp3.Response
 import java.io.IOException
 import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 import java.util.concurrent.TimeUnit
-import java.util.regex.Pattern
 import kotlin.math.roundToInt
 
 /**
- * MangaTek (mangatek.com) — Arabic "axis" platform site.
+ * MangaTek (mangatek.com) — Arabic manga platform (مانجاتك), Next.js "axis"
+ * backend with its catalog gateway on the api. subdomain:
  *
- * The web app is a Next.js shell; everything data-related goes through a
- * gateway API on the `api.` subdomain:
- *   - /api/catalog/genres                     (dynamic filter genres)
- *   - /api/catalog/search?...                 (browse + search + filters)
- *   - /api/catalog/series/by-slug/{slug}      (details)
- *   - /api/catalog/series/{id}/chapters       (chapter list)
- *   - /api/catalog/chapters/by-slug/{...}     (reader pages, direct URLs)
+ *   GET /api/catalog/search?limit=&offset=&sort=&order=&mature=&q=&status=&includeGenres=&genreMode=
+ *   GET /api/catalog/genres
+ *   GET /api/catalog/series/by-slug/{slug}
+ *   GET /api/catalog/series/{id}/chapters
+ *   GET /api/catalog/chapters/by-slug/{seriesSlug}/{chapterSlug}   (raw pages)
  *
- * The platform is deployed twice under the same brand (مانجاتك): the primary
- * mangatek.com and the twin mangatuk.com. The primary site sits behind an
- * aggressive Cloudflare configuration that hard-blocks some networks —
- * including, at recon time, datacenter IPs. Because both deployments speak
- * the exact same API, a gateway-failover interceptor (Kagane multi-mirror
- * pattern) transparently retries blocked requests on the twin and persists
- * whichever gateway answered. The failover can be forced from the source
- * settings.
+ * v100 — single origin. Earlier builds carried an automatic failover onto
+ * mangatuk.com, a twin deployment of the same platform with its OWN
+ * separate catalog. The failover engaged silently on gateway hiccups and
+ * then persisted, so readers kept seeing the wrong site's titles — exactly
+ * the "you are using the wrong site" report. The twin is gone from the
+ * host sets entirely: every call (API and page images) goes to mangatek.com
+ * and its subdomains only.
  *
- * Covers and reader pages live on the content.* subdomains, which sit
- * behind the same WAF but are NOT covered by the gateway rewrite — they
- * get their own identical failover, and cover/page URLs are normalized
- * onto the active content host when mapping API data. Without it a
- * blocked network browses fine but every image stays dead (403 / reset
- * connections on content.mangatek.com while content.mangatuk.com serves
- * the same paths).
- *
- * Details follow the MangaDot description layout: star rating header, a meta
- * info line, the synopsis, a Links section and the alternative names.
+ * Pages are raw, direct image URLs (pages[].imageUrl on content.mangatek.com)
+ * served exactly as the site's own reader receives them. Every request —
+ * API and images alike — runs through the same client with the Cloudflare
+ * solver for all mangatek hosts, so the cookie jar carries the site's own
+ * session cookies (the same cookies the browser reader holds, including the
+ * ones gating the Arabic OCR page variants) on every call.
  */
 @Source
 abstract class MangaTek :
@@ -85,310 +72,33 @@ abstract class MangaTek :
         connectTimeout(30, TimeUnit.SECONDS)
         readTimeout(60, TimeUnit.SECONDS)
         writeTimeout(30, TimeUnit.SECONDS)
-        addInterceptor(::gatewayFailoverInterceptor)
-        addInterceptor(::contentFailoverInterceptor)
-        addInterceptor(CloudflareSolverInterceptor(knownSiteHosts))
+        // The site, its gateway and its content CDN sit behind Cloudflare.
+        // Solving challenges in-app keeps cf_clearance (and with it the
+        // site's session cookies) in this client's cookie jar, so the raw
+        // pages behave like the ones the browser reader sees.
+        addInterceptor(
+            CloudflareSolverInterceptor(
+                setOf(
+                    "mangatek.com",
+                    "www.mangatek.com",
+                    "api.mangatek.com",
+                    "content.mangatek.com",
+                ),
+            ),
+        )
+        // Keep the request pace civil like the site's own traffic.
         rateLimit(3)
     }
 
-    // ============================== Gateways =============================
-    //
-    // Primary: mangatek.com (the site the user asked for). Twin:
-    // mangatuk.com — same brand, same platform, same API paths, separate
-    // catalog. "Auto" (default) starts on the primary and fails over on
-    // Cloudflare hard blocks / origin errors, then sticks to whichever
-    // gateway answered. The forced modes never rewrite.
+    // ============================== Endpoints =============================
 
-    private val primarySite = "https://mangatek.com"
-    private val primaryGateway = "https://api.mangatek.com"
-    private val primaryContent = "https://content.mangatek.com"
-    private val twinSite = "https://mangatuk.com"
-    private val twinGateway = "https://api.mangatuk.com"
-    private val twinContent = "https://content.mangatuk.com"
+    /** Catalog gateway. v100: the ONLY origin — no twin, no failover. */
+    protected open val gatewayBase = "https://api.mangatek.com"
 
-    private val knownSiteHosts = setOf(
-        "mangatek.com",
-        "www.mangatek.com",
-        "mangatuk.com",
-        "www.mangatuk.com",
-        "api.mangatek.com",
-        "api.mangatuk.com",
-        "content.mangatek.com",
-        "content.mangatuk.com",
-    )
+    /** Origin used for the user-facing [Source] links and deep links. */
+    protected open val siteBase = "https://mangatek.com"
 
-    private val siteHosts = setOf(primarySite, twinSite)
-    private val gatewayHosts = setOf(primaryGateway, twinGateway)
-    private val contentHosts = setOf(primaryContent, twinContent)
-
-    private fun gatewayMode(): String = preferences.getString(PREF_GATEWAY, PREF_GATEWAY_AUTO) ?: PREF_GATEWAY_AUTO
-
-    /** Current site origin used to build web links (deeplinks cover both). */
-    private fun currentSite(): String = when (gatewayMode()) {
-        PREF_GATEWAY_TWIN -> twinSite
-        PREF_GATEWAY_PRIMARY -> primarySite
-        else -> {
-            val pinned = preferences.getString(PREF_ACTIVE_SITE, null)
-            if (pinned != null && pinned in siteHosts) pinned else primarySite
-        }
-    }
-
-    /** Gateway origin used for API calls. */
-    private fun currentGateway(): String = when (gatewayMode()) {
-        PREF_GATEWAY_PRIMARY -> primaryGateway
-        PREF_GATEWAY_TWIN -> twinGateway
-        else -> {
-            val pinned = preferences.getString(PREF_ACTIVE_GATEWAY, null)
-            if (pinned != null && pinned in gatewayHosts) pinned else primaryGateway
-        }
-    }
-
-    private val gatewayLock = Any()
-
-    private val contentProbeLock = Any()
-
-    private var contentProbedAtMs = 0L
-
-    private fun persistActive(gateway: String) {
-        synchronized(gatewayLock) {
-            preferences.edit()
-                .putString(PREF_ACTIVE_GATEWAY, gateway)
-                .putString(PREF_ACTIVE_SITE, if (gateway == twinGateway) twinSite else primarySite)
-                .apply()
-        }
-    }
-
-    /**
-     * Rewrites requests between the two gateway hosts and retries on
-     * Cloudflare hard-block responses (403 "Attention Required" pages),
-     * stale-edge text/html 404s and origin-dead 5xx (502/504/521/522/523),
-     * exactly like Kagane's mirror failover. A 504 was the live "HTTP 504
-     * on every request" report: the edge is up but the origin behind it is
-     * dead, and the twin's origin is a different machine. Only requests to
-     * the known gateway hosts are touched. In auto mode the winning gateway
-     * is persisted so later requests start there.
-     */
-    private fun gatewayFailoverInterceptor(chain: Interceptor.Chain): Response {
-        val originalUrl = chain.request().url
-        val gatewayHostStrings = gatewayHosts.map { it.toHttpUrl().host }
-        if (originalUrl.host !in gatewayHostStrings || gatewayMode() != PREF_GATEWAY_AUTO) {
-            return chain.proceed(chain.request())
-        }
-
-        var request = chain.request()
-        val tried = mutableSetOf(originalUrl.host)
-
-        while (true) {
-            val response = try {
-                chain.proceed(request)
-            } catch (e: IOException) {
-                val next = nextGateway(tried) ?: throw e
-                request = request.withGatewayHost(next)
-                tried += next.toHttpUrl().host
-                continue
-            }
-
-            val hardBlocked = response.code == 403 &&
-                response.header("content-type")?.contains("text/html") == true
-            // A text/html 404 on an API host is a misrouted or stale edge
-            // (the gateway root answers exactly like that); real API errors
-            // are JSON. The 5xx set is "edge up, origin dead".
-            val staleEdge404 = response.code == 404 &&
-                response.header("content-type")?.contains("text/html") == true
-            if (hardBlocked || staleEdge404 || response.code in ORIGIN_DEAD_CODES) {
-                response.close()
-                val next = nextGateway(tried)
-                    ?: throw IOException("MangaTek: both gateways are unreachable")
-                Log.i(TAG, "Gateway ${request.url.host} dead (${response.code}), failing over to ${next.toHttpUrl().host}")
-                request = request.withGatewayHost(next)
-                tried += next.toHttpUrl().host
-                continue
-            }
-
-            if (request.url.host != originalUrl.host) {
-                persistActive("https://" + request.url.host)
-            }
-            return response
-        }
-    }
-
-    private fun nextGateway(excludeHosts: Set<String>): String? = gatewayHosts
-        .firstOrNull { it.toHttpUrl().host !in excludeHosts }
-
-    private fun Request.withGatewayHost(gatewayUrl: String): Request {
-        val newHost = gatewayUrl.toHttpUrl().host
-        val builder = newBuilder().url(
-            url.newBuilder().scheme("https").host(newHost).build(),
-        )
-        if (!header("Referer").isNullOrBlank()) {
-            builder.header("Referer", "https://$newHost/")
-        }
-        return builder.build()
-    }
-
-    // ============================ Content hosts ===========================
-    //
-    // Covers and reader pages live on the content.* subdomains — separate
-    // hosts the gateway failover never rewrites. They sit behind the same
-    // aggressive Cloudflare WAF as the primary site, so a network that is
-    // hard-blocked there keeps getting dead covers and dead pages even
-    // while browsing works on the twin. This mirrors the gateway failover
-    // for the two content hosts: WAF hard blocks, stale-edge text/html
-    // 404s and origin-dead 5xx (502/504/521/522/523) are retried on the
-    // twin content host with the same path, and in auto mode the winner is
-    // persisted. Forced modes pin the matching content host and never
-    // rewrite.
-
-    private fun currentContentHost(): String = when (gatewayMode()) {
-        PREF_GATEWAY_PRIMARY -> primaryContent
-        PREF_GATEWAY_TWIN -> twinContent
-        else -> {
-            val pinned = preferences.getString(PREF_ACTIVE_CONTENT, null)
-            // The primary content host is gone entirely (NXDOMAIN since
-            // 2026-10): the unpinned default must not hand out URLs on it.
-            // Host apps that fetch images with their own client (Kotatsu's
-            // Mihon-compat layer) never run the failover interceptor, and
-            // Cloudflare answers requests for a removed hostname with
-            // HTTP 404 (error 1001) when stale DNS still resolves it —
-            // exactly the "HTTP 404 on every cover and page" report.
-            if (pinned != null && pinned in contentHosts) pinned else twinContent
-        }
-    }
-
-    private fun contentFailoverInterceptor(chain: Interceptor.Chain): Response {
-        val originalUrl = chain.request().url
-        val contentHostStrings = contentHosts.map { it.toHttpUrl().host }
-        if (originalUrl.host !in contentHostStrings || gatewayMode() != PREF_GATEWAY_AUTO) {
-            return chain.proceed(chain.request())
-        }
-
-        var request = chain.request()
-        val tried = mutableSetOf(originalUrl.host)
-
-        while (true) {
-            val response = try {
-                chain.proceed(request)
-            } catch (e: IOException) {
-                val next = nextContentHost(tried) ?: throw e
-                request = request.withContentHost(next)
-                tried += next.toHttpUrl().host
-                continue
-            }
-
-            val hardBlocked = response.code == 403 &&
-                response.header("content-type")?.contains("text/html") == true
-            // Cloudflare's error-1001 page (stale DNS for a removed host)
-            // is a text/html 404 — a real missing file never looks like
-            // that, and failing over once costs a single request when it
-            // is a genuine miss. Origin-dead 5xx (a 504 was the live
-            // "HTTP 504" report) means the edge is up but the origin is
-            // gone; the twin's origin is a different machine.
-            val staleEdge404 = response.code == 404 &&
-                response.header("content-type")?.contains("text/html") == true
-            if (hardBlocked || staleEdge404 || response.code in ORIGIN_DEAD_CODES) {
-                response.close()
-                val next = nextContentHost(tried)
-                    ?: throw IOException("MangaTek: both content hosts are unreachable")
-                Log.i(TAG, "Content host ${request.url.host} dead (${response.code}), failing over to ${next.toHttpUrl().host}")
-                request = request.withContentHost(next)
-                tried += next.toHttpUrl().host
-                continue
-            }
-
-            if (request.url.host != originalUrl.host) {
-                synchronized(gatewayLock) {
-                    preferences.edit()
-                        .putString(PREF_ACTIVE_CONTENT, "https://" + request.url.host)
-                        .apply()
-                }
-            }
-            return response
-        }
-    }
-
-    private fun nextContentHost(excludeHosts: Set<String>): String? = contentHosts
-        .firstOrNull { it.toHttpUrl().host !in excludeHosts }
-
-    /**
-     * Verifies the active content host before any content URL is handed to
-     * the host app, and re-pins the liveness winner when the pinned host is
-     * dead. This replaced the 2026-10 probe that went through the source
-     * client: it could NEVER heal a pin, because the rewritten request hit
-     * the twin's WAF root 403 (text/html), the interceptor classified that
-     * as "both content hosts unreachable" and threw — so covers and pages
-     * kept pointing at whichever host the pin (or the NXDOMAIN default)
-     * named. The probe now runs on a bare client against BOTH hosts and
-     * counts any NON-ORIGIN-ERROR answer as alive — including the WAF's
-     * root 403, which proves the host exists — while a 5xx (502/504/521…)
-     * means the edge is up but the origin behind it is dead, exactly the
-     * state that handed out "HTTP 504" covers and pages. A dead host
-     * (NXDOMAIN) answers nothing at all.
-     */
-    private fun ensureActiveContentHostLive() {
-        if (gatewayMode() != PREF_GATEWAY_AUTO) return
-        synchronized(contentProbeLock) {
-            val now = System.currentTimeMillis()
-            if (now - contentProbedAtMs < CONTENT_PROBE_INTERVAL_MS) return
-            contentProbedAtMs = now
-        }
-        val active = currentContentHost()
-        if (probeHostAlive(active)) return
-        val fallback = contentHosts.firstOrNull { it != active } ?: return
-        if (probeHostAlive(fallback)) {
-            Log.i(TAG, "content host $active dead, pinning $fallback")
-            preferences.edit().putString(PREF_ACTIVE_CONTENT, fallback).apply()
-        }
-    }
-
-    /** True when the host answers with a status an origin can actually be
-     * behind: any 2xx-4xx (a WAF 403 still proves the host exists), never
-     * a 5xx (edge up, origin dead) and never a connect failure. */
-    private fun probeHostAlive(host: String): Boolean = runCatching {
-        probeClient.newCall(Request.Builder().url(host).head().build()).execute().use { response ->
-            response.code < 500
-        }
-    }.getOrDefault(false)
-
-    /**
-     * Bare client for the liveness probe: deliberately WITHOUT the source
-     * interceptors, so a dead host surfaces as a connect failure instead of
-     * being silently rewritten (and then misjudged) by the failover loop.
-     */
-    private val probeClient: OkHttpClient by lazy {
-        OkHttpClient.Builder()
-            .connectTimeout(8, TimeUnit.SECONDS)
-            .readTimeout(8, TimeUnit.SECONDS)
-            .build()
-    }
-
-    private fun Request.withContentHost(contentUrl: String): Request {
-        val newHost = contentUrl.toHttpUrl().host
-        val builder = newBuilder().url(
-            url.newBuilder().scheme("https").host(newHost).build(),
-        )
-        if (!header("Referer").isNullOrBlank()) {
-            builder.header("Referer", "https://$newHost/")
-        }
-        return builder.build()
-    }
-
-    /**
-     * Rewrites known content hosts onto the currently active one, so cover
-     * and page URLs recorded against a dead content host (library entries
-     * from before a failover, or twin API responses that still reference
-     * primary storage) are served by whichever host answers. Unknown hosts
-     * pass through untouched.
-     */
-    private fun withActiveContentHost(url: String): String {
-        val parsed = runCatching { url.toHttpUrl() }.getOrNull() ?: return url
-        val contentHostStrings = contentHosts.map { it.toHttpUrl().host }
-        if (parsed.host !in contentHostStrings) return url
-        val active = currentContentHost().toHttpUrl().host
-        if (parsed.host == active) return url
-        return parsed.newBuilder().host(active).build().toString()
-    }
-
-    // ============================ Formatting =============================
+    private val knownSiteHosts = setOf("mangatek.com", "www.mangatek.com")
 
     private val apiDateFormat by lazy {
         SimpleDateFormat("yyyy-MM-dd'T'HH:mm:ss", Locale.US).apply {
@@ -399,30 +109,27 @@ abstract class MangaTek :
 
     private fun parseDate(raw: String?): Long = apiDateFormat.tryParse(raw?.substringBefore("."))
 
+    private fun catalogUrl(sort: String, page: Int): HttpUrl = "$gatewayBase/api/catalog/search".toHttpUrl().newBuilder()
+        .addQueryParameter("limit", PAGE_LIMIT.toString())
+        .addQueryParameter("offset", ((page - 1) * PAGE_LIMIT).toString())
+        .addQueryParameter("sort", sort)
+        .addQueryParameter("order", "desc")
+        .addQueryParameter("mature", "include")
+        .build()
+
     // ========================= Popular & Latest ==========================
 
-    override suspend fun getPopularManga(page: Int): MangasPage = getCatalogPage(sort = "popular", page = page)
+    override suspend fun getPopularManga(page: Int): MangasPage = getCatalogPage("popular", page)
 
-    override suspend fun getLatestUpdates(page: Int): MangasPage = getCatalogPage(sort = "latest", page = page)
-
-    private fun catalogRequest(sort: String, page: Int, filters: FilterList? = null): Request {
-        val url = "${currentGateway()}/api/catalog/search".toHttpUrl().newBuilder().apply {
-            addQueryParameter("limit", PAGE_LIMIT.toString())
-            addQueryParameter("offset", ((page - 1) * PAGE_LIMIT).toString())
-            addQueryParameter("sort", sort)
-            addQueryParameter("order", "desc")
-            addQueryParameter("mature", "include")
-        }.build()
-        return GET(url, headers)
-    }
+    override suspend fun getLatestUpdates(page: Int): MangasPage = getCatalogPage("latest", page)
 
     private suspend fun getCatalogPage(sort: String, page: Int): MangasPage {
-        val response = client.newCall(catalogRequest(sort, page)).execute()
+        val response = retryTransient { client.newCall(GET(catalogUrl(sort, page), headers)).execute() }
         response.use {
             if (!it.isSuccessful) throw IOException("HTTP ${it.code} while browsing MangaTek")
             val data = it.parseAs<SearchResponseDto>().data
             return MangasPage(
-                data.map { series -> series.toSManga() },
+                data.map { row -> row.toSManga() },
                 data.size >= PAGE_LIMIT,
             )
         }
@@ -432,32 +139,27 @@ abstract class MangaTek :
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
         val sort = filters.firstInstanceOrNull<SortFilter>()?.selected ?: "relevance"
-        val status = filters.firstInstanceOrNull<StatusFilter>()?.selected.orEmpty()
+        val status = filters.firstInstanceOrNull<StatusFilter>()?.selected?.takeIf(String::isNotEmpty)
         val genres = filters.firstInstanceOrNull<GenreFilter>()
             ?.included
             .orEmpty()
-            .joinToString(",")
 
-        val url = "${currentGateway()}/api/catalog/search".toHttpUrl().newBuilder().apply {
-            addQueryParameter("limit", PAGE_LIMIT.toString())
-            addQueryParameter("offset", ((page - 1) * PAGE_LIMIT).toString())
-            addQueryParameter("sort", sort)
-            addQueryParameter("order", "desc")
-            addQueryParameter("mature", "include")
-            if (query.isNotBlank()) addQueryParameter("q", query.trim())
-            if (status.isNotEmpty()) addQueryParameter("status", status)
-            if (genres.isNotEmpty()) {
-                addQueryParameter("includeGenres", genres)
-                addQueryParameter("genreMode", "any")
-            }
-        }.build()
+        val urlBuilder = catalogUrl(sort, page).newBuilder()
+        if (!query.isBlank()) {
+            urlBuilder.addQueryParameter("q", query.trim())
+        }
+        status?.let { urlBuilder.addQueryParameter("status", it) }
+        if (genres.isNotEmpty()) {
+            urlBuilder.addQueryParameter("includeGenres", genres.joinToString(","))
+            urlBuilder.addQueryParameter("genreMode", "any")
+        }
 
-        val response = client.newCall(GET(url, headers)).execute()
+        val response = retryTransient { client.newCall(GET(urlBuilder.build(), headers)).execute() }
         response.use {
             if (!it.isSuccessful) throw IOException("HTTP ${it.code} while searching MangaTek")
             val data = it.parseAs<SearchResponseDto>().data
             return MangasPage(
-                data.map { series -> series.toSManga() },
+                data.map { row -> row.toSManga() },
                 data.size >= PAGE_LIMIT,
             )
         }
@@ -465,24 +167,27 @@ abstract class MangaTek :
 
     // ============================== Filters ==============================
 
-    override val supportsFilterFetching get() = true
+    override val supportsFilterFetching: Boolean get() = true
 
-    @Serializable
+    @kotlinx.serialization.Serializable
     private data class FilterDataDto(
         val genres: List<Pair<String, String>>? = null,
     )
 
-    override suspend fun fetchFilterData(): kotlinx.serialization.json.JsonElement {
-        val url = "${currentGateway()}/api/catalog/genres".toHttpUrl()
-        val genres = client.get(url, headers = headers).use { response ->
-            if (!response.isSuccessful) return@use emptyList<Pair<String, String>>()
-            response.parseAs<List<GenreDto>>()
-                .map { genre -> genre.name to genre.id }
-        }
+    override suspend fun fetchFilterData(): JsonElement {
+        val genres = runCatching {
+            client.newCall(GET("$gatewayBase/api/catalog/genres", headers)).execute().use { response ->
+                if (!response.isSuccessful) return@use emptyList<Pair<String, String>>()
+                response.parseAs<List<GenreDto>>()
+                    .map { genre -> genre.name.trim() to genre.id }
+                    .filter { (name, _) -> name.isNotEmpty() }
+                    .distinctBy { it.second }
+            }
+        }.getOrDefault(emptyList())
         return FilterDataDto(genres).toJsonElement()
     }
 
-    override fun getFilterList(data: kotlinx.serialization.json.JsonElement?): FilterList {
+    override fun getFilterList(data: JsonElement?): FilterList {
         val genres = data
             ?.let { runCatching { it.parseAs<FilterDataDto>() }.getOrNull() }
             ?.genres
@@ -491,15 +196,16 @@ abstract class MangaTek :
 
     // ============================== Details ==============================
 
-    override fun getMangaUrl(manga: SManga): String = "${currentSite()}/series/${manga.url}"
+    override fun getMangaUrl(manga: SManga): String = "$siteBase/series/${manga.url}"
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        val host = url.host
-        if (host !in knownSiteHosts) return null
+        if (url.host !in knownSiteHosts) return null
         val segments = url.pathSegments
-        if (segments.size < 2 || segments[0] != "series") return null
+        val slug = when {
+            segments.size >= 2 && segments[0] == "series" -> segments[1]
+            else -> return null
+        }.takeIf(String::isNotBlank) ?: return null
 
-        val slug = segments[1]
         val tmpManga = SManga.create().apply { this.url = slug }
         return fetchMangaUpdate(tmpManga, emptyList(), fetchDetails = true, fetchChapters = false).manga
     }
@@ -520,12 +226,20 @@ abstract class MangaTek :
     }
 
     private suspend fun fetchSeriesDetails(manga: SManga): SManga {
-        ensureActiveContentHostLive()
-        val url = "${currentGateway()}/api/catalog/series/by-slug/${manga.url}".toHttpUrl()
-        val response = client.newCall(GET(url, headers)).execute()
+        val slug = manga.url
+        if (slug.isBlank()) {
+            throw IOException("MangaTek: this entry lost its series slug — remove it and open it again from the source")
+        }
+        val response = retryTransient {
+            client.newCall(GET("$gatewayBase/api/catalog/series/by-slug/$slug", headers)).execute()
+        }
         response.use {
             if (!it.isSuccessful) throw IOException("HTTP ${it.code} while loading series details")
-            return it.parseAs<SeriesDto>().toSManga()
+            val data = it.parseAs<SeriesDto>()
+            // Keep the slug the lookup was made with — the entry's url must
+            // survive every refresh (a wiped url is what once made this
+            // source's sibling flood its chapter list).
+            return data.toSManga().apply { url = slug }
         }
     }
 
@@ -533,170 +247,197 @@ abstract class MangaTek :
 
     private suspend fun fetchChapterListInternal(manga: SManga): List<SChapter> {
         val seriesId = fetchSeriesId(manga.url)
-        val url = "${currentGateway()}/api/catalog/series/$seriesId/chapters".toHttpUrl()
-        val response = client.newCall(GET(url, headers)).execute()
+        val response = retryTransient {
+            client.newCall(GET("$gatewayBase/api/catalog/series/$seriesId/chapters", headers)).execute()
+        }
         response.use {
             if (!it.isSuccessful) throw IOException("HTTP ${it.code} while loading chapters")
             val data = it.parseAs<ChapterListDto>().data
-            val sorted = data
+            val mapped = data
                 .map { chapter ->
                     chapter.toSChapter(manga.url).apply {
-                        date_upload = parseDate(chapter.publishedAt ?: chapter.updatedAt)
+                        date_upload = parseDate(chapter.publishedAt ?: chapter.updatedAt ?: chapter.createdAt)
                     }
                 }
-                // Mihon expects newest-first; the gateway returns oldest-first.
+                // Mihon expects newest-first; the API answers newest-first already.
                 .sortedByDescending { it.chapter_number }
-            return combineDuplicateChapters(sorted)
+            return combineDuplicateChapters(mapped)
         }
-    }
-
-    /**
-     * Optional "combine duplicate chapters" — the same option the MangaDot
-     * source (and this repo's ProComic) ships: the site re-uploads the same
-     * chapter under several teams, so the TOC can carry multiple entries
-     * per chapter number. When enabled, one entry per non-zero chapter
-     * number survives — the first team in the user's priority list wins,
-     * otherwise the first (newest) upload. The zero-width scanlator filler
-     * keeps the chapter rows uniform, exactly like MangaDot's behavior.
-     */
-    private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> {
-        val hasScanlator = chapters.any { it.scanlator != null }
-        val result = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
-            // UNICODE_CHARACTER_CLASS: team names here are Arabic, and \b is
-            // ASCII-only without that flag.
-            val priorityPatterns = preferences.getString(PREF_PREFERRED_SCANLATORS, "")
-                ?.split(",")
-                ?.map { it.trim() }
-                ?.filter { it.isNotBlank() }
-                ?.map {
-                    Pattern.compile(
-                        "\\b${Regex.escape(it)}\\b",
-                        Pattern.UNICODE_CHARACTER_CLASS or Pattern.CASE_INSENSITIVE,
-                    )
-                }
-                .orEmpty()
-
-            mutableListOf<SChapter>().apply {
-                for ((_, group) in chapters.groupBy { it.chapter_number }) {
-                    if (group.first().chapter_number <= 0f || group.size == 1) {
-                        addAll(group)
-                        continue
-                    }
-                    val selected = priorityPatterns.firstNotNullOfOrNull { pattern ->
-                        group.firstOrNull { chapter ->
-                            chapter.scanlator?.let { name -> pattern.matcher(name).find() } == true
-                        }
-                    } ?: group.first()
-                    add(selected)
-                }
-            }
-        } else {
-            chapters
-        }
-
-        if (hasScanlator) {
-            result.forEach { it.scanlator = it.scanlator ?: "\u200B" }
-        }
-        return result
     }
 
     private suspend fun fetchSeriesId(slug: String): String {
-        val url = "${currentGateway()}/api/catalog/series/by-slug/$slug".toHttpUrl()
-        val response = client.newCall(GET(url, headers)).execute()
+        if (slug.isBlank()) {
+            throw IOException("MangaTek: this entry lost its series slug — remove it and open it again from the source")
+        }
+        val response = retryTransient {
+            client.newCall(GET("$gatewayBase/api/catalog/series/by-slug/$slug", headers)).execute()
+        }
         response.use {
-            if (!it.isSuccessful) throw IOException("HTTP ${it.code} while resolving series id")
+            if (!it.isSuccessful) throw IOException("HTTP ${it.code} while resolving the series id")
             return it.parseAs<SeriesDto>().id
         }
+    }
+
+    /** Runs [block] once more when it fails transiently (no HTTP code =
+     * connect/read timeout; 429 and 5xx = edge pressure). A deterministic
+     * failure (404, parse shape) propagates immediately. */
+    private suspend fun <T> retryTransient(block: () -> T): T {
+        val httpCode = Regex("HTTP (\\d{3})")
+        var lastError: IOException? = null
+        repeat(2) { attempt ->
+            try {
+                return block()
+            } catch (e: IOException) {
+                lastError = e
+                val code = httpCode.find(e.message.orEmpty())?.groupValues?.get(1)?.toIntOrNull()
+                val transient = code == null || code == 429 || code in 500..599
+                if (!transient || attempt == 1) throw e
+            }
+        }
+        throw lastError ?: IOException("MangaTek: request failed")
+    }
+
+    /**
+     * Optional "combine duplicate chapters" + "team priority" — the same
+     * options this source has shipped since the MangaDot-options round.
+     * When combining is enabled, one entry per non-zero chapter number
+     * survives; with a team priority list set, the preferred scanlator's
+     * upload wins (unknown scanlators rank after the listed ones, input
+     * order breaks ties). Zero/unknown numbers are never combined.
+     */
+    private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
+        val preferred = preferences.getString(PREF_PREFERRED_SCANLATORS, "")
+            ?.split(',')
+            ?.map(String::trim)
+            ?.filter(String::isNotEmpty)
+            .orEmpty()
+        mutableListOf<SChapter>().apply {
+            for ((_, group) in chapters.groupBy { it.chapter_number }) {
+                if (group.first().chapter_number <= 0f || group.size == 1) {
+                    addAll(group)
+                } else {
+                    // group preserves the newest-first input order
+                    add(group.pickPreferred(preferred))
+                }
+            }
+        }
+    } else {
+        chapters
+    }
+
+    private fun List<SChapter>.pickPreferred(preferred: List<String>): SChapter {
+        if (preferred.isEmpty()) return first()
+        return minByOrNull { chapter ->
+            val name = chapter.scanlator?.trim()?.lowercase()
+            val index = preferred.indexOfFirst { it.lowercase() == name }
+            if (index >= 0) index else preferred.size
+        } ?: first()
     }
 
     // =============================== Pages ===============================
 
     override fun getChapterUrl(chapter: SChapter): String {
-        val parsed = chapter.url.parseAs<ChapterRef>()
-        return "${currentSite()}/series/${parsed.seriesSlug}/${parsed.chapterSlug}"
+        val ref = chapter.url.parseAs<ChapterRef>()
+        return "$siteBase/series/${ref.seriesSlug}/${ref.chapterSlug}"
     }
 
+    /**
+     * Raw pages: the axis chapters-by-slug payload carries plain absolute
+     * image URLs on content.mangatek.com — no stitching, no proxy. The
+     * image requests ride the same solved-cookie client as everything
+     * else, so what the site's reader serves is what lands in the reader.
+     */
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        ensureActiveContentHostLive()
         val ref = chapter.url.parseAs<ChapterRef>()
-        val url = "${currentGateway()}/api/catalog/chapters/by-slug/${ref.seriesSlug}/${ref.chapterSlug}".toHttpUrl()
-        val response = client.newCall(GET(url, headers)).execute()
+        val response = retryTransient {
+            client.newCall(
+                GET("$gatewayBase/api/catalog/chapters/by-slug/${ref.seriesSlug}/${ref.chapterSlug}", headers),
+            ).execute()
+        }
         response.use {
             if (!it.isSuccessful) throw IOException("HTTP ${it.code} while loading chapter pages")
-            val detail = it.parseAs<ChapterDetailDto>()
-            return detail.pages
+            val pages = it.parseAs<ChapterDetailDto>()
+                .pages
                 .mapNotNull { page -> page.imageUrl?.takeIf(String::isNotBlank) }
-                .map(::withActiveContentHost)
-                .mapIndexed { index, imageUrl ->
-                    Page(index = index, url = getChapterUrl(chapter), imageUrl = imageUrl)
-                }
+            if (pages.isEmpty()) throw IOException("No pages found for this chapter")
+            return pages.mapIndexed { index, imageUrl ->
+                Page(index = index, url = getChapterUrl(chapter), imageUrl = imageUrl)
+            }
         }
     }
 
     // ======================== MangaDot description =======================
 
     /**
-     * MangaDot-style description block:
+     * MangaDot/ProComic-style description block:
      *   ★★★★☆ 8.00
-     *   **Type:** Manhwa · **Status:** Ongoing · **Chapters:** 19 · 12 ratings
+     *   **Type:** Manhwa · **Status:** Ongoing · **Chapters:** 19 · 12.3k views · 39 ratings
      *   ---
      *   <synopsis>
-     *   **Genres:** (pref-controlled)
+     *   **Genres:** ...
      *   **Links:** ...
      *   **Alternative Names:** ...
      */
     private fun SeriesDto.toSManga() = SManga.create().apply {
-        url = this@toSManga.slug
         title = this@toSManga.title
-        thumbnail_url = this@toSManga.coverImage
-            ?.takeIf { it.startsWith("http") }
-            ?.let(::withActiveContentHost)
-        author = this@toSManga.authorText()
-        artist = this@toSManga.artistText()
-        status = when (this@toSManga.status?.lowercase()) {
-            "ongoing" -> SManga.ONGOING
-            "completed" -> SManga.COMPLETED
-            "hiatus" -> SManga.ON_HIATUS
-            "cancelled" -> SManga.CANCELLED
-            else -> SManga.UNKNOWN
-        }
-        // Mihon splits the genre string on ", " (comma + space) into the
-        // details-screen chips — a bare "," merges every genre into ONE chip.
-        genre = this@toSManga.genreLabels().joinToString(", ") { genresLabel(it) }
+        url = this@toSManga.slug
+        thumbnail_url = this@toSManga.coverUrl
+        author = this@toSManga.authorText
+        artist = this@toSManga.artistText
+        status = statusFrom(this@toSManga.status)
+        genre = this@toSManga.genreLabels.joinToString(", ")
+        description = buildDescription(this@toSManga)
+        initialized = true
+    }
 
+    private fun statusFrom(raw: String?): Int = when (raw?.lowercase(Locale.ROOT)) {
+        "ongoing" -> SManga.ONGOING
+        "completed" -> SManga.COMPLETED
+        "hiatus" -> SManga.ON_HIATUS
+        "cancelled" -> SManga.CANCELLED
+        else -> SManga.UNKNOWN
+    }
+
+    private fun buildDescription(series: SeriesDto): String {
         val showGenres = preferences.getBoolean(PREF_SHOW_GENRES, true)
-        description = buildString {
-            val rating = this@toSManga.ratingAvgValue()
-            val ratingCount = this@toSManga.ratingCount ?: 0
-            if (rating != null && rating > 0f) {
-                val stars = (rating / 2).roundToInt().coerceIn(0, 5)
-                append("${"★".repeat(stars)}${"☆".repeat(5 - stars)} $rating\n\n")
+
+        return buildString {
+            // The site rates 0..10; the description shows the familiar 5-star row.
+            val rating = series.ratingAvgValue
+            if (rating != null) {
+                val stars = (rating / 2f).roundToInt().coerceIn(0, 5)
+                append("★".repeat(stars) + "☆".repeat(5 - stars) + " ")
+                append(String.format(Locale.US, "%.2f", rating))
+                append("\n\n")
             }
 
             val metaInfo = buildList {
-                this@toSManga.type?.let { add("**Type:** ${it.replaceFirstChar { c -> c.uppercase() }}") }
-                this@toSManga.format?.let { add("**Format:** ${it.replaceFirstChar { c -> c.uppercase() }}") }
-                when (this@toSManga.status?.lowercase()) {
+                series.type?.takeIf(String::isNotBlank)?.let {
+                    add("**Type:** ${it.replaceFirstChar { c -> c.uppercase(Locale.ROOT) }}")
+                }
+                series.format?.takeIf(String::isNotBlank)?.let {
+                    add("**Format:** ${it.replaceFirstChar { c -> c.uppercase(Locale.ROOT) }}")
+                }
+                when (series.status?.lowercase(Locale.ROOT)) {
                     "ongoing" -> add("**Status:** Ongoing")
                     "completed" -> add("**Status:** Completed")
                     "hiatus" -> add("**Status:** Hiatus")
                     "cancelled" -> add("**Status:** Cancelled")
                 }
-                this@toSManga.chapterCountText()?.let {
-                    add("**Chapters:** $it")
-                }
-                this@toSManga.viewCount?.takeIf { it > 0 }?.let { add("${it.formatCount()} views") }
-                ratingCount.takeIf { it > 0 }?.let { add("$it ratings") }
+                series.chapterCountText?.let { add("**Chapters:** $it") }
+                (series.viewCount ?: 0).takeIf { it > 0 }?.let { add("${formatCount(it)} views") }
+                (series.ratingCount ?: 0).takeIf { it > 0 }?.let { add("$it ratings") }
             }
             if (metaInfo.isNotEmpty()) {
-                append(metaInfo.joinToString(" · "), "\n\n")
+                append(metaInfo.joinToString(" · "))
+                append("\n\n")
             }
 
             if (isNotEmpty()) {
                 append("---\n\n")
             }
 
-            this@toSManga.description?.let {
+            series.description?.let {
                 append(
                     it.replace("\r\n", "\n")
                         .replace(Regex("\n{3,}"), "\n\n")
@@ -705,64 +446,35 @@ abstract class MangaTek :
                 )
             }
 
-            val labelList = this@toSManga.genreLabels()
-            if (showGenres && labelList.isNotEmpty()) {
-                append("\n**Genres:**\n")
-                labelList.forEach { label ->
-                    append("- ", genresLabel(label), "\n")
+            if (showGenres) {
+                val labels = series.genreLabels
+                if (labels.isNotEmpty()) {
+                    append("**Genres:**\n")
+                    labels.forEach { label -> append("- ", label, "\n") }
+                    append("\n")
                 }
             }
 
-            listOfNotNull(
-                "[Source](${currentSite()}/series/${this@toSManga.slug})",
-            ).also { links ->
-                if (links.isNotEmpty()) {
-                    append("\n**Links:**\n")
-                    links.forEach { link -> append("- ", link, "\n") }
-                }
-            }
+            append("**Links:**\n")
+            append("- [Source]($siteBase/series/${series.slug})\n")
 
-            val altNames = this@toSManga.associatedNames
-                ?.split("\n")
-                ?.mapNotNull { it.trim().takeIf(String::isNotEmpty) }
-                .orEmpty()
-            if (altNames.isNotEmpty()) {
+            val altList = series.altTitleList
+            if (altList.isNotEmpty()) {
                 append("\n**Alternative Names:**\n")
-                altNames.forEach { altTitle ->
-                    append("- ", altTitle, "\n")
-                }
+                altList.forEach { altTitle -> append("- ", altTitle, "\n") }
             }
         }.trim()
-        initialized = true
     }
 
-    /** Genre slugs are lowercase english (e.g. "school-life") - present them
-     * with capitalized words for the genre chips. */
-    private fun genresLabel(slug: String): String = slug
-        .split("-")
-        .joinToString(" ") { word ->
-            word.replaceFirstChar { c -> c.uppercase() }
-        }
-
-    private fun Int.formatCount(): String = when {
-        this >= 1_000_000 -> String.format(Locale.US, "%.1fM", this / 1_000_000f)
-        this >= 1_000 -> String.format(Locale.US, "%.1fk", this / 1_000f)
-        else -> toString()
+    private fun formatCount(count: Int): String = when {
+        count >= 1_000_000 -> String.format(Locale.US, "%.1fM", count / 1_000_000.0)
+        count >= 1_000 -> String.format(Locale.US, "%.1fk", count / 1_000.0)
+        else -> count.toString()
     }
 
     // ========================= Preference screen =========================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        ListPreference(screen.context).apply {
-            key = PREF_GATEWAY
-            title = "النطاق (Gateway)"
-            summary = "الأساسي mangatek.com محمي بـ Cloudflare وقد يحجب بعض الشبكات، والنسخة المطابقة mangatuk.com تستخدم نفس الواجهة البرمجية"
-            entries = arrayOf("تلقائي (تجاوز الحجب تلقائياً)", "الأساسي فقط (mangatek.com)", "النسخة المطابقة فقط (mangatuk.com)")
-            entryValues = arrayOf(PREF_GATEWAY_AUTO, PREF_GATEWAY_PRIMARY, PREF_GATEWAY_TWIN)
-            setDefaultValue(PREF_GATEWAY_AUTO)
-        }.let(screen::addPreference)
-
-        // ---- Details screen ----
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_GENRES
             title = "Show genres in details"
@@ -771,52 +483,26 @@ abstract class MangaTek :
         }.let(screen::addPreference)
 
         // ---- Chapter list (the duplicate-combining option) ----
-        val dedupeSwitch = SwitchPreferenceCompat(screen.context).apply {
+        SwitchPreferenceCompat(screen.context).apply {
             key = PREF_DEDUPLICATE_CHAPTERS
             title = "Combine duplicate chapters"
-            summary = "Keep one entry per chapter number — the site re-uploads " +
-                "the same chapter under several teams"
+            summary = "Keep one entry per chapter number — the preferred team's upload wins"
             setDefaultValue(false)
-        }
-        screen.addPreference(dedupeSwitch)
+        }.let(screen::addPreference)
 
-        val priorityPref = EditTextPreference(screen.context).apply {
+        EditTextPreference(screen.context).apply {
             key = PREF_PREFERRED_SCANLATORS
             title = "Team priority"
-            summary = "Comma-separated team names, most preferred first; the first " +
-                "match wins when combining duplicates. Empty = keep the newest upload"
+            summary = "Comma-separated team names, first has priority when combining"
             setDefaultValue("")
-            setEnabled(preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false))
-        }
-        screen.addPreference(priorityPref)
-
-        dedupeSwitch.setOnPreferenceChangeListener { _, newValue ->
-            priorityPref.setEnabled(newValue as Boolean)
-            true
-        }
+        }.let(screen::addPreference)
     }
 
     private companion object {
-        const val TAG = "MangaTek"
         const val PAGE_LIMIT = 24
 
-        const val PREF_GATEWAY = "pref_gateway"
-        const val PREF_GATEWAY_AUTO = "auto"
-        const val PREF_GATEWAY_PRIMARY = "primary"
-        const val PREF_GATEWAY_TWIN = "twin"
-        const val PREF_ACTIVE_GATEWAY = "pref_active_gateway"
-        const val PREF_ACTIVE_SITE = "pref_active_site"
-        const val PREF_ACTIVE_CONTENT = "pref_active_content"
         const val PREF_SHOW_GENRES = "pref_show_genres"
         const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
         const val PREF_PREFERRED_SCANLATORS = "pref_preferred_scanlators"
-
-        private const val CONTENT_PROBE_INTERVAL_MS = 10 * 60 * 1000L
-
-        /** Edge-up-origin-dead 5xx codes: Cloudflare answers these itself
-         * when the origin behind it is down (504 gateway timeout was the
-         * live report), so a response with one of them is retryable on the
-         * twin host whose origin is a different machine. */
-        private val ORIGIN_DEAD_CODES = setOf(502, 504, 521, 522, 523)
     }
 }

@@ -1,29 +1,40 @@
 package eu.kanade.tachiyomi.extension.ar.mangatek
 
 import eu.kanade.tachiyomi.source.model.SChapter
+import keiyoushi.utils.parseAs
 import keiyoushi.utils.toJsonString
 import kotlinx.serialization.Serializable
 import kotlinx.serialization.json.JsonArray
 import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
 import kotlinx.serialization.json.JsonPrimitive
 
+// ---------------------------------------------------------------------------
+// Axis-platform wire shapes. Every field is nullable/shape-flexible on
+// purpose: the platform evolves its payloads between deployments and the
+// catalog rows and details responses drift independently.
+// ---------------------------------------------------------------------------
+
 @Serializable
-class GenreDto(
-    val id: String,
-    val name: String,
-    val slug: String,
+internal data class SearchResponseDto(
+    val data: List<SeriesDto> = emptyList(),
+    val total: Int? = null,
 )
 
 @Serializable
-class SeriesDto(
+internal data class ChapterListDto(
+    val data: List<ChapterDto> = emptyList(),
+    val total: Int? = null,
+)
+
+@Serializable
+internal data class SeriesDto(
     val id: String,
     val slug: String,
     val title: String,
     val associatedNames: String? = null,
     val description: String? = null,
-    // The wire mixes shapes between deployments: author/artist arrive as a
-    // string on some series and as an array of names on others;
-    // chapterCount arrives as "19" or 19.
+    // string OR array of strings depending on the deployment
     val author: JsonElement? = null,
     val artist: JsonElement? = null,
     val status: String? = null,
@@ -33,73 +44,50 @@ class SeriesDto(
     val viewCount: Int? = null,
     val bookmarkCount: Int? = null,
     val ratingCount: Int? = null,
-    // "8.00" on rated series, plain number 0 on unrated ones.
+    // "8.00" or 8 depending on the deployment
     val ratingAvg: JsonPrimitive? = null,
+    // "19" or 19 depending on the deployment
     val chapterCount: JsonPrimitive? = null,
-    // Shapes as of 2026-10: details carry full genre objects
-    // ({id, name, slug, description}) while browse/search rows carry the
-    // genres split into the parallel `genreIds`/`genreNames` arrays with
-    // `genres` null — genreLabels() absorbs both so every entry point keeps
-    // its genre chips.
+    // slug strings on older deployments, {id, name, slug} objects on newer
     val genres: List<JsonElement> = emptyList(),
-    val genreNames: List<String>? = null,
+    val genreNames: List<JsonElement> = emptyList(),
 ) {
-    fun coverUrl(): String? = coverImage?.takeIf { it.startsWith("http") }
+    /** Absolute cover URL; relative paths can't be resolved safely, drop them. */
+    val coverUrl: String?
+        get() = coverImage?.takeIf { it.startsWith("http") }
 
-    fun authorText(): String? = textOrJoined(author)
+    val authorText: String?
+        get() = textOrJoined(author)
 
-    fun artistText(): String? = textOrJoined(artist)
+    val artistText: String?
+        get() = textOrJoined(artist)
 
-    fun ratingAvgValue(): Float? = ratingAvg
-        ?.content
-        ?.toFloatOrNull()
-        ?.takeIf { it > 0f }
+    val ratingAvgValue: Float?
+        get() = ratingAvg?.content?.toFloatOrNull()?.takeIf { it > 0f }
 
-    fun chapterCountText(): String? = chapterCount
-        ?.content
-        ?.takeIf { it.isNotBlank() && it != "null" }
+    val chapterCountText: String?
+        get() = chapterCount?.content?.takeIf(String::isNotBlank)
 
-    fun genreLabels(): List<String> {
-        val fromObjects = genres.mapNotNull { element ->
-            when (element) {
-                is JsonPrimitive -> element.content.takeIf(String::isNotBlank)
-                is kotlinx.serialization.json.JsonObject ->
-                    (
-                        (element["name"] as? JsonPrimitive)?.content
-                            ?: (element["slug"] as? JsonPrimitive)?.content
-                        )?.takeIf(String::isNotBlank)
-                else -> null
-            }
-        }
-        if (fromObjects.isNotEmpty()) return fromObjects
-        // Search rows (2026-10 wire): parallel genreNames array, genres null.
-        return genreNames.orEmpty().filter { it.isNotBlank() }
-    }
+    val genreLabels: List<String>
+        get() = (genres + genreNames)
+            .mapNotNull(::jsonElementText)
+            .map(String::trim)
+            .filter(String::isNotEmpty)
+            .distinctBy(String::lowercase)
 
-    companion object {
-        private fun textOrJoined(element: JsonElement?): String? = when (element) {
-            is JsonPrimitive -> element.content.takeIf { it.isNotBlank() && it != "null" }
-            is JsonArray ->
-                element
-                    .mapNotNull { (it as? JsonPrimitive)?.content?.takeIf(String::isNotBlank) }
-                    .joinToString(", ")
-                    .takeIf { it.isNotBlank() }
-            else -> null
-        }
-    }
+    val altTitleList: List<String>
+        get() = associatedNames
+            ?.split('\n')
+            ?.map(String::trim)
+            ?.filter(String::isNotEmpty)
+            .orEmpty()
 }
 
 @Serializable
-class SearchResponseDto(
-    val data: List<SeriesDto> = emptyList(),
-    val total: Int? = null,
-)
-
-@Serializable
-class ChapterDto(
+internal data class ChapterDto(
     val id: String,
     val seriesId: String,
-    val number: String,
+    val number: String? = null,
     val title: String? = null,
     val slug: String,
     val uploadedByTeamName: String? = null,
@@ -111,13 +99,16 @@ class ChapterDto(
 )
 
 @Serializable
-class ChapterListDto(
-    val data: List<ChapterDto> = emptyList(),
-    val total: Int? = null,
+internal data class ChapterDetailDto(
+    val id: String,
+    val seriesId: String,
+    val number: String? = null,
+    val slug: String,
+    val pages: List<PageDto> = emptyList(),
 )
 
 @Serializable
-class PageDto(
+internal data class PageDto(
     val number: Int? = null,
     val imageUrl: String? = null,
     val width: Int? = null,
@@ -125,43 +116,71 @@ class PageDto(
 )
 
 @Serializable
-class ChapterDetailDto(
+internal data class GenreDto(
     val id: String,
-    val seriesId: String,
-    val number: String,
-    val slug: String,
-    val pages: List<PageDto> = emptyList(),
+    val name: String,
+    val slug: String? = null,
 )
 
-/** Persisted inside SChapter.url: everything the reader flow needs. */
+/** Persisted inside SChapter.url — everything the reader flow needs. */
 @Serializable
-class ChapterRef(
-    val seriesSlug: String,
-    val chapterSlug: String,
+internal data class ChapterRef(
     val seriesId: String,
+    val seriesSlug: String,
     val chapterId: String,
+    val chapterSlug: String,
 )
 
-fun ChapterDto.toSChapter(seriesSlug: String): SChapter = SChapter.create().apply {
+// ---------------------------------------------------------------------------
+// Shape helpers
+// ---------------------------------------------------------------------------
+
+internal fun jsonElementText(element: JsonElement): String? = when (element) {
+    is JsonPrimitive -> element.content.takeIf(String::isNotBlank)
+    is JsonObject -> (element["name"] as? JsonPrimitive)?.content?.takeIf(String::isNotBlank)
+        ?: (element["title"] as? JsonPrimitive)?.content?.takeIf(String::isNotBlank)
+    is JsonArray -> element.mapNotNull(::jsonElementText).joinToString(", ").takeIf(String::isNotBlank)
+}
+
+/** `author`/`artist` arrive as a plain string OR an array of strings. */
+private fun textOrJoined(element: JsonElement?): String? = when (element) {
+    null -> null
+    is JsonPrimitive -> element.content.takeIf(String::isNotBlank)
+    is JsonArray -> element.mapNotNull(::jsonElementText)
+        .joinToString(", ")
+        .takeIf(String::isNotBlank)
+    is JsonObject -> jsonElementText(element)
+}
+
+/** SChapter from a chapter row. [seriesSlug] is what the details lookup used. */
+internal fun ChapterDto.toSChapter(seriesSlug: String): SChapter = SChapter.create().apply {
     val ref = ChapterRef(
-        seriesSlug = seriesSlug,
-        chapterSlug = this@toSChapter.slug,
         seriesId = this@toSChapter.seriesId,
+        seriesSlug = seriesSlug,
         chapterId = this@toSChapter.id,
+        chapterSlug = this@toSChapter.slug,
     )
     url = ref.toJsonString()
+
+    val number = this@toSChapter.number.orEmpty()
+        .removeSuffix(".00")
+        .removeSuffix(".0")
+    val title = this@toSChapter.title?.trim().orEmpty()
     name = buildString {
-        val number = this@toSChapter.number?.removeSuffix(".00")?.removeSuffix(".0") ?: ""
-        val title = this@toSChapter.title.orEmpty().trim()
-        append("الفصل ").append(number)
+        append("الفصل ")
+        append(number)
         if (title.isNotEmpty() && title != number) {
-            append(": ").append(title)
+            append(": ")
+            append(title)
         }
         if ((this@toSChapter.coinValue ?: 0) > 0) {
+            // coin-locked on the site — mark it so readers know up front
             append(" 🔒")
         }
     }
-    chapter_number = this@toSChapter.number?.toFloatOrNull() ?: 0f
-    scanlator = this@toSChapter.uploadedByTeamName?.takeIf { it.isNotBlank() }
-    date_upload = 0L // the source fills this from publishedAt/updatedAt
+    chapter_number = number.toFloatOrNull() ?: 0f
+    scanlator = this@toSChapter.uploadedByTeamName?.takeIf(String::isNotBlank)
 }
+
+/** Used by [MangaTek.getChapterUrl] and [MangaTek.getPageList]. */
+internal fun String.parseChapterRef(): ChapterRef = parseAs<ChapterRef>()
