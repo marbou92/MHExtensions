@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 23
+    versionCode = 24
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -62,6 +62,19 @@ keiyoushi {
     // parsed in pure Kotlin incl. grid AVIF) -> libavif (fixed loader) ->
     // ImageDecoder. No .so, no PackageManager, no System.load — the only
     // tier whose availability the OS itself guarantees.
+    // v109 FIELD VERDICT on v108: the host app CRASHED on every cover and
+    // page load — MediaCodec's c2.av1 (Android 10's brand-new software AV1
+    // codec) configured at a still image's full size is a native-crash/
+    // OOM-kill surface no Java guard can catch, and the marker breaker only
+    // gates after two process deaths. versionCode 24 = the MediaCodec tier
+    // is REMOVED from the ladder and replaced with a WebView decode tier:
+    // the host's Chromium engine (AVIF since Chrome 85; Play auto-updates
+    // the WebView package even on Android 10) decodes the AVIF offscreen
+    // (data: URL on the main looper, JS natural-size probe, draw into a
+    // software ARGB bitmap) and every failure mode is survivable — caught
+    // Java exceptions, bounded timeouts, or a sandboxed-renderer death that
+    // leaves the app alive. Ladder: BitmapFactory (12+) -> libavif (loader)
+    // -> WebView (24+) -> ImageDecoder (28+).
 
     deeplink {
         host("procomic.net")

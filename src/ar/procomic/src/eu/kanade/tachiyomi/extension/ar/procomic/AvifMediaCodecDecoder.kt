@@ -3,24 +3,22 @@ package eu.kanade.tachiyomi.extension.ar.procomic
 import java.nio.ByteBuffer
 
 /**
- * Framework-only AVIF decoder (v108): parses the ISOBMFF container in pure
- * Kotlin and pushes the embedded AV1 OBU stream through MediaCodec's
- * platform "video/av1" software decoder (c2.android.av1 — shipped with
- * Android 10, so every device this source serves can decode AVIF without
- * ANY bundled native library, WITHOUT the package manager, WITHOUT the
- * classloader walk and WITHOUT System.load).
+ * Framework-only AVIF decoder (v108, demoted to DEBUG-ONLY in v109):
+ * parses the ISOBMFF container in pure Kotlin and pushes the embedded AV1
+ * OBU stream through MediaCodec's platform "video/av1" software decoder
+ * (c2.android.av1 — shipped with Android 10).
  *
- * Why this tier exists: the page and cover files are AVIF and the edge
- * serves them AS-IS regardless of the Accept header (verified live: the
- * same 55 KB image/avif response with and without image/avif in Accept —
- * the file name pins the format), so the format cannot be negotiated away.
- * The platform BitmapFactory only decodes AVIF on Android 12+, and the
- * bundled libavif/dav1d tier depends on finding + loading our APK's .so —
- * which has never once succeeded in the field (v104–v107: the scan always
- * ran against the wrong zip, and even a correct zip ends in System.load of
- * a file from the host's cache dir, which the W^X SELinux policy of modern
- * targetSdk hosts may refuse). MediaCodec needs none of that: it is the
- * only decode path whose availability is guaranteed by the OS itself.
+ * v109 FIELD VERDICT: this tier KILLED the host app on the Android 10
+ * field device — configuring Android 10's brand-new software AV1 codec at
+ * a still image's full size (pages 800x5000, "originals" covers to
+ * 4000x6000) is a native-crash/OOM-kill surface no Java guard can catch,
+ * and the app crashed on every page and cover load. The tier is REMOVED
+ * from the decode ladder (see ProtectedPageServer.avifToJpeg — the WebView
+ * tier replaces it) and survives only behind the debugMediaCodecTier hook
+ * so the harness can keep pinning its decline behavior. The pure-Kotlin
+ * parts remain LOAD-BEARING: parseAvifImage is the WebView tier's up-front
+ * pixel-budget gate, and the NV21/pack pins keep guarding the container
+ * logic.
  *
  * Container support (verified against live app.<host> files):
  *  - single-item AVIF ('av01' primary item): full support

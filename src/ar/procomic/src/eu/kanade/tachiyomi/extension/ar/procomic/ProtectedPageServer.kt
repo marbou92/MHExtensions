@@ -110,6 +110,13 @@ class ProComicImageServer(
      */
     private val apkSourceDir: String? = null,
     private val nativeCacheDir: java.io.File? = null,
+    /**
+     * The host application context (v109) — the WebView decode tier needs a
+     * context to build an offscreen WebView on the app's main looper. Optional
+     * so the JVM harness can drive the server without one (the tier then
+     * declines deterministically with a diag row, never throwing).
+     */
+    private val webViewContext: android.content.Context? = null,
 ) {
 
     private class Machine(val socket: ServerSocket)
@@ -465,25 +472,46 @@ class ProComicImageServer(
     }
 
     /**
-     * AVIF → JPEG, decode ladder (v108):
+     * AVIF → JPEG, decode ladder (v109):
      *
      * 1. BitmapFactory — the platform codec (Android 12+), subsampled when
      *    a max edge is requested.
-     * 2. MediaCodec "video/av1" — the FRAMEWORK software AV1 decoder
-     *    (c2.android.av1, shipped with Android 10): the ISOBMFF container is
-     *    parsed in pure Kotlin and the embedded OBU stream is fed to the
-     *    codec directly. Needs no bundled library, no package manager, no
-     *    System.load — the only tier whose availability the OS itself
-     *    guarantees on the Android 10/11 devices this source serves.
-     * 3. The bundled libavif/dav1d software decoder (when the explicit
+     * 2. The bundled libavif/dav1d software decoder (when the explicit
      *    loader can find + load it).
+     * 3. WebView — the host's Chromium engine (AVIF since Chrome 85, and
+     *    the WebView package auto-updates via Play even on Android 10). A
+     *    FULL image decoder (single items AND grid AVIF) whose every
+     *    failure mode is a catchable Java exception or a sandboxed-renderer
+     *    crash that never kills the host app.
      * 4. ImageDecoder (API 28+).
+     *
+     * v109 REMOVED the MediaCodec "video/av1" tier from this ladder: the
+     * field device (Android 10) DIED inside it — c2.av1 is Android 10's
+     * brand-new software codec and configuring it at a still image's full
+     * size (pages 800x5000, "originals" covers up to 4000x6000) is a
+     * native-crash/OOM-kill surface no Java guard can catch; the process
+     * dies, the marker-based breaker only gates after two deaths, and the
+     * user experiences "the app just crashes". A video codec is simply the
+     * wrong tool for a 4 MP still. The WebView tier renders what Android 10
+     * has no other way to render, and it CANNOT take the app down. The
+     * MediaCodec path remains compiled (debug hook only, never called by
+     * this ladder) so the harness can keep pinning its decline behavior.
      *
      * Every failure surfaces in the diag trail with its ACTUAL reason.
      */
     private fun avifToJpeg(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): ByteArray {
         val quality = if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY
-        decodeWithBitmapFactory(bytes, diag, maxEdge)?.let { bitmap ->
+        // Every tier call site is Throwable-tight: an unexpected throw in
+        // one tier (JVM stubs, an exotic device API misbehavior) must fall
+        // through to the NEXT tier, never abort the ladder — an abort means
+        // the request dies with zero tier rows in the diag trail.
+        val factoryBitmap = try {
+            decodeWithBitmapFactory(bytes, diag, maxEdge)
+        } catch (t: Throwable) {
+            diag.add("bitmapfactory threw ${t.javaClass.simpleName}")
+            null
+        }
+        factoryBitmap?.let { bitmap ->
             try {
                 val output = ByteArrayOutputStream(bytes.size / 2)
                 if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
@@ -494,21 +522,44 @@ class ProComicImageServer(
                 bitmap.recycle()
             }
         }
-        if (android.os.Build.VERSION.SDK_INT >= 29) {
-            decodeWithMediaCodecFramework(bytes, diag, maxEdge)?.let { return it }
+        val nativeBitmap = try {
+            decodeWithLibavif(bytes, diag, maxEdge)
+        } catch (t: Throwable) {
+            diag.add("libavif tier threw ${t.javaClass.simpleName}")
+            null
+        }
+        nativeBitmap?.let { bitmap ->
+            try {
+                val output = ByteArrayOutputStream(bytes.size / 2)
+                if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                    throw IOException("ProComic: page JPEG encode failed")
+                }
+                return output.toByteArray()
+            } finally {
+                bitmap.recycle()
+            }
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 24) {
+            val webviewBitmap = try {
+                decodeWithWebView(bytes, diag, maxEdge)
+            } catch (t: Throwable) {
+                diag.add("webview tier threw ${t.javaClass.simpleName}")
+                null
+            }
+            webviewBitmap?.let { decoded ->
+                val bitmap = if (maxEdge > 0) downscaleTo(decoded, maxEdge, diag) else decoded
+                try {
+                    val output = ByteArrayOutputStream(bitmap.byteCount.coerceAtLeast(16_384))
+                    if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                        throw IOException("ProComic: page JPEG encode failed")
+                    }
+                    return output.toByteArray()
+                } finally {
+                    bitmap.recycle()
+                }
+            }
         } else {
-            diag.add("mediacodec: skipped (sdk ${android.os.Build.VERSION.SDK_INT})")
-        }
-        decodeWithLibavif(bytes, diag, maxEdge)?.let { bitmap ->
-            try {
-                val output = ByteArrayOutputStream(bytes.size / 2)
-                if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
-                    throw IOException("ProComic: page JPEG encode failed")
-                }
-                return output.toByteArray()
-            } finally {
-                bitmap.recycle()
-            }
+            diag.add("webview: skipped (sdk ${android.os.Build.VERSION.SDK_INT})")
         }
         if (android.os.Build.VERSION.SDK_INT >= 28) {
             try {
@@ -642,8 +693,157 @@ class ProComicImageServer(
     }
 
     /** Harness hook for the v108 framework tier: drives the MediaCodec path
-     * against a diag trail without an HTTP round-trip. */
+     * against a diag trail without an HTTP round-trip. Debug-only — the
+     * v109 ladder no longer calls the codec tier (the field device died
+     * inside it), but the decline behavior stays pinned. */
     internal fun debugMediaCodecTier(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int = 0): ByteArray? = decodeWithMediaCodecFramework(bytes, diag, maxEdge)
+
+    /** Harness hook for the v109 WebView tier. */
+    internal fun debugWebViewTier(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int = 0): Bitmap? = decodeWithWebView(bytes, diag, maxEdge)
+
+    /**
+     * The WebView decode tier (v109) — the framework-guaranteed,
+     * PROCESS-SAFE AVIF decoder for Android 10/11.
+     *
+     * Why: the host's Chromium WebView decodes AVIF natively (Chromium 85+;
+     * the WebView package auto-updates via Play, including on Android 10),
+     * it is a FULL image decoder (single items AND grid AVIF), and every
+     * failure mode is survivable — a Java exception is caught, a decode
+     * timeout latches, and even a genuine Chromium bug dies inside the
+     * sandboxed renderer process, never in the host app. That last property
+     * is the entire lesson of v108: the MediaCodec c2.av1 tier killed the
+     * whole app on the field device and no Java guard can prevent a native
+     * death.
+     *
+     * Flow: the AVIF bytes ride a data: URL inside a minimal HTML document
+     * loaded into an offscreen WebView on the app's main looper (the server
+     * thread only awaits a bounded latch — the main thread never blocks).
+     * When the document settles, JavaScript reports the image's
+     * naturalWidth x naturalHeight (or an error / pending state), the
+     * WebView is measured + laid out at the image size and drawn into a
+     * software ARGB_8888 bitmap. Every stage lands in the diag trail.
+     */
+    private fun decodeWithWebView(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap? {
+        val context = webViewContext ?: run {
+            diag.add("webview: unavailable (no context)")
+            return null
+        }
+        if (bytes.size > WEBVIEW_MAX_PAYLOAD_BYTES) {
+            diag.add("webview: declined (${bytes.size} B payload > cap)")
+            return null
+        }
+        // Pixel budget up front: parse the container in pure Kotlin so an
+        // absurd image never allocates a WebView or a bitmap. A parser
+        // refusal still tries the WebView — Chromium is a full decoder that
+        // handles shapes the lenient parser rejects.
+        AvifMediaCodecDecoder.parseAvifImage(bytes)?.let { layout ->
+            val pixels = layout.outputWidth.toLong() * layout.outputHeight
+            if (pixels > MAX_NATIVE_DECODE_PIXELS) {
+                diag.add("webview: declined (${layout.outputWidth}x${layout.outputHeight} exceeds budget)")
+                return null
+            }
+        }
+        val base64 = runCatching {
+            android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
+        }.getOrElse {
+            diag.add("webview: base64 ${it.javaClass.simpleName}")
+            return null
+        }
+        val html = "<html><head><style>html,body{margin:0;padding:0}</style></head>" +
+            "<body><img src=\"data:image/avif;base64,$base64\"></body></html>"
+
+        val handler = android.os.Handler(android.os.Looper.getMainLooper())
+        val bitmapRef = java.util.concurrent.atomic.AtomicReference<Bitmap?>()
+        val webViewRef = java.util.concurrent.atomic.AtomicReference<android.webkit.WebView?>()
+        val stageRef = java.util.concurrent.atomic.AtomicReference("load")
+        val latch = java.util.concurrent.CountDownLatch(1)
+
+        handler.post {
+            var webView: android.webkit.WebView? = null
+            try {
+                webView = android.webkit.WebView(context).apply {
+                    settings.javaScriptEnabled = true
+                    settings.blockNetworkLoads = true
+                    settings.loadsImagesAutomatically = true
+                    isVerticalScrollBarEnabled = false
+                    isHorizontalScrollBarEnabled = false
+                }
+                webViewRef.set(webView)
+                webView.webViewClient = object : android.webkit.WebViewClient() {
+                    private var probed = false
+                    override fun onPageFinished(view: android.webkit.WebView, url: String?) {
+                        if (probed) return
+                        probed = true
+                        probe(view, 0)
+                    }
+
+                    /** The <img> may still be decoding a large data URL when
+                     * the page settles — 'pending' retries, bounded. */
+                    private fun probe(view: android.webkit.WebView, attempt: Int) {
+                        if (attempt > WEBVIEW_PROBE_MAX_RETRIES) {
+                            stageRef.set("probe exhausted")
+                            latch.countDown()
+                            return
+                        }
+                        view.evaluateJavascript(WEBVIEW_PROBE_JS) { value ->
+                            val text = value ?: "null"
+                            when {
+                                text.contains("pending") ->
+                                    handler.postDelayed({ probe(view, attempt + 1) }, WEBVIEW_PROBE_RETRY_MS)
+                                else -> finishProbe(view, text)
+                            }
+                        }
+                    }
+
+                    private fun finishProbe(view: android.webkit.WebView, text: String) {
+                        val parsed = Regex("(\\d+)x(\\d+)").find(text)
+                        val width = parsed?.groupValues?.get(1)?.toIntOrNull()
+                        val height = parsed?.groupValues?.get(2)?.toIntOrNull()
+                        if (width == null || height == null || width <= 0 || height <= 0) {
+                            stageRef.set("image ${text.take(24)}")
+                            latch.countDown()
+                            return
+                        }
+                        try {
+                            view.measure(
+                                android.view.View.MeasureSpec.makeMeasureSpec(width, android.view.View.MeasureSpec.EXACTLY),
+                                android.view.View.MeasureSpec.makeMeasureSpec(height, android.view.View.MeasureSpec.EXACTLY),
+                            )
+                            view.layout(0, 0, width, height)
+                            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+                            view.draw(android.graphics.Canvas(bitmap))
+                            bitmapRef.set(bitmap)
+                            stageRef.set("decoded ${width}x$height")
+                        } catch (t: Throwable) {
+                            stageRef.set("draw ${t.javaClass.simpleName}")
+                            runCatching { bitmapRef.getAndSet(null)?.recycle() }
+                        }
+                        latch.countDown()
+                    }
+                }
+                webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+            } catch (t: Throwable) {
+                stageRef.set("init ${t.javaClass.simpleName}")
+                runCatching { webView?.destroy() }
+                webViewRef.set(null)
+                latch.countDown()
+            }
+        }
+
+        val settled = try {
+            latch.await(WEBVIEW_DEADLINE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+        } catch (_: InterruptedException) {
+            Thread.currentThread().interrupt()
+            false
+        }
+        if (!settled) stageRef.set("timeout")
+        // destroy() must run on the thread the WebView was created on.
+        handler.post { runCatching { webViewRef.getAndSet(null)?.destroy() } }
+
+        val bitmap = bitmapRef.getAndSet(null)
+        diag.add("webview: ${stageRef.get()}")
+        return bitmap
+    }
 
     /**
      * The bundled software decoder tier. Every failure mode lands in the
@@ -1120,7 +1320,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v108\"")
+        sb.append("\"server\":\"procomic-image/v109\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -1169,7 +1369,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v108")
+                add("Server build: procomic-image/v109")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -1318,6 +1518,27 @@ class ProComicImageServer(
         /** Stale decode-attempt markers tolerated before the native tier is
          * disabled permanently (bounds the native crash loop). */
         private const val MAX_NATIVE_CRASHES = 2
+
+        /** v109 WebView tier: data-URL payload cap. A page's base64 rides
+         * in memory inside the WebView — beyond this the tier declines
+         * (the libavif tier or the error page carries it instead). */
+        private const val WEBVIEW_MAX_PAYLOAD_BYTES = 2_500_000
+
+        /** v109 WebView tier: whole-decode deadline. Chromium's first-ever
+         * init on a cold process can take seconds; past this the tier
+         * declines and the ladder moves on. */
+        private const val WEBVIEW_DEADLINE_MS = 20_000L
+
+        /** v109 WebView tier: the <img> decode probe re-checks while the
+         * image is still pending — bounded retries, then decline. */
+        private const val WEBVIEW_PROBE_MAX_RETRIES = 40
+        private const val WEBVIEW_PROBE_RETRY_MS = 200L
+
+        /** v109 WebView tier: the size probe — natural dimensions when the
+         * image decoded, 'imgerr' when the WebView refused the format
+         * (WebView package too old for AVIF), 'pending' while still busy. */
+        private const val WEBVIEW_PROBE_JS =
+            "(function(){var i=document.images[0];return !i?'noimg':(!i.complete?'pending':(i.naturalWidth>0?i.naturalWidth+'x'+i.naturalHeight:'imgerr'))})()"
 
         /** Pause between background pre-transcoded pages (gentle pacing —
          * with one GET per page a full chapter prebuilds in seconds). */

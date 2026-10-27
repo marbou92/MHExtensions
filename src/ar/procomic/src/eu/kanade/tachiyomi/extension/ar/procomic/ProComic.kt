@@ -109,6 +109,21 @@ import kotlin.math.roundToInt
  *     loader scans every candidate (pm path + classloader dex paths) for
  *     the .so entry before loading, and the diag trail names each scanned
  *     zip with its per-file outcome.
+ *   - pages/covers v108: the MediaCodec "video/av1" framework tier — and
+ *     the field verdict: the host app CRASHED on every cover and page
+ *     load. Android 10's brand-new c2.av1 software codec, configured at a
+ *     still image's full size (pages 800x5000, "originals" covers to
+ *     4000x6000), is a native-crash/OOM-kill surface no Java guard can
+ *     catch; the marker breaker only gates after two process deaths.
+ *   - pages/covers v109: the MediaCodec tier is REMOVED from the ladder
+ *     and replaced with a WebView decode tier — the host's Chromium
+ *     engine (AVIF since Chrome 85; Play auto-updates the WebView package
+ *     even on Android 10) decodes the AVIF offscreen (data: URL on the
+ *     main looper, JS size probe, draw into a software bitmap) and every
+ *     failure mode is survivable: caught Java exceptions, bounded
+ *     timeouts, or a sandboxed-renderer death that leaves the app alive.
+ *     Ladder: BitmapFactory (12+) -> libavif (loader) -> WebView (24+)
+ *     -> ImageDecoder (28+).
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -159,6 +174,19 @@ abstract class ProComic :
             // wasted scan, never a silent miss.
             apkSourceDir = ownInstalledApkPath(),
             nativeCacheDir = applicationContext.cacheDir,
+            // v109: the WebView decode tier — the host application context
+            // so the server can build an offscreen WebView on the main
+            // looper and let Chromium (AVIF-capable since Chrome 85, and
+            // Play auto-updates the WebView package even on Android 10)
+            // decode the pages process-safely. v108's MediaCodec tier died
+            // in the field: configuring Android 10's brand-new c2.av1
+            // software codec at a still image's full size is a native-crash
+            // surface no Java guard can catch — the host app itself
+            // crashed on every page/cover load. The WebView tier cannot
+            // do that: its failures are caught Java exceptions, bounded
+            // timeouts, or a sandboxed-renderer death that leaves the app
+            // alive.
+            webViewContext = applicationContext,
         )
     }
 
