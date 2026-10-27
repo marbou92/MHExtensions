@@ -465,25 +465,147 @@ class ProComicImageServer(
     }
 
     /**
-     * AVIF → JPEG, three decode steps: BitmapFactory (the fast path, and
-     * the platform AVIF codec on Android 12+), the bundled SOFTWARE AVIF
-     * decoder — libavif/dav1d carries every device the host app runs on —
-     * and finally ImageDecoder (API 28+) for whatever the software decoder
-     * refuses. All guarded: any decode failure surfaces as the explicit
-     * IOException the caller turns into the 502 body (or the legible error
-     * JPEG).
+     * AVIF → JPEG, decode ladder (v108):
+     *
+     * 1. BitmapFactory — the platform codec (Android 12+), subsampled when
+     *    a max edge is requested.
+     * 2. MediaCodec "video/av1" — the FRAMEWORK software AV1 decoder
+     *    (c2.android.av1, shipped with Android 10): the ISOBMFF container is
+     *    parsed in pure Kotlin and the embedded OBU stream is fed to the
+     *    codec directly. Needs no bundled library, no package manager, no
+     *    System.load — the only tier whose availability the OS itself
+     *    guarantees on the Android 10/11 devices this source serves.
+     * 3. The bundled libavif/dav1d software decoder (when the explicit
+     *    loader can find + load it).
+     * 4. ImageDecoder (API 28+).
+     *
+     * Every failure surfaces in the diag trail with its ACTUAL reason.
      */
     private fun avifToJpeg(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): ByteArray {
-        val bitmap = decodeAvif(bytes, diag, maxEdge)
+        val quality = if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY
+        decodeWithBitmapFactory(bytes, diag, maxEdge)?.let { bitmap ->
+            try {
+                val output = ByteArrayOutputStream(bytes.size / 2)
+                if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                    throw IOException("ProComic: page JPEG encode failed")
+                }
+                return output.toByteArray()
+            } finally {
+                bitmap.recycle()
+            }
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 29) {
+            decodeWithMediaCodecFramework(bytes, diag, maxEdge)?.let { return it }
+        } else {
+            diag.add("mediacodec: skipped (sdk ${android.os.Build.VERSION.SDK_INT})")
+        }
+        decodeWithLibavif(bytes, diag, maxEdge)?.let { bitmap ->
+            try {
+                val output = ByteArrayOutputStream(bytes.size / 2)
+                if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                    throw IOException("ProComic: page JPEG encode failed")
+                }
+                return output.toByteArray()
+            } finally {
+                bitmap.recycle()
+            }
+        }
+        if (android.os.Build.VERSION.SDK_INT >= 28) {
+            try {
+                val source = android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))
+                val bitmap = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
+                    decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
+                    if (maxEdge > 0) {
+                        val longEdge = maxOf(info.size.width, info.size.height)
+                        if (longEdge > maxEdge) {
+                            val scale = maxEdge.toFloat() / longEdge
+                            decoder.setTargetSize(
+                                (info.size.width * scale).toInt().coerceAtLeast(1),
+                                (info.size.height * scale).toInt().coerceAtLeast(1),
+                            )
+                        }
+                    }
+                }
+                try {
+                    val output = ByteArrayOutputStream(bytes.size / 2)
+                    if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                        throw IOException("ProComic: page JPEG encode failed")
+                    }
+                    return output.toByteArray()
+                } finally {
+                    bitmap.recycle()
+                }
+            } catch (t: Throwable) {
+                diag.add("imagedecoder ${t.javaClass.simpleName}")
+            }
+        }
+        throw IOException("ProComic: page failed to decode (no AVIF decoder on this device)")
+    }
+
+    /** The platform BitmapFactory tier (the fast path, and the platform AVIF
+     * codec on Android 12+). The bounds probe also avoids a second full
+     * decode attempt when the platform has no codec for the container. */
+    private fun decodeWithBitmapFactory(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap? {
+        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
+        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
+            val options = BitmapFactory.Options()
+            if (maxEdge > 0) options.inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxEdge)
+            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.let { return it }
+        }
+        diag.add("bitmapfactory null (platform has no avif codec)")
+        return null
+    }
+
+    /**
+     * The v108 framework tier: AVIF → JPEG with zero external state.
+     * Gated by the same crash-loop breaker as the bundled-decoder tier (the
+     * codec is native too — a c2 crash kills the process exactly like a
+     * dav1d one) and the same pixel budget.
+     */
+    private fun decodeWithMediaCodecFramework(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): ByteArray? {
+        val crashState = nativeCrashState
+        if (!crashState.startsWith("ok")) {
+            diag.add("mediacodec tier gated: $crashState")
+            return null
+        }
+        val marker = attemptMarker()
+        return try {
+            marker?.writeText(System.currentTimeMillis().toString())
+            val jpeg = AvifMediaCodecDecoder.decodeToJpeg(bytes, { row -> diag.add("mediacodec: ${row.take(48)}") }, if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY)
+            when {
+                jpeg == null -> null
+                maxEdge > 0 -> downscaleJpeg(jpeg, maxEdge, diag)
+                else -> jpeg
+            }
+        } catch (t: Throwable) {
+            diag.add("mediacodec threw ${t.javaClass.simpleName}")
+            null
+        } finally {
+            // Deleted on every HANDLED outcome; only a native crash (which
+            // skips this finally) leaves it stale.
+            runCatching { marker?.delete() }
+        }
+    }
+
+    /** JPEG downscale for the cover variant: decode → proportional scale →
+     * re-encode at the cover quality. */
+    private fun downscaleJpeg(jpeg: ByteArray, maxEdge: Int, diag: ProxyDiag): ByteArray? {
+        val source = BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size) ?: run {
+            diag.add("mediacodec: cover jpeg decode null")
+            return null
+        }
+        val scaled = downscaleTo(source, maxEdge, diag)
         try {
-            val output = ByteArrayOutputStream(bytes.size / 2)
-            val quality = if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY
-            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
-                throw IOException("ProComic: page JPEG encode failed")
+            val output = ByteArrayOutputStream(scaled.byteCount.coerceAtLeast(16_384))
+            if (!scaled.compress(Bitmap.CompressFormat.JPEG, COVER_JPEG_QUALITY, output)) {
+                diag.add("mediacodec: cover jpeg encode false")
+                return null
             }
             return output.toByteArray()
         } finally {
-            bitmap.recycle()
+            if (scaled !== source) scaled.recycle()
+            source.recycle()
         }
     }
 
@@ -519,42 +641,9 @@ class ProComicImageServer(
         return scaled
     }
 
-    private fun decodeAvif(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap {
-        // Platform decode first, subsampled when a max edge is requested.
-        // The bounds probe also avoids a second full decode attempt when
-        // the platform has no codec for the container at all.
-        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-        BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
-        if (bounds.outWidth > 0 && bounds.outHeight > 0) {
-            val options = BitmapFactory.Options()
-            if (maxEdge > 0) options.inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxEdge)
-            BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options)?.let { return it }
-        }
-        diag.add("bitmapfactory null (platform has no avif codec)")
-        decodeWithLibavif(bytes, diag, maxEdge)?.let { return it }
-        if (android.os.Build.VERSION.SDK_INT >= 28) {
-            try {
-                val source = android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))
-                return android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
-                    decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
-                    if (maxEdge > 0) {
-                        val longEdge = maxOf(info.size.width, info.size.height)
-                        if (longEdge > maxEdge) {
-                            val scale = maxEdge.toFloat() / longEdge
-                            decoder.setTargetSize(
-                                (info.size.width * scale).toInt().coerceAtLeast(1),
-                                (info.size.height * scale).toInt().coerceAtLeast(1),
-                            )
-                        }
-                    }
-                }
-            } catch (t: Throwable) {
-                diag.add("imagedecoder ${t.javaClass.simpleName}")
-                throw IOException("ProComic: page failed to decode (${t.javaClass.simpleName})")
-            }
-        }
-        throw IOException("ProComic: page failed to decode (Android 12+ required for AVIF pages)")
-    }
+    /** Harness hook for the v108 framework tier: drives the MediaCodec path
+     * against a diag trail without an HTTP round-trip. */
+    internal fun debugMediaCodecTier(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int = 0): ByteArray? = decodeWithMediaCodecFramework(bytes, diag, maxEdge)
 
     /**
      * The bundled software decoder tier. Every failure mode lands in the
@@ -789,18 +878,26 @@ class ProComicImageServer(
     /** Best-effort reflection into BaseDexClassLoader.pathList.dexElements
      * to recover the apk paths of THIS classloader. Bounded and safe: on
      * the JVM harness (or any host that blocks these hidden fields) the
-     * whole lookup returns an empty list. */
+     * whole lookup returns an empty list.
+     *
+     * v108 fix: the v107 walk called loader.javaClass.getDeclaredField —
+     * which only sees fields declared on the EXACT class, never inherited
+     * ones. pathList is declared on BaseDexClassLoader while the concrete
+     * loader is a PathClassLoader/InMemoryDexClassLoader subclass, so the
+     * walk threw NoSuchFieldException on every real Android classloader and
+     * silently contributed nothing (the field report: exactly one scanned
+     * candidate, the pm path). The lookup now walks the superclass chain
+     * via [declaredFieldUpTo]. */
     private fun apkPathsFromCallerClassloader(): List<String> = runCatching {
         val loader = this::class.java.classLoader ?: return emptyList()
-        val pathList = loader.javaClass.getDeclaredField("pathList").apply { isAccessible = true }
-            .get(loader) ?: return emptyList()
-        val elements = pathList.javaClass.getDeclaredField("dexElements").apply { isAccessible = true }
-            .get(pathList) as? Array<*> ?: return emptyList()
+        val pathList = declaredFieldUpTo(loader.javaClass, "pathList")
+            ?.apply { isAccessible = true }?.get(loader) ?: return emptyList()
+        val elements = declaredFieldUpTo(pathList.javaClass, "dexElements")
+            ?.apply { isAccessible = true }?.get(pathList) as? Array<*> ?: return emptyList()
         elements.mapNotNull { element ->
             if (element == null) return@mapNotNull null
-            val field = runCatching {
-                element.javaClass.getDeclaredField("path").apply { isAccessible = true }
-            }.getOrNull() ?: return@mapNotNull null
+            val field = declaredFieldUpTo(element.javaClass, "path")?.apply { isAccessible = true }
+                ?: return@mapNotNull null
             when (val value = runCatching { field.get(element) }.getOrNull()) {
                 is java.io.File -> value.absolutePath
                 is String -> value
@@ -808,6 +905,21 @@ class ProComicImageServer(
             }
         }.filter { it.endsWith(".apk") }
     }.getOrDefault(emptyList())
+
+    /** getDeclaredField across the superclass chain (Class.getDeclaredField
+     * only sees the exact class — see [apkPathsFromCallerClassloader]).
+     * Internal so the harness pins the walk itself. */
+    internal fun declaredFieldUpTo(start: Class<*>, name: String): java.lang.reflect.Field? {
+        var current: Class<*>? = start
+        while (current != null && current != Any::class.java) {
+            try {
+                return current.getDeclaredField(name)
+            } catch (_: NoSuchFieldException) {
+                current = current.superclass
+            }
+        }
+        return null
+    }
 
     /** Harness hooks for the v107 loader: the resolved candidate list, the
      * per-zip scan outcome ("loaded..." can only happen on a device — the
@@ -1008,7 +1120,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v107\"")
+        sb.append("\"server\":\"procomic-image/v108\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -1057,7 +1169,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v107")
+                add("Server build: procomic-image/v108")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)

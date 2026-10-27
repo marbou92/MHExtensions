@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 22
+    versionCode = 23
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -47,6 +47,21 @@ keiyoushi {
     // path now comes from the package manager (our own package); the
     // loader verifies the .so entry in every candidate zip (pm path +
     // classloader dex paths) and names each scanned zip in the diag trail.
+    // v108 note: versionCode 23 = the framework-only decode tier. The edge
+    // serves the AVIF files AS-IS regardless of the Accept header (the
+    // file name pins the format — verified live), so the format cannot be
+    // negotiated away, and the field screenshot from 1.6.22 ("no loadable
+    // libavif_android.so scanned [base.apk: no entry]") proved the native
+    // tier is still unreachable on the affected host app even after v107:
+    // the dex-walk used Class.getDeclaredField (exact-class only), which
+    // never sees pathList on BaseDexClassLoader subclasses, and even a
+    // correct zip would end in System.load of a file from the host's cache
+    // dir — which the W^X SELinux policy of modern targetSdk hosts may
+    // refuse. New ladder: BitmapFactory (12+) -> MediaCodec "video/av1"
+    // (the framework's c2.android.av1 software decoder, Android 10+, ISOBMFF
+    // parsed in pure Kotlin incl. grid AVIF) -> libavif (fixed loader) ->
+    // ImageDecoder. No .so, no PackageManager, no System.load — the only
+    // tier whose availability the OS itself guarantees.
 
     deeplink {
         host("procomic.net")
