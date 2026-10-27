@@ -485,6 +485,12 @@ class ProComicImageServer(
      *    crash that never kills the host app.
      * 4. ImageDecoder (API 28+).
      *
+     * v110 hardening (the field device STILL died in the v109 WebView
+     * tier): one shared WebView behind a process-wide permit, ?e=-bounded
+     * draws, identity-guarded callbacks, and a crash-loop breaker that
+     * disables the tier after a process death inside it — see
+     * decodeWithWebView for the three fixed vectors.
+     *
      * v109 REMOVED the MediaCodec "video/av1" tier from this ladder: the
      * field device (Android 10) DIED inside it — c2.av1 is Android 10's
      * brand-new software codec and configuring it at a still image's full
@@ -698,34 +704,174 @@ class ProComicImageServer(
      * inside it), but the decline behavior stays pinned. */
     internal fun debugMediaCodecTier(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int = 0): ByteArray? = decodeWithMediaCodecFramework(bytes, diag, maxEdge)
 
-    /** Harness hook for the v109 WebView tier. */
+    /** Harness hook for the v110 WebView tier. */
     internal fun debugWebViewTier(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int = 0): Bitmap? = decodeWithWebView(bytes, diag, maxEdge)
 
+    /** Harness hook: the crash-loop breaker state machine (consumes a stale
+     * marker exactly like the native tier's hook does). */
+    internal fun debugWebViewCrashLoopState(): String = evaluateWebViewCrashState()
+
+    /** Harness hook: holds the shared-WebView permit so the busy-decline
+     * path is drivable without a real concurrent decode. */
+    internal fun debugHoldWebViewPermit(): java.lang.AutoCloseable {
+        webViewDecodePermits.acquire()
+        return java.lang.AutoCloseable { webViewDecodePermits.release() }
+    }
+
+    /** v110: ALL WebView decodes are serialized process-wide. The host
+     * fires covers + reader pages + the preload window CONCURRENTLY; in
+     * v109 each of those built its own offscreen WebView — parallel
+     * Chromium boots, stacked renderer processes and simultaneous
+     * full-size bitmap allocations (two concurrent ~96 MB covers) on a
+     * 2-4 GB device: OOM kill, "the app just crashes". One permit, one
+     * shared WebView, one decode at a time; a caller that cannot get the
+     * permit inside the bounded queue wait declines to the next tier.
+     * Fair so the visible page is not starved by the preload window. */
+    private val webViewDecodePermits = Semaphore(1, true)
+
+    /** The one shared offscreen WebView (main-looper only). Created lazily,
+     * reused for every decode. v109 created + destroyed a WebView per
+     * image, and the destroy raced the still-queued JS probe callbacks —
+     * evaluateJavascript on a destroyed WebView throws on the MAIN thread
+     * with nothing to catch it: process death. Reuse removes
+     * destroy-between-decodes entirely; the only destroy left is the
+     * post-timeout heal in [dropSharedWebView], which runs while no live
+     * job exists and stale callbacks are identity-guarded no-ops. */
+    @Volatile
+    private var sharedWebView: android.webkit.WebView? = null
+
+    @Volatile
+    private var wholeDocumentDrawEnabled = false
+
+    /** The decode job the WebView callbacks currently serve. Identity —
+     * not equality — so a recycled job can never resurrect stale
+     * callbacks. */
+    private val currentWebViewJob = java.util.concurrent.atomic.AtomicReference<WebViewJob?>()
+
+    /** The WebView lives on the app's main looper (Chromium requires it);
+     * server threads only await bounded latches — the main thread never
+     * blocks on a decode. Built per call (a Handler is a cheap looper
+     * wrapper) so no android.os class is ever touched outside the guarded
+     * tier path — a property initializer here put the reference on the
+     * constructor path and the JVM harness class-load died (the exact
+     * failure the harness exists to catch). */
+    private fun newMainHandler(): android.os.Handler = android.os.Handler(android.os.Looper.getMainLooper())
+
+    /** One WebView decode: verdict refs + exactly-once latch. [finish]
+     * wins once — later (stale) callbacks see [done] and do nothing. */
+    private class WebViewJob {
+        val bitmapRef = java.util.concurrent.atomic.AtomicReference<Bitmap?>()
+        val stageRef = java.util.concurrent.atomic.AtomicReference("load")
+        val done = java.util.concurrent.atomic.AtomicBoolean(false)
+        val latch = java.util.concurrent.CountDownLatch(1)
+
+        fun finish(stage: String, bitmap: Bitmap?) {
+            if (!done.compareAndSet(false, true)) return
+            stageRef.set(stage)
+            bitmapRef.set(bitmap)
+            latch.countDown()
+        }
+    }
+
     /**
-     * The WebView decode tier (v109) — the framework-guaranteed,
+     * v110 WebView crash-loop breaker — the same defense the native tier
+     * has, because Chromium has the same failure class: a death inside the
+     * WebView stack (provider boot abort, vendor WebView bug, a host-side
+     * native OOM) is NATIVE — no Java guard can catch it, and the field
+     * device crash-looped through exactly this hole. Files live next to
+     * the native tier's tracking dir:
+     *
+     * - `webview.attempt` — written right before the decode job is posted
+     *   to the main looper, deleted right after the verdict lands. A
+     *   stale marker = the previous process died INSIDE the WebView stage.
+     * - `webview.crashes` — how many stale markers were consumed.
+     *
+     * One stale marker disables the tier for this session; two disable it
+     * permanently (until the user clears the source's cache). The worst
+     * case is now two process deaths per install — then legible error
+     * cards carrying this exact reason in the diag trail, never a
+     * crash loop.
+     */
+    internal fun evaluateWebViewCrashState(): String {
+        val dir = nativeCacheDir?.let { java.io.File(it, "procomic_native") }
+            ?: return "ok (no tracking dir)"
+        val attempt = java.io.File(dir, "webview.attempt")
+        val counter = java.io.File(dir, "webview.crashes")
+        if (!attempt.exists()) return "ok"
+        val previous = runCatching { counter.readText().trim().toIntOrNull() ?: 0 }.getOrDefault(0)
+        val count = previous + 1
+        runCatching {
+            counter.writeText(count.toString())
+            attempt.delete()
+        }
+        return if (count >= MAX_WEBVIEW_CRASHES) {
+            "disabled after $count webview decode crashes (clear the source's cache to re-enable)"
+        } else {
+            "disabled this session after a webview decode crash (crashes=$count)"
+        }
+    }
+
+    private val webViewCrashState: String by lazy { evaluateWebViewCrashState() }
+
+    /** The before-decode marker file, or null when there is nowhere to
+     * track (harness / restricted storage) — tracking is best-effort. */
+    private fun webViewAttemptMarker(): java.io.File? {
+        val base = nativeCacheDir ?: return null
+        return runCatching {
+            val dir = java.io.File(base, "procomic_native")
+            dir.mkdirs()
+            java.io.File(dir, "webview.attempt")
+        }.getOrNull()
+    }
+
+    /**
+     * The WebView decode tier (v110) — the framework-guaranteed,
      * PROCESS-SAFE AVIF decoder for Android 10/11.
      *
      * Why: the host's Chromium WebView decodes AVIF natively (Chromium 85+;
      * the WebView package auto-updates via Play, including on Android 10),
-     * it is a FULL image decoder (single items AND grid AVIF), and every
-     * failure mode is survivable — a Java exception is caught, a decode
-     * timeout latches, and even a genuine Chromium bug dies inside the
-     * sandboxed renderer process, never in the host app. That last property
-     * is the entire lesson of v108: the MediaCodec c2.av1 tier killed the
-     * whole app on the field device and no Java guard can prevent a native
-     * death.
+     * it is a FULL image decoder (single items AND grid AVIF), every
+     * catchable failure is caught, and a genuine Chromium death dies inside
+     * the sandboxed renderer — or, worst case, is bounded by the v110
+     * crash-loop breaker above.
+     *
+     * v110 — the v109 field device STILL died in this tier, three ways:
+     * 1. No concurrency gate: the host fires covers, pages and the preload
+     *    window concurrently; each built its own offscreen WebView —
+     *    parallel Chromium boots and stacked renderer processes on a
+     *    2-4 GB device.
+     * 2. Full-size draw allocations: the WebView was measured at the
+     *    image's natural size, so a 4000x6000 "originals" cover allocated
+     *    a ~96 MB ARGB bitmap per decode — two concurrent decodes (the
+     *    transcode stage allows two) was an OOM kill.
+     * 3. The probe-after-destroy race: destroy() was posted when the
+     *    verdict (or the 20 s timeout) landed while JS probe retries were
+     *    still queued — evaluateJavascript on a destroyed WebView throws
+     *    on the MAIN thread with nothing to catch it: process death.
+     *
+     * All three are structurally gone: ONE shared WebView reused across
+     * decodes behind a process-wide permit (never destroyed between
+     * decodes), draws bounded by the ?e= render target, and every callback
+     * identity-checked against the current job and Throwable-guarded. The
+     * crash-loop breaker bounds anything native left to two process deaths
+     * per install, then legible error cards.
      *
      * Flow: the AVIF bytes ride a data: URL inside a minimal HTML document
-     * loaded into an offscreen WebView on the app's main looper (the server
-     * thread only awaits a bounded latch — the main thread never blocks).
-     * When the document settles, JavaScript reports the image's
-     * naturalWidth x naturalHeight (or an error / pending state), the
-     * WebView is measured + laid out at the image size and drawn into a
-     * software ARGB_8888 bitmap. Every stage lands in the diag trail.
+     * loaded into the shared offscreen WebView on the app's main looper
+     * (server threads only await bounded latches — the main thread never
+     * blocks). JavaScript reports the image's naturalWidth x naturalHeight
+     * (or an error / pending state), the WebView is measured + laid out at
+     * the (possibly ?e=-scaled) render size and drawn into a software
+     * ARGB_8888 bitmap. Every stage lands in the diag trail.
      */
     private fun decodeWithWebView(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap? {
         val context = webViewContext ?: run {
             diag.add("webview: unavailable (no context)")
+            return null
+        }
+        val crashState = webViewCrashState
+        if (!crashState.startsWith("ok")) {
+            diag.add("webview tier gated: $crashState")
             return null
         }
         if (bytes.size > WEBVIEW_MAX_PAYLOAD_BYTES) {
@@ -749,100 +895,198 @@ class ProComicImageServer(
             diag.add("webview: base64 ${it.javaClass.simpleName}")
             return null
         }
-        val html = "<html><head><style>html,body{margin:0;padding:0}</style></head>" +
+        // Covers (?e= edge) scale the img via CSS so the DRAW bitmap is the
+        // bounded target size — see finishProbe. Pages keep 1:1 px mapping
+        // (useWideViewPort stays off) so the natural-size draw is exact.
+        val scaleCss = if (maxEdge > 0) "img{max-width:100%;height:auto;display:block}" else "img{display:block}"
+        val html = "<html><head><style>html,body{margin:0;padding:0}$scaleCss</style></head>" +
             "<body><img src=\"data:image/avif;base64,$base64\"></body></html>"
 
-        val handler = android.os.Handler(android.os.Looper.getMainLooper())
-        val bitmapRef = java.util.concurrent.atomic.AtomicReference<Bitmap?>()
-        val webViewRef = java.util.concurrent.atomic.AtomicReference<android.webkit.WebView?>()
-        val stageRef = java.util.concurrent.atomic.AtomicReference("load")
-        val latch = java.util.concurrent.CountDownLatch(1)
-
-        handler.post {
-            var webView: android.webkit.WebView? = null
-            try {
-                webView = android.webkit.WebView(context).apply {
-                    settings.javaScriptEnabled = true
-                    settings.blockNetworkLoads = true
-                    settings.loadsImagesAutomatically = true
-                    isVerticalScrollBarEnabled = false
-                    isHorizontalScrollBarEnabled = false
-                }
-                webViewRef.set(webView)
-                webView.webViewClient = object : android.webkit.WebViewClient() {
-                    private var probed = false
-                    override fun onPageFinished(view: android.webkit.WebView, url: String?) {
-                        if (probed) return
-                        probed = true
-                        probe(view, 0)
-                    }
-
-                    /** The <img> may still be decoding a large data URL when
-                     * the page settles — 'pending' retries, bounded. */
-                    private fun probe(view: android.webkit.WebView, attempt: Int) {
-                        if (attempt > WEBVIEW_PROBE_MAX_RETRIES) {
-                            stageRef.set("probe exhausted")
-                            latch.countDown()
-                            return
-                        }
-                        view.evaluateJavascript(WEBVIEW_PROBE_JS) { value ->
-                            val text = value ?: "null"
-                            when {
-                                text.contains("pending") ->
-                                    handler.postDelayed({ probe(view, attempt + 1) }, WEBVIEW_PROBE_RETRY_MS)
-                                else -> finishProbe(view, text)
-                            }
-                        }
-                    }
-
-                    private fun finishProbe(view: android.webkit.WebView, text: String) {
-                        val parsed = Regex("(\\d+)x(\\d+)").find(text)
-                        val width = parsed?.groupValues?.get(1)?.toIntOrNull()
-                        val height = parsed?.groupValues?.get(2)?.toIntOrNull()
-                        if (width == null || height == null || width <= 0 || height <= 0) {
-                            stageRef.set("image ${text.take(24)}")
-                            latch.countDown()
-                            return
-                        }
-                        try {
-                            view.measure(
-                                android.view.View.MeasureSpec.makeMeasureSpec(width, android.view.View.MeasureSpec.EXACTLY),
-                                android.view.View.MeasureSpec.makeMeasureSpec(height, android.view.View.MeasureSpec.EXACTLY),
-                            )
-                            view.layout(0, 0, width, height)
-                            val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
-                            view.draw(android.graphics.Canvas(bitmap))
-                            bitmapRef.set(bitmap)
-                            stageRef.set("decoded ${width}x$height")
-                        } catch (t: Throwable) {
-                            stageRef.set("draw ${t.javaClass.simpleName}")
-                            runCatching { bitmapRef.getAndSet(null)?.recycle() }
-                        }
-                        latch.countDown()
-                    }
-                }
-                webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
-            } catch (t: Throwable) {
-                stageRef.set("init ${t.javaClass.simpleName}")
-                runCatching { webView?.destroy() }
-                webViewRef.set(null)
-                latch.countDown()
-            }
-        }
-
-        val settled = try {
-            latch.await(WEBVIEW_DEADLINE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+        // One decode at a time through the shared WebView; bounded queue
+        // wait — a starved caller declines to the next tier instead of
+        // pinning a server thread behind a long cover-grid queue.
+        val acquired = try {
+            webViewDecodePermits.tryAcquire(WEBVIEW_QUEUE_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
         } catch (_: InterruptedException) {
             Thread.currentThread().interrupt()
             false
         }
-        if (!settled) stageRef.set("timeout")
-        // destroy() must run on the thread the WebView was created on.
-        handler.post { runCatching { webViewRef.getAndSet(null)?.destroy() } }
+        if (!acquired) {
+            diag.add("webview: busy (another decode holds the shared WebView)")
+            return null
+        }
+        val job = WebViewJob()
+        val marker = webViewAttemptMarker()
+        try {
+            marker?.writeText(System.currentTimeMillis().toString())
+            val posted = try {
+                newMainHandler().post { runWebViewDecode(context, job, html, maxEdge) }
+                true
+            } catch (t: Throwable) {
+                job.finish("post ${t.javaClass.simpleName}", null)
+                false
+            }
+            if (posted) {
+                try {
+                    job.latch.await(WEBVIEW_DEADLINE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
+                if (!job.done.get()) job.finish("timeout", null)
+                // A timed-out decode may leave a wedged renderer behind —
+                // drop the shared WebView so the next decode rebuilds it.
+                // Runs after the job is finished: stale callbacks are
+                // identity-guarded no-ops, and destroy() itself is on the
+                // thread the WebView was created on (the main looper).
+                if (job.stageRef.get() == "timeout") {
+                    runCatching { newMainHandler().post { dropSharedWebView() } }
+                }
+            }
+            val bitmap = job.bitmapRef.getAndSet(null)
+            diag.add("webview: ${job.stageRef.get()}")
+            return bitmap
+        } finally {
+            // Deleted on every HANDLED outcome; only a process death inside
+            // the WebView stage (which skips this finally) leaves it stale.
+            runCatching { marker?.delete() }
+            webViewDecodePermits.release()
+        }
+    }
 
-        val bitmap = bitmapRef.getAndSet(null)
-        diag.add("webview: ${stageRef.get()}")
-        return bitmap
+    /** Main-looper body of one WebView decode against the SHARED WebView.
+     * Everything is guarded: a throw here must decline the decode, never
+     * reach the main looper's uncaught-exception handler (that kills the
+     * host app — the exact v109 crash shape). */
+    private fun runWebViewDecode(context: android.content.Context, job: WebViewJob, html: String, maxEdge: Int) {
+        var webView: android.webkit.WebView? = null
+        try {
+            webView = obtainSharedWebView(context) ?: run {
+                job.finish("init failed", null)
+                return
+            }
+            currentWebViewJob.set(job)
+            webView.webViewClient = sharedWebViewClient(maxEdge)
+            webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
+        } catch (t: Throwable) {
+            currentWebViewJob.compareAndSet(job, null)
+            job.finish("init ${t.javaClass.simpleName}", null)
+            // A half-built or broken instance is destroyed and dropped so
+            // the next decode starts clean.
+            webView?.let { broken ->
+                runCatching { broken.destroy() }
+                if (sharedWebView === broken) sharedWebView = null
+            }
+        }
+    }
+
+    private fun obtainSharedWebView(context: android.content.Context): android.webkit.WebView? {
+        sharedWebView?.let { return it }
+        if (!wholeDocumentDrawEnabled) {
+            // Without this Chromium software-draws only the visible
+            // viewport — tall-page captures would be blank or partial.
+            runCatching { android.webkit.WebView.enableSlowWholeDocumentDraw() }
+            wholeDocumentDrawEnabled = true
+        }
+        val webView = android.webkit.WebView(context)
+        webView.settings.javaScriptEnabled = true
+        webView.settings.blockNetworkLoads = true
+        webView.settings.loadsImagesAutomatically = true
+        webView.settings.useWideViewPort = false
+        webView.isVerticalScrollBarEnabled = false
+        webView.isHorizontalScrollBarEnabled = false
+        sharedWebView = webView
+        return webView
+    }
+
+    /** Destroys + clears the shared WebView (main looper only). */
+    private fun dropSharedWebView() {
+        val webView = sharedWebView ?: return
+        sharedWebView = null
+        currentWebViewJob.set(null)
+        runCatching { webView.destroy() }
+    }
+
+    /** Every callback dispatches to the CURRENT job, identity-checked and
+     * Throwable-guarded: a stale callback (previous decode, post-destroy
+     * delivery) is a no-op, and nothing here can reach the main looper's
+     * uncaught-exception handler — that is what killed the v109 app. */
+    private fun sharedWebViewClient(maxEdge: Int): android.webkit.WebViewClient = object : android.webkit.WebViewClient() {
+        private var probed = false
+
+        override fun onPageFinished(view: android.webkit.WebView, url: String?) {
+            if (probed) return
+            probed = true
+            val job = currentWebViewJob.get() ?: return
+            runCatching { probe(view, job, 0) }
+        }
+
+        /** The <img> may still be decoding a large data URL when the page
+         * settles — 'pending' retries, bounded. */
+        private fun probe(view: android.webkit.WebView, job: WebViewJob, attempt: Int) {
+            if (job.done.get()) return
+            if (attempt > WEBVIEW_PROBE_MAX_RETRIES) {
+                job.finish("probe exhausted", null)
+                return
+            }
+            view.evaluateJavascript(WEBVIEW_PROBE_JS) { value ->
+                runCatching {
+                    if (job.done.get() || currentWebViewJob.get() !== job) return@runCatching
+                    val text = value ?: "null"
+                    if (text.contains("pending")) {
+                        newMainHandler().postDelayed({
+                            runCatching {
+                                if (!job.done.get() && currentWebViewJob.get() === job) probe(view, job, attempt + 1)
+                            }
+                        }, WEBVIEW_PROBE_RETRY_MS)
+                    } else {
+                        finishProbe(view, job, text)
+                    }
+                }
+            }
+        }
+
+        private fun finishProbe(view: android.webkit.WebView, job: WebViewJob, text: String) {
+            val parsed = Regex("(\\d+)x(\\d+)").find(text)
+            val width = parsed?.groupValues?.get(1)?.toIntOrNull() ?: 0
+            val height = parsed?.groupValues?.get(2)?.toIntOrNull() ?: 0
+            if (width <= 0 || height <= 0) {
+                job.finish("image ${text.take(24)}", null)
+                return
+            }
+            // v110: the DRAW bitmap is bounded. Covers render at the ?e=
+            // edge (CSS-scaled above) — a 4000x6000 "originals" cover draws
+            // into ~1280x1920 (~9 MB) instead of the ~96 MB full-size ARGB
+            // allocation that killed the v109 process. Pages keep the
+            // natural size under the 25 MP budget gate above.
+            val drawWidth: Int
+            val drawHeight: Int
+            if (maxEdge > 0) {
+                val longEdge = maxOf(width, height)
+                if (longEdge > maxEdge) {
+                    val scale = maxEdge.toFloat() / longEdge
+                    drawWidth = (width * scale).toInt().coerceAtLeast(1)
+                    drawHeight = (height * scale).toInt().coerceAtLeast(1)
+                } else {
+                    drawWidth = width
+                    drawHeight = height
+                }
+            } else {
+                drawWidth = width
+                drawHeight = height
+            }
+            try {
+                view.measure(
+                    android.view.View.MeasureSpec.makeMeasureSpec(drawWidth, android.view.View.MeasureSpec.EXACTLY),
+                    android.view.View.MeasureSpec.makeMeasureSpec(drawHeight, android.view.View.MeasureSpec.EXACTLY),
+                )
+                view.layout(0, 0, drawWidth, drawHeight)
+                val bitmap = Bitmap.createBitmap(drawWidth, drawHeight, Bitmap.Config.ARGB_8888)
+                view.draw(android.graphics.Canvas(bitmap))
+                job.finish("decoded ${drawWidth}x$drawHeight", bitmap)
+            } catch (t: Throwable) {
+                job.finish("draw ${t.javaClass.simpleName}", null)
+            }
+        }
     }
 
     /**
@@ -1320,7 +1564,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v109\"")
+        sb.append("\"server\":\"procomic-image/v110\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -1328,6 +1572,7 @@ class ProComicImageServer(
         }
         sb.append(",\"nativeTier\":\"").append(avifNativeState.replace("\"", "'"))
         sb.append(",\"nativeCrashState\":\"").append(nativeCrashState.replace("\"", "'")).append('\"')
+        sb.append(",\"webviewCrashState\":\"").append(webViewCrashState.replace("\"", "'")).append('\"')
         sb.append(",\"recentFailures\":[")
         val records = synchronized(failuresLock) { failures.toList() }
         records.forEachIndexed { fi, f ->
@@ -1369,7 +1614,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v109")
+                add("Server build: procomic-image/v110")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -1530,9 +1775,21 @@ class ProComicImageServer(
         private const val WEBVIEW_DEADLINE_MS = 20_000L
 
         /** v109 WebView tier: the <img> decode probe re-checks while the
-         * image is still pending — bounded retries, then decline. */
-        private const val WEBVIEW_PROBE_MAX_RETRIES = 40
+         * image is still pending — bounded retries, then decline. v110:
+         * the window matches the whole-decode deadline (90 x 200 ms) so a
+         * slow first decode is not declined early. */
+        private const val WEBVIEW_PROBE_MAX_RETRIES = 90
         private const val WEBVIEW_PROBE_RETRY_MS = 200L
+
+        /** v110 WebView tier: bounded queue wait for the shared-WebView
+         * permit. A starved caller declines to the next tier instead of
+         * pinning a server thread behind a long cover-grid queue. */
+        private const val WEBVIEW_QUEUE_WAIT_MS = 8_000L
+
+        /** v110 WebView tier: stale attempt markers tolerated before the
+         * tier is disabled permanently (bounds the Chromium crash loop —
+         * the same breaker the native tier has). */
+        private const val MAX_WEBVIEW_CRASHES = 2
 
         /** v109 WebView tier: the size probe — natural dimensions when the
          * image decoded, 'imgerr' when the WebView refused the format

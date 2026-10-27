@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 24
+    versionCode = 25
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -75,6 +75,26 @@ keiyoushi {
     // Java exceptions, bounded timeouts, or a sandboxed-renderer death that
     // leaves the app alive. Ladder: BitmapFactory (12+) -> libavif (loader)
     // -> WebView (24+) -> ImageDecoder (28+).
+    // v110 FIELD VERDICT on v109: the app STILL died on every image — the
+    // WebView tier had three structural crash vectors. (1) No concurrency
+    // gate: covers + pages + the preload window each built their OWN
+    // offscreen WebView (parallel Chromium boots, stacked renderer
+    // processes). (2) Full-size draws: the WebView measured at the image's
+    // natural size, so a 4000x6000 "originals" cover allocated a ~96 MB
+    // ARGB bitmap per decode — two concurrent (the transcode stage allows
+    // two) OOM-killed the host. (3) The probe-after-destroy race: destroy()
+    // posted at verdict/timeout while JS probe retries were still queued —
+    // evaluateJavascript on a destroyed WebView throws on the MAIN thread
+    // with nothing to catch it: process death. versionCode 25 = ONE shared
+    // offscreen WebView reused across decodes behind a process-wide permit
+    // (never destroyed between decodes), ?e=-bounded draws (covers render
+    // at <=1280 long edge, ~9 MB, never 96 MB), every callback
+    // identity-checked against the current decode job and Throwable-
+    // guarded, enableSlowWholeDocumentDraw for tall-page captures, and a
+    // webview.attempt/webview.crashes marker breaker (same pattern as the
+    // native tier) that disables the tier for a session after a process
+    // death inside it and permanently after two — the worst case is now
+    // two deaths per install, then legible error cards, never a loop.
 
     deeplink {
         host("procomic.net")
