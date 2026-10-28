@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 28
+    versionCode = 29
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -147,6 +147,26 @@ keiyoushi {
     // so the app survives, and the whole solve is timeout-bounded and
     // always torn down. Solver failure = v112 behavior (3 public pages
     // + a legible trail); solver success = the FULL chapter.
+    // v114 (versionCode 29) — FIELD VERDICT on v113: the mint never
+    // produced a token because the SITEKEY ROTATED. Live recon
+    // (2026-10-28): the reader fetches its widget key per session from
+    // GET /api/auth/public-settings — loginTurnstile.siteKey =
+    // 0x4AAAAAACwjiJ5Kt0K0kWx9, while v113's baked
+    // 0x4AAAAAACk1d7qWJi_of2qU is already dead; a dead sitekey fails
+    // turnstile.render outright and retry:auto cannot recover, so the
+    // solver timed out and the field kept seeing 3 pages. The gate
+    // config is now fetched LIVE for every gate run: the sitekey from
+    // public-settings AND the widget mode from the gate's own 403
+    // answer (turnstileMode — visible -> appearance:always +
+    // size:normal, hidden -> interaction-only + size:flexible, the
+    // reader chunk's exact per-mode config); the exchange carries the
+    // reader's x-turnstile-widget: "login"; and the solver WebView is
+    // measure()+layout()-ed with real pixels (Turnstile checks the
+    // widget container's box — a 0x0 never-laid-out view can stall the
+    // challenge forever, a second independent v113 failure mode). The
+    // crash contract is untouched: image-free page, blockNetworkImage
+    // before load, renderer-death consumed, bounded, always torn down.
+    // Solver failure still = 3 public pages + a legible trail.
 
     deeplink {
         host("procomic.net")

@@ -998,7 +998,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v113\"")
+        sb.append("\"server\":\"procomic-image/v114\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -1048,7 +1048,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v113")
+                add("Server build: procomic-image/v114")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)

@@ -6,6 +6,7 @@ import android.os.Handler
 import android.os.HandlerThread
 import android.os.Looper
 import android.util.Log
+import android.view.View
 import android.webkit.JavascriptInterface
 import android.webkit.RenderProcessGoneDetail
 import android.webkit.WebChromeClient
@@ -16,7 +17,7 @@ import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
- * v113 — the one credential the plain-HTTP chain cannot mint: a real
+ * v114 — the one credential the plain-HTTP chain cannot mint: a real
  * Cloudflare Turnstile token for the site's reader gate.
  *
  * Why this exists: since the site capped the SSR page embed at three
@@ -28,12 +29,22 @@ import java.util.concurrent.atomic.AtomicBoolean
  * site's own reader solves the widget in-page, invisibly for clean
  * clients, which is why the website "just loads" the rest on scroll.
  *
- * How it solves: a throwaway offscreen WebView loads a ~1 KB local page
- * whose ORIGIN is the site's apex (loadDataWithBaseURL), renders the
- * site's Turnstile widget and hands the minted token to this object
- * through a JS bridge. The widget runs `appearance: interaction-only` —
- * exactly what the site's reader passes — so for the clean, residential
- * clients the challenge resolves with no interaction at all.
+ * v114 field verdict on v113: the mint never produced a token because
+ * the SITEKEY had rotated. The reader does not bake the key — it fetches
+ * it per session from GET /api/auth/public-settings
+ * (`loginTurnstile.siteKey`, live 2026-10-28: 0x4AAAAAACwjiJ5Kt0K0kWx9,
+ * while v113's baked 0x4AAAAAACk1d7qWJi_of2qU was already dead). A dead
+ * sitekey makes turnstile.render fail immediately (invalid sitekey
+ * error, retry:auto cannot recover), so the solver timed out and the
+ * source shipped the 3 public pages. The sitekey now arrives as a
+ * parameter (fetched fresh per gate run by ProComic), and the widget
+ * config follows the server's OWN turnstileMode from the 403 answer:
+ * visible -> appearance:always + size:normal, hidden ->
+ * interaction-only + size:flexible — exactly what the reader chunk
+ * passes for each mode. The WebView is also measure()+layout()-ed with
+ * real pixels now: Turnstile checks the widget container's box, and a
+ * never-laid-out 0x0 view gives the challenge iframe nothing to render
+ * into (a second, independent reason v113's mint could stall).
  *
  * The crash-safety contract (the v104–v110 lesson, non-negotiable):
  *   - This WebView NEVER loads an image. Not one. blockNetworkImage is
@@ -54,8 +65,13 @@ internal object TurnstileSolver {
 
     private const val TAG = "ProComicTurnstile"
 
-    /** The site's reader gate sitekey (page chunk 19573, live 2026-10-28). */
-    const val SITE_KEY = "0x4AAAAAACk1d7qWJi_of2qU"
+    /** The reader-chunk sitekey, BAKED-IN FALLBACK ONLY (v114). The live
+     * value rotates and arrives per gate run via public-settings; this
+     * constant is the last-resort default when that fetch fails. */
+    const val DEFAULT_SITE_KEY = "0x4AAAAAACk1d7qWJi_of2qU"
+
+    /** Kept as an alias so older probes keep compiling. */
+    const val SITE_KEY = DEFAULT_SITE_KEY
 
     /** Origin the solver page runs on — Turnstile is domain-bound. */
     const val ORIGIN = "https://procomic.pro/"
@@ -78,8 +94,21 @@ internal object TurnstileSolver {
      * Mints one Turnstile token, or null. Never throws. Blocks up to
      * [TIMEOUT_SECONDS]. Returns (token, widgetId) — the widget id rides
      * along because the site's reader sends it as `x-turnstile-widget`.
+     *
+     * v114: [siteKey] is the LIVE key from /api/auth/public-settings
+     * (null -> the baked-in fallback), [mode] is the server's own
+     * turnstileMode from the gate's 403 answer ("visible" -> the
+     * reader's always/normal widget, anything else ->
+     * interaction-only/flexible).
      */
-    fun solve(context: Context): Pair<String, String>? {
+    fun solve(
+        context: Context,
+        siteKey: String? = null,
+        mode: String? = null,
+    ): Pair<String, String>? {
+        val key = siteKey?.takeIf { it.isNotBlank() } ?: DEFAULT_SITE_KEY
+        val appearance = if (mode == "visible") "always" else "interaction-only"
+        val size = if (mode == "visible") "normal" else "flexible"
         val now = elapsedMillis()
         val sinceLast = now - lastSolveAt
         if (sinceLast in 0 until SOLVE_SPACING_MS) {
@@ -184,7 +213,22 @@ internal object TurnstileSolver {
 
                     webView = build()
                     webViewHolder[0] = webView
-                    webView?.loadDataWithBaseURL(ORIGIN, pageHtml(), "text/html", "utf-8", null)
+                    // v114: the widget needs a real laid-out surface. The
+                    // view is never attached to a window (nothing is ever
+                    // user-visible), but Turnstile checks the container's
+                    // box before running its challenge — a 0x0 view can
+                    // stall the challenge forever. measure+layout with
+                    // real pixels gives the challenge iframe an actual
+                    // viewport.
+                    try {
+                        webView?.measure(
+                            View.MeasureSpec.makeMeasureSpec(320, View.MeasureSpec.EXACTLY),
+                            View.MeasureSpec.makeMeasureSpec(140, View.MeasureSpec.EXACTLY),
+                        )
+                        webView?.layout(0, 0, 320, 140)
+                    } catch (_: Throwable) {
+                    }
+                    webView?.loadDataWithBaseURL(ORIGIN, pageHtml(key, appearance, size), "text/html", "utf-8", null)
 
                     // The hard wall: whatever happens, the WebView dies.
                     handler.postDelayed(
@@ -253,8 +297,14 @@ internal object TurnstileSolver {
 
     /** The solver page: one empty div, the widget loader, nothing else.
      * No <img>, no stylesheet, no font, no tracking — the only remote
-     * fetch is Cloudflare's challenge JS. */
-    internal fun pageHtml(): String {
+     * fetch is Cloudflare's challenge JS. v114: the sitekey, appearance
+     * and size arrive as parameters (live sitekey + the server's
+     * turnstileMode — the reader's exact per-mode config). */
+    internal fun pageHtml(
+        siteKey: String = DEFAULT_SITE_KEY,
+        appearance: String = "interaction-only",
+        size: String = "flexible",
+    ): String {
         val js = """
             window.__pcRendered=false;
             function __pcRender(){
@@ -264,7 +314,8 @@ internal object TurnstileSolver {
               try{
                 window.__wid=turnstile.render('#ts',{
                   sitekey:'__SITEKEY__',
-                  appearance:'interaction-only',
+                  appearance:'__APPEARANCE__',
+                  size:'__SIZE__',
                   retry:'auto',
                   'retry-interval':2000,
                   callback:function(t){try{window.__BRIDGE__.onSolved(String(window.__wid||'0'),t);}catch(e){}},
@@ -276,7 +327,9 @@ internal object TurnstileSolver {
             setTimeout(function(){try{window.__BRIDGE__.onError('script-timeout');}catch(e){}},__TIMEOUT_MS__);
             __pcRender();
         """.trimIndent()
-            .replace("__SITEKEY__", SITE_KEY)
+            .replace("__SITEKEY__", siteKey)
+            .replace("__APPEARANCE__", appearance)
+            .replace("__SIZE__", size)
             .replace("__BRIDGE__", BRIDGE_NAME)
             .replace("__TIMEOUT_MS__", (TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS) - 2_000).toString())
         return """<!doctype html><html><head><meta charset="utf-8">""" +

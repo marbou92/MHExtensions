@@ -152,6 +152,23 @@ import kotlin.math.roundToInt
  *     via onRenderProcessGone, and the whole solve is bounded and
  *     always torn down. No AVIF byte can ever reach it — the decode
  *     path that killed v104–v110 does not exist in this build.
+ *   - pages v114 (field verdict on v113): the mint never produced a
+ *     token because the sitekey ROTATED. The reader never bakes the
+ *     key — it fetches it per session from GET /api/auth/public-settings
+ *     (`loginTurnstile.siteKey`; live 2026-10-28:
+ *     0x4AAAAAACwjiJ5Kt0K0kWx9, while v113's baked key was already
+ *     dead — a dead sitekey fails turnstile.render on the spot and
+ *     retry:auto cannot recover). The gate config is now fetched LIVE
+ *     per gate run: the sitekey plus the server's own turnstileMode
+ *     from the 403 answer drive the widget (visible ->
+ *     appearance:always + size:normal, hidden -> interaction-only +
+ *     size:flexible — the reader chunk's exact per-mode config), the
+ *     widget header becomes the reader's own "login" value, and the
+ *     solver lays the WebView out with real pixels so the challenge
+ *     iframe has a container box. Everything else is the v113 shape:
+ *     the same image-free page, the same renderer-death contract, the
+ *     same bounded teardown, and the same graceful fallback to the
+ *     public pages.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -1215,7 +1232,10 @@ abstract class ProComic :
      * endpoint answers `Turnstile token required`, one in-page solver
      * run mints the real widget token (TurnstileSolver — offscreen,
      * image-blocked, renderer-death-safe) and the exchange retries
-     * with the reader's exact headers. Any solver failure returns an
+     * with the reader's exact headers. v114: the sitekey and the
+     * widget mode are fetched LIVE (public-settings + the gate's own
+     * 403 answer) instead of baked constants — the rotation that
+     * silently killed the v113 mint. Any solver failure returns an
      * empty list plus a legible diag trail; the source ships the
      * public pages exactly as before. Never throws: every failure is
      * a row.
@@ -1266,7 +1286,16 @@ abstract class ProComic :
                         return emptyList<String>() to trail
                     }
                     turnstileAttempted = true
-                    val solved = runCatching { TurnstileSolver.solve(applicationContext) }
+                    // v114: the sitekey ROTATES — the live reader pulls it
+                    // per session from /api/auth/public-settings
+                    // (loginTurnstile.siteKey). A stale baked-in key fails
+                    // turnstile.render outright, which is exactly what
+                    // v113's mint died of. Fetched fresh for every gate run.
+                    val (siteKey, siteKeyNote) = fetchTurnstileGateConfig(referer)
+                    trail += siteKeyNote
+                    val solved = runCatching {
+                        TurnstileSolver.solve(applicationContext, siteKey, outcome.mode)
+                    }
                         .onFailure { trail += "turnstile solver crashed safely: ${it.javaClass.simpleName}" }
                         .getOrNull()
                     if (solved == null) {
@@ -1274,8 +1303,10 @@ abstract class ProComic :
                         return emptyList<String>() to trail
                     }
                     turnstileToken = solved.first
-                    turnstileWidget = solved.second
-                    trail += "turnstile token minted offscreen — retrying the deferred exchange"
+                    // Reader parity: the visible-mode widget is rendered
+                    // from the login sitekey, so the header is "login".
+                    turnstileWidget = "login"
+                    trail += "turnstile token minted offscreen (mode=${outcome.mode ?: "hidden"}) — retrying the deferred exchange"
                 }
 
                 DeferredOutcome.Kind.TOKEN_EXPIRED -> {
@@ -1322,6 +1353,9 @@ abstract class ProComic :
     private class DeferredOutcome(
         val kind: Kind,
         val note: String,
+        /** v114: the server's own turnstileMode from the gate's 403
+         * answer ("hidden"/"visible") — drives the solver's widget. */
+        val mode: String? = null,
     ) {
         enum class Kind { OK, TURNSTILE, TOKEN_EXPIRED, PASS_EXPIRED, UNREACHABLE }
     }
@@ -1373,6 +1407,7 @@ abstract class ProComic :
                                     DeferredOutcome.Kind.TURNSTILE,
                                     "the gate answers '${errorNote(bodyText)}' — minting the widget " +
                                         "token the site's own reader solves ($host)",
+                                    parseDeferredTurnstileMode(bodyText),
                                 )
 
                             response.code == 403 && bodyText.contains("invalid token", ignoreCase = true) ->
@@ -1413,6 +1448,52 @@ abstract class ProComic :
                 .filter { it.startsWith("https://") && isReaderImageUrl(it) }
                 .distinct()
         }.getOrDefault(emptyList())
+    }
+
+    /** The gate's 403 answer carries the server's own widget mode
+     * (`{"error":"turnstile_token_required","turnstileMode":"visible"}`)
+     * — "hidden" or "visible" are the two values the reader accepts.
+     * v114 feeds it to the solver (it picks the widget appearance). */
+    internal fun parseDeferredTurnstileMode(bodyText: String): String? = runCatching {
+        val mode = json.parseToJsonElement(bodyText)
+            .jsonObject["turnstileMode"]?.jsonPrimitive?.content?.trim()?.lowercase()
+        mode?.takeIf { it == "hidden" || it == "visible" }
+    }.getOrNull()
+
+    /** The live Turnstile gate config from GET /api/auth/public-settings:
+     * `{"loginTurnstile":{"enabled":true,"siteKey":"0x…"}}`. The reader
+     * renders its widget from THIS key (verified live 2026-10-28 — the
+     * challenge URL sitekey equals this field, and it differs from the
+     * key baked into older page chunks). Returns (siteKey|null, note).
+     * siteKey null means every apex failed — the solver falls back to
+     * its baked-in reader key. */
+    internal fun parseTurnstileSiteKey(bodyText: String): String? = runCatching {
+        val root = json.parseToJsonElement(bodyText).jsonObject
+        val login = root["loginTurnstile"] as? kotlinx.serialization.json.JsonObject
+            ?: return@runCatching null
+        (login["siteKey"] as? JsonPrimitive)?.content?.trim()?.takeIf { it.isNotEmpty() }
+    }.getOrDefault(null)
+
+    private fun fetchTurnstileGateConfig(referer: String): Pair<String?, String> {
+        for (apex in readerApexes) {
+            val host = apex.substringAfter("//")
+            try {
+                val request = GET("$apex/api/auth/public-settings", headers).newBuilder()
+                    .header("Accept", "application/json")
+                    .header("Referer", referer)
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) return@use
+                    val key = parseTurnstileSiteKey(response.body?.string().orEmpty())
+                    if (key != null) {
+                        return key to "turnstile sitekey fetched live from $host (loginTurnstile.siteKey, ${key.take(14)}…)"
+                    }
+                }
+            } catch (_: IOException) {
+            } catch (_: Throwable) {
+            }
+        }
+        return null to "no public-settings sitekey answered — the solver falls back to the baked-in reader key"
     }
 
     /** A legible one-line summary of an error body for the diag trail. */
