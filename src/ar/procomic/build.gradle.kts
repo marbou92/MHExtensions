@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 27
+    versionCode = 28
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -131,6 +131,22 @@ keiyoushi {
     // ships the public pages unchanged; if the site ever relaxes the
     // gate, the full chapter appears with no update. No WebView, no
     // decoder changes — the v111 no-crash guarantee is untouched.
+    // v113 (versionCode 28): the gate does not relax, so the source
+    // mints the missing credential itself. A throwaway offscreen
+    // WebView (TurnstileSolver) loads a ~1 KB page whose ORIGIN is the
+    // site apex and runs the site's EXACT widget config (sitekey
+    // 0x4AAAAAACk1d7qWJi_of2qU, appearance interaction-only, retry
+    // auto — lifted from the live reader chunk), hands the minted token
+    // back over a JS bridge, and is destroyed; the deferred exchange
+    // then retries with the reader's exact shape (x-turnstile-token +
+    // x-turnstile-widget + split). Crash safety = the v111 contract
+    // extended: blockNetworkImage is set BEFORE anything loads, the
+    // page contains no image/stylesheet/font resource at all (the only
+    // remote fetch is Cloudflare's challenge JS — no decode surface can
+    // exist), onRenderProcessGone consumes a sandboxed-renderer death
+    // so the app survives, and the whole solve is timeout-bounded and
+    // always torn down. Solver failure = v112 behavior (3 public pages
+    // + a legible trail); solver success = the FULL chapter.
 
     deeplink {
         host("procomic.net")

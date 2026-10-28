@@ -138,6 +138,20 @@ import kotlin.math.roundToInt
  *     x-chapter-pass header, with the refresh / image-pass renewals);
  *     while the gate holds, the public pages ship unchanged, and if the
  *     site ever relaxes it the full chapter appears with no update.
+ *   - pages v113: the gate does not relax, so the source mints the
+ *     missing credential itself — a throwaway offscreen WebView runs
+ *     the site's exact Turnstile widget (same sitekey, same
+ *     interaction-only appearance) on the site's own origin and hands
+ *     the token to the deferred exchange (x-turnstile-token +
+ *     x-turnstile-widget + the split param, all matching the reader's
+ *     chunk). Crash safety is the v111 contract extended, not
+ *     weakened: that WebView loads ONE page with blockNetworkImage set
+ *     before anything loads, the page's only remote fetch is
+ *     Cloudflare's challenge JS (no image, stylesheet or font
+ *     resource exists on it), a sandboxed-renderer death is consumed
+ *     via onRenderProcessGone, and the whole solve is bounded and
+ *     always torn down. No AVIF byte can ever reach it — the decode
+ *     path that killed v104–v110 does not exist in this build.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -1195,15 +1209,16 @@ abstract class ProComic :
 
     /**
      * The site's own reader flow for the pages beyond the public embed:
-     * GET /chapter-deferred-media/{id}?token={deferredMedia JWT} with the
-     * x-chapter-pass header, renewing either credential through its open
-     * POST endpoint when the answer names it expired. While the site
-     * enforces its Cloudflare Turnstile gate — the state verified live on
-     * 2026-10-28 — the answer is `Turnstile token required` and this
-     * returns an empty list plus a legible diag trail; the source ships
-     * the public pages exactly as before. If the site ever relaxes the
-     * gate, the same code returns the remaining pages with no update.
-     * Never throws: every failure is a row.
+     * GET /chapter-deferred-media/{id}?token={deferredMedia JWT}&split=N
+     * with the x-chapter-pass header, renewing either credential through
+     * its open POST endpoint when the answer names it expired. When the
+     * endpoint answers `Turnstile token required`, one in-page solver
+     * run mints the real widget token (TurnstileSolver — offscreen,
+     * image-blocked, renderer-death-safe) and the exchange retries
+     * with the reader's exact headers. Any solver failure returns an
+     * empty list plus a legible diag trail; the source ships the
+     * public pages exactly as before. Never throws: every failure is
+     * a row.
      */
     private suspend fun fetchDeferredPages(
         chapterId: Int,
@@ -1223,8 +1238,21 @@ abstract class ProComic :
         var pass = imagePass
         var tokenRetried = false
         var passRetried = false
+        // v113: one offscreen mint per exchange; the token is single-use
+        // and short-lived, so there is nothing worth caching here.
+        var turnstileToken: String? = null
+        var turnstileWidget: String? = null
+        var turnstileAttempted = false
         repeat(4) {
-            val (images, outcome) = deferredAttempt(chapterId, token, pass, referer)
+            val (images, outcome) = deferredAttempt(
+                chapterId = chapterId,
+                token = token,
+                pass = pass,
+                referer = referer,
+                split = deferred.splitIndex,
+                turnstileToken = turnstileToken,
+                turnstileWidget = turnstileWidget,
+            )
             when (outcome.kind) {
                 DeferredOutcome.Kind.OK -> {
                     trail += outcome.note
@@ -1233,7 +1261,21 @@ abstract class ProComic :
 
                 DeferredOutcome.Kind.TURNSTILE -> {
                     trail += outcome.note
-                    return emptyList<String>() to trail
+                    if (turnstileAttempted) {
+                        trail += "a minted turnstile token did not clear the gate — keeping the public pages"
+                        return emptyList<String>() to trail
+                    }
+                    turnstileAttempted = true
+                    val solved = runCatching { TurnstileSolver.solve(applicationContext) }
+                        .onFailure { trail += "turnstile solver crashed safely: ${it.javaClass.simpleName}" }
+                        .getOrNull()
+                    if (solved == null) {
+                        trail += "turnstile solver returned no token — keeping the public pages"
+                        return emptyList<String>() to trail
+                    }
+                    turnstileToken = solved.first
+                    turnstileWidget = solved.second
+                    trail += "turnstile token minted offscreen — retrying the deferred exchange"
                 }
 
                 DeferredOutcome.Kind.TOKEN_EXPIRED -> {
@@ -1284,12 +1326,18 @@ abstract class ProComic :
         enum class Kind { OK, TURNSTILE, TOKEN_EXPIRED, PASS_EXPIRED, UNREACHABLE }
     }
 
-    /** One GET across the reader apexes; verdicts, never exceptions. */
+    /** One GET across the reader apexes; verdicts, never exceptions.
+     * v113 carries the reader's exact shape: the split query param plus
+     * the x-turnstile-token / x-turnstile-widget headers once a real
+     * widget token exists. */
     private fun deferredAttempt(
         chapterId: Int,
         token: String,
         pass: String?,
         referer: String,
+        split: Int?,
+        turnstileToken: String?,
+        turnstileWidget: String?,
     ): Pair<List<String>, DeferredOutcome> {
         var lastNote = "no apex answered"
         for (apex in readerApexes) {
@@ -1299,12 +1347,17 @@ abstract class ProComic :
                     .toHttpUrl()
                     .newBuilder()
                     .addQueryParameter("token", token)
+                    .apply { split?.let { addQueryParameter("split", it.toString()) } }
                     .build()
                     .toString()
                 val request = GET(url, headers).newBuilder()
                     .header("Accept", "application/json")
                     .header("Referer", referer)
-                    .apply { pass?.let { header("x-chapter-pass", it) } }
+                    .apply {
+                        pass?.let { header("x-chapter-pass", it) }
+                        turnstileToken?.let { header("x-turnstile-token", it) }
+                        turnstileWidget?.let { header("x-turnstile-widget", it) }
+                    }
                     .build()
                 client.newCall(request).execute().use { response ->
                     val bodyText = response.body?.string().orEmpty()
@@ -1318,9 +1371,8 @@ abstract class ProComic :
                             response.code == 403 && bodyText.contains("Turnstile", ignoreCase = true) ->
                                 return emptyList<String>() to DeferredOutcome(
                                     DeferredOutcome.Kind.TURNSTILE,
-                                    "the site answers 'Turnstile token required' — its browser reader " +
-                                        "solves Cloudflare Turnstile in-page; until that gate changes the " +
-                                        "source ships the public pages ($host)",
+                                    "the gate answers '${errorNote(bodyText)}' — minting the widget " +
+                                        "token the site's own reader solves ($host)",
                                 )
 
                             response.code == 403 && bodyText.contains("invalid token", ignoreCase = true) ->
