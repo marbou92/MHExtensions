@@ -33,8 +33,10 @@ import kotlinx.serialization.json.jsonPrimitive
 import okhttp3.HttpUrl
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
+import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.OkHttpClient
 import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
 import okhttp3.Response
 import java.io.IOException
 import java.text.SimpleDateFormat
@@ -124,6 +126,18 @@ import kotlin.math.roundToInt
  *     timeouts, or a sandboxed-renderer death that leaves the app alive.
  *     Ladder: BitmapFactory (12+) -> libavif (loader) -> WebView (24+)
  *     -> ImageDecoder (28+).
+ *   - pages/covers v111 (supersedes that ladder): the WebView tier died
+ *     in the field too, so the device runs NO AVIF decoder anymore — the
+ *     loopback server re-fetches every image through the weserv proxy as
+ *     plain JPEG (see ProtectedPageServer for the full story).
+ *   - pages v112: the site capped the SSR page embed at the first
+ *     `publicImageCount` pages (observed live: 3) and moved the rest
+ *     behind Cloudflare Turnstile — its own browser reader solves the
+ *     challenge in-page. The source now replays the site's own
+ *     deferred-media credential chain (deferredMedia JWT + the
+ *     x-chapter-pass header, with the refresh / image-pass renewals);
+ *     while the gate holds, the public pages ship unchanged, and if the
+ *     site ever relaxes it the full chapter appears with no update.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -974,7 +988,11 @@ abstract class ProComic :
         // serves to non-browser clients since the .net migration. Either
         // apex may carry the chapter: the payload comes from whichever
         // deployment hosts this series (the other 308s to the series page).
-        val upstreams = fetchFlightAcrossApexes(
+        // v112: the flight now also carries `deferredMedia` (a JWT for the
+        // pages beyond the public embed) and a pages-scope `imagePass` —
+        // the exact credentials the site's own reader exchanges for the
+        // remaining pages. Both are parsed here and consumed below.
+        val payload = fetchFlightAcrossApexes(
             path = readerPath,
             emptyPayloadError =
             "ProComic: no pages found \u2014 the chapter is locked or unavailable on the site " +
@@ -989,10 +1007,39 @@ abstract class ProComic :
                 // plain clients, the signature rides in the file name); the
                 // raw CDN URL is the fallback (the proxy's session retry is
                 // its last chance, the edge 403s bare TLS on those hosts).
-                List(maxOf(images.size, appImages.size)) { index ->
-                    appImages.getOrNull(index) ?: images[index]
-                }
+                PagesPayload(
+                    upstreams = List(maxOf(images.size, appImages.size)) { index ->
+                        appImages.getOrNull(index) ?: images[index]
+                    },
+                    deferred = parseDeferredMedia(flight),
+                    imagePass = parseImagePass(flight),
+                    publicCount = parsePublicImageCount(flight),
+                )
             }
+        }
+
+        var upstreams = payload.upstreams
+        val deferred = payload.deferred
+        if (deferred?.token != null && upstreams.isNotEmpty()) {
+            // The full-list exchange. While the site's turnstile gate holds
+            // this yields an empty list + a legible diag trail (logged) and
+            // the source ships the public pages exactly as before.
+            val (extra, trail) = fetchDeferredPages(
+                chapterId = ref.chapterId,
+                deferred = deferred,
+                imagePass = payload.imagePass,
+                referer = chapterPageUrl(ref),
+            )
+            if (extra.isNotEmpty()) {
+                val seen = upstreams.toHashSet()
+                upstreams = upstreams + extra.filter { it !in seen }
+                Log.i(TAG, "deferred: +${extra.size} pages (total ${upstreams.size})")
+            } else {
+                trail.forEach { Log.i(TAG, "deferred: $it") }
+            }
+        }
+        payload.publicCount?.takeIf { it > upstreams.size }?.let { cap ->
+            Log.i(TAG, "public embed capped at $cap pages by the site")
         }
 
         val pages = upstreams.mapIndexed { index, upstream ->
@@ -1098,6 +1145,283 @@ abstract class ProComic :
             }
         }.getOrDefault(emptyList())
     }
+
+    // ====================== Deferred pages (v112) =========================
+
+    /** Everything getPageList extracts from one reader flight. */
+    private class PagesPayload(
+        val upstreams: List<String>,
+        val deferred: DeferredMediaDto?,
+        val imagePass: String?,
+        val publicCount: Int?,
+    )
+
+    /** The flight's `"deferredMedia":{...}` object, when the chapter ships
+     * one (unlocked chapters above the public-image cap). */
+    internal fun parseDeferredMedia(flight: String): DeferredMediaDto? {
+        val key = "\"deferredMedia\":"
+        val index = flight.indexOf(key)
+        if (index < 0) return null
+        var start = index + key.length
+        while (start < flight.length && flight[start].isWhitespace()) start++
+        if (start >= flight.length || flight[start] != '{') return null
+        val objJson = RscFlight.balancedObject(flight, start) ?: return null
+        return runCatching { json.decodeFromString(DeferredMediaDto.serializer(), objJson) }.getOrNull()
+    }
+
+    /** The flight's `"imagePass":"p1.…"` JWT — the pages-scope credential
+     * the reader attaches as `x-chapter-pass` on protected media fetches. */
+    internal fun parseImagePass(flight: String): String? {
+        val key = "\"imagePass\":\""
+        val index = flight.indexOf(key)
+        if (index < 0) return null
+        val end = flight.indexOf('"', index + key.length)
+        if (end < 0) return null
+        return flight.substring(index + key.length, end).takeIf { it.startsWith("p1.") }
+    }
+
+    /** The flight's `"publicImageCount":N` — how many pages the site
+     * considers public (the SSR embed cap; observed live: 3). */
+    internal fun parsePublicImageCount(flight: String): Int? {
+        val key = "\"publicImageCount\":"
+        val index = flight.indexOf(key)
+        if (index < 0) return null
+        var start = index + key.length
+        var end = start
+        while (end < flight.length && flight[end].isDigit()) end++
+        if (end == start) return null
+        return flight.substring(start, end).toIntOrNull()
+    }
+
+    /**
+     * The site's own reader flow for the pages beyond the public embed:
+     * GET /chapter-deferred-media/{id}?token={deferredMedia JWT} with the
+     * x-chapter-pass header, renewing either credential through its open
+     * POST endpoint when the answer names it expired. While the site
+     * enforces its Cloudflare Turnstile gate — the state verified live on
+     * 2026-10-28 — the answer is `Turnstile token required` and this
+     * returns an empty list plus a legible diag trail; the source ships
+     * the public pages exactly as before. If the site ever relaxes the
+     * gate, the same code returns the remaining pages with no update.
+     * Never throws: every failure is a row.
+     */
+    private suspend fun fetchDeferredPages(
+        chapterId: Int,
+        deferred: DeferredMediaDto,
+        imagePass: String?,
+        referer: String,
+    ): Pair<List<String>, List<String>> {
+        val trail = mutableListOf<String>()
+        val initialToken = deferred.token
+        if (initialToken.isNullOrBlank()) {
+            trail += "deferredMedia present without a token"
+            return emptyList<String>() to trail
+        }
+        trail += "deferredMedia split=${deferred.splitIndex} turnstile=${deferred.requireTurnstile}"
+
+        var token: String = initialToken
+        var pass = imagePass
+        var tokenRetried = false
+        var passRetried = false
+        repeat(4) {
+            val (images, outcome) = deferredAttempt(chapterId, token, pass, referer)
+            when (outcome.kind) {
+                DeferredOutcome.Kind.OK -> {
+                    trail += outcome.note
+                    return images to trail
+                }
+
+                DeferredOutcome.Kind.TURNSTILE -> {
+                    trail += outcome.note
+                    return emptyList<String>() to trail
+                }
+
+                DeferredOutcome.Kind.TOKEN_EXPIRED -> {
+                    if (tokenRetried) {
+                        trail += outcome.note
+                        return emptyList<String>() to trail
+                    }
+                    tokenRetried = true
+                    val renewed = renewDeferredToken(chapterId, token, referer)
+                    if (renewed == null) {
+                        trail += "refresh POST failed — keeping the public pages"
+                        return emptyList<String>() to trail
+                    }
+                    trail += "refresh POST minted a new deferred token"
+                    token = renewed
+                }
+
+                DeferredOutcome.Kind.PASS_EXPIRED -> {
+                    if (passRetried) {
+                        trail += outcome.note
+                        return emptyList<String>() to trail
+                    }
+                    passRetried = true
+                    val renewed = pass?.let { renewImagePass(chapterId, it, referer) }
+                    if (renewed == null) {
+                        trail += "image-pass POST failed — retrying without the header"
+                        pass = null
+                    } else {
+                        trail += "image-pass POST minted a new pass"
+                        pass = renewed
+                    }
+                }
+
+                DeferredOutcome.Kind.UNREACHABLE -> {
+                    trail += outcome.note
+                    return emptyList<String>() to trail
+                }
+            }
+        }
+        trail += "deferred retries exhausted — keeping the public pages"
+        return emptyList<String>() to trail
+    }
+
+    private class DeferredOutcome(
+        val kind: Kind,
+        val note: String,
+    ) {
+        enum class Kind { OK, TURNSTILE, TOKEN_EXPIRED, PASS_EXPIRED, UNREACHABLE }
+    }
+
+    /** One GET across the reader apexes; verdicts, never exceptions. */
+    private fun deferredAttempt(
+        chapterId: Int,
+        token: String,
+        pass: String?,
+        referer: String,
+    ): Pair<List<String>, DeferredOutcome> {
+        var lastNote = "no apex answered"
+        for (apex in readerApexes) {
+            val host = apex.substringAfter("//")
+            try {
+                val url = "$apex/chapter-deferred-media/$chapterId"
+                    .toHttpUrl()
+                    .newBuilder()
+                    .addQueryParameter("token", token)
+                    .build()
+                    .toString()
+                val request = GET(url, headers).newBuilder()
+                    .header("Accept", "application/json")
+                    .header("Referer", referer)
+                    .apply { pass?.let { header("x-chapter-pass", it) } }
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    val bodyText = response.body?.string().orEmpty()
+                    if (!response.isSuccessful) {
+                        lastNote = "HTTP ${response.code} from $host: ${errorNote(bodyText)}"
+                        when {
+                            response.code == 403 && bodyText.contains("chapter_pass_expired", ignoreCase = true) ->
+                                return emptyList<String>() to
+                                    DeferredOutcome(DeferredOutcome.Kind.PASS_EXPIRED, lastNote)
+
+                            response.code == 403 && bodyText.contains("Turnstile", ignoreCase = true) ->
+                                return emptyList<String>() to DeferredOutcome(
+                                    DeferredOutcome.Kind.TURNSTILE,
+                                    "the site answers 'Turnstile token required' — its browser reader " +
+                                        "solves Cloudflare Turnstile in-page; until that gate changes the " +
+                                        "source ships the public pages ($host)",
+                                )
+
+                            response.code == 403 && bodyText.contains("invalid token", ignoreCase = true) ->
+                                return emptyList<String>() to
+                                    DeferredOutcome(DeferredOutcome.Kind.TOKEN_EXPIRED, lastNote)
+                        }
+                        return@use
+                    }
+                    val images = parseDeferredImages(bodyText)
+                    if (images.isEmpty()) {
+                        lastNote = "HTTP 200 from $host without a usable images[] payload"
+                        return@use
+                    }
+                    return images to DeferredOutcome(
+                        DeferredOutcome.Kind.OK,
+                        "deferred media answered ${images.size} additional pages via $host",
+                    )
+                }
+            } catch (e: IOException) {
+                lastNote = "$host: ${e.message ?: "connection failed"}"
+            } catch (t: Throwable) {
+                lastNote = "$host: ${t.javaClass.simpleName}"
+            }
+        }
+        return emptyList<String>() to DeferredOutcome(DeferredOutcome.Kind.UNREACHABLE, lastNote)
+    }
+
+    /** `{data:{images:[…]}}` (or the same shape top-level) — the reader
+     * appends these after the public pages. Strict about what may ride
+     * further: absolute https URLs on the site's own image hosts. */
+    internal fun parseDeferredImages(bodyText: String): List<String> {
+        if (bodyText.isBlank()) return emptyList()
+        return runCatching {
+            val root = json.parseToJsonElement(bodyText).jsonObject
+            val data = (root["data"] as? kotlinx.serialization.json.JsonObject) ?: root
+            val array = data["images"] as? JsonArray ?: return@runCatching emptyList()
+            array.mapNotNull { (it as? JsonPrimitive)?.content?.trim() }
+                .filter { it.startsWith("https://") && isReaderImageUrl(it) }
+                .distinct()
+        }.getOrDefault(emptyList())
+    }
+
+    /** A legible one-line summary of an error body for the diag trail. */
+    private fun errorNote(bodyText: String): String {
+        val json = runCatching {
+            json.parseToJsonElement(bodyText).jsonObject["error"]?.jsonPrimitive?.content
+        }.getOrNull()
+        if (!json.isNullOrBlank()) return json
+        val compact = bodyText.replace('\n', ' ').trim()
+        return if (compact.length > 80) compact.take(77) + "…" else compact.ifEmpty { "(empty body)" }
+    }
+
+    /** POST /chapter-deferred-media/{id}/refresh — the renewal endpoint
+     * the site's reader uses when the deferred JWT expires mid-read
+     * (verified live: 200 {token} with just the session cookies). */
+    private fun renewDeferredToken(chapterId: Int, token: String, referer: String): String? {
+        for (apex in readerApexes) {
+            val answer = postJson(
+                url = "$apex/chapter-deferred-media/$chapterId/refresh",
+                jsonBody = """{"token":"$token"}""",
+                referer = referer,
+            ) ?: continue
+            if (answer.first != 200) continue
+            val renewed = runCatching {
+                json.parseToJsonElement(answer.second).jsonObject["token"]?.jsonPrimitive?.content
+            }.getOrNull()
+            if (!renewed.isNullOrBlank()) return renewed
+        }
+        return null
+    }
+
+    /** POST /chapter-deferred-media/{id}/image-pass — renews the
+     * x-chapter-pass credential the same way. */
+    private fun renewImagePass(chapterId: Int, pass: String, referer: String): String? {
+        for (apex in readerApexes) {
+            val answer = postJson(
+                url = "$apex/chapter-deferred-media/$chapterId/image-pass",
+                jsonBody = """{"pass":"$pass"}""",
+                referer = referer,
+            ) ?: continue
+            if (answer.first != 200) continue
+            val renewed = runCatching {
+                json.parseToJsonElement(answer.second).jsonObject["pass"]?.jsonPrimitive?.content
+            }.getOrNull()
+            if (!renewed.isNullOrBlank()) return renewed
+        }
+        return null
+    }
+
+    /** One JSON POST across the apexes; (code, body) or null. */
+    private fun postJson(url: String, jsonBody: String, referer: String): Pair<Int, String>? = runCatching {
+        val request = Request.Builder()
+            .url(url)
+            .post(jsonBody.toRequestBody("application/json".toMediaType()))
+            .header("Accept", "application/json")
+            .header("Referer", referer)
+            .build()
+        client.newCall(request).execute().use { response ->
+            response.code to response.body?.string().orEmpty()
+        }
+    }.getOrNull()
 
     // ========================= Preference screen =========================
 

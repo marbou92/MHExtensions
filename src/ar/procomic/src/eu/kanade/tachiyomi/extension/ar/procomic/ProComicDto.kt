@@ -35,11 +35,13 @@ class SeriesMetaDto(
     companion object {
         private fun textOrJoined(element: JsonElement?): String? = when (element) {
             is JsonPrimitive -> element.content.takeIf { it.isNotBlank() && it != "null" }
+
             is JsonArray ->
                 element
                     .mapNotNull { (it as? JsonPrimitive)?.content?.takeIf(String::isNotBlank) }
                     .joinToString(", ")
                     .takeIf { it.isNotBlank() }
+
             else -> null
         }
     }
@@ -141,6 +143,22 @@ class TocChapterDto(
 class ReaderImageDto(
     val mobile: String? = null,
     val desktop: String? = null,
+)
+
+/**
+ * The flight's `deferredMedia` object (v112). When the site caps the SSR
+ * embed at the first `publicImageCount` pages (observed live: 3), its own
+ * reader fetches the rest through `/chapter-deferred-media/{id}?token=…`
+ * with this short-lived JWT (a `chapter_deferred_media` claim set carrying
+ * the chapter id, the split size and a 15-minute expiry).
+ */
+@Serializable
+class DeferredMediaDto(
+    val token: String? = null,
+    val splitIndex: Int? = null,
+    val triggerAfterImageIndex: Int? = null,
+    val requireTurnstile: Boolean? = null,
+    val turnstileMode: String? = null,
 )
 
 // ============================== Chapters API ============================

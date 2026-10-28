@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 26
+    versionCode = 27
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -116,6 +116,21 @@ keiyoushi {
     // native libs) is REMOVED — the APK drops from ~1.7 MB to ~0.1 MB.
     // Debug-only MediaCodec hook retained for the harness pins; the
     // production ladder never reaches it.
+    // v112 (versionCode 27): the site capped the SSR page embed at the
+    // first `publicImageCount` pages (observed live: 3) and moved the
+    // rest behind Cloudflare Turnstile — its browser reader solves the
+    // challenge in-page, so the field sees "only the first three pages
+    // of a chapter". The source now replays the site's own deferred-
+    // media credential chain: parse the flight's deferredMedia JWT +
+    // pages-scope imagePass, GET /chapter-deferred-media/{id}?token=…
+    // with x-chapter-pass, renew either credential via the open POST
+    // refresh / image-pass endpoints when the answer names them
+    // expired, and merge the returned images[] after the public
+    // pages. Verified live: with the gate enforced the answer is
+    // `Turnstile token required` — the source logs a legible trail and
+    // ships the public pages unchanged; if the site ever relaxes the
+    // gate, the full chapter appears with no update. No WebView, no
+    // decoder changes — the v111 no-crash guarantee is untouched.
 
     deeplink {
         host("procomic.net")
