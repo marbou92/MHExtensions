@@ -450,11 +450,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.26",
-      "versionCode": 26,
+      "version": "1.6.27",
+      "versionCode": 27,
       "baseUrl": "https://procomic.net",
-      "apk": "tachiyomi-ar.procomic-v1.6.26-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.26-release.apk",
+      "apk": "tachiyomi-ar.procomic-v1.6.27-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.27-release.apk",
       "icon": "../icons/procomic.png",
       "note": "",
       "description": ""
