@@ -154,58 +154,17 @@ abstract class ProComic :
             // session the reader page established — cookies, CF clearance,
             // the forced browser UA.
             sessionClient = client,
-            // v104: our APK path + a cache dir let the server pull its bundled
-            // libavif_android.so out of OUR OWN installed APK and System.load
-            // it explicitly — extension classloaders don't expose native lib
-            // paths, which is why Android 10/11 devices (no platform AVIF
-            // codec) saw every page fail to decode.
-            // v107 ROOT-CAUSE FIX: keiyoushi.utils.applicationContext is the
-            // HOST APP's Application (Injekt.get<Application>() — a
-            // Tachiyomi-hosted extension has no Context of its own), so
-            // applicationInfo resolved to the HOST APK, which never carries
-            // our .so. The loader scanned the wrong zip on every device and
-            // the native tier stayed dead for good (the field report: "avif
-            // native: unavailable (no libavif_android.so entry)").
-            // Extensions ARE installed packages — the package manager
-            // resolves OUR apk (an app's own package needs no visibility
-            // grant). The server additionally derives candidates from its
-            // own classloader and verifies the .so entry in every zip
-            // before loading, so a wrong candidate can only cost one
-            // wasted scan, never a silent miss.
-            apkSourceDir = ownInstalledApkPath(),
+            // v111: a writable cache dir for the crash-loop breaker's
+            // best-effort marker files. The decode ladder no longer needs
+            // an APK path (the bundled .so is gone) or a context (the
+            // WebView tier is gone) — the AVIF transcode happens SERVER-
+            // SIDE through the weserv image proxy, so on Android 10/11
+            // NO AVIF decoder ever runs in this process. Every tier that
+            // could kill the host app (libavif JNI, MediaCodec, the
+            // offscreen WebView) is removed; the worst case is the
+            // legible error card, never a crash.
             nativeCacheDir = applicationContext.cacheDir,
-            // v109: the WebView decode tier — the host application context
-            // so the server can build an offscreen WebView on the main
-            // looper and let Chromium (AVIF-capable since Chrome 85, and
-            // Play auto-updates the WebView package even on Android 10)
-            // decode the pages process-safely. v108's MediaCodec tier died
-            // in the field: configuring Android 10's brand-new c2.av1
-            // software codec at a still image's full size is a native-crash
-            // surface no Java guard can catch — the host app itself
-            // crashed on every page/cover load. The WebView tier cannot
-            // do that: its failures are caught Java exceptions, bounded
-            // timeouts, or a sandboxed-renderer death that leaves the app
-            // alive.
-            webViewContext = applicationContext,
         )
-    }
-
-    /**
-     * THIS extension's installed APK path (v107). The extension's own
-     * package is the Kotlin package the generated manifest is built from
-     * (verified: the aapt package id matches exactly). The package manager
-     * resolves it without any visibility grant — an application always sees
-     * its own package. Returns the host application path as a last resort:
-     * the server entry-verifies every candidate, so a wrong last resort
-     * wastes one zip scan instead of loading nothing.
-     */
-    private fun ownInstalledApkPath(): String? {
-        val ownPackage = ProComic::class.java.name.substringBeforeLast('.')
-        val manager = runCatching { applicationContext.packageManager }.getOrNull()
-        val resolved = manager?.let {
-            runCatching { it.getApplicationInfo(ownPackage, 0).sourceDir }.getOrNull()
-        }
-        return resolved ?: runCatching { applicationContext.applicationInfo.sourceDir }.getOrNull()
     }
 
     override fun OkHttpClient.Builder.configureClient() = apply {
@@ -539,12 +498,14 @@ abstract class ProComic :
                 // /ar/chapter/{seriesSlug}-{number}-{id}
                 resolveSeriesUrlFromChapterPage(segments[2]) ?: return null
             }
+
             segments.size >= 3 && segments[1] == "series" -> {
                 // /ar/series/{seriesSlug}-{id} — the canonical series path
                 // since the .net migration (the bare /ar/{slug}-{id} only
                 // 308s there now).
                 segments[2]
             }
+
             else -> segments[1]
         }
 
@@ -1080,12 +1041,14 @@ abstract class ProComic :
                         // Flat page list (the current .net shape): strings.
                         is JsonPrimitive ->
                             if (isReaderImageUrl(element.content)) urls.add(element.content)
+
                         // Legacy nested per-page shape: an array of piece
                         // URLs per page — flatten, order preserved.
                         is JsonArray -> element.forEach { inner ->
                             val imageUrl = (inner as? JsonPrimitive)?.content ?: return@forEach
                             if (isReaderImageUrl(imageUrl)) urls.add(imageUrl)
                         }
+
                         else -> Unit
                     }
                 }

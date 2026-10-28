@@ -73,9 +73,14 @@ internal class ProxyDiag {
  * 2. The page files are AVIF (tall long-strip pages, up to 8000px). The
  *    platform AVIF codec only exists on Android 12+ and some OEM builds
  *    lack it even after that, so a raw pass-through would fail to decode
- *    on exactly the devices this source serves. The bundled software
- *    decoder (libavif/dav1d, ARM ABIs) plus ImageDecoder carry the
- *    transcode instead, and every host app gets a plain JPEG.
+ *    on exactly the devices this source serves. v111 (the new way): the
+ *    AVIF is re-fetched through the weserv image proxy (`output=jpg`) so
+ *    the TRANSCODE HAPPENS SERVER-SIDE and this process only ever decodes
+ *    plain JPEG/PNG/WebP with BitmapFactory — on Android 10/11 NO AVIF
+ *    decoder runs on the device at all. Every decoder that ever killed
+ *    the host app (bundled libavif JNI, framework MediaCodec, the
+ *    offscreen WebView) is GONE from the ladder; the worst case is now a
+ *    legible error card, never a crash.
  *
  * Why a loopback server instead of a client interceptor: host apps differ in
  * how they execute image requests. Several Mihon-compatible readers (Kotatsu's
@@ -101,22 +106,18 @@ class ProComicImageServer(
      */
     private val sessionClient: OkHttpClient? = null,
     /**
-     * Our own installed APK path (v107: resolved via the package manager
-     * from OUR package — the host application context would hand back the
-     * host app's apk, which is the wrong zip) + a writable cache dir — the
-     * raw material for the explicit native-lib loader (it extracts
-     * libavif_android.so from the APK and System.load-s it). Both optional
-     * so the JVM harness can drive the server without an Android context.
+     * A writable cache dir — the crash-loop breaker's marker files for the
+     * DEBUG-ONLY MediaCodec hook live here. The production ladder never
+     * runs native code (v111), so tracking is best-effort and optional so
+     * the JVM harness can drive the server without one.
      */
-    private val apkSourceDir: String? = null,
     private val nativeCacheDir: java.io.File? = null,
     /**
-     * The host application context (v109) — the WebView decode tier needs a
-     * context to build an offscreen WebView on the app's main looper. Optional
-     * so the JVM harness can drive the server without one (the tier then
-     * declines deterministically with a diag row, never throwing).
+     * v111: the server-side transcode hosts, tried in order. Overridable
+     * so the JVM harness can pin the both-hosts-fail path deterministically
+     * without touching the network defaults.
      */
-    private val webViewContext: android.content.Context? = null,
+    private val proxyHosts: List<String> = DEFAULT_PROXY_HOSTS,
 ) {
 
     private class Machine(val socket: ServerSocket)
@@ -364,7 +365,7 @@ class ProComicImageServer(
             val (contentType, raw) = fetchUpstreamWithRetry(imageUrl, diag)
             stage = "decode"
             val bytes = if (isAvif(contentType, raw)) {
-                transcodeUnderPermit(raw, diag, maxEdge)
+                transcodeUnderPermit(raw, imageUrl, diag, maxEdge)
             } else {
                 // JPEG/PNG/WebP pass through untouched — no decode cost.
                 raw
@@ -377,8 +378,10 @@ class ProComicImageServer(
         } catch (t: Throwable) {
             val message = when (t) {
                 is IOException -> t.message ?: "image preparation failed (IOException)"
+
                 is OutOfMemoryError ->
                     "device ran out of memory decoding the page (OutOfMemoryError)"
+
                 else -> "image preparation failed (${t.javaClass.simpleName})"
             }
             throw ImageBuildFailure(stage, diagBody(message, diag), diag, t)
@@ -387,12 +390,14 @@ class ProComicImageServer(
 
     private fun contentTypeServed(upstreamType: String, bytes: ByteArray): String = if (isAvif(upstreamType, bytes)) "image/jpeg" else upstreamType.ifBlank { "application/octet-stream" }
 
-    /** The transcode stage under the fair semaphore: decode + JPEG encode.
-     * Raw bytes are already in memory — no network happens while it's held. */
-    private fun transcodeUnderPermit(raw: ByteArray, diag: ProxyDiag, maxEdge: Int): ByteArray {
+    /** The transcode stage under the fair semaphore: proxy fetch + decode
+     * + JPEG encode. Raw bytes are already in memory — the proxy fetch is
+     * a small network hop that shares the permit so a cover grid cannot
+     * stampede the transcoder. */
+    private fun transcodeUnderPermit(raw: ByteArray, imageUrl: String, diag: ProxyDiag, maxEdge: Int): ByteArray {
         transcodePermits.acquire()
         try {
-            return avifToJpeg(raw, diag, maxEdge)
+            return avifToJpeg(raw, imageUrl, diag, maxEdge)
         } finally {
             transcodePermits.release()
         }
@@ -472,45 +477,33 @@ class ProComicImageServer(
     }
 
     /**
-     * AVIF → JPEG, decode ladder (v109):
+     * AVIF → JPEG, the v111 ladder — THE NEW WAY. After four field rounds
+     * (v107 native loader, v108 MediaCodec, v109+v110 offscreen WebView)
+     * every on-device AVIF decoder still found a way to kill the host app
+     * on the affected Android 10 device, so the device no longer runs one:
      *
-     * 1. BitmapFactory — the platform codec (Android 12+), subsampled when
-     *    a max edge is requested.
-     * 2. The bundled libavif/dav1d software decoder (when the explicit
-     *    loader can find + load it).
-     * 3. WebView — the host's Chromium engine (AVIF since Chrome 85, and
-     *    the WebView package auto-updates via Play even on Android 10). A
-     *    FULL image decoder (single items AND grid AVIF) whose every
-     *    failure mode is a catchable Java exception or a sandboxed-renderer
-     *    crash that never kills the host app.
-     * 4. ImageDecoder (API 28+).
+     * 1. BitmapFactory — the platform codec. On Android 12+ this decodes
+     *    AVIF natively (and it also decodes the proxy tier's JPEG output
+     *    on every version). Subsampled when a max edge is requested.
+     * 2. SERVER-SIDE transcode — the same URL re-fetched through the
+     *    weserv image proxy (`output=jpg`, both hosts tried in order), so
+     *    the AVIF decode happens in their datacenter and this process only
+     *    ever touches plain JPEG bytes. On Android 10/11 this is the
+     *    production tier — there is NO AVIF decoder on the device at all.
      *
-     * v110 hardening (the field device STILL died in the v109 WebView
-     * tier): one shared WebView behind a process-wide permit, ?e=-bounded
-     * draws, identity-guarded callbacks, and a crash-loop breaker that
-     * disables the tier after a process death inside it — see
-     * decodeWithWebView for the three fixed vectors.
+     * Everything else (bundled libavif JNI, framework MediaCodec, the
+     * offscreen WebView, ImageDecoder) is REMOVED from the ladder: each was
+     * a native-crash/OOM surface no Java guard could catch, and the field
+     * device died inside all of them across v108-v110. A total decode
+     * failure now throws the legible IOException -> the error card — never
+     * a dead process.
      *
-     * v109 REMOVED the MediaCodec "video/av1" tier from this ladder: the
-     * field device (Android 10) DIED inside it — c2.av1 is Android 10's
-     * brand-new software codec and configuring it at a still image's full
-     * size (pages 800x5000, "originals" covers up to 4000x6000) is a
-     * native-crash/OOM-kill surface no Java guard can catch; the process
-     * dies, the marker-based breaker only gates after two deaths, and the
-     * user experiences "the app just crashes". A video codec is simply the
-     * wrong tool for a 4 MP still. The WebView tier renders what Android 10
-     * has no other way to render, and it CANNOT take the app down. The
-     * MediaCodec path remains compiled (debug hook only, never called by
-     * this ladder) so the harness can keep pinning its decline behavior.
-     *
-     * Every failure surfaces in the diag trail with its ACTUAL reason.
+     * Every tier call site is Throwable-tight: an unexpected throw in one
+     * tier (JVM stubs, an exotic device API misbehavior) must fall through
+     * to the NEXT tier, never abort the ladder.
      */
-    private fun avifToJpeg(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): ByteArray {
+    private fun avifToJpeg(bytes: ByteArray, imageUrl: String, diag: ProxyDiag, maxEdge: Int): ByteArray {
         val quality = if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY
-        // Every tier call site is Throwable-tight: an unexpected throw in
-        // one tier (JVM stubs, an exotic device API misbehavior) must fall
-        // through to the NEXT tier, never abort the ladder — an abort means
-        // the request dies with zero tier rows in the diag trail.
         val factoryBitmap = try {
             decodeWithBitmapFactory(bytes, diag, maxEdge)
         } catch (t: Throwable) {
@@ -528,15 +521,18 @@ class ProComicImageServer(
                 bitmap.recycle()
             }
         }
-        val nativeBitmap = try {
-            decodeWithLibavif(bytes, diag, maxEdge)
+        // v111: the server-side transcode tier — weserv decodes the AVIF
+        // in its datacenter and hands back a plain JPEG this process CAN
+        // decode (BitmapFactory handles JPEG on every Android version).
+        val proxyBitmap = try {
+            fetchProxyJpeg(imageUrl, bytes, diag, maxEdge)
         } catch (t: Throwable) {
-            diag.add("libavif tier threw ${t.javaClass.simpleName}")
+            diag.add("proxy tier threw ${t.javaClass.simpleName}")
             null
         }
-        nativeBitmap?.let { bitmap ->
+        proxyBitmap?.let { bitmap ->
             try {
-                val output = ByteArrayOutputStream(bytes.size / 2)
+                val output = ByteArrayOutputStream(bitmap.byteCount.coerceAtLeast(16_384))
                 if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
                     throw IOException("ProComic: page JPEG encode failed")
                 }
@@ -545,58 +541,116 @@ class ProComicImageServer(
                 bitmap.recycle()
             }
         }
-        if (android.os.Build.VERSION.SDK_INT >= 24) {
-            val webviewBitmap = try {
-                decodeWithWebView(bytes, diag, maxEdge)
-            } catch (t: Throwable) {
-                diag.add("webview tier threw ${t.javaClass.simpleName}")
-                null
-            }
-            webviewBitmap?.let { decoded ->
-                val bitmap = if (maxEdge > 0) downscaleTo(decoded, maxEdge, diag) else decoded
-                try {
-                    val output = ByteArrayOutputStream(bitmap.byteCount.coerceAtLeast(16_384))
-                    if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
-                        throw IOException("ProComic: page JPEG encode failed")
-                    }
-                    return output.toByteArray()
-                } finally {
-                    bitmap.recycle()
-                }
-            }
-        } else {
-            diag.add("webview: skipped (sdk ${android.os.Build.VERSION.SDK_INT})")
+        throw IOException("ProComic: page failed to decode (server-side transcode unavailable)")
+    }
+
+    /**
+     * The server-side transcode tier (v111): re-fetch [imageUrl] through
+     * the weserv image proxy with `output=jpg` so the AVIF decode happens
+     * on their infrastructure, then decode the returned JPEG with
+     * BitmapFactory — the one decoder that exists and is safe on EVERY
+     * Android version. Both proxy hosts are tried in order; every failure
+     * lands in the diag trail and the tier returns null (the ladder then
+     * throws the legible decode failure — the error card, never a crash).
+     *
+     * Sizing: covers ride their ?e= box (`w`+`h`+`fit=inside`+`we` — the
+     * long edge is capped server-side, so a 4000x6000 "originals" cover
+     * never even crosses the network at full size); pages without a max
+     * edge get a box ONLY when the container (parsed in pure Kotlin from
+     * the already-downloaded bytes) declares more pixels than the decode
+     * budget — the proxy downscales instead of this process ever seeing a
+     * budget-busting bitmap.
+     */
+    private fun fetchProxyJpeg(imageUrl: String, raw: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap? {
+        if (proxyHosts.isEmpty()) {
+            diag.add("proxy: no hosts configured")
+            return null
         }
-        if (android.os.Build.VERSION.SDK_INT >= 28) {
+        val encoded = runCatching { java.net.URLEncoder.encode(imageUrl, "UTF-8") }.getOrNull() ?: run {
+            diag.add("proxy: encode failed")
+            return null
+        }
+        val quality = if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY
+        val box = proxyBoxFor(proxyPixelBudgetGate(raw), maxEdge, diag)
+        for (host in proxyHosts) {
+            val url = proxyTranscodeUrl(imageUrl, encoded, quality, box, host)
             try {
-                val source = android.graphics.ImageDecoder.createSource(java.nio.ByteBuffer.wrap(bytes))
-                val bitmap = android.graphics.ImageDecoder.decodeBitmap(source) { decoder, info, _ ->
-                    decoder.allocator = android.graphics.ImageDecoder.ALLOCATOR_SOFTWARE
-                    if (maxEdge > 0) {
-                        val longEdge = maxOf(info.size.width, info.size.height)
-                        if (longEdge > maxEdge) {
-                            val scale = maxEdge.toFloat() / longEdge
-                            decoder.setTargetSize(
-                                (info.size.width * scale).toInt().coerceAtLeast(1),
-                                (info.size.height * scale).toInt().coerceAtLeast(1),
-                            )
-                        }
+                val request = Request.Builder()
+                    .url(url)
+                    .header("User-Agent", BROWSER_UA)
+                    .build()
+                innerClient.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        diag.add("proxy/$host http ${response.code}")
+                        return@use
                     }
-                }
-                try {
-                    val output = ByteArrayOutputStream(bytes.size / 2)
-                    if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
-                        throw IOException("ProComic: page JPEG encode failed")
+                    val body = response.body.bytes()
+                    if (body.isEmpty()) {
+                        diag.add("proxy/$host empty body")
+                        return@use
                     }
-                    return output.toByteArray()
-                } finally {
-                    bitmap.recycle()
+                    // Loop guard: the proxy must hand back a decodable
+                    // raster — an AVIF answer would send us in circles.
+                    if (isAvif("", body)) {
+                        diag.add("proxy/$host returned avif")
+                        return@use
+                    }
+                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                    BitmapFactory.decodeByteArray(body, 0, body.size, bounds)
+                    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                        diag.add("proxy/$host undecodable (${bounds.outMimeType ?: "unknown"})")
+                        return@use
+                    }
+                    diag.add("proxy/$host ok ${bounds.outWidth}x${bounds.outHeight} ${body.size}B")
+                    val options = BitmapFactory.Options()
+                    if (maxEdge > 0) options.inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxEdge)
+                    BitmapFactory.decodeByteArray(body, 0, body.size, options)?.let { return it }
+                    diag.add("proxy/$host decode null")
                 }
             } catch (t: Throwable) {
-                diag.add("imagedecoder ${t.javaClass.simpleName}")
+                diag.add("proxy/$host ${t.javaClass.simpleName}")
             }
         }
-        throw IOException("ProComic: page failed to decode (no AVIF decoder on this device)")
+        return null
+    }
+
+    /** Pixels the raw container declares (pure-Kotlin ISOBMFF parse of the
+     * already-downloaded bytes), or null when the parser refuses a shape —
+     * a refusal simply means no server-side downscale, the same policy the
+     * WebView tier had (a full decoder handles what the lenient parser
+     * rejects). Never throws. */
+    private fun proxyPixelBudgetGate(raw: ByteArray): Pair<Int, Int>? = runCatching {
+        AvifMediaCodecDecoder.parseAvifImage(raw)?.let { layout -> layout.outputWidth to layout.outputHeight }
+    }.getOrNull()
+
+    /** The server-side downscale box: the cover's ?e= edge wins outright;
+     * pages get a box only when the declared pixels exceed the decode
+     * budget (the box caps the long edge so the proxy hands back a bitmap
+     * this device can actually hold). Internal + pure for the harness. */
+    internal fun proxyBoxFor(dims: Pair<Int, Int>?, maxEdge: Int, diag: ProxyDiag? = null): Int {
+        if (maxEdge > 0) return maxEdge
+        if (dims == null) return 0
+        val (width, height) = dims
+        val pixels = width.toLong() * height.toLong()
+        if (pixels <= MAX_NATIVE_DECODE_PIXELS) return 0
+        val scale = kotlin.math.sqrt(MAX_NATIVE_DECODE_PIXELS.toDouble() / pixels)
+        val box = (maxOf(width, height) * scale).toInt().coerceIn(MIN_DOWNSCALE_EDGE, MAX_PROXY_BOX_EDGE)
+        diag?.add("proxy: budget box ${box}px (${width}x$height)")
+        return box
+    }
+
+    /** The weserv transcode URL (internal + pure for the harness pins):
+     * url-encoded origin, forced JPEG output, the tier's quality, and the
+     * server-side fit-inside box when one is set (`we` = never upscale). */
+    internal fun proxyTranscodeUrl(imageUrl: String, encoded: String, quality: Int, box: Int, host: String): String {
+        require(imageUrl.isNotBlank()) { "imageUrl required" }
+        require(encoded.isNotBlank()) { "encoded required" }
+        require(host.isNotBlank()) { "host required" }
+        return buildString {
+            append("https://").append(host).append("/?url=").append(encoded)
+            append("&output=jpg&q=").append(quality)
+            if (box > 0) append("&w=").append(box).append("&h=").append(box).append("&fit=inside&we")
+        }
     }
 
     /** The platform BitmapFactory tier (the fast path, and the platform AVIF
@@ -701,478 +755,15 @@ class ProComicImageServer(
     /** Harness hook for the v108 framework tier: drives the MediaCodec path
      * against a diag trail without an HTTP round-trip. Debug-only — the
      * v109 ladder no longer calls the codec tier (the field device died
-     * inside it), but the decline behavior stays pinned. */
+     * inside it) and v111 removed every remaining on-device decoder, but
+     * the decline behavior stays pinned. */
     internal fun debugMediaCodecTier(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int = 0): ByteArray? = decodeWithMediaCodecFramework(bytes, diag, maxEdge)
 
-    /** Harness hook for the v110 WebView tier. */
-    internal fun debugWebViewTier(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int = 0): Bitmap? = decodeWithWebView(bytes, diag, maxEdge)
-
-    /** Harness hook: the crash-loop breaker state machine (consumes a stale
-     * marker exactly like the native tier's hook does). */
-    internal fun debugWebViewCrashLoopState(): String = evaluateWebViewCrashState()
-
-    /** Harness hook: holds the shared-WebView permit so the busy-decline
-     * path is drivable without a real concurrent decode. */
-    internal fun debugHoldWebViewPermit(): java.lang.AutoCloseable {
-        webViewDecodePermits.acquire()
-        return java.lang.AutoCloseable { webViewDecodePermits.release() }
-    }
-
-    /** v110: ALL WebView decodes are serialized process-wide. The host
-     * fires covers + reader pages + the preload window CONCURRENTLY; in
-     * v109 each of those built its own offscreen WebView — parallel
-     * Chromium boots, stacked renderer processes and simultaneous
-     * full-size bitmap allocations (two concurrent ~96 MB covers) on a
-     * 2-4 GB device: OOM kill, "the app just crashes". One permit, one
-     * shared WebView, one decode at a time; a caller that cannot get the
-     * permit inside the bounded queue wait declines to the next tier.
-     * Fair so the visible page is not starved by the preload window. */
-    private val webViewDecodePermits = Semaphore(1, true)
-
-    /** The one shared offscreen WebView (main-looper only). Created lazily,
-     * reused for every decode. v109 created + destroyed a WebView per
-     * image, and the destroy raced the still-queued JS probe callbacks —
-     * evaluateJavascript on a destroyed WebView throws on the MAIN thread
-     * with nothing to catch it: process death. Reuse removes
-     * destroy-between-decodes entirely; the only destroy left is the
-     * post-timeout heal in [dropSharedWebView], which runs while no live
-     * job exists and stale callbacks are identity-guarded no-ops. */
-    @Volatile
-    private var sharedWebView: android.webkit.WebView? = null
-
-    @Volatile
-    private var wholeDocumentDrawEnabled = false
-
-    /** The decode job the WebView callbacks currently serve. Identity —
-     * not equality — so a recycled job can never resurrect stale
-     * callbacks. */
-    private val currentWebViewJob = java.util.concurrent.atomic.AtomicReference<WebViewJob?>()
-
-    /** The WebView lives on the app's main looper (Chromium requires it);
-     * server threads only await bounded latches — the main thread never
-     * blocks on a decode. Built per call (a Handler is a cheap looper
-     * wrapper) so no android.os class is ever touched outside the guarded
-     * tier path — a property initializer here put the reference on the
-     * constructor path and the JVM harness class-load died (the exact
-     * failure the harness exists to catch). */
-    private fun newMainHandler(): android.os.Handler = android.os.Handler(android.os.Looper.getMainLooper())
-
-    /** One WebView decode: verdict refs + exactly-once latch. [finish]
-     * wins once — later (stale) callbacks see [done] and do nothing. */
-    private class WebViewJob {
-        val bitmapRef = java.util.concurrent.atomic.AtomicReference<Bitmap?>()
-        val stageRef = java.util.concurrent.atomic.AtomicReference("load")
-        val done = java.util.concurrent.atomic.AtomicBoolean(false)
-        val latch = java.util.concurrent.CountDownLatch(1)
-
-        fun finish(stage: String, bitmap: Bitmap?) {
-            if (!done.compareAndSet(false, true)) return
-            stageRef.set(stage)
-            bitmapRef.set(bitmap)
-            latch.countDown()
-        }
-    }
-
     /**
-     * v110 WebView crash-loop breaker — the same defense the native tier
-     * has, because Chromium has the same failure class: a death inside the
-     * WebView stack (provider boot abort, vendor WebView bug, a host-side
-     * native OOM) is NATIVE — no Java guard can catch it, and the field
-     * device crash-looped through exactly this hole. Files live next to
-     * the native tier's tracking dir:
-     *
-     * - `webview.attempt` — written right before the decode job is posted
-     *   to the main looper, deleted right after the verdict lands. A
-     *   stale marker = the previous process died INSIDE the WebView stage.
-     * - `webview.crashes` — how many stale markers were consumed.
-     *
-     * One stale marker disables the tier for this session; two disable it
-     * permanently (until the user clears the source's cache). The worst
-     * case is now two process deaths per install — then legible error
-     * cards carrying this exact reason in the diag trail, never a
-     * crash loop.
-     */
-    internal fun evaluateWebViewCrashState(): String {
-        val dir = nativeCacheDir?.let { java.io.File(it, "procomic_native") }
-            ?: return "ok (no tracking dir)"
-        val attempt = java.io.File(dir, "webview.attempt")
-        val counter = java.io.File(dir, "webview.crashes")
-        if (!attempt.exists()) return "ok"
-        val previous = runCatching { counter.readText().trim().toIntOrNull() ?: 0 }.getOrDefault(0)
-        val count = previous + 1
-        runCatching {
-            counter.writeText(count.toString())
-            attempt.delete()
-        }
-        return if (count >= MAX_WEBVIEW_CRASHES) {
-            "disabled after $count webview decode crashes (clear the source's cache to re-enable)"
-        } else {
-            "disabled this session after a webview decode crash (crashes=$count)"
-        }
-    }
-
-    private val webViewCrashState: String by lazy { evaluateWebViewCrashState() }
-
-    /** The before-decode marker file, or null when there is nowhere to
-     * track (harness / restricted storage) — tracking is best-effort. */
-    private fun webViewAttemptMarker(): java.io.File? {
-        val base = nativeCacheDir ?: return null
-        return runCatching {
-            val dir = java.io.File(base, "procomic_native")
-            dir.mkdirs()
-            java.io.File(dir, "webview.attempt")
-        }.getOrNull()
-    }
-
-    /**
-     * The WebView decode tier (v110) — the framework-guaranteed,
-     * PROCESS-SAFE AVIF decoder for Android 10/11.
-     *
-     * Why: the host's Chromium WebView decodes AVIF natively (Chromium 85+;
-     * the WebView package auto-updates via Play, including on Android 10),
-     * it is a FULL image decoder (single items AND grid AVIF), every
-     * catchable failure is caught, and a genuine Chromium death dies inside
-     * the sandboxed renderer — or, worst case, is bounded by the v110
-     * crash-loop breaker above.
-     *
-     * v110 — the v109 field device STILL died in this tier, three ways:
-     * 1. No concurrency gate: the host fires covers, pages and the preload
-     *    window concurrently; each built its own offscreen WebView —
-     *    parallel Chromium boots and stacked renderer processes on a
-     *    2-4 GB device.
-     * 2. Full-size draw allocations: the WebView was measured at the
-     *    image's natural size, so a 4000x6000 "originals" cover allocated
-     *    a ~96 MB ARGB bitmap per decode — two concurrent decodes (the
-     *    transcode stage allows two) was an OOM kill.
-     * 3. The probe-after-destroy race: destroy() was posted when the
-     *    verdict (or the 20 s timeout) landed while JS probe retries were
-     *    still queued — evaluateJavascript on a destroyed WebView throws
-     *    on the MAIN thread with nothing to catch it: process death.
-     *
-     * All three are structurally gone: ONE shared WebView reused across
-     * decodes behind a process-wide permit (never destroyed between
-     * decodes), draws bounded by the ?e= render target, and every callback
-     * identity-checked against the current job and Throwable-guarded. The
-     * crash-loop breaker bounds anything native left to two process deaths
-     * per install, then legible error cards.
-     *
-     * Flow: the AVIF bytes ride a data: URL inside a minimal HTML document
-     * loaded into the shared offscreen WebView on the app's main looper
-     * (server threads only await bounded latches — the main thread never
-     * blocks). JavaScript reports the image's naturalWidth x naturalHeight
-     * (or an error / pending state), the WebView is measured + laid out at
-     * the (possibly ?e=-scaled) render size and drawn into a software
-     * ARGB_8888 bitmap. Every stage lands in the diag trail.
-     */
-    private fun decodeWithWebView(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap? {
-        val context = webViewContext ?: run {
-            diag.add("webview: unavailable (no context)")
-            return null
-        }
-        val crashState = webViewCrashState
-        if (!crashState.startsWith("ok")) {
-            diag.add("webview tier gated: $crashState")
-            return null
-        }
-        if (bytes.size > WEBVIEW_MAX_PAYLOAD_BYTES) {
-            diag.add("webview: declined (${bytes.size} B payload > cap)")
-            return null
-        }
-        // Pixel budget up front: parse the container in pure Kotlin so an
-        // absurd image never allocates a WebView or a bitmap. A parser
-        // refusal still tries the WebView — Chromium is a full decoder that
-        // handles shapes the lenient parser rejects.
-        AvifMediaCodecDecoder.parseAvifImage(bytes)?.let { layout ->
-            val pixels = layout.outputWidth.toLong() * layout.outputHeight
-            if (pixels > MAX_NATIVE_DECODE_PIXELS) {
-                diag.add("webview: declined (${layout.outputWidth}x${layout.outputHeight} exceeds budget)")
-                return null
-            }
-        }
-        val base64 = runCatching {
-            android.util.Base64.encodeToString(bytes, android.util.Base64.NO_WRAP)
-        }.getOrElse {
-            diag.add("webview: base64 ${it.javaClass.simpleName}")
-            return null
-        }
-        // Covers (?e= edge) scale the img via CSS so the DRAW bitmap is the
-        // bounded target size — see finishProbe. Pages keep 1:1 px mapping
-        // (useWideViewPort stays off) so the natural-size draw is exact.
-        val scaleCss = if (maxEdge > 0) "img{max-width:100%;height:auto;display:block}" else "img{display:block}"
-        val html = "<html><head><style>html,body{margin:0;padding:0}$scaleCss</style></head>" +
-            "<body><img src=\"data:image/avif;base64,$base64\"></body></html>"
-
-        // One decode at a time through the shared WebView; bounded queue
-        // wait — a starved caller declines to the next tier instead of
-        // pinning a server thread behind a long cover-grid queue.
-        val acquired = try {
-            webViewDecodePermits.tryAcquire(WEBVIEW_QUEUE_WAIT_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
-        } catch (_: InterruptedException) {
-            Thread.currentThread().interrupt()
-            false
-        }
-        if (!acquired) {
-            diag.add("webview: busy (another decode holds the shared WebView)")
-            return null
-        }
-        val job = WebViewJob()
-        val marker = webViewAttemptMarker()
-        try {
-            marker?.writeText(System.currentTimeMillis().toString())
-            val posted = try {
-                newMainHandler().post { runWebViewDecode(context, job, html, maxEdge) }
-                true
-            } catch (t: Throwable) {
-                job.finish("post ${t.javaClass.simpleName}", null)
-                false
-            }
-            if (posted) {
-                try {
-                    job.latch.await(WEBVIEW_DEADLINE_MS, java.util.concurrent.TimeUnit.MILLISECONDS)
-                } catch (_: InterruptedException) {
-                    Thread.currentThread().interrupt()
-                }
-                if (!job.done.get()) job.finish("timeout", null)
-                // A timed-out decode may leave a wedged renderer behind —
-                // drop the shared WebView so the next decode rebuilds it.
-                // Runs after the job is finished: stale callbacks are
-                // identity-guarded no-ops, and destroy() itself is on the
-                // thread the WebView was created on (the main looper).
-                if (job.stageRef.get() == "timeout") {
-                    runCatching { newMainHandler().post { dropSharedWebView() } }
-                }
-            }
-            val bitmap = job.bitmapRef.getAndSet(null)
-            diag.add("webview: ${job.stageRef.get()}")
-            return bitmap
-        } finally {
-            // Deleted on every HANDLED outcome; only a process death inside
-            // the WebView stage (which skips this finally) leaves it stale.
-            runCatching { marker?.delete() }
-            webViewDecodePermits.release()
-        }
-    }
-
-    /** Main-looper body of one WebView decode against the SHARED WebView.
-     * Everything is guarded: a throw here must decline the decode, never
-     * reach the main looper's uncaught-exception handler (that kills the
-     * host app — the exact v109 crash shape). */
-    private fun runWebViewDecode(context: android.content.Context, job: WebViewJob, html: String, maxEdge: Int) {
-        var webView: android.webkit.WebView? = null
-        try {
-            webView = obtainSharedWebView(context) ?: run {
-                job.finish("init failed", null)
-                return
-            }
-            currentWebViewJob.set(job)
-            webView.webViewClient = sharedWebViewClient(maxEdge)
-            webView.loadDataWithBaseURL(null, html, "text/html", "utf-8", null)
-        } catch (t: Throwable) {
-            currentWebViewJob.compareAndSet(job, null)
-            job.finish("init ${t.javaClass.simpleName}", null)
-            // A half-built or broken instance is destroyed and dropped so
-            // the next decode starts clean.
-            webView?.let { broken ->
-                runCatching { broken.destroy() }
-                if (sharedWebView === broken) sharedWebView = null
-            }
-        }
-    }
-
-    private fun obtainSharedWebView(context: android.content.Context): android.webkit.WebView? {
-        sharedWebView?.let { return it }
-        if (!wholeDocumentDrawEnabled) {
-            // Without this Chromium software-draws only the visible
-            // viewport — tall-page captures would be blank or partial.
-            runCatching { android.webkit.WebView.enableSlowWholeDocumentDraw() }
-            wholeDocumentDrawEnabled = true
-        }
-        val webView = android.webkit.WebView(context)
-        webView.settings.javaScriptEnabled = true
-        webView.settings.blockNetworkLoads = true
-        webView.settings.loadsImagesAutomatically = true
-        webView.settings.useWideViewPort = false
-        webView.isVerticalScrollBarEnabled = false
-        webView.isHorizontalScrollBarEnabled = false
-        sharedWebView = webView
-        return webView
-    }
-
-    /** Destroys + clears the shared WebView (main looper only). */
-    private fun dropSharedWebView() {
-        val webView = sharedWebView ?: return
-        sharedWebView = null
-        currentWebViewJob.set(null)
-        runCatching { webView.destroy() }
-    }
-
-    /** Every callback dispatches to the CURRENT job, identity-checked and
-     * Throwable-guarded: a stale callback (previous decode, post-destroy
-     * delivery) is a no-op, and nothing here can reach the main looper's
-     * uncaught-exception handler — that is what killed the v109 app. */
-    private fun sharedWebViewClient(maxEdge: Int): android.webkit.WebViewClient = object : android.webkit.WebViewClient() {
-        private var probed = false
-
-        override fun onPageFinished(view: android.webkit.WebView, url: String?) {
-            if (probed) return
-            probed = true
-            val job = currentWebViewJob.get() ?: return
-            runCatching { probe(view, job, 0) }
-        }
-
-        /** The <img> may still be decoding a large data URL when the page
-         * settles — 'pending' retries, bounded. */
-        private fun probe(view: android.webkit.WebView, job: WebViewJob, attempt: Int) {
-            if (job.done.get()) return
-            if (attempt > WEBVIEW_PROBE_MAX_RETRIES) {
-                job.finish("probe exhausted", null)
-                return
-            }
-            view.evaluateJavascript(WEBVIEW_PROBE_JS) { value ->
-                runCatching {
-                    if (job.done.get() || currentWebViewJob.get() !== job) return@runCatching
-                    val text = value ?: "null"
-                    if (text.contains("pending")) {
-                        newMainHandler().postDelayed({
-                            runCatching {
-                                if (!job.done.get() && currentWebViewJob.get() === job) probe(view, job, attempt + 1)
-                            }
-                        }, WEBVIEW_PROBE_RETRY_MS)
-                    } else {
-                        finishProbe(view, job, text)
-                    }
-                }
-            }
-        }
-
-        private fun finishProbe(view: android.webkit.WebView, job: WebViewJob, text: String) {
-            val parsed = Regex("(\\d+)x(\\d+)").find(text)
-            val width = parsed?.groupValues?.get(1)?.toIntOrNull() ?: 0
-            val height = parsed?.groupValues?.get(2)?.toIntOrNull() ?: 0
-            if (width <= 0 || height <= 0) {
-                job.finish("image ${text.take(24)}", null)
-                return
-            }
-            // v110: the DRAW bitmap is bounded. Covers render at the ?e=
-            // edge (CSS-scaled above) — a 4000x6000 "originals" cover draws
-            // into ~1280x1920 (~9 MB) instead of the ~96 MB full-size ARGB
-            // allocation that killed the v109 process. Pages keep the
-            // natural size under the 25 MP budget gate above.
-            val drawWidth: Int
-            val drawHeight: Int
-            if (maxEdge > 0) {
-                val longEdge = maxOf(width, height)
-                if (longEdge > maxEdge) {
-                    val scale = maxEdge.toFloat() / longEdge
-                    drawWidth = (width * scale).toInt().coerceAtLeast(1)
-                    drawHeight = (height * scale).toInt().coerceAtLeast(1)
-                } else {
-                    drawWidth = width
-                    drawHeight = height
-                }
-            } else {
-                drawWidth = width
-                drawHeight = height
-            }
-            try {
-                view.measure(
-                    android.view.View.MeasureSpec.makeMeasureSpec(drawWidth, android.view.View.MeasureSpec.EXACTLY),
-                    android.view.View.MeasureSpec.makeMeasureSpec(drawHeight, android.view.View.MeasureSpec.EXACTLY),
-                )
-                view.layout(0, 0, drawWidth, drawHeight)
-                val bitmap = Bitmap.createBitmap(drawWidth, drawHeight, Bitmap.Config.ARGB_8888)
-                view.draw(android.graphics.Canvas(bitmap))
-                job.finish("decoded ${drawWidth}x$drawHeight", bitmap)
-            } catch (t: Throwable) {
-                job.finish("draw ${t.javaClass.simpleName}", null)
-            }
-        }
-    }
-
-    /**
-     * The bundled software decoder tier. Every failure mode lands in the
-     * diag trail with its ACTUAL reason — the v104 fix exists because the
-     * previous bare runCatching swallowed the one fact that mattered (the
-     * JNI library never loaded), leaving "bitmapfactory+libavif decode
-     * failed" as the only clue.
-     *
-     * v106 — the tier is now CRASH-LOOP-GATED. A native crash inside the
-     * JNI (dav1d/decoder bug, exotic bitstream, OEM-specific abort) cannot
-     * be caught in Java and takes the whole host-app process down — that
-     * was the 1.6.19 chapter-load crash and the 1.6.20 cover-load crash on
-     * Android 10 arm64. Defense: a marker file is written before every
-     * native decode and deleted right after it returns; a marker found at
-     * process start means the PREVIOUS process died mid-decode, so the
-     * native tier is disabled for this session (and permanently after the
-     * second death) — the app stays alive and the platform tiers keep the
-     * pipeline functional. Also: ARGB_8888 output only (the RGBA_F16 path
-     * for 10-bit content is a native-crash surface) and oversized images
-     * are refused before any bitmap allocation.
-     */
-    private fun decodeWithLibavif(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap? {
-        val nativeState = avifNativeState
-        diag.add("avif native: $nativeState")
-        if (nativeState != "system" && !nativeState.startsWith("loaded")) return null
-        val crashState = nativeCrashState
-        if (!crashState.startsWith("ok")) {
-            diag.add("native tier gated: $crashState")
-            return null
-        }
-        return try {
-            val buffer = java.nio.ByteBuffer.wrap(bytes)
-            if (!org.aomedia.avif.android.AvifDecoder.isAvifImage(buffer)) {
-                diag.add("libavif: header refused")
-                null
-            } else {
-                val info = org.aomedia.avif.android.AvifDecoder.Info()
-                if (!org.aomedia.avif.android.AvifDecoder.getInfo(buffer, bytes.size, info)) {
-                    diag.add("libavif: getInfo refused")
-                    null
-                } else {
-                    diag.add("libavif: ${info.width}x${info.height} depth=${info.depth}")
-                    val pixels = info.width.toLong() * info.height
-                    if (pixels > MAX_NATIVE_DECODE_PIXELS) {
-                        diag.add("libavif: refused (" + pixels + " px exceeds the software-decode budget)")
-                        null
-                    } else {
-                        // ARGB_8888 ALWAYS — never RGBA_F16. The F16 path
-                        // for >8-bit content was the native-crash suspect
-                        // on the field device; 10-bit input decodes into
-                        // 8-bit output (tone-truncated) instead of dying.
-                        val bitmap = try {
-                            Bitmap.createBitmap(info.width, info.height, Bitmap.Config.ARGB_8888)
-                        } catch (_: OutOfMemoryError) {
-                            diag.add("libavif: OOM at ARGB_8888")
-                            null
-                        } ?: return null
-                        val marker = attemptMarker()
-                        val decoded: Boolean = try {
-                            marker?.writeText(System.currentTimeMillis().toString())
-                            org.aomedia.avif.android.AvifDecoder.decode(java.nio.ByteBuffer.wrap(bytes), bytes.size, bitmap)
-                        } finally {
-                            // Deleted on every HANDLED outcome; only a native
-                            // crash (which skips this finally) leaves it stale.
-                            runCatching { marker?.delete() }
-                        }
-                        if (decoded) {
-                            if (maxEdge > 0) downscaleTo(bitmap, maxEdge, diag) else bitmap
-                        } else {
-                            bitmap.recycle()
-                            diag.add("libavif: decode returned false")
-                            null
-                        }
-                    }
-                }
-            }
-        } catch (t: Throwable) {
-            diag.add("libavif threw ${t.javaClass.simpleName}: ${t.message?.take(60)}")
-            null
-        }
-    }
-
-    /**
-     * Crash-loop breaker state, evaluated ONCE per process on the first
-     * software-decode attempt. Files live next to the extracted .so:
+     * Crash-loop breaker state for the DEBUG-ONLY MediaCodec hook,
+     * evaluated ONCE per process on its first (debug-only) invocation.
+     * The production v111 ladder never runs native code, so this only
+     * matters to the harness hooks. Files live in the tracking dir:
      *
      * - `decode.attempt` — written right before a native decode, deleted
      *   right after it returns. Stale marker = the previous process died
@@ -1217,163 +808,6 @@ class ProComicImageServer(
         }.getOrNull()
     }
 
-    /**
-     * Why the explicit loader exists: the avif-android library opens its JNI
-     * lib in a static initializer via System.loadLibrary, which searches the
-     * CLASSLOADER's native paths. Host apps load extension APKs with a bare
-     * PathClassLoader (dex path only) and extractNativeLibs=false keeps the
-     * .so inside our APK — so the search falls back to the HOST app's native
-     * dirs, never finds libavif_android.so, and AvifDecoder's class init
-     * throws UnsatisfiedLinkError. On an Android 10/11 device there is no
-     * platform AVIF codec behind it either, so every page "failed to decode"
-     * while the old runCatching swallowed the error class — the reader
-     * screenshot that reported this fix showed exactly that dead end.
-     *
-     * Fix: before the first AvifDecoder reference, pull the .so out of OUR
-     * OWN installed APK (the installed extension APK is a readable zip) and
-     * System.load it by absolute path. That binds the library to THIS classloader; the static initializer's
-     * System.loadLibrary then resolves against the already-loaded soname.
-     *
-     * v107 — "our own installed APK" was resolved from the HOST application
-     * context (keiyoushi.utils.applicationContext IS Injekt's Application —
-     * extensions have no Context of their own), so the scan always ran
-     * against the host apk, never found the entry, and the native tier was
-     * dead on every device (the field report: "avif native: unavailable (no
-     * libavif_android.so entry)"). The path now arrives from the package
-     * manager (ProComic.kt, our own package); this loader additionally
-     * derives candidates from its own classloader's dex paths and verifies
-     * the .so entry in EVERY candidate zip before loading — a wrong
-     * candidate costs one wasted scan, never a silent miss. The scanned
-     * zips and their per-file outcomes land in the diag trail so the next
-     * field report names the exact zips seen.
-     */
-    private val avifNativeState: String by lazy { ensureAvifNative() }
-
-    private fun ensureAvifNative(): String {
-        // Fast path: some hosts create the extension classloader WITH the
-        // native lib path — the static init just works there.
-        try {
-            org.aomedia.avif.android.AvifDecoder.isAvifImage(java.nio.ByteBuffer.wrap(AVIF_PROBE_BYTES))
-            return "system"
-        } catch (_: Throwable) {
-            // fall through to the explicit loader
-        }
-        val cacheBase = nativeCacheDir ?: return "unavailable (no cache dir)"
-        return nativeCandidateWalk(cacheBase)
-    }
-
-    /** The candidate walk, probe-free: every apk zip that might carry the
-     * bundled .so is scanned in trust order and the first entry-positive
-     * one is extracted + loaded. Probe-independent so the JVM harness can
-     * drive it deterministically (the probe outcome there depends on
-     * whether this particular JVM has an avif_android library reachable,
-     * which is an environment artifact, not a pipeline property). */
-    internal fun nativeCandidateWalk(cacheBase: java.io.File): String {
-        if (android.os.Build.SUPPORTED_ABIS.isEmpty()) return "unavailable (unknown abi)"
-        val candidates = apkCandidates()
-        if (candidates.isEmpty()) return "unavailable (no apk source)"
-        val scanned = StringBuilder()
-        for (apkPath in candidates) {
-            val outcome = scanAndLoadFromApk(apkPath, cacheBase)
-            if (outcome.startsWith("loaded")) return outcome
-            scanned.append('[').append(apkPath.substringAfterLast('/').take(40)).append(": ").append(outcome).append("] ")
-        }
-        return "unavailable (no loadable libavif_android.so; scanned $scanned)"
-    }
-
-    /** Extract + System.load the bundled .so out of ONE apk-shaped zip.
-     * Returns "loaded from apk (...)" on success, "no entry" when the zip
-     * carries no ABI-matching libavif_android.so, or "<SimpleName>: <msg>"
-     * for open/extract/load failures. Every outcome except "loaded" lets
-     * the caller move on to the next candidate. */
-    private fun scanAndLoadFromApk(apkPath: String, cacheBase: java.io.File): String = try {
-        java.util.zip.ZipFile(apkPath).use { zip ->
-            val entry = android.os.Build.SUPPORTED_ABIS.firstNotNullOfOrNull { candidate ->
-                zip.getEntry("lib/$candidate/libavif_android.so")
-            }
-            if (entry == null) {
-                "no entry"
-            } else {
-                val dir = java.io.File(cacheBase, "procomic_native").apply { mkdirs() }
-                val target = java.io.File(dir, "libavif_android.so")
-                if (!target.exists() || target.length() != entry.size) {
-                    zip.getInputStream(entry).use { input ->
-                        target.outputStream().use { output -> input.copyTo(output) }
-                    }
-                }
-                System.load(target.absolutePath)
-                "loaded from apk (${entry.name}, ${entry.size} B)"
-            }
-        }
-    } catch (t: Throwable) {
-        "${t.javaClass.simpleName}: ${t.message?.take(60)}"
-    }
-
-    /** Zips that may carry our bundled .so, in trust order: the caller's
-     * package-manager-resolved path (the EXTENSION's own apk since v107),
-     * then the dex/apk paths this class was actually loaded from (some
-     * hosts copy or relocate extension apks). Deduplicated; each candidate
-     * is entry-verified before its library loads. */
-    private fun apkCandidates(): List<String> = buildList {
-        apkSourceDir?.takeIf { it.isNotBlank() }?.let(::add)
-        addAll(apkPathsFromCallerClassloader())
-    }.distinct()
-
-    /** Best-effort reflection into BaseDexClassLoader.pathList.dexElements
-     * to recover the apk paths of THIS classloader. Bounded and safe: on
-     * the JVM harness (or any host that blocks these hidden fields) the
-     * whole lookup returns an empty list.
-     *
-     * v108 fix: the v107 walk called loader.javaClass.getDeclaredField —
-     * which only sees fields declared on the EXACT class, never inherited
-     * ones. pathList is declared on BaseDexClassLoader while the concrete
-     * loader is a PathClassLoader/InMemoryDexClassLoader subclass, so the
-     * walk threw NoSuchFieldException on every real Android classloader and
-     * silently contributed nothing (the field report: exactly one scanned
-     * candidate, the pm path). The lookup now walks the superclass chain
-     * via [declaredFieldUpTo]. */
-    private fun apkPathsFromCallerClassloader(): List<String> = runCatching {
-        val loader = this::class.java.classLoader ?: return emptyList()
-        val pathList = declaredFieldUpTo(loader.javaClass, "pathList")
-            ?.apply { isAccessible = true }?.get(loader) ?: return emptyList()
-        val elements = declaredFieldUpTo(pathList.javaClass, "dexElements")
-            ?.apply { isAccessible = true }?.get(pathList) as? Array<*> ?: return emptyList()
-        elements.mapNotNull { element ->
-            if (element == null) return@mapNotNull null
-            val field = declaredFieldUpTo(element.javaClass, "path")?.apply { isAccessible = true }
-                ?: return@mapNotNull null
-            when (val value = runCatching { field.get(element) }.getOrNull()) {
-                is java.io.File -> value.absolutePath
-                is String -> value
-                else -> null
-            }
-        }.filter { it.endsWith(".apk") }
-    }.getOrDefault(emptyList())
-
-    /** getDeclaredField across the superclass chain (Class.getDeclaredField
-     * only sees the exact class — see [apkPathsFromCallerClassloader]).
-     * Internal so the harness pins the walk itself. */
-    internal fun declaredFieldUpTo(start: Class<*>, name: String): java.lang.reflect.Field? {
-        var current: Class<*>? = start
-        while (current != null && current != Any::class.java) {
-            try {
-                return current.getDeclaredField(name)
-            } catch (_: NoSuchFieldException) {
-                current = current.superclass
-            }
-        }
-        return null
-    }
-
-    /** Harness hooks for the v107 loader: the resolved candidate list, the
-     * per-zip scan outcome ("loaded..." can only happen on a device — the
-     * JVM cannot dlopen an ARM ELF, so an entry-positive scan ends at a
-     * load-stage failure there), and the fully evaluated native state. */
-    internal fun debugApkCandidates(): List<String> = apkCandidates()
-
-    internal fun debugScanApk(apkPath: String, cacheBase: java.io.File): String = scanAndLoadFromApk(apkPath, cacheBase)
-
-    internal fun debugNativeState(): String = avifNativeState
     // ===================== in-flight build dedup =========================
 
     /** The host app fires several concurrent fetches for the same page
@@ -1564,15 +998,15 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v110\"")
+        sb.append("\"server\":\"procomic-image/v111\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
             sb.append(",\"cachedBytes\":").append(cachedBytes)
         }
-        sb.append(",\"nativeTier\":\"").append(avifNativeState.replace("\"", "'"))
+        sb.append(",\"decoder\":\"bitmapfactory+server-proxy (v111, no on-device AVIF decoder)\"")
+        sb.append(",\"proxyHosts\":\"").append(proxyHosts.joinToString(",").replace("\"", "'")).append('\"')
         sb.append(",\"nativeCrashState\":\"").append(nativeCrashState.replace("\"", "'")).append('\"')
-        sb.append(",\"webviewCrashState\":\"").append(webViewCrashState.replace("\"", "'")).append('\"')
         sb.append(",\"recentFailures\":[")
         val records = synchronized(failuresLock) { failures.toList() }
         records.forEachIndexed { fi, f ->
@@ -1614,7 +1048,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v110")
+                add("Server build: procomic-image/v111")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
@@ -1755,47 +1189,25 @@ class ProComicImageServer(
         private const val COVER_JPEG_QUALITY = 82
 
         /** Software-decode pixel budget: ~25 MP (~100 MB ARGB_8888) is the
-         * largest allocation the native tier will even attempt; larger
-         * "originals" fall through to the platform tiers or the error JPEG
-         * instead of OOM-killing a phone. */
+         * largest bitmap this process will even attempt; when the container
+         * declares more, the v111 proxy tier downscales SERVER-SIDE (the
+         * device never sees a budget-busting bitmap) and larger "originals"
+         * fall through to the error JPEG instead of OOM-killing a phone. */
         private const val MAX_NATIVE_DECODE_PIXELS = 25_000_000L
 
-        /** Stale decode-attempt markers tolerated before the native tier is
-         * disabled permanently (bounds the native crash loop). */
+        /** Stale decode-attempt markers tolerated before the DEBUG-ONLY
+         * MediaCodec hook's tier is disabled permanently (bounds a native
+         * crash loop for the hook; the production ladder never runs it). */
         private const val MAX_NATIVE_CRASHES = 2
 
-        /** v109 WebView tier: data-URL payload cap. A page's base64 rides
-         * in memory inside the WebView — beyond this the tier declines
-         * (the libavif tier or the error page carries it instead). */
-        private const val WEBVIEW_MAX_PAYLOAD_BYTES = 2_500_000
+        /** v111 server-side transcode hosts, tried in order. wsrv.nl is
+         * weserv's alias domain — same service, second routing domain for
+         * a network-level block of the primary host. */
+        val DEFAULT_PROXY_HOSTS = listOf("images.weserv.nl", "wsrv.nl")
 
-        /** v109 WebView tier: whole-decode deadline. Chromium's first-ever
-         * init on a cold process can take seconds; past this the tier
-         * declines and the ladder moves on. */
-        private const val WEBVIEW_DEADLINE_MS = 20_000L
-
-        /** v109 WebView tier: the <img> decode probe re-checks while the
-         * image is still pending — bounded retries, then decline. v110:
-         * the window matches the whole-decode deadline (90 x 200 ms) so a
-         * slow first decode is not declined early. */
-        private const val WEBVIEW_PROBE_MAX_RETRIES = 90
-        private const val WEBVIEW_PROBE_RETRY_MS = 200L
-
-        /** v110 WebView tier: bounded queue wait for the shared-WebView
-         * permit. A starved caller declines to the next tier instead of
-         * pinning a server thread behind a long cover-grid queue. */
-        private const val WEBVIEW_QUEUE_WAIT_MS = 8_000L
-
-        /** v110 WebView tier: stale attempt markers tolerated before the
-         * tier is disabled permanently (bounds the Chromium crash loop —
-         * the same breaker the native tier has). */
-        private const val MAX_WEBVIEW_CRASHES = 2
-
-        /** v109 WebView tier: the size probe — natural dimensions when the
-         * image decoded, 'imgerr' when the WebView refused the format
-         * (WebView package too old for AVIF), 'pending' while still busy. */
-        private const val WEBVIEW_PROBE_JS =
-            "(function(){var i=document.images[0];return !i?'noimg':(!i.complete?'pending':(i.naturalWidth>0?i.naturalWidth+'x'+i.naturalHeight:'imgerr'))})()"
+        /** Hard ceiling for the server-side downscale box derived from the
+         * pixel budget (never larger than the cover edge cap allows). */
+        private const val MAX_PROXY_BOX_EDGE = 8000
 
         /** Pause between background pre-transcoded pages (gentle pacing —
          * with one GET per page a full chapter prebuilds in seconds). */
@@ -1814,11 +1226,5 @@ class ProComicImageServer(
         private const val MAX_FAILURE_RECORDS = 64
 
         private val TAG = "ProComic"
-
-        /** Minimal ftyp/avif header — only exercises AvifDecoder's class
-         * init (the JNI load), never a real decode. */
-        private val AVIF_PROBE_BYTES = byteArrayOf(
-            0, 0, 0, 16, 0x66, 0x74, 0x79, 0x70, 0x61, 0x76, 0x69, 0x66, 0, 0, 0, 0,
-        )
     }
 }

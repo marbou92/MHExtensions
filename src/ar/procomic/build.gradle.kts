@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 25
+    versionCode = 26
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -96,6 +96,27 @@ keiyoushi {
     // death inside it and permanently after two — the worst case is now
     // two deaths per install, then legible error cards, never a loop.
 
+    // v111 FIELD VERDICT on v110: the app STILL died on every cover and
+    // page. Four on-device AVIF decoders (bundled libavif JNI, framework
+    // MediaCodec, the offscreen WebView twice) all found a way to kill the
+    // host process on the affected Android 10 device — every one of them
+    // is a native-crash/OOM surface no Java guard can catch. versionCode
+    // 26 = THE NEW WAY: the device no longer runs ANY AVIF decoder. The
+    // loopback server re-fetches each AVIF URL through the weserv image
+    // proxy (images.weserv.nl, then the wsrv.nl alias) with output=jpg so
+    // the decode happens SERVER-SIDE, and this process only ever runs
+    // BitmapFactory on plain JPEG — the one decoder that exists and is
+    // safe on every Android version. Covers ride their ?e= box as
+    // w/h/fit=inside/we params (the long edge is capped before the bytes
+    // ever cross the network); pages get a server-side box only when the
+    // container declares more than the 25 MP budget (parsed in pure
+    // Kotlin from the already-downloaded bytes). Ladder:
+    // BitmapFactory (12+ native AVIF) -> weserv JPEG -> legible error
+    // card. The avif-android dependency (libavif + dav1d, 1.6 MB of
+    // native libs) is REMOVED — the APK drops from ~1.7 MB to ~0.1 MB.
+    // Debug-only MediaCodec hook retained for the harness pins; the
+    // production ladder never reaches it.
+
     deeplink {
         host("procomic.net")
         host("www.procomic.net")
@@ -106,23 +127,10 @@ keiyoushi {
     }
 }
 
-android {
-    packaging {
-        // AGP 9 removed ndk.abiFilters — the packaging excludes strip the
-        // emulator-only ABIs of the software AVIF decoder (libavif + dav1d
-        // below) at packaging time. The x86/x86_64 builds only matter to
-        // emulators (which run Android 12+ with the platform codec anyway)
-        // and were 3.1 MB of the APK; real devices are ARM. Cuts the APK
-        // from ~4.8 MB to ~1.7 MB.
-        excludes += listOf("lib/x86/**", "lib/x86_64/**", "lib/mips/**", "lib/mips64/**")
-    }
-}
-
 dependencies {
-    // Software AVIF decode (libavif + dav1d, native libs for the ARM ABIs):
-    // the site's page files are AVIF (tall long-strip pages) and the
-    // platform codec only ships on Android 12+ (and is missing on some OEM
-    // builds after that). The image proxy transcodes every AVIF page to
-    // JPEG with it, so pages render on every device and every host app.
-    implementation("org.aomedia.avif.android:avif:1.1.1.14d8e3c4")
+    // v111: NO native decoder dependency. The software AVIF transcode
+    // moved server-side (the weserv image proxy) — the avif-android
+    // artifact (libavif + dav1d, ~1.6 MB of ARM .so files) is gone from
+    // the APK, and with it the last piece of on-device AVIF decode
+    // machinery that ever killed a host process.
 }
