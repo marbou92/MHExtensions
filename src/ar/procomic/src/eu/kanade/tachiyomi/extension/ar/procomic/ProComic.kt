@@ -209,8 +209,25 @@ abstract class ProComic :
             // offscreen WebView) is removed; the worst case is the
             // legible error card, never a crash.
             nativeCacheDir = applicationContext.cacheDir,
-        )
+        ).apply {
+            // v116: the loopback server fetches signed-proxy urls with the
+            // exchange's chapter credential (x-chapter-pass, exactly the
+            // header the site's reader attaches), and re-signs a rejected
+            // or expired signed url through the gated session — an expired
+            // mid-read page heals itself instead of dying into an error
+            // card. Both hooks are optional so the JVM harness can drive
+            // the server bare.
+            chapterPassProvider = { latestImagePass }
+            deferredResigner = { rejected -> resignDeferredImageUrl(rejected) }
+        }
     }
+
+    /** v116: the newest x-chapter-pass credential (flight's imagePass or
+     * a renewed one) — the loopback server reads it through
+     * [ProComicImageServer.chapterPassProvider] when it fetches
+     * signed-proxy urls. */
+    @Volatile
+    private var latestImagePass: String? = null
 
     override fun OkHttpClient.Builder.configureClient() = apply {
         connectTimeout(30, TimeUnit.SECONDS)
@@ -1051,10 +1068,15 @@ abstract class ProComic :
 
         var upstreams = payload.upstreams
         val deferred = payload.deferred
+        latestImagePass = payload.imagePass
         if (deferred?.token != null && upstreams.isNotEmpty()) {
-            // The full-list exchange. While the site's turnstile gate holds
-            // this yields an empty list + a legible diag trail (logged) and
-            // the source ships the public pages exactly as before.
+            // v116: the full-list exchange WALKS THE BATCHES (the server
+            // hands out the deferred list in redis-tracked batches; the
+            // loop re-calls with the reader's constant split until the
+            // answer is an empty images[]). While the site's turnstile
+            // gate holds this yields whatever the session cleared plus a
+            // legible diag trail (mirrored to /.diag) and the source
+            // ships at least the public pages exactly as before.
             val (extra, trail) = fetchDeferredPages(
                 chapterId = ref.chapterId,
                 deferred = deferred,
@@ -1277,14 +1299,25 @@ abstract class ProComic :
 
         var token: String = initialToken
         var pass = imagePass
-        var tokenRetried = false
-        var passRetried = false
-        // v113: one offscreen mint per exchange; the token is single-use
-        // and short-lived, so there is nothing worth caching here.
+        var tokenRenewals = 0
+        var passRenewals = 0
+        var mints = 0
+        var exchanges = 0
         var turnstileToken: String? = null
         var turnstileWidget: String? = null
-        var turnstileAttempted = false
-        repeat(4) {
+        val collected = mutableListOf<String>()
+        val seen = HashSet<String>()
+
+        // v116: the exchange is BATCHED server-side (redis progression —
+        // the reader re-calls with the SAME split value and renews its
+        // token when the server invalidates it; every call yields the next
+        // batch until the list is exhausted). One call = one batch, which
+        // is exactly why every chapter stopped at 3 public pages plus the
+        // first batch. The loop walks the batches with the reader's own
+        // economics: the same split every time, credential renewals
+        // bounded, at most a couple of mints if the gate re-arms mid-list.
+        while (exchanges < MAX_DEFERRED_EXCHANGES && collected.size < MAX_DEFERRED_PAGES) {
+            exchanges++
             val (images, outcome) = deferredAttempt(
                 chapterId = chapterId,
                 token = token,
@@ -1297,19 +1330,32 @@ abstract class ProComic :
             when (outcome.kind) {
                 DeferredOutcome.Kind.OK -> {
                     trail += outcome.note
-                    return images to trail
+                    val fresh = images.filter { seen.add(it) }
+                    if (fresh.isEmpty()) {
+                        trail += "the deferred list is complete (${collected.size} pages beyond the public embed)"
+                        return collected to trail
+                    }
+                    collected += fresh
+                    trail += "deferred batch: +${fresh.size} pages (running total ${collected.size})"
+                }
+
+                DeferredOutcome.Kind.DONE -> {
+                    trail += outcome.note
+                    trail += "the deferred list is complete (${collected.size} pages beyond the public embed)"
+                    return collected to trail
                 }
 
                 DeferredOutcome.Kind.TURNSTILE -> {
                     trail += outcome.note
-                    if (turnstileAttempted) {
-                        trail += "a minted turnstile token did not clear the gate — keeping the public pages"
-                        return emptyList<String>() to trail
+                    if (mints >= MAX_TURNSTILE_MINTS) {
+                        trail += if (collected.isEmpty()) {
+                            "a minted turnstile token did not clear the gate — keeping the public pages"
+                        } else {
+                            "the gate re-armed after ${collected.size} deferred pages — shipping what was fetched"
+                        }
+                        return collected to trail
                     }
-                    // v115: a single mint now walks the ladder; the flag
-                    // still guarantees the exchange is attempted at most
-                    // once with a token, exactly as before.
-                    turnstileAttempted = true
+                    mints++
                     // v114: the sitekey ROTATES — the live reader pulls it
                     // per session from /api/auth/public-settings
                     // (loginTurnstile.siteKey). A stale baked-in key fails
@@ -1324,7 +1370,7 @@ abstract class ProComic :
                         .getOrNull()
                     if (solved == null) {
                         trail += "turnstile solver returned no token — keeping the public pages"
-                        return emptyList<String>() to trail
+                        return collected to trail
                     }
                     turnstileToken = solved.first
                     // Reader parity: the visible-mode widget is rendered
@@ -1334,44 +1380,51 @@ abstract class ProComic :
                 }
 
                 DeferredOutcome.Kind.TOKEN_EXPIRED -> {
-                    if (tokenRetried) {
+                    if (tokenRenewals >= MAX_TOKEN_RENEWALS) {
                         trail += outcome.note
-                        return emptyList<String>() to trail
+                        trail += "deferred renewals exhausted — shipping ${collected.size} deferred pages"
+                        return collected to trail
                     }
-                    tokenRetried = true
+                    tokenRenewals++
                     val renewed = renewDeferredToken(chapterId, token, referer)
                     if (renewed == null) {
                         trail += "refresh POST failed — keeping the public pages"
-                        return emptyList<String>() to trail
+                        return collected to trail
                     }
                     trail += "refresh POST minted a new deferred token"
                     token = renewed
                 }
 
                 DeferredOutcome.Kind.PASS_EXPIRED -> {
-                    if (passRetried) {
+                    if (passRenewals >= MAX_PASS_RENEWALS) {
                         trail += outcome.note
-                        return emptyList<String>() to trail
+                        pass = null
+                        latestImagePass = null
+                        continue
                     }
-                    passRetried = true
+                    passRenewals++
                     val renewed = pass?.let { renewImagePass(chapterId, it, referer) }
                     if (renewed == null) {
                         trail += "image-pass POST failed — retrying without the header"
                         pass = null
+                        latestImagePass = null
                     } else {
                         trail += "image-pass POST minted a new pass"
                         pass = renewed
+                        latestImagePass = renewed
                     }
                 }
 
                 DeferredOutcome.Kind.UNREACHABLE -> {
                     trail += outcome.note
-                    return emptyList<String>() to trail
+                    if (collected.isEmpty()) return emptyList<String>() to trail
+                    trail += "deferred exchanges stopped — shipping ${collected.size} deferred pages"
+                    return collected to trail
                 }
             }
         }
-        trail += "deferred retries exhausted — keeping the public pages"
-        return emptyList<String>() to trail
+        trail += "deferred page bound reached — shipping ${collected.size} deferred pages"
+        return collected to trail
     }
 
     private class DeferredOutcome(
@@ -1381,7 +1434,7 @@ abstract class ProComic :
          * answer ("hidden"/"visible") — drives the solver's widget. */
         val mode: String? = null,
     ) {
-        enum class Kind { OK, TURNSTILE, TOKEN_EXPIRED, PASS_EXPIRED, UNREACHABLE }
+        enum class Kind { OK, DONE, TURNSTILE, TOKEN_EXPIRED, PASS_EXPIRED, UNREACHABLE }
     }
 
     /** One GET across the reader apexes; verdicts, never exceptions.
@@ -1442,6 +1495,15 @@ abstract class ProComic :
                     }
                     val images = parseDeferredImages(bodyText)
                     if (images.isEmpty()) {
+                        // v116: an empty images[] ARRAY is the reader's
+                        // terminal answer — the server has handed out every
+                        // deferred page for this session (batch walk done).
+                        if (hasDeferredImagesArray(bodyText)) {
+                            return emptyList<String>() to DeferredOutcome(
+                                DeferredOutcome.Kind.DONE,
+                                "HTTP 200 from $host with an empty images[] — the deferred list is complete",
+                            )
+                        }
                         lastNote = "HTTP 200 from $host without a usable images[] payload"
                         return@use
                     }
@@ -1473,6 +1535,17 @@ abstract class ProComic :
                 .distinct()
         }.getOrDefault(emptyList())
     }
+
+    /** v116: does the body carry a `data.images` (or top-level `images`)
+     * JSON ARRAY — present even when EMPTY, which is the server's
+     * batch-exhausted terminal answer. Distinguishing "empty because done"
+     * from "no images field at all" is what lets the batch walk stop on
+     * completion instead of retrying. */
+    internal fun hasDeferredImagesArray(bodyText: String): Boolean = runCatching {
+        val root = json.parseToJsonElement(bodyText).jsonObject
+        val data = (root["data"] as? kotlinx.serialization.json.JsonObject) ?: root
+        data["images"] is JsonArray
+    }.getOrDefault(false)
 
     /** The gate's 403 answer carries the server's own widget mode
      * (`{"error":"turnstile_token_required","turnstileMode":"visible"}`)
@@ -1567,18 +1640,68 @@ abstract class ProComic :
         return null
     }
 
-    /** One JSON POST across the apexes; (code, body) or null. */
-    private fun postJson(url: String, jsonBody: String, referer: String): Pair<Int, String>? = runCatching {
+    /** One JSON POST across the apexes; (code, body) or null. v116:
+     * [passHeader] rides as x-chapter-pass (the re-sign endpoint validates
+     * the chapter credential exactly like the media fetches do). */
+    private fun postJson(url: String, jsonBody: String, referer: String, passHeader: String? = null): Pair<Int, String>? = runCatching {
         val request = Request.Builder()
             .url(url)
             .post(jsonBody.toRequestBody("application/json".toMediaType()))
             .header("Accept", "application/json")
             .header("Referer", referer)
+            .apply { passHeader?.let { header("x-chapter-pass", it) } }
             .build()
         client.newCall(request).execute().use { response ->
             response.code to response.body?.string().orEmpty()
         }
     }.getOrNull()
+
+    /**
+     * v116: mint a fresh signed-proxy URL for one the edge rejected (410
+     * expired mid-read / 403), or sign a raw CDN url the deferred answer
+     * shipped unsigned. The site's own flow: POST /api/cdn-image/sign
+     * {url} with the chapter pass + the gated session (the successful
+     * exchange just established it) → {token, expires, es?, host?} → the
+     * signed fetch URL. Verified live in the v99 recon: sign 200 → signed
+     * fetch 200 (273 KB AVIF). Null on any refusal — the server's diag
+     * names the rung.
+     */
+    private fun resignDeferredImageUrl(rejectedUrl: String): String? {
+        val pass = latestImagePass ?: return null
+        val raw = runCatching { rejectedUrl.toHttpUrl().queryParameter("url") }.getOrNull()
+            ?.takeIf { it.isNotBlank() }
+            ?: rejectedUrl
+        for (apex in readerApexes) {
+            val answer = postJson(
+                url = "$apex/api/cdn-image/sign",
+                jsonBody = """{"url":"$raw"}""",
+                referer = "$baseUrl/",
+                passHeader = pass,
+            ) ?: continue
+            if (answer.first != 200) continue
+            val obj = runCatching { json.parseToJsonElement(answer.second).jsonObject }.getOrNull() ?: continue
+            val token = obj["token"]?.jsonPrimitive?.content?.takeIf { it.isNotBlank() } ?: continue
+            val expires = obj["expires"]?.jsonPrimitive?.content
+            val es = obj["es"]?.jsonPrimitive?.content
+            val host = obj["host"]?.jsonPrimitive?.content
+            val signed = runCatching {
+                (if (!host.isNullOrBlank()) "https://$host" else apex).toHttpUrl()
+                    .newBuilder()
+                    .addPathSegment("api")
+                    .addPathSegment("cdn-image")
+                    .addQueryParameter("url", raw)
+                    .addQueryParameter("token", token)
+                    .apply {
+                        expires?.let { addQueryParameter("expires", it) }
+                        es?.let { addQueryParameter("es", it) }
+                    }
+                    .build()
+                    .toString()
+            }.getOrNull() ?: continue
+            return signed
+        }
+        return null
+    }
 
     // ========================= Preference screen =========================
 
@@ -1643,6 +1766,16 @@ abstract class ProComic :
     private companion object {
         const val TAG = "ProComic"
         const val PAGE_LIMIT = 24
+
+        /** v116: the deferred exchange is BATCHED server-side (redis
+         * progression — the reader re-calls with the same split value and
+         * renews its token as batches advance). These bounds keep the
+         * batch walk finite no matter what the server answers. */
+        const val MAX_DEFERRED_EXCHANGES = 40
+        const val MAX_DEFERRED_PAGES = 200
+        const val MAX_TOKEN_RENEWALS = 3
+        const val MAX_PASS_RENEWALS = 2
+        const val MAX_TURNSTILE_MINTS = 3
 
         /** A single letter keeps the search endpoint in its "trusted" mode
          * (no Turnstile) while matching nearly every English-titled series. */

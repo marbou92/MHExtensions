@@ -127,6 +127,20 @@ class ProComicImageServer(
 
     private val startedAtMs = System.currentTimeMillis()
 
+    /** v116: the current x-chapter-pass credential (the pages-scope p1 JWT
+     * the deferred exchange holds and renews). Attached to signed-proxy
+     * fetches — the same header the site's own reader sends on protected
+     * media. Optional so the JVM harness can drive the server bare. */
+    @Volatile
+    var chapterPassProvider: (() -> String?)? = null
+
+    /** v116: mints a fresh signed-proxy URL for a rejected or expired one
+     * (the source re-signs the wrapped CDN url through the site's own
+     * POST /api/cdn-image/sign with its gated session). Returning null
+     * keeps the legible failure + diag trail. */
+    @Volatile
+    var deferredResigner: ((String) -> String?)? = null
+
     /** Fair 2-wide semaphore over the TRANSCODE stage only (decode + JPEG
      * encode of tall pages). Fairness keeps a reader's preloaded pages from
      * being starved by late requests; the network fetch happens OUTSIDE the
@@ -403,9 +417,17 @@ class ProComicImageServer(
         }
     }
 
+    /** v116: the signed-proxy URL class — /api/cdn-image answers mint
+     * short-lived (~15 min observed) signed urls whose token rides the
+     * query. These get the pass header, the session-first fetch order and
+     * the re-sign rung; plain CDN/app-host urls keep the v101 ladder. */
+    internal fun isSignedProxyUrl(imageUrl: String): Boolean = imageUrl.contains("/api/cdn-image")
+
     /** One upstream fetch attempt with the exact headers a browser <img>
-     * sends. Caller retries/cascades. */
-    private fun fetchUpstreamOnce(imageUrl: String, client: OkHttpClient): Pair<String, ByteArray> {
+     * sends. Caller retries/cascades. v116: [pass] rides as x-chapter-pass
+     * on signed-proxy urls — the credential the site's reader attaches to
+     * the same requests. */
+    private fun fetchUpstreamOnce(imageUrl: String, client: OkHttpClient, pass: String? = null): Pair<String, ByteArray> {
         val request = Request.Builder()
             .url(imageUrl)
             .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
@@ -414,6 +436,9 @@ class ProComicImageServer(
             .header("sec-fetch-dest", "image")
             .header("sec-fetch-mode", "no-cors")
             .header("sec-fetch-site", "same-site")
+            .apply {
+                if (pass != null && isSignedProxyUrl(imageUrl)) header("x-chapter-pass", pass)
+            }
             .build()
         client.newCall(request).execute().use { response ->
             if (!response.isSuccessful) {
@@ -423,28 +448,55 @@ class ProComicImageServer(
         }
     }
 
-    /** Inner client first (no source interceptors, no rate limiter
-     * contention, no recursion), then one retry through the session client
-     * (cookies, CF clearance, the reader page's browsing session). */
+    /** v116 fetch ladder. Signed-proxy urls (/api/cdn-image) try the
+     * SESSION client first (the fetch may be cookie-gated exactly like
+     * the exchange that minted them), then the bare inner client; every
+     * other host keeps the v101 order (inner first, session as the
+     * retry). When a signed url is rejected outright by the edge (410
+     * expired / 403), the source's re-sign hook mints a fresh signed url
+     * out of the gated session and both clients retry it once — an
+     * expired mid-read page heals itself instead of dying into an error
+     * card. */
     private fun fetchUpstreamWithRetry(imageUrl: String, diag: ProxyDiag): Pair<String, ByteArray> {
         val host = runCatching { imageUrl.toHttpUrl().host }.getOrDefault("?")
-        try {
-            return fetchUpstreamOnce(imageUrl, innerClient)
-        } catch (first: IOException) {
-            diag.add("fetch/$host ${describe(first)}")
-            val sessionClient = this.sessionClient ?: throw first
+        val signed = isSignedProxyUrl(imageUrl)
+        val pass = runCatching { chapterPassProvider?.invoke() }.getOrNull()
+        val tiers: List<Pair<OkHttpClient, String>> = if (signed && sessionClient != null) {
+            listOf(sessionClient to "session", innerClient to "inner")
+        } else {
+            listOf(innerClient to "inner") + (sessionClient?.let { listOf(it to "session") } ?: emptyList())
+        }
+        var last: IOException? = null
+        for ((client, tag) in tiers) {
             try {
-                Thread.sleep(RETRY_DELAY_MS)
-            } catch (_: InterruptedException) {
-                Thread.currentThread().interrupt()
-            }
-            try {
-                return fetchUpstreamOnce(imageUrl, sessionClient)
-            } catch (second: IOException) {
-                diag.add("fetch/$host session ${describe(second)}")
-                throw second
+                return fetchUpstreamOnce(imageUrl, client, pass)
+            } catch (e: IOException) {
+                last = e
+                diag.add("fetch/$host $tag ${describe(e)}")
+                try {
+                    Thread.sleep(RETRY_DELAY_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                }
             }
         }
+        if (signed) {
+            val fresh = runCatching { deferredResigner?.invoke(imageUrl) }.getOrNull()
+            if (fresh != null && fresh != imageUrl) {
+                diag.add("resign: fresh signed url minted after ${describe(last ?: IOException("fetch failed"))}")
+                for ((client, tag) in tiers) {
+                    try {
+                        return fetchUpstreamOnce(fresh, client, pass)
+                    } catch (e: IOException) {
+                        last = e
+                        diag.add("fetch/$host resign-$tag ${describe(e)}")
+                    }
+                }
+            } else {
+                diag.add("resign: no fresh url (the source could not re-sign)")
+            }
+        }
+        throw last ?: IOException("ProComic: image fetch failed")
     }
 
     private val innerClient: OkHttpClient by lazy {
@@ -1020,7 +1072,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v115\"")
+        sb.append("\"server\":\"procomic-image/v116\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -1082,7 +1134,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v114")
+                add("Server build: procomic-image/v116")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)
