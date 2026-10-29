@@ -281,20 +281,23 @@ abstract class ProComic :
 
     private fun parseDate(raw: String?): Long = dateFormat.tryParse(raw?.substringBefore('.')?.take(19))
 
-    private fun seriesPageUrl(mangaUrl: String): String = "$baseUrl/ar/series/$mangaUrl"
+    // v117: seriesPageUrl removed — the series page walks both apexes
+    // through fetchFlightAcrossApexes (net first); see fetchSeriesPage.
 
     private fun chapterPageUrl(ref: ChapterRef): String = "$baseUrl/ar/chapter/${ref.seriesSlug}-${ref.chapterNumber}-${ref.chapterId}"
 
     /**
-     * The reader/series routes exist on BOTH deployments (v105): the site
-     * is dual-homed — most series migrated to procomic.net, but a share of
-     * the catalog (series 224 "On a Deserted Island..." among them) still
-     * lives on procomic.pro, where the .net reader route 308s to the series
-     * page instead of carrying the flight payload. Derived from baseUrl so
-     * it tracks whichever apex the build targets.
+     * The reader/series routes exist on BOTH deployments (v104/v105): the
+     * build's baseUrl is the .net deployment (where the real flight
+     * payloads serve since the migration), and the .pro apex stays as the
+     * fallthrough for the share of the catalog that still lives there
+     * (their .net reader route 308s to the series page instead of
+     * carrying the payload). Pure helper so the harness can pin the
+     * order; every apex ladder (details, reader flight, deferred
+     * exchange, refresh, re-sign) walks this list.
      */
-    private val readerApexes: List<String> by lazy {
-        val base = baseUrl.trimEnd('/')
+    internal fun apexOrderFor(rawBaseUrl: String): List<String> {
+        val base = rawBaseUrl.trimEnd('/')
         val host = base.substringAfter("//")
         val alt = when {
             host.startsWith("www.") -> null
@@ -302,8 +305,10 @@ abstract class ProComic :
             host.endsWith(".pro") -> host.removeSuffix(".pro") + ".net"
             else -> null
         }
-        listOfNotNull(base, alt?.let { "https://$it" }).distinct()
+        return listOfNotNull(base, alt?.let { "https://$it" }).distinct()
     }
+
+    private val readerApexes: List<String> by lazy { apexOrderFor(baseUrl) }
 
     /**
      * Fetches a reader-side path across both apexes, extracts the RSC
@@ -393,7 +398,10 @@ abstract class ProComic :
             thumbnail = null,
             cdnPath = cdn_path,
         )?.let(::coverProxyUrl)
-        genre = type?.let { it.replaceFirstChar { c -> c.uppercase() } }
+        // v117: the type rides with the canonical long-strip keywords so
+        // reader apps auto-suggest the webtoon/long-strip mode (see
+        // typeGenreKeywords).
+        genre = typeGenreKeywords(type).joinToString(", ").ifBlank { null }
         status = this@toSManga.status.toProComicStatus()
         initialized = true
     }
@@ -493,7 +501,9 @@ abstract class ProComic :
             cdnPath = cdn_path,
         )?.let(::coverProxyUrl)
         genre = buildList {
-            this@toSManga.type?.let { add(it.replaceFirstChar { c -> c.uppercase() }) }
+            // v117: the canonical long-strip keywords ride the browse rows
+            // too (the suggestion fires on them before details ever load).
+            addAll(typeGenreKeywords(this@toSManga.type))
             addAll(this@toSManga.metadata?.genres.orEmpty())
         }.distinct().joinToString(", ")
         status = progress.toProComicStatus()
@@ -538,7 +548,10 @@ abstract class ProComic :
 
     // ============================== Details ==============================
 
-    override fun getMangaUrl(manga: SManga): String = "$baseUrl/ar/series/${manga.url}"
+    /** v117: the series INFO page lives on the .net deployment now (the
+     * .pro series route renders a "page moved" shell) — "Open in WebView"
+     * follows the site. */
+    override fun getMangaUrl(manga: SManga): String = "${readerApexes.first()}/ar/series/${manga.url}"
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
         // Both apexes (and their www forms) — the site migrated .pro → .net
@@ -675,10 +688,15 @@ abstract class ProComic :
             author = meta?.authorText()
             artist = meta?.artistText()
             genre = buildList {
-                series.type?.let { add(it.replaceFirstChar { c -> c.uppercase() }) }
+                addAll(typeGenreKeywords(series.type))
+                // v117: BOTH shapes — the legacy flat strings (search rows
+                // + any .pro-served legacy flight) and the migrated
+                // flight's localized categories object.
                 addAll(meta?.genres.orEmpty())
+                addAll(pageData.categories?.genreNames().orEmpty())
                 if (showTags) {
                     meta?.tags.orEmpty().forEach { add(it.trim()) }
+                    pageData.categories?.tagNames().orEmpty().forEach { add(it) }
                 }
             }.distinct()
                 .filterNot { it.lowercase() in blockedGenres() }
@@ -689,6 +707,26 @@ abstract class ProComic :
             status = pageData.statusText.toProComicStatus()
             description = buildDescription(series)
             initialized = true
+        }
+    }
+
+    /**
+     * v117: the site's own type string plus the CANONICAL long-strip
+     * genre keywords. Field report: reader apps ("Mihon and the like")
+     * auto-suggest the long-strip / webtoon mode from exact genre strings
+     * — different forks key on different subsets ("Long Strip",
+     * "Webtoon", "Manhwa", "Manhua"), so every long-strip type carries
+     * them ALL (they are semantically true: every ProComic page is an
+     * 800xN tall strip). Non-long-strip types keep the capitalized site
+     * value only. Pure so the harness pins it.
+     */
+    internal fun typeGenreKeywords(type: String?): List<String> {
+        val trimmed = type?.trim().orEmpty()
+        if (trimmed.isEmpty()) return emptyList()
+        val capitalized = trimmed.replaceFirstChar { c -> c.uppercase() }
+        return when (trimmed.lowercase()) {
+            "manhwa", "manhua", "webtoon", "long strip" -> listOf(capitalized, "Long Strip", "Webtoon").distinct()
+            else -> listOf(capitalized)
         }
     }
 
@@ -787,30 +825,47 @@ abstract class ProComic :
 
     // ============================= Chapters ==============================
 
-    /** Parsed from the series page flight payload (or the search fallback). */
-    private class SeriesPageData(
+    /** Parsed from the series page flight payload (or the search fallback).
+     * v117: [categories] carries the migrated flight's sibling
+     * genres/tags object (null on legacy flights and search fallbacks).
+     * Internal so the JVM harness can pin the parse with real payloads. */
+    internal class SeriesPageData(
         val series: SeriesDetailsDto,
         val recentChapters: List<ChapterRowDto>,
         val statusText: String? = null,
+        val categories: SeriesCategoriesDto? = null,
     )
 
-    private suspend fun fetchSeriesPage(mangaUrl: String): SeriesPageData {
-        val response = client.newCall(GET(seriesPageUrl(mangaUrl), headers)).execute()
-        response.use {
-            if (!it.isSuccessful) throw IOException("HTTP ${it.code} on series page")
-            val flight = RscFlight.extract(it.body.string())
+    /**
+     * v117: the series page walks BOTH apexes (the .net base leads — see
+     * [apexOrderFor]; the .pro fallthrough covers the legacy catalog
+     * share whose .net route 308s to the series page). The .pro series
+     * route renders a "page moved" shell whose flight carries no
+     * `{"series":{...}}` payload, and the real payload (title, type,
+     * genres, tags, description, progress) serves from procomic.net. The
+     * search-API fallback downstream stays as the last resort for
+     * client-rendered series.
+     */
+    private suspend fun fetchSeriesPage(mangaUrl: String): SeriesPageData = fetchFlightAcrossApexes(
+        path = "/ar/series/$mangaUrl",
+        emptyPayloadError = "ProComic: the series page carried no payload on either apex",
+        parse = ::parseSeriesFlight,
+    )
 
-            // `{"series":{...}}` — capture the INNER object for the DTO.
-            val wrapperKey = "{\"series\":{"
-            val wrapperStart = flight.indexOf(wrapperKey)
-            if (wrapperStart < 0) throw IOException("series payload missing")
-            val innerStart = wrapperStart + wrapperKey.length - 1
-            val seriesJson = RscFlight.balancedObject(flight, innerStart)
-                ?: throw IOException("series payload unbalanced")
-            val series = json.decodeFromString(SeriesDetailsDto.serializer(), seriesJson)
-
-            return SeriesPageData(series, parseChapterRows(flight))
-        }
+    /** The `{"series":{…},"categories":{…},…}` props object of the
+     * migrated series flight + the recent chapter rows. The wrapper decode
+     * is what v117 restores: the pre-migration parse captured the inner
+     * series object only, and the migration moved genres/tags into the
+     * sibling `categories` — metadata.genres now parses null and the
+     * genre field collapsed to the bare type. Internal + payload-only for
+     * the harness pins. */
+    internal fun parseSeriesFlight(flight: String): SeriesPageData? {
+        val wrapperKey = "{\"series\":{"
+        val wrapperStart = flight.indexOf(wrapperKey)
+        if (wrapperStart < 0) return null
+        val wrapperJson = RscFlight.balancedObject(flight, wrapperStart) ?: return null
+        val wrapper = runCatching { json.decodeFromString(SeriesFlightWrapperDto.serializer(), wrapperJson) }.getOrNull() ?: return null
+        return SeriesPageData(wrapper.series, parseChapterRows(flight), categories = wrapper.categories)
     }
 
     private fun parseChapterRows(flight: String): List<ChapterRowDto> {
@@ -1307,15 +1362,45 @@ abstract class ProComic :
         var turnstileWidget: String? = null
         val collected = mutableListOf<String>()
         val seen = HashSet<String>()
+        // v117: whether the CURRENT token is a fresh renewal that has
+        // already been exchanged once and replayed the same slice.
+        var replayedAfterRenewal = false
 
-        // v116: the exchange is BATCHED server-side (redis progression —
-        // the reader re-calls with the SAME split value and renews its
-        // token when the server invalidates it; every call yields the next
-        // batch until the list is exhausted). One call = one batch, which
-        // is exactly why every chapter stopped at 3 public pages plus the
-        // first batch. The loop walks the batches with the reader's own
-        // economics: the same split every time, credential renewals
-        // bounded, at most a couple of mints if the gate re-arms mid-list.
+        // v117: one slice-advance renewal — the walk's between-batches
+        // refresh (the reader's own economics: a fresh token per loader
+        // call). Counts against MAX_TOKEN_RENEWALS (now walk-scale: every
+        // slice costs one refresh) and appends a trail row on both
+        // outcomes. Null = the walk keeps the current token (a
+        // session-keyed cursor may still advance without a renewal).
+        fun renewForNextSlice(): String? {
+            if (tokenRenewals >= MAX_TOKEN_RENEWALS) {
+                trail += "deferred renewals exhausted — walking with the current token"
+                return null
+            }
+            tokenRenewals++
+            val renewed = renewDeferredToken(chapterId, token, referer)
+            if (renewed == null) {
+                trail += "refresh POST failed — continuing with the current token"
+                return null
+            }
+            trail += "refresh POST minted the next-batch token"
+            return renewed
+        }
+
+        // v116 introduced the batch walk; v117 fixes its economics. LIVE
+        // RECON (the decisive test, run from the sandbox): the refresh
+        // endpoint is UNGATED (200 with just the token, no Turnstile, no
+        // cookies) and re-issues the SAME split claim — so the exchange's
+        // slice cursor is tracked server-side per session, and the site's
+        // own reader advances it by calling the loader with a RENEWED
+        // token each time (its promise memo makes same-token repeats
+        // impossible). v116 repeated the exchange with the same token: the
+        // server replayed the same slice, the dedup guard saw an empty
+        // delta and declared the list "complete" after the FIRST batch —
+        // exactly the field symptom (3 public + one batch = 5 pages). The
+        // walk now RENEWS the token between slices (the reader's own
+        // economics) and only terminates on: an empty images[] ARRAY (the
+        // server's terminal answer), a replay AFTER a renewal, or bounds.
         while (exchanges < MAX_DEFERRED_EXCHANGES && collected.size < MAX_DEFERRED_PAGES) {
             exchanges++
             val (images, outcome) = deferredAttempt(
@@ -1332,11 +1417,30 @@ abstract class ProComic :
                     trail += outcome.note
                     val fresh = images.filter { seen.add(it) }
                     if (fresh.isEmpty()) {
-                        trail += "the deferred list is complete (${collected.size} pages beyond the public embed)"
-                        return collected to trail
+                        if (replayedAfterRenewal) {
+                            trail += "the renewed token replayed the same slice — the deferred list is complete (${collected.size} pages beyond the public embed)"
+                            return collected to trail
+                        }
+                        // Same slice again: advance the cursor the reader's
+                        // way — renew the token, then exchange once more.
+                        val renewed = renewForNextSlice()
+                        if (renewed == null) {
+                            trail += "the deferred list is complete (${collected.size} pages beyond the public embed)"
+                            return collected to trail
+                        }
+                        token = renewed
+                        replayedAfterRenewal = true
+                        continue
                     }
                     collected += fresh
                     trail += "deferred batch: +${fresh.size} pages (running total ${collected.size})"
+                    replayedAfterRenewal = false
+                    // v117: refresh between slices so the server's cursor
+                    // advances (the reader renews its token before every
+                    // load). A failed renewal is not fatal — one more
+                    // exchange with the current token may still advance a
+                    // session-keyed cursor.
+                    renewForNextSlice()?.let { token = it }
                 }
 
                 DeferredOutcome.Kind.DONE -> {
@@ -1364,7 +1468,16 @@ abstract class ProComic :
                     val (siteKey, siteKeyNote) = fetchTurnstileGateConfig(referer)
                     trail += siteKeyNote
                     val solved = runCatching {
-                        TurnstileSolver.solve(applicationContext, siteKey, outcome.mode, ProComicImageServer.BROWSER_UA)
+                        // v117: the mint runs on the SAME apex the exchange
+                        // targets (Turnstile is domain-bound — the widget's
+                        // token carries the page origin's hostname).
+                        TurnstileSolver.solve(
+                            applicationContext,
+                            siteKey,
+                            outcome.mode,
+                            ProComicImageServer.BROWSER_UA,
+                            origin = readerApexes.first().trimEnd('/') + "/",
+                        )
                     }
                         .onFailure { trail += "turnstile solver crashed safely: ${it.javaClass.simpleName}" }
                         .getOrNull()
@@ -1770,10 +1883,12 @@ abstract class ProComic :
         /** v116: the deferred exchange is BATCHED server-side (redis
          * progression — the reader re-calls with the same split value and
          * renews its token as batches advance). These bounds keep the
-         * batch walk finite no matter what the server answers. */
+         * batch walk finite no matter what the server answers. v117:
+         * MAX_TOKEN_RENEWALS is walk-scale — every slice advance costs one
+         * refresh POST (the reader's own renewal cadence). */
         const val MAX_DEFERRED_EXCHANGES = 40
         const val MAX_DEFERRED_PAGES = 200
-        const val MAX_TOKEN_RENEWALS = 3
+        const val MAX_TOKEN_RENEWALS = 40
         const val MAX_PASS_RENEWALS = 2
         const val MAX_TURNSTILE_MINTS = 3
 

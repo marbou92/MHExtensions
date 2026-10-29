@@ -94,7 +94,10 @@ internal object TurnstileSolver {
     /** Kept as an alias so older probes keep compiling. */
     const val SITE_KEY = DEFAULT_SITE_KEY
 
-    /** Origin the solver page runs on — Turnstile is domain-bound. */
+    /** Origin the solver page runs on — Turnstile is domain-bound.
+     * v117: parameterizable (the deferred exchange now walks the .net
+     * apex first, so the mint runs there too); the .pro constant stays
+     * the default for the harness pins and any legacy caller. */
     const val ORIGIN = "https://procomic.pro/"
 
     /** Cloudflare's widget script (render=explicit, same as the reader). */
@@ -143,6 +146,7 @@ internal object TurnstileSolver {
         siteKey: String? = null,
         mode: String? = null,
         ua: String? = null,
+        origin: String = ORIGIN,
     ): Pair<String, String>? {
         val key = siteKey?.takeIf { it.isNotBlank() } ?: DEFAULT_SITE_KEY
         val now = elapsedMillis()
@@ -161,7 +165,7 @@ internal object TurnstileSolver {
         rungs.forEachIndexed { index, (appearance, size) ->
             val budget = RUNG_TIMEOUTS_SECONDS.getOrElse(index) { 14L }
             val solved = runCatching {
-                attemptOnce(context, key, appearance, size, ua, budget)
+                attemptOnce(context, key, appearance, size, ua, budget, origin)
             }.getOrNull()
             if (solved != null) return solved
             Log.i(TAG, "ladder rung $index ($appearance/$size) yielded no token")
@@ -182,6 +186,7 @@ internal object TurnstileSolver {
         size: String,
         ua: String?,
         timeoutSeconds: Long,
+        origin: String = ORIGIN,
     ): Pair<String, String>? {
         val result = Cell()
         var thread: HandlerThread? = null
@@ -293,7 +298,7 @@ internal object TurnstileSolver {
                         webView?.layout(0, 0, 320, 140)
                     } catch (_: Throwable) {
                     }
-                    webView?.loadDataWithBaseURL(ORIGIN, pageHtml(key, appearance, size), "text/html", "utf-8", null)
+                    webView?.loadDataWithBaseURL(origin, pageHtml(key, appearance, size), "text/html", "utf-8", null)
 
                     // The hard wall: whatever happens, the WebView dies.
                     handler.postDelayed(

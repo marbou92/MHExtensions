@@ -372,8 +372,28 @@ class ProComicImageServer(
     /** Fetch + transcode for one upstream URL, throwing [ImageBuildFailure]
      * with the reader-visible body. Shared by the request path and the
      * background preloader; runs ONCE per URL even under concurrent host
-     * fetches (coalesced by [buildImageCoalesced]). */
+     * fetches (coalesced by [buildImageCoalesced]). v117: signed-proxy
+     * urls (the deferred pages' /api/cdn-image wraps) walk a dedicated
+     * ladder — see [buildSignedImageBytes]. */
     private fun buildImageBytes(imageUrl: String, diag: ProxyDiag, maxEdge: Int = 0): Pair<String, ByteArray> {
+        if (isSignedProxyUrl(imageUrl)) {
+            var stage = "signed"
+            try {
+                val (contentType, bytes) = buildSignedImageBytes(imageUrl, diag, maxEdge)
+                stage = "cache"
+                cacheResult(cacheKey(imageUrl), contentTypeServed(contentType, bytes), bytes)
+                return contentTypeServed(contentType, bytes) to bytes
+            } catch (failure: ImageBuildFailure) {
+                throw failure
+            } catch (t: Throwable) {
+                val message = when (t) {
+                    is IOException -> t.message ?: "image preparation failed (IOException)"
+                    is OutOfMemoryError -> "device ran out of memory decoding the page (OutOfMemoryError)"
+                    else -> "image preparation failed (${t.javaClass.simpleName})"
+                }
+                throw ImageBuildFailure(stage, diagBody(message, diag), diag, t)
+            }
+        }
         var stage = "fetch"
         try {
             val (contentType, raw) = fetchUpstreamWithRetry(imageUrl, diag)
@@ -399,6 +419,92 @@ class ProComicImageServer(
                 else -> "image preparation failed (${t.javaClass.simpleName})"
             }
             throw ImageBuildFailure(stage, diagBody(message, diag), diag, t)
+        }
+    }
+
+    /** The signed url's inner target (the `url` query param) when it is a
+     * WIDE-OPEN app host — those files are served to any client (the
+     * signature rides in the file name), so the wrap can be skipped
+     * entirely and the plain p1-p3-style ladder used. Null for any other
+     * host (cdn2 and friends stay behind the signed route). Internal +
+     * pure for the harness pins. */
+    internal fun signedInnerAppUrl(imageUrl: String): String? = runCatching {
+        val inner = imageUrl.toHttpUrl().queryParameter("url")
+            ?.takeIf { it.startsWith("https://") }
+            ?: return@runCatching null
+        val host = inner.toHttpUrl().host
+        if (host.startsWith("app.")) inner else null
+    }.getOrNull()
+
+    /**
+     * v117: the signed-proxy ladder. LIVE RECON (all from the sandbox,
+     * with a real flight-issued pass): signed urls are MULTI-USE within
+     * their ~4-min window, BOTH apexes' /api/cdn-image fetches answer 200,
+     * and weserv converts a signed url to JPEG cleanly — so the v116
+     * failure was never weserv's refetch. The ladder walks the cheapest
+     * proven rungs first and names every one in the diag trail:
+     *
+     *  1. UNWRAP — when the wrap is a wide-open app host, use the inner
+     *     url through the exact p1-p3-proven plain ladder (no token, no
+     *     cdn-image route, no expiry).
+     *  2. WESERV-ON-SIGNED — weserv fetches the signed url itself (its
+     *     datacenter reaches the route; proven 200 → JPEG) with one 5xx
+     *     retry per host (the route 502s cold-started on first hit).
+     *  3. UPSTREAM — the v116 ladder: the session client first with the
+     *     x-chapter-pass header, then inner; on a rejected/expired signed
+     *     url the source's re-sign hook mints a fresh one and the weserv
+     *     tier tries the fresh url.
+     */
+    private fun buildSignedImageBytes(imageUrl: String, diag: ProxyDiag, maxEdge: Int): Pair<String, ByteArray> {
+        // Rung 1 — unwrap to the wide-open app host.
+        signedInnerAppUrl(imageUrl)?.let { inner ->
+            diag.add("signed rung 1: unwrap → ${runCatching { inner.toHttpUrl().host }.getOrDefault("?")} (wide-open app host)")
+            try {
+                val (ct, raw) = fetchUpstreamWithRetry(inner, diag)
+                val bytes = if (isAvif(ct, raw)) transcodeUnderPermit(raw, inner, diag, maxEdge) else raw
+                diag.add("signed rung 1: served ${bytes.size}B via the unwrapped app url")
+                return contentTypeServed(ct, bytes) to bytes
+            } catch (t: Throwable) {
+                diag.add("signed rung 1 failed: ${t.message ?: t.javaClass.simpleName}")
+            }
+        } ?: diag.add("signed rung 1: inner host is not a wide-open app host — skipped")
+
+        // Rung 2 — weserv fetches the signed url itself.
+        diag.add("signed rung 2: weserv on the signed url")
+        try {
+            val jpeg = fetchProxyJpegBytes(imageUrl, raw = null, diag = diag, maxEdge = maxEdge)
+            if (jpeg != null) {
+                diag.add("signed rung 2: served ${jpeg.size}B via weserv")
+                return "image/jpeg" to jpeg
+            }
+        } catch (t: Throwable) {
+            diag.add("signed rung 2 threw: ${t.javaClass.simpleName}")
+        }
+
+        // Rung 3 — the proxy fetches the signed url (session-first + pass,
+        // the v116 ladder), then re-signs a rejection and lets weserv try
+        // the fresh url.
+        diag.add("signed rung 3: upstream fetch (session-first + pass)")
+        val (ct, raw) = fetchUpstreamWithRetry(imageUrl, diag)
+        if (!isAvif(ct, raw)) {
+            diag.add("signed rung 3: served ${raw.size}B directly (${ct.ifBlank { "raster" }})")
+            return contentTypeServed(ct, raw) to raw
+        }
+        val fresh = runCatching { deferredResigner?.invoke(imageUrl) }.getOrNull()
+        if (fresh != null && fresh != imageUrl) {
+            diag.add("signed rung 3: re-signed → weserv on the fresh url")
+            fetchProxyJpegBytes(fresh, raw = null, diag = diag, maxEdge = maxEdge)?.let { jpeg ->
+                diag.add("signed rung 3: served ${jpeg.size}B via the re-signed url")
+                return "image/jpeg" to jpeg
+            }
+        } else {
+            diag.add("signed rung 3: no fresh url (the source could not re-sign)")
+        }
+        // Last resort inside rung 3: the v111 weserv tier on the original
+        // bytes (harmless repeat — named for the trail).
+        transcodeUnderPermit(raw, imageUrl, diag, maxEdge).let { bytes ->
+            diag.add("signed rung 3: served ${bytes.size}B via the local transcode tier")
+            return "image/jpeg" to bytes
         }
     }
 
@@ -576,44 +682,34 @@ class ProComicImageServer(
         // v111: the server-side transcode tier — weserv decodes the AVIF
         // in its datacenter and hands back a plain JPEG this process CAN
         // decode (BitmapFactory handles JPEG on every Android version).
-        val proxyBitmap = try {
-            fetchProxyJpeg(imageUrl, bytes, diag, maxEdge)
+        // v117: the tier returns finished JPEG BYTES (the weserv answer is
+        // already a raster; one compress instead of decode→recompress).
+        val proxyBytes = try {
+            fetchProxyJpegBytes(imageUrl, raw = bytes, diag = diag, maxEdge = maxEdge)
         } catch (t: Throwable) {
             diag.add("proxy tier threw ${t.javaClass.simpleName}")
             null
         }
-        proxyBitmap?.let { bitmap ->
-            try {
-                val output = ByteArrayOutputStream(bitmap.byteCount.coerceAtLeast(16_384))
-                if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
-                    throw IOException("ProComic: page JPEG encode failed")
-                }
-                return output.toByteArray()
-            } finally {
-                bitmap.recycle()
-            }
-        }
+        if (proxyBytes != null) return proxyBytes
         throw IOException("ProComic: page failed to decode (server-side transcode unavailable)")
     }
 
     /**
      * The server-side transcode tier (v111): re-fetch [imageUrl] through
      * the weserv image proxy with `output=jpg` so the AVIF decode happens
-     * on their infrastructure, then decode the returned JPEG with
-     * BitmapFactory — the one decoder that exists and is safe on EVERY
-     * Android version. Both proxy hosts are tried in order; every failure
-     * lands in the diag trail and the tier returns null (the ladder then
-     * throws the legible decode failure — the error card, never a crash).
-     *
-     * Sizing: covers ride their ?e= box (`w`+`h`+`fit=inside`+`we` — the
-     * long edge is capped server-side, so a 4000x6000 "originals" cover
-     * never even crosses the network at full size); pages without a max
-     * edge get a box ONLY when the container (parsed in pure Kotlin from
-     * the already-downloaded bytes) declares more pixels than the decode
-     * budget — the proxy downscales instead of this process ever seeing a
-     * budget-busting bitmap.
+     * on their infrastructure, then keep the returned JPEG — the one
+     * format BitmapFactory decodes safely on EVERY Android version.
+     * Both proxy hosts are tried in order (one 5xx retry each — v117: the
+     * cdn-image route behind the signed urls 502s cold-started on its
+     * first hit, so a single attempt could poison the rung); every
+     * failure lands in the diag trail and the tier returns null (the
+     * ladder then throws the legible decode failure — the error card,
+     * never a crash). [raw] is the already-downloaded source bytes when
+     * they exist (they feed the container pixel-budget gate) and null for
+     * the v117 signed rungs, which never fetch the source first — the
+     * budget then applies client-side from the JPEG bounds.
      */
-    private fun fetchProxyJpeg(imageUrl: String, raw: ByteArray, diag: ProxyDiag, maxEdge: Int): Bitmap? {
+    private fun fetchProxyJpegBytes(imageUrl: String, raw: ByteArray?, diag: ProxyDiag, maxEdge: Int): ByteArray? {
         if (proxyHosts.isEmpty()) {
             diag.add("proxy: no hosts configured")
             return null
@@ -623,44 +719,71 @@ class ProComicImageServer(
             return null
         }
         val quality = if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY
-        val box = proxyBoxFor(proxyPixelBudgetGate(raw), maxEdge, diag)
+        val box = proxyBoxFor(raw?.let(::proxyPixelBudgetGate), maxEdge, diag)
         for (host in proxyHosts) {
             val url = proxyTranscodeUrl(imageUrl, encoded, quality, box, host)
-            try {
-                val request = Request.Builder()
-                    .url(url)
-                    .header("User-Agent", BROWSER_UA)
-                    .build()
-                innerClient.newCall(request).execute().use { response ->
-                    if (!response.isSuccessful) {
-                        diag.add("proxy/$host http ${response.code}")
-                        return@use
+            // v117: one 5xx retry per host (the signed route's cold-start
+            // 502s are transient — a retry succeeds).
+            for (attempt in 0..1) {
+                try {
+                    val request = Request.Builder()
+                        .url(url)
+                        .header("User-Agent", BROWSER_UA)
+                        .build()
+                    innerClient.newCall(request).execute().use { response ->
+                        if (response.code >= 500) {
+                            diag.add("proxy/$host http ${response.code}${if (attempt == 0) " — retrying" else ""}")
+                            return@use
+                        }
+                        if (!response.isSuccessful) {
+                            diag.add("proxy/$host http ${response.code}")
+                            return@use
+                        }
+                        val body = response.body.bytes()
+                        if (body.isEmpty()) {
+                            diag.add("proxy/$host empty body")
+                            return@use
+                        }
+                        // Loop guard: the proxy must hand back a decodable
+                        // raster — an AVIF answer would send us in circles.
+                        if (isAvif("", body)) {
+                            diag.add("proxy/$host returned avif")
+                            return@use
+                        }
+                        val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                        BitmapFactory.decodeByteArray(body, 0, body.size, bounds)
+                        if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
+                            diag.add("proxy/$host undecodable (${bounds.outMimeType ?: "unknown"})")
+                            return@use
+                        }
+                        diag.add("proxy/$host ok ${bounds.outWidth}x${bounds.outHeight} ${body.size}B")
+                        // v117: the signed rungs never see the source bytes,
+                        // so the decode budget applies from the JPEG bounds.
+                        val options = BitmapFactory.Options()
+                        options.inSampleSize = when {
+                            maxEdge > 0 -> sampleSizeFor(bounds.outWidth, bounds.outHeight, maxEdge)
+                            raw == null && (bounds.outWidth.toLong() * bounds.outHeight) > MAX_NATIVE_DECODE_PIXELS ->
+                                sampleSizeFor(bounds.outWidth, bounds.outHeight, proxyBoxFor(bounds.outWidth to bounds.outHeight, 0, null))
+                            else -> 1
+                        }
+                        val bitmap = BitmapFactory.decodeByteArray(body, 0, body.size, options) ?: run {
+                            diag.add("proxy/$host decode null")
+                            return@use
+                        }
+                        val output = ByteArrayOutputStream(body.size / 2)
+                        try {
+                            if (!bitmap.compress(Bitmap.CompressFormat.JPEG, quality, output)) {
+                                throw IOException("ProComic: page JPEG encode failed")
+                            }
+                        } finally {
+                            bitmap.recycle()
+                        }
+                        return output.toByteArray()
                     }
-                    val body = response.body.bytes()
-                    if (body.isEmpty()) {
-                        diag.add("proxy/$host empty body")
-                        return@use
-                    }
-                    // Loop guard: the proxy must hand back a decodable
-                    // raster — an AVIF answer would send us in circles.
-                    if (isAvif("", body)) {
-                        diag.add("proxy/$host returned avif")
-                        return@use
-                    }
-                    val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-                    BitmapFactory.decodeByteArray(body, 0, body.size, bounds)
-                    if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
-                        diag.add("proxy/$host undecodable (${bounds.outMimeType ?: "unknown"})")
-                        return@use
-                    }
-                    diag.add("proxy/$host ok ${bounds.outWidth}x${bounds.outHeight} ${body.size}B")
-                    val options = BitmapFactory.Options()
-                    if (maxEdge > 0) options.inSampleSize = sampleSizeFor(bounds.outWidth, bounds.outHeight, maxEdge)
-                    BitmapFactory.decodeByteArray(body, 0, body.size, options)?.let { return it }
-                    diag.add("proxy/$host decode null")
+                } catch (t: Throwable) {
+                    diag.add("proxy/$host ${t.javaClass.simpleName}")
+                    break
                 }
-            } catch (t: Throwable) {
-                diag.add("proxy/$host ${t.javaClass.simpleName}")
             }
         }
         return null
@@ -1072,7 +1195,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v116\"")
+        sb.append("\"server\":\"procomic-image/v117\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -1134,7 +1257,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v116")
+                add("Server build: procomic-image/v117")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)

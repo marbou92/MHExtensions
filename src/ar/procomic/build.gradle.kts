@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 31
+    versionCode = 32
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -183,6 +183,42 @@ keiyoushi {
     // plumbing: the deferred attempt trail is mirrored into /.diag
     // (lastDeferred) so a screenshot alone answers mint-fail vs
     // exchange-reject. Crash contract untouched.
+    // v116 (versionCode 31) — FIELD VERDICT on v115: the mint LADDER
+    // worked (the reader now shows 5 slots — the deferred exchange
+    // succeeds) but the failure moved downstream: the exchange was
+    // BATCHED server-side and the module did ONE call (3 public + the
+    // first batch = 5 slots), and the deferred pages failed to load.
+    // v116 walked the batches (dedup-guarded, bounded) and added the
+    // session-first + x-chapter-pass + re-sign ladder for the signed
+    // /api/cdn-image urls.
+    // v117 (versionCode 32) — FIELD VERDICT on v116 + full live recon:
+    // (1) PAGE COUNT: the walk repeated the SAME token per slice; the
+    // server replays the same slice for the same token, the dedup guard
+    // saw an empty delta and ended the walk after one batch. Sandbox
+    // recon: the refresh endpoint is UNGATED (200 {token}, no Turnstile)
+    // and re-issues the same split — the slice cursor is server-side per
+    // session, and the reader advances it by RENEWING its token between
+    // loads (its promise memo makes same-token repeats impossible). The
+    // walk now refreshes between slices (walk-scale renewal bound) and
+    // only stops on an empty images[] ARRAY, a post-renewal replay, or
+    // bounds. (2) GENRES/TYPE: the site migration RESTRUCTURED the
+    // series flight — genres/tags moved out of series.metadata (flat
+    // strings, now absent) into a sibling categories object of {en, ar}
+    // pairs; metadata.genres parsed null and every entry's genre list
+    // collapsed to the bare type, killing the reader apps' long-strip/
+    // RTL auto-recognition that feeds on those genre strings. The parse
+    // now decodes the WRAPPER (series + categories), merges both shapes
+    // (legacy flat + migrated localized), and every long-strip type
+    // carries the canonical "Long Strip"/"Webtoon" keywords so every
+    // fork's suggestion logic recognizes it. The series page also walks
+    // both apexes through the shared flight ladder (the .pro route
+    // serves a "moved" shell; the real payload lives on .net). (3)
+    // SIGNED IMAGES: sandbox recon proved the signed urls are MULTI-USE
+    // (~4-min window) and weserv converts them cleanly — the ladder now
+    // walks unwrap-to-app-host first (wide-open, token-free), weserv-on-
+    // signed second (with one 5xx retry per host — the cdn-image route
+    // 502s cold-started), then the v116 upstream+re-sign rung; every
+    // rung is named in /.diag so the next field test is decisive.
 
     deeplink {
         host("procomic.net")

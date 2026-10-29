@@ -107,6 +107,44 @@ class SeriesDetailsDto(
     val metadata: SeriesMetaDto? = null,
 )
 
+/** v117: one localized category entry — the migrated series flight
+ * ships genres/tags as `{en, ar}` pairs. The English name is what the
+ * genre field (and every reader app's long-strip/type recognition)
+ * consumes; Arabic is kept for possible future UI use. */
+@Serializable
+class SeriesCategoryDto(
+    val en: String? = null,
+    val ar: String? = null,
+)
+
+/** v117: the migrated series flight's SIBLING categories object. FIELD
+ * ROOT CAUSE of the "type not recognizable" report: the migration moved
+ * genres/tags OUT of `series.metadata` (flat strings, now absent) into a
+ * `categories` object beside the series object — the old DTO read
+ * `metadata.genres = null` and every entry's genre list collapsed to the
+ * bare type string, which killed the reader apps' long-strip/RTL
+ * auto-detection that feeds on those genre strings. The legacy flat
+ * shape still rides the search-API rows (and any .pro-served legacy
+ * flight), so both are merged upstream. */
+@Serializable
+class SeriesCategoriesDto(
+    val genres: List<SeriesCategoryDto>? = null,
+    val tags: List<SeriesCategoryDto>? = null,
+) {
+    fun genreNames(): List<String> = genres.orEmpty().mapNotNull { it.en?.trim() }.filter { it.isNotEmpty() }
+
+    fun tagNames(): List<String> = tags.orEmpty().mapNotNull { it.en?.trim() }.filter { it.isNotEmpty() }
+}
+
+/** The `{"series":{…},"categories":{…},…}` props object the migrated
+ * series flight embeds; the categories sibling is null on legacy
+ * flights. */
+@Serializable
+class SeriesFlightWrapperDto(
+    val series: SeriesDetailsDto,
+    val categories: SeriesCategoriesDto? = null,
+)
+
 // ============================== Chapters ===============================
 
 /** Chapter rows embedded in the series details page (latest 30, with dates). */
