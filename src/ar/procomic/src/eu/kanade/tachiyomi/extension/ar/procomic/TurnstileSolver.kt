@@ -46,6 +46,27 @@ import java.util.concurrent.atomic.AtomicBoolean
  * never-laid-out 0x0 view gives the challenge iframe nothing to render
  * into (a second, independent reason v113's mint could stall).
  *
+ * v115 field verdict on v114: still three pages in the field. The
+ * exchange side is provably consistent (the minted token never carries
+ * a UA the site could see — Cloudflare's siteverify does not expose it
+ * — and the deferred JWT is fetched and spent with ONE forced UA), so
+ * the failing link is the mint itself. Two changes, both surgical:
+ *   1. MODE LADDER — the gate's `turnstileMode` is the site's UX
+ *      preference for the widget; the server validates the TOKEN, not
+ *      the widget's appearance. v114 minted once with the server's
+ *      mode; a `visible` widget sits in an interaction loop forever in
+ *      a low-trust WebView. The solver now runs a LADDER: the server's
+ *      mode first (20 s), then the opposite mode (14 s) — an
+ *      interaction-only/flexible widget frequently auto-passes where
+ *      the visible one loops, and the token is identical either way.
+ *   2. UA MASKING — the WebView's natural UA carries the `; wv)`
+ *      marker, an instant WebView/bot tell for Cloudflare. The solver
+ *      now presents the module's BROWSER_UA (the exact string every
+ *      other hop of the chain uses), removing the most deterministic
+ *      of the challenge's negative signals. (Client-hint headers still
+ *      speak with the WebView's real version — nothing more can be
+ *      done about that from a WebView.)
+ *
  * The crash-safety contract (the v104–v110 lesson, non-negotiable):
  *   - This WebView NEVER loads an image. Not one. blockNetworkImage is
  *     set BEFORE the page loads, and the page HTML contains no <img>,
@@ -82,11 +103,28 @@ internal object TurnstileSolver {
     /** JS bridge name. */
     const val BRIDGE_NAME = "ProChanBridge"
 
-    /** Hard wall for the whole solve. */
-    const val TIMEOUT_SECONDS = 30L
+    /** Hard wall for the whole solve (both ladder rungs). */
+    const val TIMEOUT_SECONDS = 40L
+
+    /** Per-rung walls: the server's own mode gets the bigger window. */
+    internal val RUNG_TIMEOUTS_SECONDS = listOf(24L, 14L)
 
     /** Minimum spacing between solves (be polite to the challenge). */
     private const val SOLVE_SPACING_MS = 3000L
+
+    /** v115: the ladder of widget configs one solve walks. The gate's
+     * `turnstileMode` ("visible"/"hidden") picks the FIRST rung — the
+     * server's own preference — and the OPPOSITE mode rides second: the
+     * token validates the same regardless of the widget's appearance,
+     * and an interaction-only widget often auto-passes where a visible
+     * one loops in a low-trust WebView. Pure so the harness can pin it.
+     * Returns (appearance, size) pairs, reader-chunk semantics:
+     * visible -> always/normal, anything else -> interaction-only/flexible. */
+    internal fun ladderConfigs(mode: String?): List<Pair<String, String>> {
+        val visible = "always" to "normal"
+        val hidden = "interaction-only" to "flexible"
+        return if (mode == "visible") listOf(visible, hidden) else listOf(hidden, visible)
+    }
 
     @Volatile private var lastSolveAt = 0L
 
@@ -97,18 +135,16 @@ internal object TurnstileSolver {
      *
      * v114: [siteKey] is the LIVE key from /api/auth/public-settings
      * (null -> the baked-in fallback), [mode] is the server's own
-     * turnstileMode from the gate's 403 answer ("visible" -> the
-     * reader's always/normal widget, anything else ->
-     * interaction-only/flexible).
+     * turnstileMode from the gate's 403 answer. v115: [ua] masks the
+     * WebView's `; wv)` tell with the chain's forced browser UA.
      */
     fun solve(
         context: Context,
         siteKey: String? = null,
         mode: String? = null,
+        ua: String? = null,
     ): Pair<String, String>? {
         val key = siteKey?.takeIf { it.isNotBlank() } ?: DEFAULT_SITE_KEY
-        val appearance = if (mode == "visible") "always" else "interaction-only"
-        val size = if (mode == "visible") "normal" else "flexible"
         val now = elapsedMillis()
         val sinceLast = now - lastSolveAt
         if (sinceLast in 0 until SOLVE_SPACING_MS) {
@@ -121,6 +157,32 @@ internal object TurnstileSolver {
         }
         lastSolveAt = elapsedMillis()
 
+        val rungs = ladderConfigs(mode)
+        rungs.forEachIndexed { index, (appearance, size) ->
+            val budget = RUNG_TIMEOUTS_SECONDS.getOrElse(index) { 14L }
+            val solved = runCatching {
+                attemptOnce(context, key, appearance, size, ua, budget)
+            }.getOrNull()
+            if (solved != null) return solved
+            Log.i(TAG, "ladder rung $index ($appearance/$size) yielded no token")
+        }
+        return null
+    }
+
+    /**
+     * One ladder rung: one WebView, one widget, one [timeoutSeconds]
+     * wall. Identical to the v114 solver apart from the [ua] override
+     * and the parameterized budget. Never throws.
+     */
+    @Suppress("SameParameterValue")
+    private fun attemptOnce(
+        context: Context,
+        key: String,
+        appearance: String,
+        size: String,
+        ua: String?,
+        timeoutSeconds: Long,
+    ): Pair<String, String>? {
         val result = Cell()
         var thread: HandlerThread? = null
         val webViewHolder = arrayOfNulls<WebView>(1)
@@ -148,6 +210,9 @@ internal object TurnstileSolver {
                         settings.allowFileAccess = false
                         settings.allowContentAccess = false
                         settings.mediaPlaybackRequiresUserGesture = true
+                        // v115: mask the WebView's `; wv)` UA tell with the
+                        // chain's forced browser UA (null -> the natural UA).
+                        ua?.let { settings.userAgentString = it }
                         webViewClient = object : WebViewClient() {
                             override fun shouldOverrideUrlLoading(
                                 view: WebView?,
@@ -236,7 +301,7 @@ internal object TurnstileSolver {
                             result.error = result.error ?: "timeout"
                             finishOnce.run()
                         },
-                        TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS),
+                        TimeUnit.SECONDS.toMillis(timeoutSeconds),
                     )
                 } catch (t: Throwable) {
                     Log.w(TAG, "solver setup failed: ${t.javaClass.simpleName}")
@@ -249,7 +314,7 @@ internal object TurnstileSolver {
                 }
             }
 
-            latch.await(TimeUnit.SECONDS.toMillis(TIMEOUT_SECONDS) + 5_000, TimeUnit.MILLISECONDS)
+            latch.await(TimeUnit.SECONDS.toMillis(timeoutSeconds) + 5_000, TimeUnit.MILLISECONDS)
 
             val token = result.token
             if (token.isNullOrBlank()) {

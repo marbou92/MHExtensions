@@ -973,6 +973,28 @@ class ProComicImageServer(
 
     private val failuresLock = Any()
 
+    // v115: the last deferred-media attempt trail (the 3-page wall's
+    // diagnosis). The reader only sees logcat; this ring gives /.diag
+    // the full trail so a screenshot alone answers "mint fail or
+    // exchange reject?".
+    private class DeferredRecord(
+        val chapterId: Int,
+        val trail: List<String>,
+        val at: Long,
+    )
+
+    @Volatile private var lastDeferred: DeferredRecord? = null
+
+    /** Mirrors the deferred-media attempt trail into /.diag state.
+     * JVM-safe, never throws (the extension calls it from pageList). */
+    internal fun recordDeferredTrail(chapterId: Int, trail: List<String>) {
+        if (trail.isEmpty()) return
+        try {
+            lastDeferred = DeferredRecord(chapterId, trail.takeLast(12), System.currentTimeMillis())
+        } catch (_: Throwable) {
+        }
+    }
+
     private fun recordFailure(imageUrl: String, stage: String, diag: ProxyDiag) {
         if (diag.isEmpty()) return
         synchronized(failuresLock) {
@@ -998,7 +1020,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v114\"")
+        sb.append("\"server\":\"procomic-image/v115\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -1007,6 +1029,18 @@ class ProComicImageServer(
         sb.append(",\"decoder\":\"bitmapfactory+server-proxy (v111, no on-device AVIF decoder)\"")
         sb.append(",\"proxyHosts\":\"").append(proxyHosts.joinToString(",").replace("\"", "'")).append('\"')
         sb.append(",\"nativeCrashState\":\"").append(nativeCrashState.replace("\"", "'")).append('\"')
+        // v115: the last deferred-media attempt trail (the 3-page wall
+        // diagnosis) — mint-fail vs exchange-reject at a glance.
+        lastDeferred?.let { d ->
+            sb.append(",\"lastDeferred\":{\"at\":").append(d.at)
+                .append(",\"chapterId\":").append(d.chapterId)
+                .append(",\"trail\":[")
+            d.trail.forEachIndexed { ti, t ->
+                if (ti > 0) sb.append(',')
+                sb.append('"').append(t.take(220).replace("\"", "'")).append('"')
+            }
+            sb.append(']').append('}')
+        }
         sb.append(",\"recentFailures\":[")
         val records = synchronized(failuresLock) { failures.toList() }
         records.forEachIndexed { fi, f ->

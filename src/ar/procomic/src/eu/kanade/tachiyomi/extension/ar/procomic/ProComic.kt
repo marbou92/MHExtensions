@@ -1225,22 +1225,43 @@ abstract class ProComic :
     }
 
     /**
+     * v115: thin wrapper — runs the deferred exchange and mirrors the
+     * attempt trail into the image server's /.diag state, so the trail
+     * is user-visible (the reader only sees logcat otherwise; a
+     * screenshot of /.diag in a phone browser is now an actionable
+     * report: mint-fail vs mint-ok/exchange-reject is distinguishable
+     * at a glance).
+     */
+    private suspend fun fetchDeferredPages(
+        chapterId: Int,
+        deferred: DeferredMediaDto,
+        imagePass: String?,
+        referer: String,
+    ): Pair<List<String>, List<String>> {
+        val (images, trail) = fetchDeferredPagesInner(chapterId, deferred, imagePass, referer)
+        runCatching { imageServer.recordDeferredTrail(chapterId, trail) }
+        return images to trail
+    }
+
+    /**
      * The site's own reader flow for the pages beyond the public embed:
      * GET /chapter-deferred-media/{id}?token={deferredMedia JWT}&split=N
      * with the x-chapter-pass header, renewing either credential through
      * its open POST endpoint when the answer names it expired. When the
-     * endpoint answers `Turnstile token required`, one in-page solver
-     * run mints the real widget token (TurnstileSolver — offscreen,
-     * image-blocked, renderer-death-safe) and the exchange retries
-     * with the reader's exact headers. v114: the sitekey and the
-     * widget mode are fetched LIVE (public-settings + the gate's own
-     * 403 answer) instead of baked constants — the rotation that
-     * silently killed the v113 mint. Any solver failure returns an
-     * empty list plus a legible diag trail; the source ships the
-     * public pages exactly as before. Never throws: every failure is
-     * a row.
+     * endpoint answers `Turnstile token required`, the solver mints the
+     * real widget token (TurnstileSolver — offscreen, image-blocked,
+     * renderer-death-safe) and the exchange retries with the reader's
+     * exact headers. v114: the sitekey and the widget mode are fetched
+     * LIVE (public-settings + the gate's own 403 answer) instead of
+     * baked constants — the rotation that silently killed the v113 mint.
+     * v115: the solver walks a mode ladder (server's mode first, then
+     * the opposite — the token validates the same either way) and masks
+     * the WebView's `; wv)` UA tell with the chain's forced browser UA.
+     * Any solver failure returns an empty list plus a legible diag
+     * trail (now mirrored to /.diag); the source ships the public
+     * pages exactly as before. Never throws: every failure is a row.
      */
-    private suspend fun fetchDeferredPages(
+    private suspend fun fetchDeferredPagesInner(
         chapterId: Int,
         deferred: DeferredMediaDto,
         imagePass: String?,
@@ -1285,6 +1306,9 @@ abstract class ProComic :
                         trail += "a minted turnstile token did not clear the gate — keeping the public pages"
                         return emptyList<String>() to trail
                     }
+                    // v115: a single mint now walks the ladder; the flag
+                    // still guarantees the exchange is attempted at most
+                    // once with a token, exactly as before.
                     turnstileAttempted = true
                     // v114: the sitekey ROTATES — the live reader pulls it
                     // per session from /api/auth/public-settings
@@ -1294,7 +1318,7 @@ abstract class ProComic :
                     val (siteKey, siteKeyNote) = fetchTurnstileGateConfig(referer)
                     trail += siteKeyNote
                     val solved = runCatching {
-                        TurnstileSolver.solve(applicationContext, siteKey, outcome.mode)
+                        TurnstileSolver.solve(applicationContext, siteKey, outcome.mode, ProComicImageServer.BROWSER_UA)
                     }
                         .onFailure { trail += "turnstile solver crashed safely: ${it.javaClass.simpleName}" }
                         .getOrNull()

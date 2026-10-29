@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 29
+    versionCode = 30
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -167,6 +167,22 @@ keiyoushi {
     // crash contract is untouched: image-free page, blockNetworkImage
     // before load, renderer-death consumed, bounded, always torn down.
     // Solver failure still = 3 public pages + a legible trail.
+    // v115 (versionCode 30) — FIELD VERDICT on v114: still 3 pages. The
+    // exchange side is provably consistent (Cloudflare's siteverify does
+    // not expose the mint's UA to the site, and the deferred JWT is
+    // fetched and spent with ONE forced UA), so the failing link is the
+    // MINT itself. Two surgical changes: (1) MODE LADDER — the gate's
+    // turnstileMode is the site's widget UX preference; the server
+    // validates the TOKEN, not the widget's appearance. The solver now
+    // mints with the server's mode first (24 s), then the OPPOSITE mode
+    // (14 s) — an interaction-only/flexible widget frequently auto-passes
+    // where a visible one sits in an interaction loop in a low-trust
+    // WebView. (2) UA MASKING — the WebView's natural UA carries the
+    // "; wv)" marker, an instant WebView/bot tell for Cloudflare; the
+    // solver now presents the chain's forced browser UA. Plus evidence
+    // plumbing: the deferred attempt trail is mirrored into /.diag
+    // (lastDeferred) so a screenshot alone answers mint-fail vs
+    // exchange-reject. Crash contract untouched.
 
     deeplink {
         host("procomic.net")
