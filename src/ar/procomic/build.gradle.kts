@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 33
+    versionCode = 34
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -236,6 +236,31 @@ keiyoushi {
     // whole walk — the fetch can never stall past it again. The genres,
     // the renewal economics and the three-rung signed ladder from v117
     // are untouched and stay.
+    //
+    // v119 (versionCode 34) — FIELD VERDICT on v118: "just entering a
+    // chapter crashes the entire extension". The v118 economics were
+    // right (one mint, bounded walk) yet the process still died, so the
+    // killer was never the walk's shape — it is the UNCAUGHT-THROWABLE
+    // CLASS itself: in Android, ANY uncaught exception on ANY thread the
+    // extension spawns reaches the default handler and kills the HOST
+    // APP (the exact 1.6.19/1.6.20 field crash shape). v117's rework
+    // widened the raw-thread surface (the preloader now walks 25+
+    // signed-ladder pages on a pool thread whose catch named only two
+    // exception types; the walk made the mint a chapter-open hot path).
+    // v119 is the PROCESS-DEATH FIREWALL: every thread the extension
+    // spawns (server pool, acceptor, the mint's WebView HandlerThread)
+    // carries a swallowing uncaught-exception handler — a thread's death
+    // degrades that one answer to the error card, never the app; the
+    // preloader catches Throwable per page and around its loop; the
+    // transcode semaphore converts interrupts into the legible decode
+    // failure; the walk's wall now also holds ACROSS the mint (a mint
+    // past the deadline is skipped, shipped as "wall reached before the
+    // mint"); and the diag trail names the mint moment ("minting the
+    // widget token offscreen…") so a /.diag screenshot pins how far a
+    // chapter open got before anything died. Everything v117/v118
+    // delivered (genres + Long Strip/Webtoon keywords, renewal
+    // economics, one-mint bounds, 90 s wall, three-rung signed ladder)
+    // is untouched.
 
     deeplink {
         host("procomic.net")

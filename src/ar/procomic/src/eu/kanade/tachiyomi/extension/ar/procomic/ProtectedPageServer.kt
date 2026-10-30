@@ -149,7 +149,21 @@ class ProComicImageServer(
 
     private val executor by lazy {
         Executors.newCachedThreadPool { runnable ->
-            Thread(runnable, "ProComicImageServer").apply { isDaemon = true }
+            Thread(runnable, "ProComicImageServer").apply {
+                isDaemon = true
+                // v119: THE PROCESS-DEATH FIREWALL. An uncaught Throwable on
+                // ANY extension-spawned thread reaches the default
+                // uncaught-exception handler and kills the HOST APP — the
+                // exact 1.6.19/1.6.20 field crash shape, back in the field
+                // on 1.6.32/33 ("entering a chapter crashes the entire
+                // extension"). Every thread this server spawns now swallows
+                // its own death: a worker that dies mid-build costs that one
+                // answer (the host sees the error card / a 502), the pool
+                // heals per request, and the app survives.
+                uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { t, e ->
+                    Log.w(TAG, "server thread ${t.name} died safely: ${e.javaClass.simpleName}")
+                }
+            }
         }
     }
 
@@ -215,8 +229,14 @@ class ProComicImageServer(
 
     private fun startAcceptor(socket: ServerSocket) {
         machine.set(Machine(socket))
-        val acceptor = Thread({ acceptLoop(socket) }, "ProComicImageServer-accept")
-        acceptor.isDaemon = true
+        val acceptor = Thread({ acceptLoop(socket) }, "ProComicImageServer-accept").apply {
+            isDaemon = true
+            // v119: the acceptor carries the same firewall — its death may
+            // never be the app's death (a fresh acceptor starts on demand).
+            uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { t, e ->
+                Log.w(TAG, "acceptor ${t.name} died safely: ${e.javaClass.simpleName}")
+            }
+        }
         acceptor.start()
     }
 
@@ -242,7 +262,13 @@ class ProComicImageServer(
             } catch (_: IOException) {
                 return // socket closed or unrecoverable; a new one starts on demand
             }
-            executor.execute { handleConnection(connection) }
+            try {
+                executor.execute { handleConnection(connection) }
+            } catch (_: Throwable) {
+                // v119: a rejected dispatch (pool saturated/shutting down)
+                // must not kill the acceptor — close the socket and move on.
+                runCatching { connection.close() }
+            }
         }
     }
 
@@ -515,7 +541,15 @@ class ProComicImageServer(
      * a small network hop that shares the permit so a cover grid cannot
      * stampede the transcoder. */
     private fun transcodeUnderPermit(raw: ByteArray, imageUrl: String, diag: ProxyDiag, maxEdge: Int): ByteArray {
-        transcodePermits.acquire()
+        try {
+            transcodePermits.acquire()
+        } catch (_: InterruptedException) {
+            // v119: an interrupt must surface as the legible decode failure
+            // (the error card), never as a raw InterruptedException
+            // escaping a pool thread.
+            Thread.currentThread().interrupt()
+            throw ImageBuildFailure("decode", "ProComic: page transcode interrupted", diag)
+        }
         try {
             return avifToJpeg(raw, imageUrl, diag, maxEdge)
         } finally {
@@ -1085,6 +1119,12 @@ class ProComicImageServer(
                         Log.i(TAG, "preload $chapterId failed at ${t.stage}")
                     } catch (t: IOException) {
                         Log.i(TAG, "preload $chapterId failed: ${t.message?.substringAfter("ProComic: ")}")
+                    } catch (t: Throwable) {
+                        // v119: the preloader walks 25+ signed-ladder pages on
+                        // a raw pool thread — NOTHING it does may escape as an
+                        // uncaught throwable (the process-death class). The
+                        // walk continues with the next page.
+                        Log.w(TAG, "preload $chapterId page died safely: ${t.javaClass.simpleName}")
                     }
                     try {
                         Thread.sleep(PRELOAD_PAGE_PAUSE_MS)
@@ -1093,6 +1133,10 @@ class ProComicImageServer(
                         return@execute
                     }
                 }
+            } catch (outer: Throwable) {
+                // v119: the loop itself (cacheKey/cachedResult/sleep) gets
+                // the same guarantee — a preloader death is never fatal.
+                Log.w(TAG, "preload $chapterId stopped safely: ${outer.javaClass.simpleName}")
             } finally {
                 synchronized(preloadLock) { preloadStarted.remove(chapterId) }
             }
@@ -1195,7 +1239,7 @@ class ProComicImageServer(
     private fun buildDiagJson(): String {
         val sb = StringBuilder(1024)
         sb.append('{')
-        sb.append("\"server\":\"procomic-image/v118\"")
+        sb.append("\"server\":\"procomic-image/v119\"")
         sb.append(",\"uptimeMs\":").append(System.currentTimeMillis() - startedAtMs)
         synchronized(resultsLock) {
             sb.append(",\"cachedResults\":").append(results.size)
@@ -1257,7 +1301,7 @@ class ProComicImageServer(
                 failure.readerBody.split("; ").forEach { add(it) }
                 add("")
                 add("Device: Android ${android.os.Build.VERSION.RELEASE} (${android.os.Build.SUPPORTED_ABIS.firstOrNull() ?: "?"})")
-                add("Server build: procomic-image/v118")
+                add("Server build: procomic-image/v119")
                 add("More: /${DIAG_PATH_PREFIX} in the app logs")
             }.flatMap { line ->
                 if (line.length <= 46) listOf(line) else line.chunked(46)

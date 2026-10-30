@@ -48,13 +48,21 @@ object RscFlight {
     private fun appendEscape(sb: StringBuilder, html: String, i: Int) {
         when (val c = html[i + 1]) {
             '\\' -> sb.append('\\')
+
             '"' -> sb.append('"')
+
             '/' -> sb.append('/')
+
             'n' -> sb.append('\n')
+
             'r' -> sb.append('\r')
+
             't' -> sb.append('\t')
+
             'b' -> sb.append('\b')
+
             'f' -> sb.append('\u000C')
+
             'u' -> {
                 val end = i + 6
                 if (end <= html.length) {
@@ -67,6 +75,7 @@ object RscFlight {
                 }
                 sb.append(html, i, i + 2)
             }
+
             else -> {
                 sb.append('\\')
                 sb.append(c)
@@ -87,9 +96,13 @@ object RscFlight {
             val c = data[i]
             when {
                 escaped -> escaped = false
+
                 c == '\\' -> escaped = true
+
                 c == '"' -> inString = !inString
+
                 !inString && c == '{' -> depth++
+
                 !inString && c == '}' -> {
                     depth--
                     if (depth == 0) return data.substring(start, i + 1)
@@ -109,9 +122,13 @@ object RscFlight {
             val c = data[i]
             when {
                 escaped -> escaped = false
+
                 c == '\\' -> escaped = true
+
                 c == '"' -> inString = !inString
+
                 !inString && c == '[' -> depth++
+
                 !inString && c == ']' -> {
                     depth--
                     if (depth == 0) return data.substring(start, i + 1)

@@ -1473,7 +1473,21 @@ abstract class ProComic :
                         }
                         return collected to trail
                     }
+                    // v119: the wall must hold ACROSS the mint — a WebView
+                    // ladder burns ~40 s and the deadline is only checked
+                    // between rounds, so a mint launched past the wall
+                    // stretched the fetch back into the minutes the v118
+                    // verdict called a dead app. Past the wall: ship what
+                    // the session cleared.
+                    if (System.currentTimeMillis() > walkDeadline) {
+                        trail += "deferred walk wall reached before the mint — shipping ${collected.size} deferred pages"
+                        return collected to trail
+                    }
                     mints++
+                    // v119: a /.diag screenshot now names the mint moment —
+                    // if a device death happens mid-mint, the trail shows
+                    // exactly how far the walk got before it.
+                    trail += "minting the widget token offscreen (mint $mints/${MAX_TURNSTILE_MINTS}, mode=${outcome.mode ?: "hidden"})…"
                     // v114: the sitekey ROTATES — the live reader pulls it
                     // per session from /api/auth/public-settings
                     // (loginTurnstile.siteKey). A stale baked-in key fails

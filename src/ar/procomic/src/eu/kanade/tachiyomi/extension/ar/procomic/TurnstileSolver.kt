@@ -192,7 +192,19 @@ internal object TurnstileSolver {
         var thread: HandlerThread? = null
         val webViewHolder = arrayOfNulls<WebView>(1)
         try {
-            thread = HandlerThread("ProComicTurnstile").apply { start() }
+            thread = HandlerThread("ProComicTurnstile").apply {
+                // v119: the process-death firewall for the mint. The
+                // per-step guards (try/catch at every lifecycle step,
+                // renderer-gone consumed) cover the known paths — but any
+                // throwable a WebView/chromium callback raises OUTSIDE
+                // them reaches the default uncaught-exception handler and
+                // kills the HOST APP. This thread's death is now a null
+                // token, never a dead app.
+                setUncaughtExceptionHandler { t, e ->
+                    Log.w(TAG, "solver thread ${t.name} died safely: ${e.javaClass.simpleName}")
+                }
+                start()
+            }
             val handler = Handler(thread.looper)
             val finished = AtomicBoolean(false)
             val latch = CountDownLatch(1)

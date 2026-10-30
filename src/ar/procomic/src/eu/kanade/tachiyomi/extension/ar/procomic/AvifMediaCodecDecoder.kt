@@ -114,9 +114,13 @@ internal object AvifMediaCodecDecoder {
                 "meta" -> walkBoxes(data, bodyStart + 4, bodyEnd) { child, start, end ->
                     when (child) {
                         "pitm" -> primaryId = parsePitm(data, start, end)
+
                         "iloc" -> parseIloc(data, start, end, itemExtents)
+
                         "iinf" -> parseIinf(data, start, end, itemTypes)
+
                         "iref" -> parseIref(data, start, end, dimgRefs)
+
                         // iprp sits INSIDE meta: ipco (the property pool)
                         // and ipma (item <-> property association).
                         "iprp" -> walkBoxes(data, start, end) { propContainer, pcStart, pcEnd ->
@@ -124,6 +128,7 @@ internal object AvifMediaCodecDecoder {
                                 "ipco" -> walkBoxes(data, pcStart, pcEnd) { prop, propStart, propEnd ->
                                     properties.add(Triple(prop, propStart, propEnd))
                                 }
+
                                 "ipma" -> parseIpma(data, pcStart, pcEnd, itemProps)
                             }
                         }
@@ -468,13 +473,18 @@ internal object AvifMediaCodecDecoder {
     /** Big-endian integer of [size] bytes (0/1/2/4/8 — the iloc field widths). */
     private fun readIntSized(data: ByteArray, pos: Int, size: Int): Long = when (size) {
         0 -> 0L
+
         1 -> (data[pos].toLong() and 0xFF)
+
         2 -> readU16(data, pos).toLong()
+
         4 -> readU32(data, pos)
+
         8 -> {
             val high = readU32(data, pos)
             if (high != 0L) Long.MAX_VALUE else readU32(data, pos + 4)
         }
+
         else -> 0L
     }
 
@@ -524,12 +534,16 @@ internal object AvifMediaCodecDecoder {
                 val outputIndex = codec.dequeueOutputBuffer(info, QUEUE_TIMEOUT_MS)
                 when {
                     outputIndex == INFO_TRY_AGAIN -> continue
+
                     outputIndex == INFO_FORMAT_CHANGED -> continue
+
                     outputIndex == INFO_BUFFERS_CHANGED -> continue
+
                     outputIndex < 0 -> {
                         log("unexpected dequeue $outputIndex")
                         return null
                     }
+
                     else -> {
                         val image = try {
                             codec.getOutputImage(outputIndex)
