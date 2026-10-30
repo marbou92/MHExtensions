@@ -1400,9 +1400,18 @@ abstract class ProComic :
         // exactly the field symptom (3 public + one batch = 5 pages). The
         // walk now RENEWS the token between slices (the reader's own
         // economics) and only terminates on: an empty images[] ARRAY (the
-        // server's terminal answer), a replay AFTER a renewal, or bounds.
+        // server's terminal answer), a replay AFTER a renewal, bounds, or
+        // the v118 wall-clock budget (a Turnstile token is single-use —
+        // the second exchange re-arms the gate, and every re-arm used to
+        // cost a full WebView mint; the wall keeps the fetch bounded no
+        // matter how the gate behaves).
+        val walkDeadline = System.currentTimeMillis() + MAX_WALK_WALL_MS
         while (exchanges < MAX_DEFERRED_EXCHANGES && collected.size < MAX_DEFERRED_PAGES) {
             exchanges++
+            if (System.currentTimeMillis() > walkDeadline) {
+                trail += "deferred walk wall (${MAX_WALK_WALL_MS / 1000} s) reached — shipping ${collected.size} deferred pages"
+                return collected to trail
+            }
             val (images, outcome) = deferredAttempt(
                 chapterId = chapterId,
                 token = token,
@@ -1452,10 +1461,15 @@ abstract class ProComic :
                 DeferredOutcome.Kind.TURNSTILE -> {
                     trail += outcome.note
                     if (mints >= MAX_TURNSTILE_MINTS) {
+                        // v118: ONE mint per chapter open — the widget token
+                        // is single-use per exchange, so a re-armed gate
+                        // cannot be walked for free; every extra mint costs
+                        // a full WebView ladder (the v117 crash). Ship what
+                        // the session cleared.
                         trail += if (collected.isEmpty()) {
                             "a minted turnstile token did not clear the gate — keeping the public pages"
                         } else {
-                            "the gate re-armed after ${collected.size} deferred pages — shipping what was fetched"
+                            "the gate re-armed after ${collected.size} deferred pages (the widget token is single-use per exchange) — shipping what was fetched"
                         }
                         return collected to trail
                     }
@@ -1468,15 +1482,18 @@ abstract class ProComic :
                     val (siteKey, siteKeyNote) = fetchTurnstileGateConfig(referer)
                     trail += siteKeyNote
                     val solved = runCatching {
-                        // v117: the mint runs on the SAME apex the exchange
-                        // targets (Turnstile is domain-bound — the widget's
-                        // token carries the page origin's hostname).
+                        // v118: the mint origin is BACK on the solver default
+                        // (procomic.pro) — the field-proven pairing. 1.6.30/31
+                        // minted there and the token cleared the .net exchange
+                        // (5 pages every time); v117's .net-origin mint was
+                        // never field-proven and burned its full ladder when
+                        // the widget would not clear. The exchange validates
+                        // the token server-side; the mint just has to WORK.
                         TurnstileSolver.solve(
                             applicationContext,
                             siteKey,
                             outcome.mode,
                             ProComicImageServer.BROWSER_UA,
-                            origin = readerApexes.first().trimEnd('/') + "/",
                         )
                     }
                         .onFailure { trail += "turnstile solver crashed safely: ${it.javaClass.simpleName}" }
@@ -1885,12 +1902,30 @@ abstract class ProComic :
          * renews its token as batches advance). These bounds keep the
          * batch walk finite no matter what the server answers. v117:
          * MAX_TOKEN_RENEWALS is walk-scale — every slice advance costs one
-         * refresh POST (the reader's own renewal cadence). */
-        const val MAX_DEFERRED_EXCHANGES = 40
+         * refresh POST (the reader's own renewal cadence).
+         *
+         * v118 FIELD VERDICT on v117 (1.6.32): "procomic just crashes the
+         * app when it tries to fetch the chapter pages". Root cause: a
+         * Turnstile token is SINGLE-USE (siteverify consumes it), so the
+         * second exchange re-arms the gate and the walk minted AGAIN —
+         * v117 allowed up to 3 sequential WebView mints per chapter open
+         * (each a ~40 s ladder + a full chromium renderer spawn), plus
+         * 40 exchange/renewal rounds: minutes of blocked fetch = the
+         * crash. The bounds come back down to one-mint scale (the exact
+         * 1.6.30/31 economics that worked in the field) and a hard
+         * wall-clock budget caps the whole walk. */
+        const val MAX_DEFERRED_EXCHANGES = 14
         const val MAX_DEFERRED_PAGES = 200
-        const val MAX_TOKEN_RENEWALS = 40
+        const val MAX_TOKEN_RENEWALS = 14
         const val MAX_PASS_RENEWALS = 2
-        const val MAX_TURNSTILE_MINTS = 3
+        const val MAX_TURNSTILE_MINTS = 1
+
+        /** v118: the whole deferred walk (exchanges + renewals + the one
+         * mint) must finish inside this wall — getPageList is a blocking
+         * fetch a host app waits on, and v117 proved a minutes-long walk
+         * reads as a dead app. 90 s covers one full mint ladder (~40 s)
+         * plus the public+first-batch economics with room to spare. */
+        const val MAX_WALK_WALL_MS = 90_000L
 
         /** A single letter keeps the search endpoint in its "trusted" mode
          * (no Turnstile) while matching nearly every English-titled series. */

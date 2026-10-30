@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 32
+    versionCode = 33
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -219,6 +219,23 @@ keiyoushi {
     // signed second (with one 5xx retry per host — the cdn-image route
     // 502s cold-started), then the v116 upstream+re-sign rung; every
     // rung is named in /.diag so the next field test is decisive.
+    //
+    // v118 (versionCode 33) — FIELD VERDICT on v117: "procomic just
+    // crashes the app when it tries to fetch the chapter pages". Root
+    // cause: a Turnstile token is SINGLE-USE (siteverify consumes it),
+    // so the walk's second exchange re-arms the gate and v117 minted
+    // AGAIN — up to 3 sequential WebView mints per chapter open (each
+    // a ~40 s ladder + a full chromium renderer spawn) on top of 40
+    // exchange/renewal rounds: a minutes-long blocked page-list fetch
+    // that reads as a dead app. v117 also moved the mint origin to .net
+    // (never field-proven); the proven 1.6.30/31 pairing minted on the
+    // solver's .pro default and its tokens cleared the .net exchange.
+    // The fix: ONE mint per chapter open (the exact working economics),
+    // the mint origin back on the solver default, exchange/renewal
+    // bounds down to 14, and a hard 90 s wall-clock budget around the
+    // whole walk — the fetch can never stall past it again. The genres,
+    // the renewal economics and the three-rung signed ladder from v117
+    // are untouched and stay.
 
     deeplink {
         host("procomic.net")
