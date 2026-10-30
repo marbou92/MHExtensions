@@ -188,6 +188,28 @@ import kotlin.math.roundToInt
  *     (mint + library solve) plus a fruitless-mint cooldown breaker:
  *     two consecutive dead ladders pause mints for 30 minutes so opens
  *     stay fast and WebView-free until then.
+ *   - pages (live recon on the site-gated CDN era): the site now serves
+ *     every page beyond the public embed ONLY through a real browser
+ *     session. The deferred exchange hard-requires a fresh Cloudflare
+ *     Turnstile widget token per call (a single-use credential — one
+ *     mint buys one ~2-page batch), the pages it hands out ride raw
+ *     cdn{1-4} hosts that answer 403 to every non-browser fetch
+ *     (browser UA + referer included — origin nginx rule), and the raw
+ *     files' only lawful route (/api/cdn-image) needs a session-signed
+ *     token minted by POST /api/cdn-image/sign — which refuses any
+ *     cookie-less client (verified live on both apexes, pass header
+ *     included). A minted batch therefore lists pages that can never
+ *     render. The source ships exactly what it can serve: the flight's
+ *     app-host pages (signed filenames, wide-open) plus any deferred
+ *     pages that ride app hosts; raw-host-only batches are dropped
+ *     instead of listed as permanent error cards (the legacy guard
+ *     keeps a raw-only flight intact — a maybe-dead page beats an
+ *     empty chapter), and a mint whose whole batch is raw-host-only
+ *     counts against the fruitless-mint breaker and ends the walk —
+ *     every further batch would cost another WebView and die the same
+ *     way. Reader flights that arrive as a data-less app shell are
+ *     retried through the router's own flight form (RSC header + the
+ *     router's _rsc param), which still returns the payload stream.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -379,9 +401,35 @@ abstract class ProComic :
             } catch (e: IOException) {
                 lastError = e
             }
+            // The edge sometimes answers the document route with a data-less
+            // app shell (its flight middleware routes some clients to it,
+            // live-verified: 200 + x-prochan-shell, no payload at all). The
+            // router's OWN flight form of the same route — the RSC header
+            // plus the _rsc param — still returns the raw payload stream.
+            // NOTE: the raw stream carries no self.__next_f.push markers,
+            // so the body is parsed as-is (no RscFlight.extract pass).
+            try {
+                val request = GET(rscFlightUrl(apex, path), headers).newBuilder()
+                    .header("RSC", "1")
+                    .build()
+                val response = client.newCall(request).execute()
+                response.use {
+                    if (!it.isSuccessful) throw IOException("HTTP ${it.code} on $path (flight form)")
+                    parse(it.body.string())
+                        ?.let { parsed -> return parsed }
+                    lastError = IOException(emptyPayloadError)
+                }
+            } catch (e: IOException) {
+                lastError = e
+            }
         }
         throw lastError ?: IOException("ProComic: reader unreachable for $path")
     }
+
+    /** The router's flight form of a reader path: the URL the site's own
+     * client-side router requests (the `_rsc` param; the RSC request
+     * header is added by the caller). Pure so the harness can pin it. */
+    internal fun rscFlightUrl(apex: String, path: String): String = "${apex.trimEnd('/')}$path?_rsc=1"
 
     // ========================= Popular & Latest ==========================
 
@@ -1189,6 +1237,7 @@ abstract class ProComic :
         var upstreams = payload.upstreams
         val deferred = payload.deferred
         latestImagePass = payload.imagePass
+        var walkTrail: List<String> = emptyList()
         if (deferred?.token != null && upstreams.isNotEmpty()) {
             // v116: the full-list exchange WALKS THE BATCHES (the server
             // hands out the deferred list in redis-tracked batches; the
@@ -1203,6 +1252,7 @@ abstract class ProComic :
                 imagePass = payload.imagePass,
                 referer = chapterPageUrl(ref),
             )
+            walkTrail = trail
             if (extra.isNotEmpty()) {
                 val seen = upstreams.toHashSet()
                 upstreams = upstreams + extra.filter { it !in seen }
@@ -1214,6 +1264,30 @@ abstract class ProComic :
         payload.publicCount?.takeIf { it > upstreams.size }?.let { cap ->
             Log.i(TAG, "public embed capped at $cap pages by the site")
         }
+
+        // The site-gated CDN era: pages that ride only the raw cdn{1-4}
+        // hosts cannot be fetched WebView-free at all (the origin 403s
+        // every non-browser client, and their lawful signed route needs a
+        // browser session). Listing them renders permanent error cards —
+        // the reader gets the loadable pages only, with the drop named
+        // in logcat and /.diag. A raw-ONLY flight still ships everything
+        // (the legacy guard inside [partitionLoadablePages]).
+        val (loadable, gated) = partitionLoadablePages(upstreams)
+        if (gated.isNotEmpty()) {
+            Log.i(
+                TAG,
+                "site serves ${gated.size} pages of this chapter only through a browser-signed " +
+                    "CDN route — listing the ${loadable.size} loadable pages",
+            )
+            runCatching {
+                imageServer.recordDeferredTrail(
+                    ref.chapterId,
+                    walkTrail + "shipped ${loadable.size} loadable pages; " +
+                        "${gated.size} browser-gated pages not listed (they cannot render WebView-free)",
+                )
+            }
+        }
+        upstreams = loadable
 
         val pages = upstreams.mapIndexed { index, upstream ->
             Page(
@@ -1276,6 +1350,34 @@ abstract class ProComic :
             index = arrayStart + arrayJson.length
         }
         return urls.distinct()
+    }
+
+    /** The app-host image class: signed-filename files on `app.<apex>`
+     * (app.procomic.net, app.procomic.pro, app.prochan.net — the parent
+     * brand serves a share of the catalog) that fetch directly from any
+     * client, the signature riding in the file name (live-verified: 200
+     * for plain TLS on every probed chapter). These are the only page
+     * hosts the WebView-free chain can always serve. */
+    internal fun isAppHostImageUrl(url: String): Boolean = runCatching {
+        val httpUrl = url.toHttpUrl()
+        httpUrl.isHttps && httpUrl.host.startsWith("app.") && isReaderImageUrl(url)
+    }.getOrDefault(false)
+
+    /** The loadable/gated partition of a page list. App-host pages ship;
+     * raw cdn{1-4} pages are the site's browser-gated CDN class — the
+     * origin 403s every non-browser fetch (browser UA + referer
+     * included, live-verified) and their lawful route (/api/cdn-image)
+     * needs a session-signed token a cookie-less client cannot mint, so
+     * listing them only renders error cards. Legacy guard: when NOTHING
+     * is loadable the whole list ships unchanged — a maybe-dead page
+     * beats a guaranteed-empty chapter (a flight that predates the app
+     * hosts, or a future site change that re-opens the raw hosts). Pure
+     * so the harness can pin it. */
+    internal fun partitionLoadablePages(upstreams: List<String>): Pair<List<String>, List<String>> {
+        val loadable = upstreams.filter { isAppHostImageUrl(it) }
+        if (loadable.isEmpty() || loadable.size == upstreams.size) return upstreams to emptyList()
+        val kept = loadable.toHashSet()
+        return loadable to upstreams.filterNot { it in kept }
     }
 
     /** Any https URL on a site-owned image host. The app-CDN pool grew in
@@ -1509,7 +1611,24 @@ abstract class ProComic :
                     collected += fresh
                     trail += "deferred batch: +${fresh.size} pages (running total ${collected.size})"
                     replayedAfterRenewal = false
-                    // v117: refresh between slices so the server's cursor
+                    // The site-gated CDN era: a batch whose pages ALL ride
+                    // the raw cdn hosts can never be displayed (their
+                    // signed route needs a browser session the WebView-free
+                    // chain cannot mint) — the WebView mint that bought it
+                    // was fruitless. Count it against the breaker and end
+                    // the walk: every further batch costs another mint and
+                    // dies the same way. The page-list partition drops
+                    // these pages downstream.
+                    if (fresh.none { isAppHostImageUrl(it) }) {
+                        mintFruitless++
+                        if (mintFruitless >= MINT_FRUITLESS_LIMIT && mintPausedUntil == 0L) {
+                            mintPausedUntil = System.currentTimeMillis() + MINT_COOLDOWN_MS
+                            trail += "$MINT_FRUITLESS_LIMIT minted batches carried only browser-gated pages — solver cooling down for ${MINT_COOLDOWN_MS / 60000} min"
+                        }
+                        trail += "the batch's pages all ride the browser-only signed CDN route — ending the walk"
+                        return collected to trail
+                    }
+                    // Refresh between slices so the server's cursor
                     // advances (the reader renews its token before every
                     // load). A failed renewal is not fatal — one more
                     // exchange with the current token may still advance a

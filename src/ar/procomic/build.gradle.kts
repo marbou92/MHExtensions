@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 35
+    versionCode = 36
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -281,6 +281,25 @@ keiyoushi {
     // library solve) plus a fruitless-mint cooldown breaker: two
     // consecutive dead ladders pause mints for 30 minutes. The diag
     // marker is v120; everything v117–v119 delivered stays.
+
+    // The site-gated CDN era (live recon): every page beyond the public
+    // embed now requires a real browser session — the deferred exchange
+    // hard-requires a fresh single-use Cloudflare Turnstile widget token
+    // per call, and the pages it hands out ride raw cdn{1-4} hosts whose
+    // only lawful route (/api/cdn-image) needs a session-signed token
+    // from POST /api/cdn-image/sign, which refuses any cookie-less
+    // client (both apexes, pass header included). A minted batch
+    // therefore listed pages that could never render: the reader showed
+    // a handful of entries and only the public ones loaded. The source
+    // now ships exactly what it can serve: the flight's app-host pages
+    // (wide-open signed filenames) plus any deferred pages that ride
+    // app hosts; raw-host-only batches are dropped instead of listed as
+    // error cards (raw-only flights keep everything — a maybe-dead page
+    // beats an empty chapter), a mint whose whole batch is raw-host-only
+    // counts against the fruitless-mint breaker and ends the walk, and
+    // reader flights that arrive as a data-less app shell are retried
+    // through the router's own flight form (RSC header + _rsc param),
+    // which still returns the payload stream.
 
     deeplink {
         host("procomic.net")
