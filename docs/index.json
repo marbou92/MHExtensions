@@ -331,11 +331,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.57",
-      "versionCode": 57,
+      "version": "1.6.58",
+      "versionCode": 58,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.mangalek-v1.6.57-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.57-release.apk",
+      "apk": "tachiyomi-ar.mangalek-v1.6.58-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.58-release.apk",
       "icon": "../icons/mangalek.png",
       "note": "",
       "description": ""
@@ -416,11 +416,11 @@
       "langs": [
         "all"
       ],
-      "version": "1.6.114",
-      "versionCode": 114,
+      "version": "1.6.115",
+      "versionCode": 115,
       "baseUrl": "https://manhuarmtl.com",
-      "apk": "tachiyomi-all.manhuarmtl-v1.6.114-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.manhuarmtl-v1.6.114-release.apk",
+      "apk": "tachiyomi-all.manhuarmtl-v1.6.115-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.manhuarmtl-v1.6.115-release.apk",
       "icon": "../icons/manhuarmtl.png",
       "note": "Madara theme + OCR text overlay burned onto raws in 12 languages",
       "description": "Madara theme with custom MRM selectors; Popular/Latest dedup via the archive endpoint; OCR text overlay burned onto raws in Arabic + 10 languages, toggleable; NSFW filter; full filter sheet."
