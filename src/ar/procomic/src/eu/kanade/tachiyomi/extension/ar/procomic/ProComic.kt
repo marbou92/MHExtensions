@@ -169,6 +169,25 @@ import kotlin.math.roundToInt
  *     the same image-free page, the same renderer-death contract, the
  *     same bounded teardown, and the same graceful fallback to the
  *     public pages.
+ *   - pages v120 (field verdict on v118/v119: "it still crashes when it
+ *     tries to fetch the number of pages a chapter has"): the one WebView
+ *     surface OUTSIDE the v119 firewall is the LIBRARY
+ *     CloudflareSolverInterceptor wired into the client. Its challenge
+ *     solve builds the WebView on the MAIN looper with NO
+ *     onRenderProcessGone handler — and Android's documented default for
+ *     an unhandled renderer death is KILL THE APP PROCESS. It arms on
+ *     any 403/503/429 HTML answer from the site's hosts, and the reader
+ *     flight IS an HTML page — i.e. exactly the page-count fetch. v120
+ *     makes the fetch WebView-free BY DEFAULT: a safe-fetch preference
+ *     (default ON) turns the page-count fetch into pure HTTP — the
+ *     challenge interceptor fast-fails legibly instead of spawning a
+ *     WebView, the walk ships the public pages when the gate holds, and
+ *     getPageList itself is Throwable-tight (worst case a legible empty
+ *     list — never an exception into the host, never a WebView). Opting
+ *     out ("Solve challenges" toggle) restores the full-chapter attempt
+ *     (mint + library solve) plus a fruitless-mint cooldown breaker:
+ *     two consecutive dead ladders pause mints for 30 minutes so opens
+ *     stay fast and WebView-free until then.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -235,9 +254,33 @@ abstract class ProComic :
         writeTimeout(30, TimeUnit.SECONDS)
         addInterceptor(::userAgentOverrideInterceptor)
         addInterceptor(::originSanitizerInterceptor)
-        addInterceptor(CloudflareSolverInterceptor(setOf(baseUrl.toHttpUrl().host)))
+        // v120: the challenge gate that CANNOT kill the host app. The
+        // library solver this delegates to (ONLY when the user opts out
+        // of safe fetch) builds its WebView on the main looper with no
+        // onRenderProcessGone handler — an unhandled renderer death there
+        // kills the process. Safe fetch (default) answers a challenged
+        // response with a legible IOException instead of spawning it.
+        addInterceptor(
+            ProComicChallengeInterceptor(setOf(baseUrl.toHttpUrl().host)) { safeFetchEnabled },
+        )
         rateLimit(3)
     }
+
+    /** v120: safe fetch (default ON) — the page-count fetch spawns NO
+     * WebView at all: no library challenge solve, no Turnstile mint.
+     * Live read per request so a settings toggle applies immediately. */
+    private val safeFetchEnabled: Boolean
+        get() = preferences.getBoolean(PREF_SAFE_FETCH, true)
+
+    /** v120: the fruitless-mint circuit breaker (safe fetch OFF): two
+     * consecutive mint ladders that yielded no token pause further mints
+     * for the cooldown window — chapter opens stay fast and WebView-free
+     * until it lapses. */
+    @Volatile
+    private var mintFruitless = 0
+
+    @Volatile
+    private var mintPausedUntil = 0L
 
     /**
      * The site's WAF answers 403 to non-browser User-Agents — including the
@@ -1078,12 +1121,34 @@ abstract class ProComic :
     // =============================== Pages ===============================
 
     override fun getChapterUrl(chapter: SChapter): String {
-        val ref = json.decodeFromString(ChapterRef.serializer(), chapter.url)
-        return chapterPageUrl(ref)
+        // v120: guarded — hosts call this for the "open in web" action and
+        // several fork shapes crash on a throw from it.
+        val ref = runCatching { json.decodeFromString(ChapterRef.serializer(), chapter.url) }.getOrNull()
+        return if (ref != null) chapterPageUrl(ref) else "$baseUrl/ar"
     }
 
-    override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val ref = json.decodeFromString(ChapterRef.serializer(), chapter.url)
+    /**
+     * v120: the page-count fetch is the call a host app waits on with the
+     * reader spinner up — NOTHING inside it may escape as an exception
+     * (fork-shaped hosts vary in what they do with one; several die). The
+     * worst case is a legible empty list, never a crash. Cancellation
+     * still propagates (structured concurrency is not ours to swallow).
+     */
+    override suspend fun getPageList(chapter: SChapter): List<Page> = runCatching { pageListInternal(chapter) }
+        .onFailure { t ->
+            if (t is kotlinx.coroutines.CancellationException) throw t
+            Log.e(TAG, "page-list fetch survived: ${t.javaClass.simpleName}: ${t.message?.take(180)}")
+        }
+        .getOrDefault(emptyList())
+
+    private suspend fun pageListInternal(chapter: SChapter): List<Page> {
+        // v120: chapters cached by an older build can carry a url this
+        // decoder refuses — a legible empty list beats any crash shape.
+        val ref = runCatching { json.decodeFromString(ChapterRef.serializer(), chapter.url) }.getOrNull()
+        if (ref == null) {
+            Log.e(TAG, "chapter url decode failed: ${chapter.url.take(80)}")
+            return emptyList()
+        }
         val readerPath = "/ar/chapter/${ref.seriesSlug}-${ref.chapterNumber}-${ref.chapterId}"
         // images[] is the site's own page list (cdn.<host> raw files);
         // appImages[] mirrors it with the signed-filename app.<host>
@@ -1460,6 +1525,18 @@ abstract class ProComic :
 
                 DeferredOutcome.Kind.TURNSTILE -> {
                     trail += outcome.note
+                    // v120: safe fetch never mints — the walk ships what
+                    // the session cleared and the chapter opens in
+                    // seconds, WebView-free (the library/own-WebView
+                    // crash class is structurally out of the fetch).
+                    if (preferences.getBoolean(PREF_SAFE_FETCH, true)) {
+                        trail += if (collected.isEmpty()) {
+                            "safe fetch: challenge solving disabled (no WebView) — keeping the public pages"
+                        } else {
+                            "safe fetch: challenge solving disabled (no WebView) — shipping ${collected.size} deferred pages"
+                        }
+                        return collected to trail
+                    }
                     if (mints >= MAX_TURNSTILE_MINTS) {
                         // v118: ONE mint per chapter open — the widget token
                         // is single-use per exchange, so a re-armed gate
@@ -1484,6 +1561,15 @@ abstract class ProComic :
                         return collected to trail
                     }
                     mints++
+                    // v120: the fruitless-mint cooldown (safe fetch OFF).
+                    // A mint ladder that yields no token (rotated sitekey,
+                    // hostile WebView stack) costs ~40 s of Chromium every
+                    // chapter open — after two consecutive dead ladders the
+                    // breaker pauses mints for the window.
+                    if (System.currentTimeMillis() < mintPausedUntil) {
+                        trail += "turnstile solver cooling down after fruitless mints — shipping ${collected.size} deferred pages"
+                        return collected to trail
+                    }
                     // v119: a /.diag screenshot now names the mint moment —
                     // if a device death happens mid-mint, the trail shows
                     // exactly how far the walk got before it.
@@ -1513,9 +1599,15 @@ abstract class ProComic :
                         .onFailure { trail += "turnstile solver crashed safely: ${it.javaClass.simpleName}" }
                         .getOrNull()
                     if (solved == null) {
+                        mintFruitless++
+                        if (mintFruitless >= MINT_FRUITLESS_LIMIT && mintPausedUntil == 0L) {
+                            mintPausedUntil = System.currentTimeMillis() + MINT_COOLDOWN_MS
+                            trail += "${MINT_FRUITLESS_LIMIT} fruitless mint ladders — solver cooling down for ${MINT_COOLDOWN_MS / 60000} min"
+                        }
                         trail += "turnstile solver returned no token — keeping the public pages"
                         return collected to trail
                     }
+                    mintFruitless = 0
                     turnstileToken = solved.first
                     // Reader parity: the visible-mode widget is rendered
                     // from the login sitekey, so the header is "login".
@@ -1850,6 +1942,18 @@ abstract class ProComic :
     // ========================= Preference screen =========================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        // ---- v120: the safe-fetch master switch (default ON) ----
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_SAFE_FETCH
+            title = "Safe chapter fetch (no WebView)"
+            summary = "Recommended. Chapter pages load with pure HTTP — the fastest, " +
+                "crash-proof path on every device. Pages beyond the site's public " +
+                "preview may be missing while the site's challenge gate holds. " +
+                "Turn OFF to also solve the challenge with an offscreen WebView " +
+                "(fuller chapters, slower and heavier)."
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+
         // ---- Description (the Comix-style options) ----
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SHOW_EXTRA_INFO
@@ -1952,12 +2056,87 @@ abstract class ProComic :
         const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
         const val PREF_PREFERRED_SCANLATORS = "pref_preferred_scanlators"
 
+        /** v120: safe chapter fetch — the page-count fetch spawns NO
+         * WebView (no library challenge solve, no Turnstile mint). */
+        const val PREF_SAFE_FETCH = "pref_safe_fetch"
+
+        /** v120: the fruitless-mint cooldown (safe fetch OFF only). */
+        const val MINT_FRUITLESS_LIMIT = 2
+        const val MINT_COOLDOWN_MS = 30L * 60_000L
+
         val GENRE_FALLBACK = listOf(
             "Action", "Adventure", "Comedy", "Doujinshi", "Drama", "Ecchi",
             "Fantasy", "Gender Bender", "Harem", "Historical", "Horror",
             "Josei", "Martial Arts", "Mecha", "Mystery", "Psychological",
             "Romance", "School Life", "Sci-fi", "Seinen", "Shoujo",
             "Shounen", "Slice of Life", "Sports", "Supernatural", "Tragedy",
+        )
+    }
+}
+
+/**
+ * v120: the challenge gate that CANNOT kill the host app. The library
+ * [CloudflareSolverInterceptor] it delegates to (ONLY when the user opts
+ * out of safe fetch) solves Cloudflare interstitials with a WebView built
+ * on the MAIN looper and NO onRenderProcessGone handler — Android's
+ * documented default for an unhandled renderer death is KILL THE PROCESS.
+ * On the page-count fetch (the reader flight is an HTML GET) that was the
+ * last unprotected WebView in the chain — the exact "crashes when it
+ * tries to fetch the number of pages" report.
+ *
+ * Safe fetch (default) never spawns one: a challenged response is closed
+ * and answered with a legible IOException every caller already treats as
+ * a transport miss. Detection mirrors the library's own verdict logic
+ * (cf-mitigated header, HTML content type, challenge markers).
+ */
+private class ProComicChallengeInterceptor(
+    private val cookieHosts: Set<String>,
+    private val safeMode: () -> Boolean,
+) : Interceptor {
+
+    /** The library solver only loads when the user opts out of safe
+     * mode — lazy keeps the safe path free of any WebView dependency. */
+    private val webviewSolver: Interceptor by lazy { CloudflareSolverInterceptor(cookieHosts) }
+
+    override fun intercept(chain: Interceptor.Chain): Response {
+        val request = chain.request()
+        if (request.url.host !in cookieHosts) return chain.proceed(request)
+
+        // Opt-out: the library behavior wholesale (proceed + detect +
+        // solve + retry), unchanged — the user accepted the WebView risk.
+        if (!safeMode()) return webviewSolver.intercept(chain)
+
+        val response = chain.proceed(request)
+        if (!isChallenge(response)) return response
+        response.close()
+        throw IOException(
+            "ProComic: Cloudflare challenge on ${request.url.host} — " +
+                "safe fetch keeps the page-count fetch WebView-free " +
+                "(turn OFF 'Safe chapter fetch' in settings to solve it)",
+        )
+    }
+
+    private fun isChallenge(response: Response): Boolean {
+        if (response.code != 403 && response.code != 503 && response.code != 429) return false
+        if (response.header("cf-mitigated") == "challenge") return true
+        val contentType = response.header("Content-Type").orEmpty()
+        if (contentType.isNotEmpty() && !contentType.contains("text/html", ignoreCase = true)) return false
+        return runCatching {
+            val body = response.peekBody(MAX_PEEK_BYTES).string()
+            CHALLENGE_MARKERS.any { body.contains(it, ignoreCase = true) }
+        }.getOrDefault(false)
+    }
+
+    private companion object {
+        const val MAX_PEEK_BYTES = 256L * 1024L
+
+        val CHALLENGE_MARKERS = listOf(
+            "Just a moment",
+            "Attention Required",
+            "cf_chl_opt",
+            "cf-challenge",
+            "challenge-platform",
+            "challenge-error-text",
         )
     }
 }

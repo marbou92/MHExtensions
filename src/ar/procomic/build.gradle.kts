@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 34
+    versionCode = 35
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -261,6 +261,26 @@ keiyoushi {
     // delivered (genres + Long Strip/Webtoon keywords, renewal
     // economics, one-mint bounds, 90 s wall, three-rung signed ladder)
     // is untouched.
+    // v120 (versionCode 35) — FIELD VERDICT on v118/v119: "it still
+    // crashes when it tries to fetch the number of pages a chapter has".
+    // The one WebView surface OUTSIDE the v119 firewall was the LIBRARY
+    // CloudflareSolverInterceptor wired into the client: its challenge
+    // solve builds the WebView on the MAIN looper with NO
+    // onRenderProcessGone handler — Android's documented default for an
+    // unhandled renderer death is KILL THE APP PROCESS — and it arms on
+    // any 403/503/429 HTML answer from the site's hosts, which the reader
+    // flight (an HTML page) is: exactly the page-count fetch. v120 makes
+    // the fetch WebView-free BY DEFAULT: a safe-fetch preference (default
+    // ON) turns the page-count fetch into pure HTTP — a module-local
+    // challenge interceptor fast-fails legibly instead of spawning the
+    // library WebView, the walk ships the public pages when the gate
+    // holds, and getPageList itself is Throwable-tight (worst case a
+    // legible empty list, never an exception into the host) with the
+    // ChapterRef decode guarded (old cached chapters). Opting out ("Safe
+    // chapter fetch" toggle) restores the full-chapter attempt (mint +
+    // library solve) plus a fruitless-mint cooldown breaker: two
+    // consecutive dead ladders pause mints for 30 minutes. The diag
+    // marker is v120; everything v117–v119 delivered stays.
 
     deeplink {
         host("procomic.net")
