@@ -47,11 +47,11 @@
       "langs": [
         "all"
       ],
-      "version": "1.4.49",
-      "versionCode": 49,
+      "version": "1.4.50",
+      "versionCode": 50,
       "baseUrl": "https://comix.to",
-      "apk": "tachiyomi-all.comixto-v1.4.49-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.comixto-v1.4.49-release.apk",
+      "apk": "tachiyomi-all.comixto-v1.4.50-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.comixto-v1.4.50-release.apk",
       "icon": "../icons/comixto.png",
       "note": "Signed+encrypted API via the WebView signing bridge; Cloudflare bypass; image descrambling",
       "description": "signed+encrypted JSON API. The site's VM-protected signer means every <code>/api/v1</code> call runs through a WebView bridge that boots the site's own chunk graph and lets the site sign/decrypt in-JS; frozen native constants stay as the fast path. Cloudflare bypass, tile descrambling, 10 settings."
@@ -331,11 +331,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.58",
-      "versionCode": 58,
+      "version": "1.6.59",
+      "versionCode": 59,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.mangalek-v1.6.58-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.58-release.apk",
+      "apk": "tachiyomi-ar.mangalek-v1.6.59-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.59-release.apk",
       "icon": "../icons/mangalek.png",
       "note": "",
       "description": ""
@@ -450,11 +450,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.36",
-      "versionCode": 36,
+      "version": "1.6.37",
+      "versionCode": 37,
       "baseUrl": "https://procomic.net",
-      "apk": "tachiyomi-ar.procomic-v1.6.36-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.36-release.apk",
+      "apk": "tachiyomi-ar.procomic-v1.6.37-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.37-release.apk",
       "icon": "../icons/procomic.png",
       "note": "",
       "description": ""
