@@ -16,6 +16,8 @@ import keiyoushi.cloudflare.CloudflareSolverInterceptor
 import keiyoushi.cloudflare.isCloudflareChallenge
 import keiyoushi.utils.getPreferences
 import keiyoushi.utils.parseAs
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
 import okhttp3.HttpUrl.Companion.toHttpUrl
 import okhttp3.Interceptor
 import okhttp3.MediaType.Companion.toMediaType
@@ -139,21 +141,176 @@ abstract class Comix :
             throw IOException("Comix WebView bridge returned an empty payload for $path")
         }
         CloudflareSolverDiagnostics.record("COMIX WebView bridge OK ($path)")
-        return Response.Builder()
-            .request(request)
-            .protocol(Protocol.HTTP_1_1)
-            .code(200)
-            .message("OK")
-            .body(payload.toResponseBody("application/json".toMediaType()))
-            .build()
+        return teeResponse(request, payload)
     }
+
+    // ========================================================================
+    // The real-page tee (v50) — the site's own SPA answers the API
+    // ========================================================================
+
+    private val teeJson = Json { ignoreUnknownKeys = true }
+
+    /** Learnt route template for the reader page (e.g. /title/{hid}/{slug}). */
+    private val readerTemplate: String?
+        get() = runCatching {
+            preferences.getString(PREF_READER_TEMPLATE, null)?.takeIf { it.contains("{hid}") && it.contains("{slug}") }
+        }.getOrNull()
+
+    private fun rememberReaderTemplate(href: String, mangaHid: String, chapterSlug: String) {
+        runCatching {
+            val path = href.substringBefore('?').substringBefore('#')
+            if (!path.contains(chapterSlug)) return
+            val templated = path.replace(chapterSlug, "{slug}").replace(mangaHid, "{hid}")
+            if (templated.contains("{slug}") && templated.contains("{hid}")) {
+                preferences.edit().putString(PREF_READER_TEMPLATE, templated).apply()
+                CloudflareSolverDiagnostics.record("COMIX page-tee reader template learnt: $templated")
+            }
+        }
+    }
+
+    /** Wraps a captured payload in a synthetic 200 response for the parsers. */
+    private fun teeResponse(request: Request, payload: String): Response = Response.Builder()
+        .request(request)
+        .protocol(Protocol.HTTP_1_1)
+        .code(200)
+        .message("OK")
+        .body(payload.toResponseBody("application/json".toMediaType()))
+        .build()
+
+    /**
+     * Runs the real-page tee for a native request's endpoint: maps the API
+     * path to the site page that fires it (browse → /browse, details and
+     * chapter lists → /title/<hid>), captures the SPA's own exchanges and
+     * re-serves them as the response the parser expects.
+     */
+    private fun teeForRequest(request: Request): Response {
+        val url = request.url
+        val path = url.encodedPath
+        val captures: List<TeeItemHolder> = when {
+            path == "/api/v1/manga" -> {
+                // Browse/search: the SPA's /browse page reads sort/q/types
+                // from its own URL and fires the catalog call.
+                val sort = url.queryParameter("sort") ?: "relevance:desc"
+                val page = url.queryParameter("page") ?: "1"
+                val query = url.queryParameter("q")
+                val types = url.queryParameter("types")
+                val siteUrl = buildString {
+                    append(baseUrl).append("/browse?sort=").append(percentEncode(sort))
+                    if (!query.isNullOrBlank()) append("&q=").append(percentEncode(query))
+                    if (!types.isNullOrBlank()) append("&types=").append(percentEncode(types))
+                    append("&page=").append(page)
+                }
+                val items = ComixPageTee.capture(siteUrl, webViewUserAgent, """/api/v1/manga\?""", maxPayloads = 16, autoScroll = true)
+                val wanted = items.filter { page == "1" || ComixPageTee.capturedPage(it.u) == page.toIntOrNull() ?: 1 }
+                    .ifEmpty { items.takeIf { page == "1" } ?: emptyList() }
+                val merged = mergeListCaptures(wanted)
+                listOf(TeeItemHolder(request, merged))
+            }
+
+            path.startsWith("/api/v1/manga/") && path.endsWith("/chapters") -> {
+                val hid = path.removePrefix("/api/v1/manga/").removeSuffix("/chapters")
+                val items = ComixPageTee.capture(
+                    "$baseUrl/title/$hid",
+                    webViewUserAgent,
+                    """/api/v1/manga/$hid/chapters\?""",
+                    maxPayloads = 24,
+                    autoScroll = true,
+                )
+                val ordered = items.sortedBy { ComixPageTee.capturedPage(it.u) }
+                val merged = mergeChapterCaptures(ordered)
+                listOf(TeeItemHolder(request, merged))
+            }
+
+            path.startsWith("/api/v1/manga/") -> {
+                val hid = path.removePrefix("/api/v1/manga/")
+                val payload = ComixPageTee.capture(
+                    "$baseUrl/title/$hid",
+                    webViewUserAgent,
+                    "/api/v1/manga/$hid(\\?|$)",
+                    maxPayloads = 4,
+                ).maxByOrNull { it.b.length }?.b
+                    ?: throw IOException("page-tee captured nothing for $hid")
+                listOf(TeeItemHolder(request, payload))
+            }
+
+            else -> throw IOException("$path has no page-tee route")
+        }
+        val holder = captures.first()
+        CloudflareSolverDiagnostics.record("COMIX page-tee OK (${holder.payload.length} B for $path)")
+        return teeResponse(holder.request, holder.payload)
+    }
+
+    /** A captured payload held together with the request it answers. */
+    private class TeeItemHolder(val request: Request, val payload: String)
+
+    /** Merges browse/search captures into one catalog payload (site order, deduped by hid). */
+    private fun mergeListCaptures(items: List<ComixPageTee.TeeItem>): String {
+        if (items.isEmpty()) throw IOException("page-tee captured no catalog payloads")
+        val parsed = items.mapNotNull { item ->
+            runCatching { item.b.parseAs<ComixMangaListDto>() }.getOrNull()
+        }
+        if (parsed.isEmpty()) throw IOException("page-tee catalog payloads were unreadable")
+        val seen = LinkedHashSet<ComixMangaListItemDto>()
+        parsed.forEach { dto -> dto.items.forEach { item -> if (seen.none { it.hid == item.hid }) seen.add(item) } }
+        val meta = parsed.firstNotNullOfOrNull { it.meta }
+        return teeJson.encodeToString(ComixMangaListDto.serializer(), ComixMangaListDto(seen.toList(), meta))
+    }
+
+    /** Merges chapter-list captures in page order into one payload. */
+    private fun mergeChapterCaptures(items: List<ComixPageTee.TeeItem>): String {
+        if (items.isEmpty()) throw IOException("page-tee captured no chapter-list payloads")
+        val parsed = items.mapNotNull { item ->
+            runCatching { item.b.parseAs<ComixChapterListDto>() }.getOrNull()
+        }
+        if (parsed.isEmpty()) throw IOException("page-tee chapter payloads were unreadable")
+        val seen = LinkedHashSet<ComixChapterDto>()
+        parsed.forEach { dto -> dto.items.forEach { item -> if (seen.none { it.id == item.id }) seen.add(item) } }
+        return teeJson.encodeToString(ComixChapterListDto.serializer(), ComixChapterListDto(seen.toList(), null))
+    }
+
+    private fun percentEncode(value: String): String = java.net.URLEncoder.encode(value, "UTF-8")
+
+    // ------------------------------------------------------------------
+    // The chapter route map (lib 1.4 has no per-chapter memo — the
+    // page-tee's hid+slug pairs live in one bounded preference, newest
+    // chapter first, oldest evicted past the cap).
+    // ------------------------------------------------------------------
+
+    private fun rememberChapterRoute(chapterId: String, mangaHid: String, chapterSlug: String?) {
+        if (chapterSlug.isNullOrBlank()) return
+        runCatching {
+            val map = chapterRouteMap().toMutableMap()
+            map[chapterId] = listOf(mangaHid, chapterSlug)
+            val bounded = if (map.size > ROUTE_CAP) {
+                map.entries.toList().takeLast(ROUTE_CAP).associate { it.key to it.value }
+            } else {
+                map
+            }
+            preferences.edit()
+                .putString(PREF_CHAPTER_ROUTES, teeJson.encodeToString<Map<String, List<String>>>(bounded))
+                .apply()
+        }
+    }
+
+    private fun chapterRouteMap(): Map<String, List<String>> = runCatching {
+        val raw = preferences.getString(PREF_CHAPTER_ROUTES, null) ?: return emptyMap()
+        val obj = org.json.JSONObject(raw)
+        buildMap {
+            for (key in obj.keys()) {
+                val pair = obj.optJSONArray(key) ?: continue
+                if (pair.length() >= 2) put(key, listOf(pair.optString(0), pair.optString(1)))
+            }
+        }
+    }.getOrDefault(emptyMap())
+
+    private fun lookupChapterRoute(chapterId: String): Pair<String, String>? = chapterRouteMap()[chapterId]?.let { it[0] to it[1] }
 
     /**
      * Shared fetch shape: native call through the FULL source client first
-     * (solver + retry + signing interceptors ride along), then the WebView
-     * bridge on ANY failure. The request is built once and reused by both
-     * paths, so the WebView call hits the exact endpoint the native one
-     * wanted.
+     * (solver + retry + signing interceptors ride along), then the REAL-PAGE
+     * tee (the site's own SPA fires and answers the API call — no signature
+     * replication, no chunk discovery), then the legacy chunk-import bridge.
+     * The request is built once and reused by all three paths.
      */
     private fun <T> fetchWithWebViewFallback(request: Request, parse: (Response) -> T): Observable<T> = Observable.fromCallable {
         client.newCall(request).execute().use { resp ->
@@ -163,14 +320,21 @@ abstract class Comix :
     }
         .subscribeOn(Schedulers.io())
         .onErrorResumeNext { error ->
-            Observable.fromCallable { parse(webViewApiGet(request)) }
+            Observable.fromCallable { parse(teeForRequest(request)) }
                 .subscribeOn(Schedulers.io())
-                .onErrorResumeNext { bridgeError ->
-                    // Both paths failed: surface the native status AND the
-                    // bridge's reason instead of the bare "HTTP 403".
-                    Observable.error<T>(
-                        IOException("${error.message} (WebView bridge: ${bridgeError.message})", bridgeError),
-                    )
+                .onErrorResumeNext { teeError ->
+                    Observable.fromCallable { parse(webViewApiGet(request)) }
+                        .subscribeOn(Schedulers.io())
+                        .onErrorResumeNext { bridgeError ->
+                            // All three paths failed: surface the native
+                            // status plus each fallback's reason.
+                            Observable.error<T>(
+                                IOException(
+                                    "${error.message} (page-tee: ${teeError.message}; WebView bridge: ${bridgeError.message})",
+                                    bridgeError,
+                                ),
+                            )
+                        }
                 }
         }
 
@@ -303,7 +467,7 @@ abstract class Comix :
             }
         }
         CloudflareSolverDiagnostics.record("COMIX WebView bridge chapter list OK (${items.size} items)")
-        return processChapterItems(items)
+        return processChapterItems(items, mangaHid = hid)
     }
 
     override fun chapterListRequest(manga: SManga): Request {
@@ -347,7 +511,7 @@ abstract class Comix :
             }
         }
 
-        var chapters = items.map { it.toSChapter() }
+        var chapters = items.map { it.toSChapter(hid) }
 
         // Deduplicate chapters by number — keep the best version of each
         if (preferences.deduplicateChapters()) {
@@ -361,7 +525,7 @@ abstract class Comix :
                 }
             }
             val bestIds = bestByKey.values.map { it.id }.toSet()
-            chapters = items.filter { it.id in bestIds }.map { it.toSChapter() }
+            chapters = items.filter { it.id in bestIds }.map { it.toSChapter(hid) }
         }
 
         // Filter by scanlator preference
@@ -378,9 +542,8 @@ abstract class Comix :
     }
 
     /** Shared post-processing (dedupe + scanlator filter) for the WebView chapter path. */
-    private fun processChapterItems(items: List<ComixChapterDto>): List<SChapter> {
-        var chapters = items.map { it.toSChapter() }
-
+    private fun processChapterItems(items: List<ComixChapterDto>, mangaHid: String? = null): List<SChapter> {
+        var chapters = items.map { it.toSChapter(mangaHid) }
         if (preferences.deduplicateChapters()) {
             val bestByKey = mutableMapOf<Float, ComixChapterDto>()
             for (dto in items) {
@@ -391,7 +554,7 @@ abstract class Comix :
                 }
             }
             val bestIds = bestByKey.values.map { it.id }.toSet()
-            chapters = items.filter { it.id in bestIds }.map { it.toSChapter() }
+            chapters = items.filter { it.id in bestIds }.map { it.toSChapter(mangaHid) }
         }
 
         val scanlatorPref = preferences.getScanlatorFilter()
@@ -441,14 +604,69 @@ abstract class Comix :
         return GET("$apiBaseUrl/chapters/$chapterId", apiHeaders)
     }
 
-    // v47: same fallback shape as the chapter list — the site's own client
-    // signs + decrypts the /chapters/{id} call inside the WebView.
-    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = fetchWithWebViewFallback(pageListRequest(chapter)) { response -> pageListParse(response) }
-        .onErrorResumeNext { error ->
-            Observable.fromCallable { webViewPageList(chapter) }
-                .subscribeOn(Schedulers.io())
-                .onErrorResumeNext { Observable.error<List<Page>>(error) }
+    // v50: native first, then the real-page tee on the chapter's own site
+    // route (memo carries hid + slug from the last list refresh), then the
+    // legacy chunk-import bridge.
+    override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
+        client.newCall(pageListRequest(chapter)).execute().use { resp ->
+            if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
+            pageListParse(resp)
         }
+    }
+        .subscribeOn(Schedulers.io())
+        .onErrorResumeNext { error ->
+            Observable.fromCallable { teePageList(chapter) }
+                .subscribeOn(Schedulers.io())
+                .onErrorResumeNext { teeError ->
+                    Observable.fromCallable { webViewPageList(chapter) }
+                        .subscribeOn(Schedulers.io())
+                        .onErrorResumeNext { bridgeError ->
+                            Observable.error<List<Page>>(
+                                IOException(
+                                    "${error.message} (page-tee: ${teeError.message}; WebView bridge: ${bridgeError.message})",
+                                    bridgeError,
+                                ),
+                            )
+                        }
+                }
+        }
+
+    /**
+     * Page list via the real-page tee: the reader page's own SPA fires the
+     * signed /chapters/{id} call — the tee records its response verbatim.
+     * The reader route comes from the learnt template, or (first run) from
+     * following the chapter's own link on the rendered title page.
+     */
+    private fun teePageList(chapter: SChapter): List<Page> {
+        val chapterId = chapter.url
+        val (mangaHid, chapterSlug) = lookupChapterRoute(chapterId)
+            ?: throw IOException("page-tee has no chapter route — refresh the chapter list once")
+        CloudflareSolverDiagnostics.record("COMIX native page list failed → page-tee (chapter=$chapterId, slug=$chapterSlug)")
+        val pattern = "/api/v1/chapters/$chapterId(\\?|$)"
+        val target = readerTemplate?.let { template -> baseUrl + template.replace("{hid}", mangaHid).replace("{slug}", chapterSlug) }
+        val payload: String = if (target != null) {
+            ComixPageTee.capture(target, webViewUserAgent, pattern, maxPayloads = 4)
+                .maxByOrNull { it.b.length }?.b
+        } else {
+            var resolvedHref: String? = null
+            val items = ComixPageTee.capture(
+                "$baseUrl/title/$mangaHid",
+                webViewUserAgent,
+                pattern,
+                maxPayloads = 4,
+                autoScroll = true,
+                navigateToSlug = chapterSlug,
+                onResolvedLink = { resolvedHref = it },
+            )
+            resolvedHref?.let { rememberReaderTemplate(it, mangaHid, chapterSlug) }
+            items.maxByOrNull { it.b.length }?.b
+        } ?: throw IOException("page-tee captured nothing for chapter $chapterId")
+        val container = runCatching { payload.parseAs<ComixChapterPagesDto>().pages }
+            .getOrElse { payload.parseAs<WebViewPagesResult>().pages }
+            ?: throw IOException("page-tee returned no page container")
+        CloudflareSolverDiagnostics.record("COMIX page-tee page list OK (${container.items.size} pages)")
+        return buildPageList(container)
+    }
 
     override fun getChapterUrl(chapter: SChapter): String {
         // chapter.url is the numeric chapter ID; we cannot reconstruct the full web URL without
@@ -1311,7 +1529,7 @@ abstract class Comix :
         else -> lang ?: "Unknown"
     }
 
-    private fun ComixChapterDto.toSChapter(): SChapter {
+    private fun ComixChapterDto.toSChapter(mangaHid: String? = null): SChapter {
         val chNum = number
         val chName = name
         return SChapter.create().apply {
@@ -1331,6 +1549,14 @@ abstract class Comix :
             chapter_number = chNum ?: -1f
             date_upload = parseRelativeDate(createdAtFormatted)
             scanlator = group?.name
+            // The page-tee needs the site's own route to this chapter: the
+            // chapter slug from the DTO plus the manga hid. lib 1.4's model
+            // carries no per-chapter memo, so the route map lives in the
+            // source preferences (bounded, newest-wins) — one list refresh
+            // teaches it every chapter of the series.
+            if (mangaHid != null) {
+                rememberChapterRoute(id.toString(), mangaHid, url)
+            }
         }
     }
 
@@ -1497,6 +1723,17 @@ abstract class Comix :
         private const val PREF_SHOW_EXTRA_INFO = "pref_show_extra_info"
         private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
         private const val PREF_SCORE_POSITION = "pref_score_position"
+
+        /** v50: the learnt reader route template (e.g. /title/{hid}/{slug}) —
+         * discovered once from the title page's own chapter link, then used
+         * directly for every following page-list tee. */
+        private const val PREF_READER_TEMPLATE = "pref_reader_template"
+
+        /** v50: the bounded chapter route map (chapterId → [hid, slug]). */
+        private const val PREF_CHAPTER_ROUTES = "pref_chapter_routes"
+
+        /** Route-map cap: the newest N chapter routes survive eviction. */
+        private const val ROUTE_CAP = 400
 
         private const val SBOX1_B64 = "gbicCvAMzfcXEtGAyjvvhmb2yCWzWhjqcxXZ7ZhpzANOzoQLo3nuPZ2vK9dkb9hJExC0Vni/hdQBceI+mw611gkhQFjBuf4bJg1TxYqM+SL4YDqtwjxiGSdeH7so7Fn1HiRo37Z+RNvl44twXWVhomtMjw+8bemfmv9XEXr7mS82MxaCOJZRR0oHd9PLI5O+gyBGT6hcLoduNa7yCObVVCk3bFWsoD+xcqTrBcP6dNJN/NB1Br2QGhSN2snHAqeRNKVFQiyeAFLPSKGwY8aq9EPgsi17qd4ywPMxiH8w6N1qX1tLKtzhOeemHWeJQfFQ5H23q7qSlJUcjgTEl3x2/Q=="
         private const val KEY1_B64 = "rafYl4oSAKQX+GYoic9oW4iGwiYpZzs0"

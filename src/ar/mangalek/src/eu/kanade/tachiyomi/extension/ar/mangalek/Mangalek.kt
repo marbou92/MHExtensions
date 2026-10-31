@@ -47,6 +47,20 @@ abstract class Mangalek :
 
     override val filterNonMangaItems get() = false
 
+    /**
+     * The chapter list lives ONLY behind the admin-ajax endpoint now.
+     * Live-verified on mangalik.net: the series page HTML embeds zero
+     * `li.wp-manga-chapter` rows (the page's own TOC widget renders empty),
+     * so the stock MangaPage mode parses nothing and every series shows
+     * "0 chapters". The theme's own reader still loads them the classic
+     * way — POST /wp-admin/admin-ajax.php with action=manga_get_chapters
+     * and the series' numeric post ID (the `data-id` the page carries)
+     * returns the full `li.wp-manga-chapter` list. AdminAjax mode does
+     * exactly that; the memoized post ID rides in the manga url (and the
+     * page's data-id resolves it for entries cached before this change).
+     */
+    override val chapterMode = ChapterMode.AdminAjax
+
     override val chapterDateFormat = DateTimeFormatter.ofPattern("MMMM dd, yyyy", Locale.forLanguageTag("ar"))
     private val formatTwo = DateTimeFormatter.ofPattern("yyyy-MM-dd", Locale.US)
 

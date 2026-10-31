@@ -120,6 +120,17 @@ class ExtensionPlugin : Plugin<Project> {
                 ?: throw AssertionError("Theme project :lib-multisrc:$themeName must apply kei.plugins.multisrc")
         }
 
+        // Standalone (non-themed) extensions keep the family's long
+        // versionCode: <libMajor>*1,000,000 + <libMinor>*1,000 + the
+        // extension's own increment — procomic's delivered ladder runs
+        // 106001..1060xx and a bare extension number would downgrade
+        // every device install. Themed modules stay on the theme's
+        // baseVersionCode + the extension increment (the madara family's
+        // delivered ladder).
+        val standaloneVersionCode = keiyoushi.libVersion.zip(keiyoushi.versionCode) { libVersion, extCode ->
+            val (major, minor) = libVersion.split('.').map { it.toInt() }
+            major * 1_000_000 + minor * 10_000 + extCode
+        }
         val versionCodeProvider = themeExtension.flatMap { themeKeiyoushi ->
             val themeLib = themeKeiyoushi.libVersion.get()
             val extLib = keiyoushi.libVersion.get()
@@ -127,13 +138,15 @@ class ExtensionPlugin : Plugin<Project> {
                 "Multisrc libVersion ($themeLib) and extension libVersion ($extLib) must match."
             }
             themeKeiyoushi.baseVersionCode.zip(keiyoushi.versionCode) { base, ext -> base + ext }
-        }.orElse(keiyoushi.versionCode)
+        }.orElse(standaloneVersionCode)
 
         val versionNameProvider = keiyoushi.libVersion.flatMap { libVersion ->
             check(libVersion in VALID_LIB_VERSIONS) {
                 "libVersion $libVersion is not supported. Supported versions: $VALID_LIB_VERSIONS"
             }
-            versionCodeProvider.map { "$libVersion.$it" }
+            // The display name rides the RAW extension increment (1.6.37),
+            // never the long APK versionCode.
+            keiyoushi.versionCode.map { "$libVersion.$it" }
         }
 
         val themeDeeplinks = themeExtension

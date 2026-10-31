@@ -3,6 +3,12 @@
 pluginManagement {
     includeBuild("gradle/build-logic")
     repositories {
+        // Maven Central 429-throttles this sandbox IP — Aliyun mirrors
+        // resolve first, fallbacks after (same cure the fork already
+        // carries in gradle/build-logic/settings.gradle.kts).
+        maven(url = "https://maven.aliyun.com/repository/gradle-plugin")
+        maven(url = "https://maven.aliyun.com/repository/public")
+        maven(url = "https://maven.aliyun.com/repository/google")
         google()
         mavenCentral()
         gradlePluginPortal()
@@ -20,9 +26,14 @@ dependencyResolutionManagement {
     repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
     @Suppress("UnstableApiUsage")
     repositories {
+        // Aliyun first — same Maven Central 429 throttling. NOTE: jitpack
+        // sits BEFORE mavenCentral — a 404 falls through to the next repo,
+        // but a 429 ABORTS resolution; com.github.* only exists on jitpack.
+        maven(url = "https://maven.aliyun.com/repository/public")
+        maven(url = "https://maven.aliyun.com/repository/google")
         google()
-        mavenCentral()
         maven(url = "https://www.jitpack.io")
+        mavenCentral()
     }
 }
 

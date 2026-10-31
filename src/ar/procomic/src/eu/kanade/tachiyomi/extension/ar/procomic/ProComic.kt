@@ -304,6 +304,18 @@ abstract class ProComic :
     @Volatile
     private var mintPausedUntil = 0L
 
+    /** The reader-session breaker (see SESSION_FAILURE_LIMIT): consecutive
+     * sessions that produced nothing usable pause the session for the
+     * cooldown window. Reset on the first session that helps. */
+    @Volatile
+    private var sessionFailures = 0
+
+    @Volatile
+    private var sessionPausedUntil = 0L
+
+    private val readerSessionEnabled: Boolean
+        get() = preferences.getBoolean(PREF_READER_SESSION, true)
+
     /**
      * The site's WAF answers 403 to non-browser User-Agents — including the
      * app UA some hosts stamp onto every request (Kotatsu's Mihon-compat
@@ -1287,7 +1299,55 @@ abstract class ProComic :
                 )
             }
         }
-        upstreams = loadable
+        var finalUrls: List<String> = loadable
+
+        // The reader session: when the chapter has pages the plain fetch
+        // cannot serve (gated extras, or the site itself says the public
+        // embed is bigger than what we hold), ONE bounded offscreen browser
+        // session loads the real chapter page and collects the pages the
+        // site's own reader renders — the exact addresses the site shows,
+        // including the freshly-observed app.<apex> class that serves any
+        // plain client. The harvested urls replace the WebView-free list
+        // for the page numbers they cover.
+        val chapterHasMore = gated.isNotEmpty() || (payload.publicCount ?: 0) > loadable.size
+        if (chapterHasMore && readerSessionEnabled) {
+            if (System.currentTimeMillis() < sessionPausedUntil) {
+                Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")
+                runCatching {
+                    imageServer.recordDeferredTrail(
+                        ref.chapterId,
+                        walkTrail + "reader session cooling down — shipping the WebView-free list",
+                    )
+                }
+            } else {
+                val harvest = runCatching {
+                    ProComicReaderSession.harvest(chapterPageUrl(ref), ProComicImageServer.BROWSER_UA)
+                }
+                    .onFailure { t ->
+                        Log.e(TAG, "reader session survived: ${t.javaClass.simpleName}: ${t.message?.take(140)}")
+                    }
+                    .getOrNull()
+                val harvested = harvest?.pageUrls.orEmpty()
+                harvest?.notes?.forEach { Log.i(TAG, it) }
+                runCatching { imageServer.recordDeferredTrail(ref.chapterId, harvest?.notes.orEmpty()) }
+                if (harvested.size > finalUrls.size) {
+                    val merged = ProComicReaderSession.mergeWithSession(finalUrls, harvested)
+                    if (merged.size > finalUrls.size) {
+                        Log.i(TAG, "reader session: ${finalUrls.size} -> ${merged.size} pages")
+                        finalUrls = merged
+                        sessionFailures = 0
+                    }
+                }
+                if (finalUrls.size <= loadable.size) {
+                    sessionFailures++
+                    if (sessionFailures >= SESSION_FAILURE_LIMIT && sessionPausedUntil == 0L) {
+                        sessionPausedUntil = System.currentTimeMillis() + SESSION_COOLDOWN_MS
+                        Log.i(TAG, "${SESSION_FAILURE_LIMIT} fruitless reader sessions — cooling down for ${SESSION_COOLDOWN_MS / 60000} min")
+                    }
+                }
+            }
+        }
+        upstreams = finalUrls
 
         val pages = upstreams.mapIndexed { index, upstream ->
             Page(
@@ -2061,15 +2121,27 @@ abstract class ProComic :
     // ========================= Preference screen =========================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
+        // ---- the reader session (default ON) ----
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_READER_SESSION
+            title = "Load gated pages with a browser session"
+            summary = "Recommended. When the chapter has pages the plain fetch " +
+                "cannot serve, one bounded offscreen browser session opens the " +
+                "chapter like a reader and collects the pages the site itself " +
+                "renders (fuller chapters, a few seconds slower). Turn OFF to " +
+                "stay browser-free (public pages only)."
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+
         // ---- v120: the safe-fetch master switch (default ON) ----
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SAFE_FETCH
-            title = "Safe chapter fetch (no WebView)"
-            summary = "Recommended. Chapter pages load with pure HTTP — the fastest, " +
-                "crash-proof path on every device. Pages beyond the site's public " +
-                "preview may be missing while the site's challenge gate holds. " +
-                "Turn OFF to also solve the challenge with an offscreen WebView " +
-                "(fuller chapters, slower and heavier)."
+            title = "Safe chapter fetch (no solver WebView)"
+            summary = "Recommended. The direct HTTP walk never mints challenge " +
+                "tokens with a WebView of its own — the reader session above " +
+                "(a separate, crash-hardened surface) covers the gated pages. " +
+                "Turn OFF to let the walk also solve challenges directly " +
+                "(legacy path, slower)."
             setDefaultValue(true)
         }.let(screen::addPreference)
 
@@ -2178,6 +2250,18 @@ abstract class ProComic :
         /** v120: safe chapter fetch — the page-count fetch spawns NO
          * WebView (no library challenge solve, no Turnstile mint). */
         const val PREF_SAFE_FETCH = "pref_safe_fetch"
+
+        /** The reader session: when the plain fetch cannot serve the whole
+         * chapter, one bounded offscreen browser session collects the pages
+         * the site's own reader renders. Default ON — it is the only path
+         * to the gated pages. */
+        const val PREF_READER_SESSION = "pref_reader_session"
+
+        /** The reader-session failure breaker: N consecutive sessions that
+         * yielded nothing pause the session for the cooldown window —
+         * chapter opens stay fast and browser-free until it lapses. */
+        const val SESSION_FAILURE_LIMIT = 3
+        const val SESSION_COOLDOWN_MS = 30L * 60_000L
 
         /** v120: the fruitless-mint cooldown (safe fetch OFF only). */
         const val MINT_FRUITLESS_LIMIT = 2
