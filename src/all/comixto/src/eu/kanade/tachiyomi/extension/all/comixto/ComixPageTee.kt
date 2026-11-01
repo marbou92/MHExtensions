@@ -49,8 +49,11 @@ internal object ComixPageTee {
     /** Quiet ticks (no new captured payload) before the session resolves. */
     private const val QUIET_TICKS = 5
 
-    /** Hard tick cap — a session never outlives ~70 s of polling. */
-    private const val MAX_TICKS = 115
+    /** Hard tick cap — a session never outlives ~85 s of polling. */
+    private const val MAX_TICKS = 140
+
+    /** Ticks of a Cloudflare challenge before the session reports and gives up. */
+    private const val CHALLENGE_TICK_CAP = 90
 
     private const val DIAG_TAG = "page-tee"
 
@@ -111,8 +114,10 @@ internal object ComixPageTee {
     ): List<TeeItem> {
         val json = Json { ignoreUnknownKeys = true }
         val items = LinkedHashMap<String, TeeItem>() // url -> item (first-seen order)
+        var challengeTicks = 0
+        var challengeSeen = false
 
-        runWebView<List<TeeItem>>(timeout = 110.seconds) {
+        runWebView<List<TeeItem>>(timeout = 130.seconds) {
             javaScriptEnabled = true
             domStorageEnabled = true
             blockImages = true
@@ -150,7 +155,23 @@ internal object ComixPageTee {
 
             poll(POLL_MS.milliseconds) {
                 ticks++
-                if (navigateToSlug != null && !navigated && ticks > 2) {
+                // v124: watch the challenge instead of blind-polling through
+                // it — while "Just a moment" holds, the SPA cannot have fired
+                // anything; wait (bounded) rather than resolve empty.
+                evaluateJs("document.title || ''") { raw ->
+                    val title = decodeEval(raw).orEmpty()
+                    if (title.contains("just a moment", true) || title.contains("attention required", true)) {
+                        challengeTicks++
+                        challengeSeen = true
+                    } else {
+                        challengeTicks = 0
+                    }
+                }
+                if (challengeTicks > CHALLENGE_TICK_CAP) {
+                    resolve(emptyList())
+                    return@poll
+                }
+                if (navigateToSlug != null && !navigated && ticks > 2 && challengeTicks == 0) {
                     evaluateJs(findChapterLinkScript(navigateToSlug)) { raw ->
                         val href = decodeEval(raw).orEmpty().trim()
                         if (href.isNotEmpty()) {
@@ -176,7 +197,9 @@ internal object ComixPageTee {
                         lastCount = items.size
                         quietTicks = 0
                     } else {
-                        quietTicks++
+                        // v124: a challenge tick is not a quiet tick — the
+                        // SPA simply has not booted yet.
+                        if (challengeTicks == 0) quietTicks++
                     }
                     if (ticks >= MAX_TICKS || items.size >= maxPayloads || (quietTicks >= QUIET_TICKS && items.isNotEmpty())) {
                         resolve(items.values.toList())
@@ -187,6 +210,10 @@ internal object ComixPageTee {
             loadUrl(pageUrl)
         }
 
+        if (challengeSeen && items.isEmpty()) {
+            // One diag marker the caller can surface: the challenge won.
+            runCatching { items["challenge-blocked"] = TeeItem("challenge-blocked", "true") }
+        }
         return items.values.toList()
     }
 

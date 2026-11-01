@@ -24,7 +24,7 @@ val languages = listOf(
 
 keiyoushi {
     name = "MangaDot"
-    versionCode = 3
+    versionCode = 4
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

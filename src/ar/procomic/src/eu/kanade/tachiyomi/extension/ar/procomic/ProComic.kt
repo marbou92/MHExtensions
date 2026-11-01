@@ -1220,30 +1220,43 @@ abstract class ProComic :
         // pages beyond the public embed) and a pages-scope `imagePass` —
         // the exact credentials the site's own reader exchanges for the
         // remaining pages. Both are parsed here and consumed below.
-        val payload = fetchFlightAcrossApexes(
-            path = readerPath,
-            emptyPayloadError =
-            "ProComic: no pages found \u2014 the chapter is locked or unavailable on the site " +
-                "(unlock with coins or the shortlink there first)",
-        ) { flight ->
-            val images = parseReaderImages(flight)
-            val appImages = parseAppImages(flight)
-            if (images.isEmpty() && appImages.isEmpty()) {
-                null
-            } else {
-                // Prefer the app variant per page (verified live: 200 for
-                // plain clients, the signature rides in the file name); the
-                // raw CDN URL is the fallback (the proxy's session retry is
-                // its last chance, the edge 403s bare TLS on those hosts).
-                PagesPayload(
-                    upstreams = List(maxOf(images.size, appImages.size)) { index ->
-                        appImages.getOrNull(index) ?: images[index]
-                    },
-                    deferred = parseDeferredMedia(flight),
-                    imagePass = parseImagePass(flight),
-                    publicCount = parsePublicImageCount(flight),
-                )
+        // v124: the chapter flights are GONE (no images/appImages/deferred
+        // on either apex — the reader moved to the .pro deployment and
+        // streams pages into a real browser only). A missing payload no
+        // longer aborts the open: the session below becomes the source.
+        val payload = runCatching {
+            fetchFlightAcrossApexes(
+                path = readerPath,
+                emptyPayloadError =
+                "ProComic: no pages found \u2014 the chapter is locked or unavailable on the site " +
+                    "(unlock with coins or the shortlink there first)",
+            ) { flight ->
+                val images = parseReaderImages(flight)
+                val appImages = parseAppImages(flight)
+                if (images.isEmpty() && appImages.isEmpty()) {
+                    null
+                } else {
+                    // Prefer the app variant per page (verified live: 200 for
+                    // plain clients, the signature rides in the file name); the
+                    // raw CDN URL is the fallback (the proxy's session retry is
+                    // its last chance, the edge 403s bare TLS on those hosts).
+                    PagesPayload(
+                        upstreams = List(maxOf(images.size, appImages.size)) { index ->
+                            appImages.getOrNull(index) ?: images[index]
+                        },
+                        deferred = parseDeferredMedia(flight),
+                        imagePass = parseImagePass(flight),
+                        publicCount = parsePublicImageCount(flight),
+                    )
+                }
             }
+        }.getOrElse { t ->
+            if (t is kotlinx.coroutines.CancellationException) throw t
+            Log.i(TAG, "no WebView-free payload (${t.message?.take(120)}) — the reader session is the source")
+            runCatching {
+                imageServer.recordDeferredTrail(ref.chapterId, listOf("flight carried no page list — reader session is the source"))
+            }
+            PagesPayload(emptyList(), null, null, null)
         }
 
         var upstreams = payload.upstreams
@@ -1301,15 +1314,17 @@ abstract class ProComic :
         }
         var finalUrls: List<String> = loadable
 
-        // The reader session: when the chapter has pages the plain fetch
-        // cannot serve (gated extras, or the site itself says the public
-        // embed is bigger than what we hold), ONE bounded offscreen browser
-        // session loads the real chapter page and collects the pages the
-        // site's own reader renders — the exact addresses the site shows,
-        // including the freshly-observed app.<apex> class that serves any
-        // plain client. The harvested urls replace the WebView-free list
-        // for the page numbers they cover.
-        val chapterHasMore = gated.isNotEmpty() || (payload.publicCount ?: 0) > loadable.size
+        // The reader session (v124, the manhuarmtl architecture): the
+        // WebView-free list is usually empty now — the flight no longer
+        // carries pages. ONE bounded offscreen browser session opens the
+        // REAL reader (procomic.pro — the .net apex 308s away, detected
+        // and walked), waits through a Cloudflare challenge, and walks the
+        // chapter like a reading user while the site's own reader mounts
+        // its rows. Simple rows ship as proxied direct URLs; piece rows
+        // are re-assembled by the loopback server from the site's own
+        // freshly-signed piece URLs. The harvest is authoritative when it
+        // sees more pages than the plain chain.
+        val chapterHasMore = finalUrls.isEmpty() || gated.isNotEmpty() || (payload.publicCount ?: 0) > loadable.size
         if (chapterHasMore && readerSessionEnabled) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
                 Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")
@@ -1321,22 +1336,34 @@ abstract class ProComic :
                 }
             } else {
                 val harvest = runCatching {
-                    ProComicReaderSession.harvest(chapterPageUrl(ref), ProComicImageServer.BROWSER_UA)
+                    ProComicReaderSession.harvest(readerApexes, readerPath, ProComicImageServer.BROWSER_UA)
                 }
                     .onFailure { t ->
                         Log.e(TAG, "reader session survived: ${t.javaClass.simpleName}: ${t.message?.take(140)}")
                     }
                     .getOrNull()
-                val harvested = harvest?.pageUrls.orEmpty()
+                val harvestedRows = harvest?.rows.orEmpty()
                 harvest?.notes?.forEach { Log.i(TAG, it) }
                 runCatching { imageServer.recordDeferredTrail(ref.chapterId, harvest?.notes.orEmpty()) }
-                if (harvested.size > finalUrls.size) {
-                    val merged = ProComicReaderSession.mergeWithSession(finalUrls, harvested)
-                    if (merged.size > finalUrls.size) {
-                        Log.i(TAG, "reader session: ${finalUrls.size} -> ${merged.size} pages")
-                        finalUrls = merged
-                        sessionFailures = 0
+                var sessionUrls: List<String>? = null
+                if (harvestedRows.isNotEmpty()) {
+                    sessionUrls = harvestedRows.mapIndexedNotNull { index, row ->
+                        runCatching {
+                            if (row.isPieces) {
+                                imageServer.composedProxyUrl(row)
+                            } else {
+                                row.u?.let { imageServer.imageProxyUrl(it) }
+                            }
+                        }.onFailure { t ->
+                            Log.w(TAG, "row $index skipped: ${t.javaClass.simpleName}")
+                            null
+                        }.getOrNull()
                     }
+                }
+                if (sessionUrls != null && sessionUrls.size > finalUrls.size) {
+                    Log.i(TAG, "reader session: ${finalUrls.size} -> ${sessionUrls.size} pages")
+                    finalUrls = sessionUrls
+                    sessionFailures = 0
                 }
                 if (finalUrls.size <= loadable.size) {
                     sessionFailures++
@@ -1363,7 +1390,10 @@ abstract class ProComic :
         // v101: warm the transcode cache in the background so the
         // reader's own fetches land on finished JPEGs (the old
         // protected-page preloader, re-targeted at direct app images).
-        imageServer.preloadImages(ref.chapterId.toString(), upstreams)
+        // v124: composed loopback rows are skipped — they build+cache on
+        // first request, and a self-call into the loopback server from the
+        // preloader would be a pointless self-visit.
+        imageServer.preloadImages(ref.chapterId.toString(), upstreams.filterNot { it.startsWith("http://127.0.0.1/") })
         return pages
     }
 

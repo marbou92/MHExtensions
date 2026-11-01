@@ -144,9 +144,16 @@ class ExtensionPlugin : Plugin<Project> {
             check(libVersion in VALID_LIB_VERSIONS) {
                 "libVersion $libVersion is not supported. Supported versions: $VALID_LIB_VERSIONS"
             }
-            // The display name rides the RAW extension increment (1.6.37),
-            // never the long APK versionCode.
-            keiyoushi.versionCode.map { "$libVersion.$it" }
+            // The display name rides the FINAL extension increment — raw for
+            // standalone modules (1.6.38), base+raw for themed ones (the
+            // madara family's delivered ladder runs 1.6.59 → 1.6.60; a raw
+            // "1.6.4" would read like a downgrade to the installed base).
+            themeExtension
+                .flatMap { themeKeiyoushi ->
+                    themeKeiyoushi.baseVersionCode.zip(keiyoushi.versionCode) { base, ext -> base + ext }
+                }
+                .orElse(keiyoushi.versionCode)
+                .map { "$libVersion.$it" }
         }
 
         val themeDeeplinks = themeExtension

@@ -181,7 +181,10 @@ abstract class Comix :
      * Runs the real-page tee for a native request's endpoint: maps the API
      * path to the site page that fires it (browse → /browse, details and
      * chapter lists → /title/<hid>), captures the SPA's own exchanges and
-     * re-serves them as the response the parser expects.
+     * re-serves them as the response the parser expects. v124: the capture
+     * pattern is deliberately broad (any /api/ exchange) and the payloads
+     * are ROUTED BY SHAPE below — the site has renamed endpoints before
+     * and the URL-keyed filter was the single point of blindness.
      */
     private fun teeForRequest(request: Request): Response {
         val url = request.url
@@ -200,11 +203,9 @@ abstract class Comix :
                     if (!types.isNullOrBlank()) append("&types=").append(percentEncode(types))
                     append("&page=").append(page)
                 }
-                val items = ComixPageTee.capture(siteUrl, webViewUserAgent, """/api/v1/manga\?""", maxPayloads = 16, autoScroll = true)
-                val wanted = items.filter { page == "1" || ComixPageTee.capturedPage(it.u) == page.toIntOrNull() ?: 1 }
-                    .ifEmpty { items.takeIf { page == "1" } ?: emptyList() }
-                val merged = mergeListCaptures(wanted)
-                listOf(TeeItemHolder(request, merged))
+                val items = ComixPageTee.capture(siteUrl, webViewUserAgent, """/api/""", maxPayloads = 24, autoScroll = true)
+                val payload = mergeListCaptures(items)
+                listOf(TeeItemHolder(request, payload))
             }
 
             path.startsWith("/api/v1/manga/") && path.endsWith("/chapters") -> {
@@ -212,13 +213,12 @@ abstract class Comix :
                 val items = ComixPageTee.capture(
                     "$baseUrl/title/$hid",
                     webViewUserAgent,
-                    """/api/v1/manga/$hid/chapters\?""",
-                    maxPayloads = 24,
+                    """/api/""",
+                    maxPayloads = 32,
                     autoScroll = true,
                 )
-                val ordered = items.sortedBy { ComixPageTee.capturedPage(it.u) }
-                val merged = mergeChapterCaptures(ordered)
-                listOf(TeeItemHolder(request, merged))
+                val payload = mergeChapterCaptures(items)
+                listOf(TeeItemHolder(request, payload))
             }
 
             path.startsWith("/api/v1/manga/") -> {
@@ -226,10 +226,14 @@ abstract class Comix :
                 val payload = ComixPageTee.capture(
                     "$baseUrl/title/$hid",
                     webViewUserAgent,
-                    "/api/v1/manga/$hid(\\?|$)",
-                    maxPayloads = 4,
-                ).maxByOrNull { it.b.length }?.b
-                    ?: throw IOException("page-tee captured nothing for $hid")
+                    "/api/",
+                    maxPayloads = 16,
+                )
+                    .asSequence()
+                    .mapNotNull { item -> parseShape<ComixMangaDetailDto>(item.b) }
+                    .firstOrNull { it.hid == hid }
+                    ?.let { detail -> teeJson.encodeToString(ComixMangaDetailDto.serializer(), detail) }
+                    ?: throw IOException("page-tee captured no detail payload for $hid")
                 listOf(TeeItemHolder(request, payload))
             }
 
@@ -240,32 +244,130 @@ abstract class Comix :
         return teeResponse(holder.request, holder.payload)
     }
 
+    /** Parses [body] as [T] when it plausibly matches (the shape router). */
+    private inline fun <reified T> parseShape(body: String): T? = runCatching {
+        teeJson.decodeFromString(kotlinx.serialization.serializer<T>(), body)
+    }.getOrNull()
+
     /** A captured payload held together with the request it answers. */
     private class TeeItemHolder(val request: Request, val payload: String)
 
-    /** Merges browse/search captures into one catalog payload (site order, deduped by hid). */
+    /** Merges browse/search captures into one catalog payload (site order, deduped by hid).
+     * v124: shape-routed — a captured payload counts when it parses as the
+     * list DTO, or when it contains manga-shaped objects anywhere inside
+     * (endpoint renames cannot blind the parse anymore). */
     private fun mergeListCaptures(items: List<ComixPageTee.TeeItem>): String {
         if (items.isEmpty()) throw IOException("page-tee captured no catalog payloads")
-        val parsed = items.mapNotNull { item ->
-            runCatching { item.b.parseAs<ComixMangaListDto>() }.getOrNull()
-        }
-        if (parsed.isEmpty()) throw IOException("page-tee catalog payloads were unreadable")
         val seen = LinkedHashSet<ComixMangaListItemDto>()
-        parsed.forEach { dto -> dto.items.forEach { item -> if (seen.none { it.hid == item.hid }) seen.add(item) } }
-        val meta = parsed.firstNotNullOfOrNull { it.meta }
+        var meta: ComixMetaDto? = null
+        items.forEach { item ->
+            val parsedList = runCatching { item.b.parseAs<ComixMangaListDto>() }.getOrNull()
+            if (parsedList != null && parsedList.items.isNotEmpty()) {
+                parsedList.items.forEach { entry -> if (seen.none { it.hid == entry.hid }) seen.add(entry) }
+                if (meta == null) meta = parsedList.meta
+            } else {
+                extractMangaObjects(item.b).forEach { entry -> if (seen.none { it.hid == entry.hid }) seen.add(entry) }
+            }
+        }
+        if (seen.isEmpty()) throw IOException("page-tee catalog payloads were unreadable")
         return teeJson.encodeToString(ComixMangaListDto.serializer(), ComixMangaListDto(seen.toList(), meta))
     }
 
-    /** Merges chapter-list captures in page order into one payload. */
+    /** Walks any JSON payload and pulls every object that looks like a
+     * manga entry (hid + title) regardless of the wrapper's field names. */
+    private fun extractMangaObjects(payload: String): List<ComixMangaListItemDto> {
+        val root = runCatching { teeJson.parseToJsonElement(payload) }.getOrNull() ?: return emptyList()
+        val found = mutableListOf<kotlinx.serialization.json.JsonObject>()
+        fun walk(element: kotlinx.serialization.json.JsonElement) {
+            when (element) {
+                is kotlinx.serialization.json.JsonObject -> {
+                    val hid = (element["hid"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+                    val title = (element["title"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+                    if (!hid.isNullOrBlank() && !title.isNullOrBlank()) found.add(element)
+                    element.values.forEach { walk(it) }
+                }
+                is kotlinx.serialization.json.JsonArray -> element.forEach { walk(it) }
+                else -> Unit
+            }
+        }
+        walk(root)
+        return found.mapNotNull { obj ->
+            runCatching {
+                val hid = (obj["hid"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return@mapNotNull null
+                val title = (obj["title"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: return@mapNotNull null
+                ComixMangaListItemDto(
+                    id = (obj["id"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull()
+                        ?: hid.hashCode().toLong(),
+                    hid = hid,
+                    title = title,
+                    type = (obj["type"] as? kotlinx.serialization.json.JsonPrimitive)?.content,
+                    status = (obj["status"] as? kotlinx.serialization.json.JsonPrimitive)?.content,
+                    poster = (obj["poster"] as? kotlinx.serialization.json.JsonObject)?.let { p ->
+                        ComixPosterDto(
+                            (p["medium"] as? kotlinx.serialization.json.JsonPrimitive)?.content,
+                            (p["large"] as? kotlinx.serialization.json.JsonPrimitive)?.content,
+                        )
+                    },
+                    latestChapter = (obj["latestChapter"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toFloatOrNull()
+                        ?: (obj["last_chapter"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toFloatOrNull(),
+                    year = (obj["year"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toIntOrNull(),
+                    url = (obj["url"] as? kotlinx.serialization.json.JsonPrimitive)?.content ?: "/title/$hid",
+                )
+            }.getOrNull()
+        }.distinctBy { it.hid }
+    }
+
+    /** Merges chapter-list captures in page order into one payload.
+     * v124: shape-routed like the catalog merge. */
     private fun mergeChapterCaptures(items: List<ComixPageTee.TeeItem>): String {
         if (items.isEmpty()) throw IOException("page-tee captured no chapter-list payloads")
-        val parsed = items.mapNotNull { item ->
-            runCatching { item.b.parseAs<ComixChapterListDto>() }.getOrNull()
-        }
-        if (parsed.isEmpty()) throw IOException("page-tee chapter payloads were unreadable")
+        val ordered = items.sortedBy { ComixPageTee.capturedPage(it.u) }
         val seen = LinkedHashSet<ComixChapterDto>()
-        parsed.forEach { dto -> dto.items.forEach { item -> if (seen.none { it.id == item.id }) seen.add(item) } }
+        ordered.forEach { item ->
+            val parsedList = runCatching { item.b.parseAs<ComixChapterListDto>() }.getOrNull()
+            if (parsedList != null && parsedList.items.isNotEmpty()) {
+                parsedList.items.forEach { entry -> if (seen.none { it.id == entry.id }) seen.add(entry) }
+            } else {
+                extractChapterObjects(item.b).forEach { entry -> if (seen.none { it.id == entry.id }) seen.add(entry) }
+            }
+        }
+        if (seen.isEmpty()) throw IOException("page-tee chapter payloads were unreadable")
         return teeJson.encodeToString(ComixChapterListDto.serializer(), ComixChapterListDto(seen.toList(), null))
+    }
+
+    /** Chapter-shaped fallback: objects with a numeric id plus a number or
+     * name, found at any depth. */
+    private fun extractChapterObjects(payload: String): List<ComixChapterDto> {
+        val root = runCatching { teeJson.parseToJsonElement(payload) }.getOrNull() ?: return emptyList()
+        val found = mutableListOf<kotlinx.serialization.json.JsonObject>()
+        fun walk(element: kotlinx.serialization.json.JsonElement) {
+            when (element) {
+                is kotlinx.serialization.json.JsonObject -> {
+                    val id = (element["id"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull()
+                    val number = (element["number"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toFloatOrNull()
+                    val name = (element["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+                    if (id != null && (number != null || !name.isNullOrBlank())) found.add(element)
+                    element.values.forEach { walk(it) }
+                }
+                is kotlinx.serialization.json.JsonArray -> element.forEach { walk(it) }
+                else -> Unit
+            }
+        }
+        walk(root)
+        return found.mapNotNull { obj ->
+            runCatching {
+                val id = (obj["id"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toLongOrNull() ?: return@mapNotNull null
+                ComixChapterDto(
+                    id = id,
+                    number = (obj["number"] as? kotlinx.serialization.json.JsonPrimitive)?.content?.toFloatOrNull(),
+                    name = (obj["name"] as? kotlinx.serialization.json.JsonPrimitive)?.content,
+                    language = (obj["language"] as? kotlinx.serialization.json.JsonPrimitive)?.content,
+                    createdAtFormatted = (obj["createdAtFormatted"] as? kotlinx.serialization.json.JsonPrimitive)?.content
+                        ?: (obj["created_at"] as? kotlinx.serialization.json.JsonPrimitive)?.content,
+                    url = (obj["url"] as? kotlinx.serialization.json.JsonPrimitive)?.content,
+                )
+            }.getOrNull()
+        }.distinctBy { it.id }
     }
 
     private fun percentEncode(value: String): String = java.net.URLEncoder.encode(value, "UTF-8")

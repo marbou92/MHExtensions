@@ -197,6 +197,48 @@ class ProComicImageServer(
         return "http://127.0.0.1:${ensureStarted()}/$IMAGE_PROXY_PATH_PREFIX/$encoded$query"
     }
 
+    /**
+     * Loopback URL that serves a COMPOSED reader row (v124): [row] is one
+     * of the reader session's piece rows — the site's own freshly-signed
+     * piece URLs plus the rectangles they were laid out at. The server
+     * fetches every piece through the normal proxy ladder (which already
+     * knows the /api/cdn-image signed wraps) and stitches them onto one
+     * canvas — the same assembly the site performs in the browser. The
+     * spec rides an in-memory registry keyed by its own hash; a process
+     * restart simply re-harvests on the next chapter open.
+     */
+    internal fun composedProxyUrl(row: ProComicReaderSession.HarvestRow): String? {
+        if (row.pieces.isEmpty()) return null
+        val spec = ComposedSpec(row.w, row.h, row.pieces.map { ComposedPiece(it.u, it.x, it.y, it.w, it.h) })
+        val specJson = runCatching {
+            composedJson.encodeToString(ComposedSpec.serializer(), spec)
+        }.getOrNull() ?: return null
+        val key = MessageDigest.getInstance("SHA-256").digest(specJson.toByteArray(Charsets.UTF_8)).joinToString("") { "%02x".format(it) }.take(24)
+        synchronized(composedLock) {
+            composedSpecs[key] = spec
+            val iterator = composedSpecs.entries.iterator()
+            while (iterator.hasNext() && composedSpecs.size > MAX_COMPOSED_SPECS) {
+                iterator.next()
+                iterator.remove()
+            }
+        }
+        return "http://127.0.0.1:${ensureStarted()}/$COMPOSED_PATH_PREFIX/$key"
+    }
+
+    /** One fetchable layer of a composed row: source + destination rect. */
+    @kotlinx.serialization.Serializable
+    internal data class ComposedPiece(val u: String, val x: Int, val y: Int, val w: Int, val h: Int)
+
+    /** A whole composed row: canvas size + the piece layers. */
+    @kotlinx.serialization.Serializable
+    internal data class ComposedSpec(val w: Int, val h: Int, val pieces: List<ComposedPiece>)
+
+    private val composedLock = Any()
+
+    private val composedJson = kotlinx.serialization.json.Json
+
+    private val composedSpecs = LinkedHashMap<String, ComposedSpec>()
+
     /** Starts (or restarts) the loopback server and returns its port.
      *
      * v105: a FIXED preferred port is tried first so proxy URLs embedded in
@@ -317,7 +359,103 @@ class ProComicImageServer(
         when {
             path.startsWith("/$DIAG_PATH_PREFIX") -> serveDiag(path, output)
             path.startsWith("/$IMAGE_PROXY_PATH_PREFIX/") -> serveImageProxy(path, query, output)
+            path.startsWith("/$COMPOSED_PATH_PREFIX/") -> serveComposed(path, output)
             else -> writeResponse(output, 404, "Not Found", "text/plain", "unknown path".toByteArray())
+        }
+    }
+
+    /**
+     * Serves a composed reader row: fetch every piece through the normal
+     * proxy ladder, draw each at its harvested rectangle, JPEG the canvas.
+     * Coalesced per key; every failure surfaces as a legible 502.
+     */
+    private fun serveComposed(path: String, output: java.io.OutputStream) {
+        val key = path.removePrefix("/$COMPOSED_PATH_PREFIX/").trim()
+        val spec = synchronized(composedLock) { composedSpecs[key] }
+        if (key.isEmpty() || spec == null) {
+            writeResponse(output, 410, "Gone", "text/plain", "composed row expired — reopen the chapter".toByteArray())
+            return
+        }
+        val cacheId = "cmp:$key"
+        cachedResult(cacheId)?.let {
+            writeImageBytes(output, it.first, it.second)
+            return
+        }
+        val (contentType, bytes) = composedCoalesced(cacheId) {
+            composeRow(spec)
+        }
+        writeImageBytes(output, contentType, bytes)
+    }
+
+    /** Per-key coalescing for composed builds (same shape as the image
+     * coalescer, minus the URL bookkeeping). */
+    private val composedInFlight = java.util.concurrent.ConcurrentHashMap<String, java.util.concurrent.CompletableFuture<Pair<String, ByteArray>>>()
+
+    private fun composedCoalesced(cacheId: String, build: () -> Pair<String, ByteArray>): Pair<String, ByteArray> {
+        while (true) {
+            val existing = composedInFlight[cacheId]
+            if (existing != null) {
+                return runCatching { existing.get() }.getOrElse {
+                    throw IOException("composed row failed: ${it.javaClass.simpleName}", it)
+                }
+            }
+            val future = java.util.concurrent.CompletableFuture<Pair<String, ByteArray>>()
+            if (composedInFlight.putIfAbsent(cacheId, future) == null) {
+                try {
+                    val result = build()
+                    cacheResult(cacheId, result.first, result.second)
+                    future.complete(result)
+                    return result
+                } catch (t: Throwable) {
+                    future.completeExceptionally(t)
+                    throw t
+                } finally {
+                    composedInFlight.remove(cacheId)
+                }
+            }
+        }
+    }
+
+    /** Fetches every piece (through the full proxy ladder — signed wraps
+     * included), draws them at their harvested rects, JPEGs the canvas.
+     * A single failed piece leaves its rect blank (the page stays
+     * readable); a fully failed row throws. */
+    private fun composeRow(spec: ComposedSpec): Pair<String, ByteArray> {
+        val width = spec.w.coerceIn(8, MAX_COMPOSED_EDGE)
+        val height = spec.h.coerceIn(8, MAX_COMPOSED_EDGE * 2)
+        val bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        val canvas = Canvas(bitmap)
+        canvas.drawColor(Color.WHITE)
+        var drawn = 0
+        val diag = ProxyDiag()
+        try {
+            for (piece in spec.pieces) {
+                runCatching {
+                    val (_, bytes) = buildImageBytes(piece.u, diag)
+                    val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size) ?: return@runCatching
+                    canvas.drawBitmap(
+                        decoded,
+                        null,
+                        android.graphics.RectF(
+                            piece.x.toFloat().coerceAtLeast(0f),
+                            piece.y.toFloat().coerceAtLeast(0f),
+                            (piece.x + piece.w).toFloat().coerceAtMost(width.toFloat()),
+                            (piece.y + piece.h).toFloat().coerceAtMost(height.toFloat()),
+                        ),
+                        null,
+                    )
+                    drawn++
+                    decoded.recycle()
+                }.onFailure { t ->
+                    Log.w(TAG, "composed piece ${piece.u.take(90)} failed: ${t.javaClass.simpleName}")
+                }
+            }
+            if (drawn == 0) throw ImageBuildFailure("compose", "every piece of the row failed", diag)
+            val out = ByteArrayOutputStream()
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            return "image/jpeg" to out.toByteArray()
+        } finally {
+            bitmap.recycle()
         }
     }
 
@@ -1386,7 +1524,14 @@ class ProComicImageServer(
 
     companion object {
         const val IMAGE_PROXY_PATH_PREFIX = ".image-proxy"
+        const val COMPOSED_PATH_PREFIX = ".composed"
         const val DIAG_PATH_PREFIX = ".diag"
+
+        /** Bounded registry for composed-row specs (one chapter ~= 40 rows). */
+        private const val MAX_COMPOSED_SPECS = 256
+
+        /** Composed canvas bounds (a reader row is ~800x1300 CSS px). */
+        private const val MAX_COMPOSED_EDGE = 2600
         const val JPEG_QUALITY = 88
 
         /**
