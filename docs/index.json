@@ -13,11 +13,11 @@
       "langs": [
         "en"
       ],
-      "version": "1.4.28",
-      "versionCode": 28,
+      "version": "1.4.29",
+      "versionCode": 29,
       "baseUrl": "https://atsu.moe",
-      "apk": "tachiyomi-en.atsumaru-v1.4.28-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.atsumaru-v1.4.28-release.apk",
+      "apk": "tachiyomi-en.atsumaru-v1.4.29-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.atsumaru-v1.4.29-release.apk",
       "icon": "../icons/atsumaru.png",
       "note": "Custom JSON API: home2 browse + Typesense search",
       "description": "<code>home2</code> browse endpoints + Typesense search; full filter set."
@@ -30,11 +30,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.30",
-      "versionCode": 30,
+      "version": "1.6.31",
+      "versionCode": 31,
       "baseUrl": "https://azorafly.com",
-      "apk": "tachiyomi-ar.azora-v1.6.30-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.azora-v1.6.30-release.apk",
+      "apk": "tachiyomi-ar.azora-v1.6.31-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.azora-v1.6.31-release.apk",
       "icon": "../icons/azora.png",
       "note": "",
       "description": ""
@@ -47,11 +47,11 @@
       "langs": [
         "all"
       ],
-      "version": "1.4.50",
-      "versionCode": 50,
+      "version": "1.4.51",
+      "versionCode": 51,
       "baseUrl": "https://comix.to",
-      "apk": "tachiyomi-all.comixto-v1.4.50-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.comixto-v1.4.50-release.apk",
+      "apk": "tachiyomi-all.comixto-v1.4.51-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.comixto-v1.4.51-release.apk",
       "icon": "../icons/comixto.png",
       "note": "Signed+encrypted API via the WebView signing bridge; Cloudflare bypass; image descrambling",
       "description": "signed+encrypted JSON API. The site's VM-protected signer means every <code>/api/v1</code> call runs through a WebView bridge that boots the site's own chunk graph and lets the site sign/decrypt in-JS; frozen native constants stay as the fast path. Cloudflare bypass, tile descrambling, 10 settings."
@@ -64,11 +64,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.2",
-      "versionCode": 2,
+      "version": "1.6.3",
+      "versionCode": 3,
       "baseUrl": "https://hijala.com",
-      "apk": "tachiyomi-ar.hijala-v1.6.2-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.hijala-v1.6.2-release.apk",
+      "apk": "tachiyomi-ar.hijala-v1.6.3-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.hijala-v1.6.3-release.apk",
       "icon": "../icons/hijala.png",
       "note": "",
       "description": ""
@@ -81,11 +81,11 @@
       "langs": [
         "en"
       ],
-      "version": "1.6.51",
-      "versionCode": 51,
+      "version": "1.6.52",
+      "versionCode": 52,
       "baseUrl": "https://kagane.si",
-      "apk": "tachiyomi-en.kagane-v1.6.51-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.kagane-v1.6.51-release.apk",
+      "apk": "tachiyomi-en.kagane-v1.6.52-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.kagane-v1.6.52-release.apk",
       "icon": "../icons/kagane.png",
       "note": "Integrity-token flow + Cloudflare bypass; data saver",
       "description": "Komga-fork <code>/api/v2</code> with short-lived integrity tokens for chapter manifests; transparent page-token refresh; data saver."
@@ -98,11 +98,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.3",
-      "versionCode": 3,
+      "version": "1.6.4",
+      "versionCode": 4,
       "baseUrl": "https://kawaiimanga.org",
-      "apk": "tachiyomi-ar.kawaiimanga-v1.6.3-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.kawaiimanga-v1.6.3-release.apk",
+      "apk": "tachiyomi-ar.kawaiimanga-v1.6.4-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.kawaiimanga-v1.6.4-release.apk",
       "icon": "../icons/kawaiimanga.png",
       "note": "",
       "description": ""
@@ -133,11 +133,11 @@
         "nl",
         "uk"
       ],
-      "version": "1.6.11",
-      "versionCode": 11,
+      "version": "1.6.12",
+      "versionCode": 12,
       "baseUrl": "https://mangaball.com",
-      "apk": "tachiyomi-all.mangaball-v1.6.11-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangaball-v1.6.11-release.apk",
+      "apk": "tachiyomi-all.mangaball-v1.6.12-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangaball-v1.6.12-release.apk",
       "icon": "../icons/mangaball.png",
       "note": "",
       "description": "all-languages source."
@@ -150,11 +150,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.5",
-      "versionCode": 5,
+      "version": "1.6.6",
+      "versionCode": 6,
       "baseUrl": "https://mangadar.com",
-      "apk": "tachiyomi-ar.mangadar-v1.6.5-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.5-release.apk",
+      "apk": "tachiyomi-ar.mangadar-v1.6.6-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangadar-v1.6.6-release.apk",
       "icon": "../icons/mangadar.png",
       "note": "",
       "description": ""
@@ -274,11 +274,11 @@
         "af",
         "ab"
       ],
-      "version": "1.6.3",
-      "versionCode": 3,
+      "version": "1.6.4",
+      "versionCode": 4,
       "baseUrl": "https://mangadot.net",
-      "apk": "tachiyomi-all.mangadot-v1.6.3-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangadot-v1.6.3-release.apk",
+      "apk": "tachiyomi-all.mangadot-v1.6.4-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangadot-v1.6.4-release.apk",
       "icon": "../icons/mangadot.png",
       "note": "One source per language (100+ content languages)",
       "description": "one source per content language (100+); Cloudflare solver."
@@ -297,11 +297,11 @@
         "pt-br",
         "ja"
       ],
-      "version": "1.4.5",
-      "versionCode": 5,
+      "version": "1.4.6",
+      "versionCode": 6,
       "baseUrl": "https://mangafire.to",
-      "apk": "tachiyomi-all.mangafire-v1.4.5-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangafire-v1.4.5-release.apk",
+      "apk": "tachiyomi-all.mangafire-v1.4.6-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.mangafire-v1.4.6-release.apk",
       "icon": "../icons/mangafire.png",
       "note": "One source per content language (7); vrf-signed API computed offline in a WebView",
       "description": "one source per content language (en, fr, es, es-la, pt, pt-br, ja); vrf-protected API signed offline by the site's own polyfill chunk running in a WebView; full filter sheet; smart description."
@@ -314,11 +314,11 @@
       "langs": [
         "en"
       ],
-      "version": "1.4.4",
-      "versionCode": 4,
+      "version": "1.4.5",
+      "versionCode": 5,
       "baseUrl": "https://www.mangago.me",
-      "apk": "tachiyomi-en.mangago-v1.4.4-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangago-v1.4.4-release.apk",
+      "apk": "tachiyomi-en.mangago-v1.4.5-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangago-v1.4.5-release.apk",
       "icon": "../icons/mangago.png",
       "note": "Reader images harvested via the window-attached WebView; CF solver",
       "description": "classic HTML browse/search; reader images harvested from the window-attached WebView; route-level CF solving."
@@ -331,11 +331,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.59",
-      "versionCode": 59,
+      "version": "1.6.60",
+      "versionCode": 60,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.mangalek-v1.6.59-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.59-release.apk",
+      "apk": "tachiyomi-ar.mangalek-v1.6.60-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangalek-v1.6.60-release.apk",
       "icon": "../icons/mangalek.png",
       "note": "",
       "description": ""
@@ -348,11 +348,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.3",
-      "versionCode": 3,
+      "version": "1.6.4",
+      "versionCode": 4,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.mangaswat-v1.6.3-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangaswat-v1.6.3-release.apk",
+      "apk": "tachiyomi-ar.mangaswat-v1.6.4-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangaswat-v1.6.4-release.apk",
       "icon": "../icons/mangaswat.png",
       "note": "",
       "description": ""
@@ -365,11 +365,11 @@
       "langs": [
         "en"
       ],
-      "version": "1.4.7",
-      "versionCode": 7,
+      "version": "1.4.8",
+      "versionCode": 8,
       "baseUrl": "https://mangataro.org",
-      "apk": "tachiyomi-en.mangataro-v1.4.7-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangataro-v1.4.7-release.apk",
+      "apk": "tachiyomi-en.mangataro-v1.4.8-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mangataro-v1.4.8-release.apk",
       "icon": "../icons/mangataro.png",
       "note": "WordPress manga/v1 JSON API with double-encoded filters",
       "description": "WordPress manga/v1 JSON API with the theme's double-encoded filters and MD5 chapter tokens; curated TriState genre list."
@@ -382,11 +382,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.9",
-      "versionCode": 9,
+      "version": "1.6.10",
+      "versionCode": 10,
       "baseUrl": "https://mangatek.com",
-      "apk": "tachiyomi-ar.mangatek-v1.6.9-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatek-v1.6.9-release.apk",
+      "apk": "tachiyomi-ar.mangatek-v1.6.10-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatek-v1.6.10-release.apk",
       "icon": "../icons/mangatek.png",
       "note": "",
       "description": ""
@@ -399,11 +399,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.4",
-      "versionCode": 4,
+      "version": "1.6.5",
+      "versionCode": 5,
       "baseUrl": "https://mangatime.org",
-      "apk": "tachiyomi-ar.mangatime-v1.6.4-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatime-v1.6.4-release.apk",
+      "apk": "tachiyomi-ar.mangatime-v1.6.5-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatime-v1.6.5-release.apk",
       "icon": "../icons/mangatime.png",
       "note": "",
       "description": ""
@@ -416,11 +416,11 @@
       "langs": [
         "all"
       ],
-      "version": "1.6.115",
-      "versionCode": 115,
+      "version": "1.6.116",
+      "versionCode": 116,
       "baseUrl": "https://manhuarmtl.com",
-      "apk": "tachiyomi-all.manhuarmtl-v1.6.115-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.manhuarmtl-v1.6.115-release.apk",
+      "apk": "tachiyomi-all.manhuarmtl-v1.6.116-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.manhuarmtl-v1.6.116-release.apk",
       "icon": "../icons/manhuarmtl.png",
       "note": "Madara theme + OCR text overlay burned onto raws in 12 languages",
       "description": "Madara theme with custom MRM selectors; Popular/Latest dedup via the archive endpoint; OCR text overlay burned onto raws in Arabic + 10 languages, toggleable; NSFW filter; full filter sheet."
@@ -433,11 +433,11 @@
       "langs": [
         "en"
       ],
-      "version": "1.6.24",
-      "versionCode": 24,
+      "version": "1.6.25",
+      "versionCode": 25,
       "baseUrl": "https://mkissa.to",
-      "apk": "tachiyomi-en.mkissa-v1.6.24-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mkissa-v1.6.24-release.apk",
+      "apk": "tachiyomi-en.mkissa-v1.6.25-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.mkissa-v1.6.25-release.apk",
       "icon": "../icons/mkissa.png",
       "note": "Browse/search/details only \u2014 chapter images blocked by the site's anti-bot token",
       "description": "GraphQL persisted queries; browse/search/details only (anti-bot images)."
@@ -450,11 +450,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.37",
-      "versionCode": 37,
+      "version": "1.6.38",
+      "versionCode": 38,
       "baseUrl": "https://procomic.net",
-      "apk": "tachiyomi-ar.procomic-v1.6.37-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.37-release.apk",
+      "apk": "tachiyomi-ar.procomic-v1.6.38-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.38-release.apk",
       "icon": "../icons/procomic.png",
       "note": "",
       "description": ""
@@ -481,11 +481,11 @@
         "zh",
         "pl"
       ],
-      "version": "1.4.7",
-      "versionCode": 7,
+      "version": "1.4.8",
+      "versionCode": 8,
       "baseUrl": "https://swarm.ws",
-      "apk": "tachiyomi-all.swarm-v1.4.7-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.swarm-v1.4.7-release.apk",
+      "apk": "tachiyomi-all.swarm-v1.4.8-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.swarm-v1.4.8-release.apk",
       "icon": "../icons/swarm.png",
       "note": "",
       "description": "swarm sites."
@@ -498,11 +498,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.2",
-      "versionCode": 2,
+      "version": "1.6.3",
+      "versionCode": 3,
       "baseUrl": "",
-      "apk": "tachiyomi-ar.teamx-v1.6.2-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.teamx-v1.6.2-release.apk",
+      "apk": "tachiyomi-ar.teamx-v1.6.3-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.teamx-v1.6.3-release.apk",
       "icon": "../icons/teamx.png",
       "note": "",
       "description": ""
@@ -515,11 +515,11 @@
       "langs": [
         "en"
       ],
-      "version": "1.4.4",
-      "versionCode": 4,
+      "version": "1.4.5",
+      "versionCode": 5,
       "baseUrl": "https://toonz.to",
-      "apk": "tachiyomi-en.toonz-v1.4.4-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.toonz-v1.4.4-release.apk",
+      "apk": "tachiyomi-en.toonz-v1.4.5-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.toonz-v1.4.5-release.apk",
       "icon": "../icons/toonz.png",
       "note": "Next.js site + JSON endpoints; JSON-LD details",
       "description": "Next.js + JSON endpoints; JSON-LD details; browse section setting."
@@ -532,11 +532,11 @@
       "langs": [
         "en"
       ],
-      "version": "1.4.2",
-      "versionCode": 2,
+      "version": "1.4.3",
+      "versionCode": 3,
       "baseUrl": "https://weebcentral.com",
-      "apk": "tachiyomi-en.weebcentral-v1.4.2-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.weebcentral-v1.4.2-release.apk",
+      "apk": "tachiyomi-en.weebcentral-v1.4.3-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-en.weebcentral-v1.4.3-release.apk",
       "icon": "../icons/weebcentral.png",
       "note": "",
       "description": "English source."
@@ -549,11 +549,11 @@
       "langs": [
         "all"
       ],
-      "version": "1.4.6",
-      "versionCode": 6,
+      "version": "1.4.7",
+      "versionCode": 7,
       "baseUrl": "https://xcomic.me",
-      "apk": "tachiyomi-all.xcomic-v1.4.6-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.xcomic-v1.4.6-release.apk",
+      "apk": "tachiyomi-all.xcomic-v1.4.7-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-all.xcomic-v1.4.7-release.apk",
       "icon": "../icons/xcomic.png",
       "note": "Fetches the complete source list incl. DOM-hidden groups; real scanlator badge naming",
       "description": "reconciles the rendered Sources grid with the page state so hidden groups are fetched too; real scanlator badge naming; per-number dedupe across languages."
