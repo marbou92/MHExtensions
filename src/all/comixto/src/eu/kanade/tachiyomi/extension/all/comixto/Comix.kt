@@ -223,6 +223,17 @@ abstract class Comix :
 
             path.startsWith("/api/v1/manga/") -> {
                 val hid = path.removePrefix("/api/v1/manga/")
+                // v126 rung 1: the SSR island. The title page now embeds the
+                // FULL detail in a plain `initial-data` JSON island — the SPA
+                // hydrates from it and fires NO details XHR, so the tee can
+                // wait forever and see nothing. One plain HTTP GET (no
+                // signature, no challenge on these routes) carries it.
+                detailFromIsland(hid)?.let { detail ->
+                    val payload = teeJson.encodeToString(ComixMangaDetailDto.serializer(), detail)
+                    CloudflareSolverDiagnostics.record("COMIX detail island OK ($hid)")
+                    return teeResponse(request, payload)
+                }
+                // rung 2: the page tee (kept for resilience).
                 val payload = ComixPageTee.capture(
                     "$baseUrl/title/$hid",
                     webViewUserAgent,
@@ -248,6 +259,33 @@ abstract class Comix :
     private inline fun <reified T> parseShape(body: String): T? = runCatching {
         teeJson.decodeFromString(kotlinx.serialization.serializer<T>(), body)
     }.getOrNull()
+
+    /**
+     * v126: the SSR detail island. `GET /title/<hid>` serves the full detail
+     * embedded in `<script type="application/json" id="initial-data">` under
+     * the query key `["manga","detail","<hid>"]` — plain JSON, no signature,
+     * no WebView, no challenge dance. Returns the mapped DTO or null (the
+     * caller falls back to the page tee).
+     */
+    private fun detailFromIsland(hid: String): ComixMangaDetailDto? = runCatching {
+        val html = client.newCall(GET("$baseUrl/title/$hid")).execute().body.string()
+        val island = islandRegex.find(html)?.groupValues?.get(1) ?: return@runCatching null
+        val root = teeJson.parseToJsonElement(island) as? kotlinx.serialization.json.JsonObject ?: return@runCatching null
+        val queries = root["queries"] as? kotlinx.serialization.json.JsonObject ?: return@runCatching null
+        val detail = queries.entries
+            .firstOrNull { entry ->
+                entry.key.contains("\"detail\"") && entry.key.contains(hid)
+            }
+            ?.value as? kotlinx.serialization.json.JsonObject
+            ?: return@runCatching null
+        teeJson.decodeFromJsonElement(ComixMangaDetailDto.serializer(), detail)
+    }.getOrNull()
+
+    /** The initial-data island carrier on every SSR page. */
+    private val islandRegex = Regex(
+        """<script type="application/json" id="initial-data">(.*?)</script>""",
+        RegexOption.DOT_MATCHES_ALL,
+    )
 
     /** A captured payload held together with the request it answers. */
     private class TeeItemHolder(val request: Request, val payload: String)

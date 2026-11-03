@@ -60,11 +60,16 @@ internal object ProComicReaderSession {
     /** Quiet ticks (no growth in mounted rows) before the session resolves. */
     private const val QUIET_TICKS = 5
 
-    /** Hard tick cap — the session never outlives ~90 s of polling. */
-    private const val MAX_TICKS = 120
+    /** Hard tick cap — the session never outlives ~110 s of polling. */
+    private const val MAX_TICKS = 150
 
     /** Ticks of a Cloudflare challenge before the session calls it unwinnable. */
     private const val CHALLENGE_TICK_CAP = 60
+
+    /** Ticks the session tolerates a parked /login redirect (the site's
+     * unlock flow bounces through it; earned cookies usually pass it
+     * silently) before the session reports the wall and leaves. */
+    private const val LOGIN_WALL_TICKS = 18
 
     private const val DIAG_TAG = "reader-session"
 
@@ -142,6 +147,8 @@ internal object ProComicReaderSession {
             var lastGrowthKey = ""
             var ticks = 0
             var apexIndex = 0
+            var loginTicks = 0
+            var unlockClicked = false
 
             poll(POLL_MS.milliseconds) {
                 ticks++
@@ -161,13 +168,45 @@ internal object ProComicReaderSession {
                     return@poll
                 }
 
+                // v126: the site monetized the reader — a chapter route now
+                // mounts an unlock gate (an "open the chapter" button) and
+                // may bounce to /login. Dismiss the consent banner, press
+                // the site's OWN unlock button once, and wait out a login
+                // bounce (the session shares the host cookie store — a
+                // device signed into the site passes it silently). A parked
+                // login wall after the grace window ends the session
+                // legibly; the breaker keeps the next opens fast.
+                evaluateJs(unlockScript()) { raw ->
+                    val action = decodeEval(raw).orEmpty().trim('"')
+                    when {
+                        action.startsWith("login") -> {
+                            loginTicks++
+                            if (loginTicks == 1) notes += "$DIAG_TAG: unlock bounced to /login — waiting on the shared cookies"
+                            if (loginTicks >= LOGIN_WALL_TICKS) {
+                                notes += "$DIAG_TAG: the reader is behind a login the WebView cookies cannot pass"
+                                resolve(Unit)
+                            }
+                        }
+                        action.startsWith("clicked") -> {
+                            if (!unlockClicked) notes += "$DIAG_TAG: pressed the site's own unlock button"
+                            unlockClicked = true
+                            loginTicks = 0
+                        }
+                        else -> {
+                            loginTicks = 0
+                        }
+                    }
+                }
+
                 evaluateJs(harvestScript()) { raw ->
                     val state = decodeRowState(decodeEval(raw))
                     // Apex walk: a route that redirected off /chapter/ (the
                     // .net deployment 308s to the series page) moves to the
-                    // next apex instead of harvesting the wrong page.
+                    // next apex instead of harvesting the wrong page. A
+                    // /login bounce is NOT an apex problem — the unlock
+                    // branch above owns it.
                     val href = state["href"].orEmpty()
-                    val onChapter = href.contains("/chapter/")
+                    val onChapter = href.contains("/chapter/") || href.contains("/login")
                     if (!onChapter && apexIndex < readerApexes.lastIndex) {
                         apexIndex++
                         ticks = 0
@@ -187,7 +226,12 @@ internal object ProComicReaderSession {
                     } else {
                         quietTicks++
                     }
-                    if (ticks >= MAX_TICKS || (quietTicks >= QUIET_TICKS && rows.isNotEmpty())) {
+                    // v126: quiet is not enough alone — the walk must have
+                    // REACHED THE BOTTOM of the reader (the reading motion
+                    // is what makes the site mount every row), or the tick
+                    // budget must be spent.
+                    val atEnd = state["atEnd"] == "1"
+                    if (ticks >= MAX_TICKS || (quietTicks >= QUIET_TICKS && rows.isNotEmpty() && atEnd)) {
                         resolve(Unit)
                     }
                 }
@@ -251,6 +295,36 @@ internal object ProComicReaderSession {
     // ------------------------------------------------------------------
 
     /**
+     * v126: the site's own unlock flow. A chapter route mounts a consent
+     * banner (رفض/موافق) and an "open the chapter" button (the monetized
+     * gate the reader sits behind); pressing THE SITE'S OWN button is the
+     * lawful way in — the same tap a reading user performs. Returns one
+     * of: "login" (parked on /login), "clicked:<label>", "consent", or
+     * "none". Never navigates to the bypass/short-link host — only the
+     * on-page button.
+     */
+    private fun unlockScript(): String = """
+        (function () {
+            if (location.pathname.indexOf('/login') !== -1) return 'login';
+            var texts = ['رفض', 'Decline', 'Refuse'];
+            var buttons = document.querySelectorAll('button, [role=button], a');
+            for (var i = 0; i < buttons.length; i++) {
+                var t = (buttons[i].textContent || '').trim();
+                if (texts.indexOf(t) !== -1) { try { buttons[i].click(); return 'consent'; } catch (e) {} }
+            }
+            for (var j = 0; j < buttons.length; j++) {
+                var b = buttons[j];
+                var label = (b.textContent || '').trim();
+                if (label.length === 0 || label.length > 60) continue;
+                if (label.indexOf('الفصل') !== -1 && (b.tagName === 'BUTTON' || b.getAttribute('role') === 'button')) {
+                    try { b.click(); return 'clicked:' + label.slice(0, 30); } catch (e2) {}
+                }
+            }
+            return 'none';
+        })();
+    """.trimIndent()
+
+    /**
      * Collects the reader's mounted rows and steps the scroll one beat
      * deeper. Per row (`div[data-reader-image-row="N"]`): a single loaded
      * image is reported as its absolute src; a piece assembly is reported
@@ -258,6 +332,9 @@ internal object ProComicReaderSession {
      * (the extension re-assembles the image itself — same descramble the
      * site performs, no canvas taint games). Falls back to any mounted
      * site-hosted image when the row grid is absent (older readers).
+     * v126: the scroll walks to the ABSOLUTE END of the reader (last row
+     * scrolled into view every beat) and reports atEnd so the session
+     * only settles after the site has had its chance to mount everything.
      */
     private fun harvestScript(): String = """
         (function () {
@@ -314,6 +391,10 @@ internal object ProComicReaderSession {
             try {
                 var sc = document.scrollingElement || document.body;
                 var step = Math.max(600, Math.round(window.innerHeight * 1.2));
+                var lastRow = nodeList.length > 0 ? nodeList[nodeList.length - 1] : null;
+                if (lastRow) {
+                    try { lastRow.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e3) { lastRow.scrollIntoView(true); }
+                }
                 window.scrollBy(0, step);
                 var groups = document.querySelectorAll('div,section,main');
                 for (var g = 0; g < groups.length; g++) {
@@ -323,10 +404,17 @@ internal object ProComicReaderSession {
                     }
                 }
             } catch (e) {}
+            var atEnd = 0;
+            try {
+                var sc2 = document.scrollingElement || document.documentElement;
+                var bottom = (sc2.scrollHeight || document.body.scrollHeight) - window.innerHeight - 40;
+                if (window.scrollY >= Math.max(0, bottom)) atEnd = 1;
+            } catch (e4) {}
             return JSON.stringify({
                 href: location.href,
                 rows: nodeList.length,
                 loaded: loadedRows,
+                atEnd: atEnd,
                 rowsJson: JSON.stringify(out)
             });
         })();

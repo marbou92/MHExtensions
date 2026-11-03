@@ -1324,8 +1324,15 @@ abstract class ProComic :
         // are re-assembled by the loopback server from the site's own
         // freshly-signed piece URLs. The harvest is authoritative when it
         // sees more pages than the plain chain.
-        val chapterHasMore = finalUrls.isEmpty() || gated.isNotEmpty() || (payload.publicCount ?: 0) > loadable.size
-        if (chapterHasMore && readerSessionEnabled) {
+        // v126: the session runs on EVERY chapter open (the preference
+        // stays default-ON, the breaker still guards it). The flight can
+        // no longer prove completeness — it carries exactly the 3 public
+        // pages (publicCount == loadable, gated empty), which reads as
+        // "complete" to any comparison and is exactly the "only the first
+        // 3 pages" report. The reader is the only source of the truth:
+        // it unlocks, scrolls to the end, and its rows replace this list
+        // when it sees more.
+        if (readerSessionEnabled) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
                 Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")
                 runCatching {

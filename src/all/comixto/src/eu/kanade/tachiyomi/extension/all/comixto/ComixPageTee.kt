@@ -55,6 +55,13 @@ internal object ComixPageTee {
     /** Ticks of a Cloudflare challenge before the session reports and gives up. */
     private const val CHALLENGE_TICK_CAP = 90
 
+    /** v126: a held challenge gets RELOADED at these ticks — live-verified
+     * that a second/third load of the same URL passes after the first one
+     * challenges (the managed challenge clears on the reload, not the
+     * first paint). Two bounded reloads, then the original cap stands. */
+    private const val CHALLENGE_RELOAD_AT_1 = 25
+    private const val CHALLENGE_RELOAD_AT_2 = 60
+
     private const val DIAG_TAG = "page-tee"
 
     /** One-flight guard: never stack two capture sessions. */
@@ -116,6 +123,7 @@ internal object ComixPageTee {
         val items = LinkedHashMap<String, TeeItem>() // url -> item (first-seen order)
         var challengeTicks = 0
         var challengeSeen = false
+        var challengeReloads = 0
 
         runWebView<List<TeeItem>>(timeout = 130.seconds) {
             javaScriptEnabled = true
@@ -166,6 +174,14 @@ internal object ComixPageTee {
                     } else {
                         challengeTicks = 0
                     }
+                }
+                if (challengeTicks == CHALLENGE_RELOAD_AT_1 || challengeTicks == CHALLENGE_RELOAD_AT_2) {
+                    // v126: the reload dance — a fresh load of the SAME url
+                    // after the challenge has held for a while clears it
+                    // (observed live: the first paint challenges, the
+                    // reload passes). Bounded to two per session.
+                    challengeReloads++
+                    loadUrl(pageUrl)
                 }
                 if (challengeTicks > CHALLENGE_TICK_CAP) {
                     resolve(emptyList())
