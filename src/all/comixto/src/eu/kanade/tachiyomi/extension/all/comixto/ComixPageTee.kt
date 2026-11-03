@@ -62,6 +62,17 @@ internal object ComixPageTee {
     private const val CHALLENGE_RELOAD_AT_1 = 25
     private const val CHALLENGE_RELOAD_AT_2 = 60
 
+    /** v127 — SPA-DRIVE. The title page SSRs the detail into the island
+     * and fires NO chapters XHR on its own: the chapter list mounts from
+     * client-side state only after interaction (a tab/section click or a
+     * chapter-route navigation), and the SPA's router intercepts every
+     * click on the document — so a dispatched click on a real control IS
+     * an SPA navigation. [PRIME_EVERY_TICKS] paces the drive, [PRIME_MAX]
+     * bounds it (each round clicks the current best controls once; the
+     * SPA's own code does the rest). */
+    private const val PRIME_EVERY_TICKS = 4
+    private const val PRIME_MAX_ROUNDS = 10
+
     private const val DIAG_TAG = "page-tee"
 
     /** One-flight guard: never stack two capture sessions. */
@@ -78,6 +89,10 @@ internal object ComixPageTee {
      * injected before the SPA boots, and returns every response whose URL
      * matches [urlPattern]. [autoScroll] drives lazy loading (chapter
      * lists, browse feeds) one scroll step per poll tick.
+     * [clickDrive] (v127) additionally DISPATCHES REAL CLICKS on the
+     * page's chapter controls — tabs, load-more buttons, the first
+     * chapter link — so the SPA navigates/renders the list and fires the
+     * API call the tee is waiting for (the title page alone never does).
      * [navigateToSlug] (first page-list run) locates the chapter's own
      * link on the rendered page and follows it — the tee re-injects on the
      * reader page and captures there; [onResolvedLink] receives the href
@@ -90,6 +105,7 @@ internal object ComixPageTee {
         urlPattern: String,
         maxPayloads: Int = 64,
         autoScroll: Boolean = false,
+        clickDrive: Boolean = false,
         navigateToSlug: String? = null,
         onResolvedLink: ((String) -> Unit)? = null,
     ): List<TeeItem> {
@@ -101,7 +117,7 @@ internal object ComixPageTee {
         }
         return try {
             runBlocking {
-                captureSuspend(pageUrl, userAgent, urlPattern, maxPayloads, autoScroll, navigateToSlug, onResolvedLink)
+                captureSuspend(pageUrl, userAgent, urlPattern, maxPayloads, autoScroll, clickDrive, navigateToSlug, onResolvedLink)
             }
         } catch (t: Throwable) {
             emptyList()
@@ -116,6 +132,7 @@ internal object ComixPageTee {
         urlPattern: String,
         maxPayloads: Int,
         autoScroll: Boolean,
+        clickDrive: Boolean,
         navigateToSlug: String?,
         onResolvedLink: ((String) -> Unit)?,
     ): List<TeeItem> {
@@ -160,6 +177,7 @@ internal object ComixPageTee {
             var lastCount = 0
             var ticks = 0
             var navigated = false
+            var primeRounds = 0
 
             poll(POLL_MS.milliseconds) {
                 ticks++
@@ -197,6 +215,19 @@ internal object ComixPageTee {
                             evaluateJs("location.assign(" + org.json.JSONObject.quote(full ?: href) + ")")
                         }
                     }
+                }
+                // v127: SPA-drive — pace real clicks through the page's own
+                // chapter controls so the SPA fires the calls the tee waits
+                // for. The router's global click handler turns each click
+                // into an SPA navigation/render; the tee wrapper persists
+                // across pushState navigations and keeps recording.
+                if (clickDrive && challengeTicks == 0 && ticks >= 4 &&
+                    primeRounds < PRIME_MAX_ROUNDS && (ticks - 4) % PRIME_EVERY_TICKS == 0
+                ) {
+                    primeRounds++
+                    // The action label is not tracked — the captured payloads
+                    // are the truth; the click only nudges the SPA.
+                    evaluateJs(primeScript()) { _ -> }
                 }
                 evaluateJs(dumpScript(autoScroll)) { raw ->
                     val decoded = decodeEval(raw).orEmpty()
@@ -319,6 +350,61 @@ internal object ComixPageTee {
                 }
             } catch (e) {}
             return JSON.stringify((window.__mhTee || { items: [] }).items);
+        })();
+    """.trimIndent()
+
+    /**
+     * v127: the SPA-drive — one round of real clicks through the page's
+     * own chapter controls, in escalating order:
+     * 1. a tab/section/button whose text names the chapter list
+     *    ("Chapters", "Chapter list", "فصول" — bounded length, no nav
+     *    away from the page),
+     * 2. a "load more / show more / view all" control (paged lists),
+     * 3. the first anchor that navigates INTO a chapter route
+     *    (`/…-chapter-…` — the SPA boots its reader route, whose own
+     *    client code fetches what the route needs; the tee keeps
+     *    recording across the pushState navigation).
+     * Returns the action taken ("clicked:<label>" / "none") — the settle
+     * logic does not depend on it; the captured payloads are the truth.
+     */
+    internal fun primeScript(): String = """
+        (function () {
+            var clicked = function (el, label) {
+                try { el.click(); return 'clicked:' + label; } catch (e) { return 'none'; }
+            };
+            var isChapterish = function (t) {
+                if (!t || t.length === 0 || t.length > 40) return false;
+                var low = t.toLowerCase();
+                return low.indexOf('chapter') !== -1 || t.indexOf('فصل') !== -1 || t.indexOf('الفصول') !== -1;
+            };
+            var isLoadMore = function (t) {
+                if (!t || t.length === 0 || t.length > 40) return false;
+                var low = t.toLowerCase();
+                return low.indexOf('load more') !== -1 || low.indexOf('show more') !== -1 ||
+                    low.indexOf('view all') !== -1 || low.indexOf('see all') !== -1 || low.indexOf('more chapters') !== -1;
+            };
+            var candidates = document.querySelectorAll('button, [role=button], [role=tab], a');
+            for (var i = 0; i < candidates.length; i++) {
+                var el = candidates[i];
+                var t = (el.textContent || '').trim();
+                if (isLoadMore(t) && el.tagName !== 'A') return clicked(el, t.slice(0, 24));
+            }
+            for (var j = 0; j < candidates.length; j++) {
+                var el2 = candidates[j];
+                var t2 = (el2.textContent || '').trim();
+                if (isChapterish(t2) && el2.tagName !== 'A') return clicked(el2, t2.slice(0, 24));
+            }
+            var links = document.querySelectorAll('a[href]');
+            for (var k = 0; k < links.length; k++) {
+                var h = links[k].getAttribute('href') || '';
+                if (h.indexOf('-chapter-') !== -1) return clicked(links[k], 'route');
+            }
+            for (var m = 0; m < candidates.length; m++) {
+                var el3 = candidates[m];
+                var t3 = (el3.textContent || '').trim();
+                if (isChapterish(t3)) return clicked(el3, t3.slice(0, 24));
+            }
+            return 'none';
         })();
     """.trimIndent()
 

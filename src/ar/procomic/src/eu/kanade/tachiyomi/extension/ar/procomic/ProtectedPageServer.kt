@@ -1468,7 +1468,10 @@ class ProComicImageServer(
 
     /** Only site-owned image hosts, https only — the proxy is not a general
      * purpose fetcher. Both apexes (the .net migration keeps .pro library
-     * links alive) plus every CDN/app subdomain. */
+     * links alive) plus every CDN/app subdomain. v127: the .im apex joins —
+     * the live reader mounts its rows on app.procomic.im, so a session-
+     * harvested row URL would otherwise be refused by the loopback proxy
+     * right after the session worked for it. */
     private fun isAllowedImageUrl(url: String): Boolean = runCatching {
         val httpUrl = url.toHttpUrl()
         httpUrl.isHttps && (
@@ -1478,9 +1481,12 @@ class ProComicImageServer(
                 httpUrl.host == "www.procomic.pro" ||
                 httpUrl.host == "prochan.net" ||
                 httpUrl.host == "www.prochan.net" ||
+                httpUrl.host == "procomic.im" ||
+                httpUrl.host == "www.procomic.im" ||
                 httpUrl.host.endsWith(".procomic.net") ||
                 httpUrl.host.endsWith(".procomic.pro") ||
-                httpUrl.host.endsWith(".prochan.net")
+                httpUrl.host.endsWith(".prochan.net") ||
+                httpUrl.host.endsWith(".procomic.im")
             )
     }.getOrDefault(false)
 

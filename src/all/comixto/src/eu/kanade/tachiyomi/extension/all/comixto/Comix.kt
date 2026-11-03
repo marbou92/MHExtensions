@@ -210,12 +210,20 @@ abstract class Comix :
 
             path.startsWith("/api/v1/manga/") && path.endsWith("/chapters") -> {
                 val hid = path.removePrefix("/api/v1/manga/").removeSuffix("/chapters")
+                // v127: the title page SSRs the detail but fires NO chapters
+                // XHR on its own — the list mounts from client-side state
+                // after interaction. clickDrive dispatches REAL clicks on the
+                // page's chapter controls (tabs, load-more, the first
+                // chapter route link — the SPA's router intercepts every
+                // click), so the SPA's own signed client fires the call the
+                // tee is here to capture.
                 val items = ComixPageTee.capture(
                     "$baseUrl/title/$hid",
                     webViewUserAgent,
                     """/api/""",
                     maxPayloads = 32,
                     autoScroll = true,
+                    clickDrive = true,
                 )
                 val payload = mergeChapterCaptures(items)
                 listOf(TeeItemHolder(request, payload))

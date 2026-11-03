@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 39
+    versionCode = 40
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -300,6 +300,24 @@ keiyoushi {
     // reader flights that arrive as a data-less app shell are retried
     // through the router's own flight form (RSC header + _rsc param),
     // which still returns the payload stream.
+    //
+    // v127 (versionCode 40) — FIELD VERDICT on v126: the reader session
+    // IS running, but the chapter still opens on exactly the public
+    // pages. Two causes, both live-verified. (1) THE SETTLE RACE: on a
+    // short reader (the 3 public rows) the harvest scroll hits the
+    // absolute end instantly, the quiet-tick budget lapses, and the
+    // session resolves BEFORE the site's own deferred walk — which the
+    // reader only starts once the scroll lands at the bottom — has
+    // mounted anything. The session is now WALK-AWARE: the request
+    // interceptor observes the site's own /chapter-deferred-media calls
+    // (the wire signature of the walk) and every observed call buys the
+    // session fresh patience; a settle additionally requires the walk
+    // grace to lapse at the bottom, so the site always gets its window
+    // to fire. (2) THE HOST GAP: the live reader mounts its rows on
+    // app.procomic.im — a .im apex the URL-acceptance checks never
+    // knew — so a session-harvested row URL would have been refused by
+    // the loopback proxy right after the session worked for it;
+    // procomic.im joins isReaderImageUrl + the server's allow-list.
 
     deeplink {
         host("procomic.net")

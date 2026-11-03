@@ -12,7 +12,7 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * The reader session (the manhuarmtl-style WebView harvest) — v124.
+ * The reader session (the manhuarmtl-style WebView harvest) — v127.
  *
  * WHY THIS EXISTS, AND WHY v1.6.37 COULD NOT WORK
  *
@@ -71,6 +71,27 @@ internal object ProComicReaderSession {
      * silently) before the session reports the wall and leaves. */
     private const val LOGIN_WALL_TICKS = 18
 
+    /** v127 — WALK-AWARE SETTLE. Two bounds keep the session from
+     * resolving while the site's own deferred walk is still working:
+     *
+     * [WALK_GRACE_TICKS] — once the scroll reaches the absolute end with
+     * rows mounted, the site's reader needs a beat to NOTICE and fire its
+     * own /chapter-deferred-media walk (the batch loader the reader
+     * drives on scroll). The session never settles before this grace
+     * lapses — the v1.6.39 field report was exactly a settle that won the
+     * race against the site's walk on a short (3 public rows) reader.
+     *
+     * [WALK_ACTIVE_MS] — after every observed /chapter-deferred-media
+     * request, the site is actively minting/exchanging for the next
+     * batch; its rows follow within seconds when the mint succeeds. The
+     * session stays patient for this long after the LAST walk request
+     * (a retry loop therefore keeps the session alive — bounded by the
+     * hard tick cap), and settles only once the walk has been quiet for
+     * this long. A chapter whose walk never fires (public-only) settles
+     * on the grace alone. */
+    private const val WALK_GRACE_TICKS = 10
+    private const val WALK_ACTIVE_MS = 10_000L
+
     private const val DIAG_TAG = "reader-session"
 
     /** One-flight guard: a chapter open never stacks two sessions. */
@@ -103,6 +124,12 @@ internal object ProComicReaderSession {
         val notes = mutableListOf<String>()
         val rows = LinkedHashMap<Int, HarvestRow>() // row index -> row (newest wins)
         var challengeTicks = 0
+        // v127: the site's own deferred walk, observed on the wire. The
+        // interceptRequest below stamps every /chapter-deferred-media
+        // request; the settle logic reads the stamp so it never resolves
+        // while the site is mid-walk.
+        val lastWalkAt = java.util.concurrent.atomic.AtomicLong(0L)
+        var walkNoteLogged = false
 
         notes += "$DIAG_TAG: start (${readerApexes.size} apexes)"
 
@@ -121,6 +148,15 @@ internal object ProComicReaderSession {
             interceptRequest { request ->
                 val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
                     ?: return@interceptRequest emptyResponse
+                // v127: the site's own batch walk rides this path — every
+                // observed call stamps the walk clock the settle logic waits on.
+                if (requestUrl.encodedPath.contains("/chapter-deferred-media")) {
+                    lastWalkAt.set(System.currentTimeMillis())
+                    if (!walkNoteLogged) {
+                        walkNoteLogged = true
+                        notes += "$DIAG_TAG: the site's own deferred walk fired — staying for its batches"
+                    }
+                }
                 val allowed = requestUrl.isHttps && requestUrl.host.let { host ->
                     host == "procomic.net" ||
                         host == "www.procomic.net" ||
@@ -149,6 +185,7 @@ internal object ProComicReaderSession {
             var apexIndex = 0
             var loginTicks = 0
             var unlockClicked = false
+            var endTicks = 0
 
             poll(POLL_MS.milliseconds) {
                 ticks++
@@ -226,12 +263,22 @@ internal object ProComicReaderSession {
                     } else {
                         quietTicks++
                     }
-                    // v126: quiet is not enough alone — the walk must have
-                    // REACHED THE BOTTOM of the reader (the reading motion
-                    // is what makes the site mount every row), or the tick
-                    // budget must be spent.
+                    // v127 — WALK-AWARE SETTLE. Quiet is not enough alone:
+                    // the walk must have REACHED THE BOTTOM (the reading
+                    // motion is what makes the site mount every row), the
+                    // site's own deferred walk must have had its grace to
+                    // fire, and — once it fires — it must have gone quiet
+                    // again (each walk request buys the session fresh
+                    // patience: its batches mount as rows seconds later).
                     val atEnd = state["atEnd"] == "1"
-                    if (ticks >= MAX_TICKS || (quietTicks >= QUIET_TICKS && rows.isNotEmpty() && atEnd)) {
+                    if (atEnd && rows.isNotEmpty()) endTicks++ else endTicks = 0
+                    val walkQuiet = System.currentTimeMillis() - lastWalkAt.get() >= WALK_ACTIVE_MS
+                    if (ticks >= MAX_TICKS ||
+                        (
+                            quietTicks >= QUIET_TICKS && rows.isNotEmpty() && atEnd &&
+                                endTicks >= WALK_GRACE_TICKS && walkQuiet
+                            )
+                    ) {
                         resolve(Unit)
                     }
                 }

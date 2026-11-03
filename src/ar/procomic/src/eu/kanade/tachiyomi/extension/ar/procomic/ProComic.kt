@@ -1480,7 +1480,10 @@ abstract class ProComic :
     /** Any https URL on a site-owned image host. The app-CDN pool grew in
      * v105: pages/covers ride app.procomic.net, app.procomic.pro AND
      * app.prochan.net (the parent brand serves a share of the catalog's
-     * images), with raw files on cdn{1..4}.procomic.net. */
+     * images), with raw files on cdn{1..4}.procomic.net. v127: the .im
+     * apex joins — the live reader mounts its own rows on app.procomic.im
+     * (observed in the real reader DOM), so a session-harvested URL on
+     * that host is exactly as site-owned as its .net/.pro siblings. */
     private fun isReaderImageUrl(url: String): Boolean = runCatching {
         val httpUrl = url.toHttpUrl()
         httpUrl.isHttps && (
@@ -1490,9 +1493,12 @@ abstract class ProComic :
                 httpUrl.host == "www.procomic.pro" ||
                 httpUrl.host == "prochan.net" ||
                 httpUrl.host == "www.prochan.net" ||
+                httpUrl.host == "procomic.im" ||
+                httpUrl.host == "www.procomic.im" ||
                 httpUrl.host.endsWith(".procomic.net") ||
                 httpUrl.host.endsWith(".procomic.pro") ||
-                httpUrl.host.endsWith(".prochan.net")
+                httpUrl.host.endsWith(".prochan.net") ||
+                httpUrl.host.endsWith(".procomic.im")
             )
     }.getOrDefault(false)
 
