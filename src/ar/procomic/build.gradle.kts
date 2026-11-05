@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 40
+    versionCode = 41
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -318,6 +318,30 @@ keiyoushi {
     // knew — so a session-harvested row URL would have been refused by
     // the loopback proxy right after the session worked for it;
     // procomic.im joins isReaderImageUrl + the server's allow-list.
+    //
+    // v128 (versionCode 41) — FIELD VERDICT on v127: "chapter pages are
+    // not loading, and when they do load it only loads the first
+    // three". Live recon re-verified the whole chain: the flight still
+    // carries images[]/appImages[] + deferredMedia/imagePass; the
+    // exchange 403s "Turnstile token required" for a tokenless client,
+    // "Turnstile verification failed" for a bogus one (real tokens
+    // validate); the refresh endpoint is ungated 200; the sitekey is
+    // live (public-settings). Both field symptoms map to two switches:
+    // (1) "ONLY THE FIRST THREE" — the mint sat behind safe fetch (the
+    // default) and its early return shipped the public embed without
+    // ever trying; the mint is now its own preference, DEFAULT ON (the
+    // hardened v113 solver: one solve per open, the 90 s wall, the
+    // fruitless breaker). (2) "NOT LOADING" — the reader session ran on
+    // EVERY open; the anonymous reader mounts exactly the public rows
+    // and never fires its own deferred walk (live-verified: 3 rows at
+    // the absolute bottom, zero /chapter-deferred-media requests), so
+    // the session added nothing, burned 20–110 s, and 3 fruitless
+    // sessions tripped the 30-min breaker whose cooldown then shipped
+    // short/empty chapters. The walk now reports whether it reached the
+    // server's own terminal answer and the session runs ONLY when the
+    // chapter's completeness is unproven (no-payload flights — the
+    // dual-homed .pro catalog —, gate-held walks, raw-host-only
+    // batches); signed-in devices keep their entitlement through it.
 
     deeplink {
         host("procomic.net")

@@ -106,14 +106,14 @@ abstract class MangaTek : KeiSource() {
     // ========================= Details & Chapters  =========================
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        check(url.pathSegments.size >= 2) { "Unsupported URL" }
-        val slug = url.pathSegments[1]
+        // v104 (upstream vc 11): ignore foreign and unsupported URLs instead of crashing on
+        // them — only /manga/<slug> (and /reader/<slug>/…) resolve to a manga here.
+        if (url.host != baseUrl.toHttpUrl().host || url.pathSegments.first() !in setOf("manga", "reader")) return null
+        val slug = url.pathSegments.getOrNull(1)?.takeIf { it.isNotEmpty() } ?: return null
         val manga = SManga.create().apply {
             this.url = "/manga/$slug"
         }
-        return fetchMangaUpdate(manga, emptyList(), true, false).manga.apply {
-            initialized = true
-        }
+        return getMangaUpdate(manga, emptyList(), fetchDetails = true, fetchChapters = false).manga
     }
 
     override suspend fun fetchMangaUpdate(
@@ -122,7 +122,7 @@ abstract class MangaTek : KeiSource() {
         fetchDetails: Boolean,
         fetchChapters: Boolean,
     ): SMangaUpdate {
-        val url = "$baseUrl${manga.url}".toHttpUrl()
+        val url = getMangaUrl(manga).toHttpUrl()
         val data: MangaDto = client.get(url).asJsoup().extractAstroProp("manga")
         val slug = url.pathSegments[1]
 
@@ -152,18 +152,26 @@ abstract class MangaTek : KeiSource() {
     //  ============================== Page ==============================
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
-        val document = client.get("$baseUrl${chapter.url}").asJsoup()
+        val document = client.get(getChapterUrl(chapter)).asJsoup()
         val props: ChapterProps = document.extractAstroProp("imageUrls")
 
+        // v105 (upstream vc 12): the embedded list is a MIX of plain urls and objects — a
+        // pending marker means the site withholds that page from the SSR embed, and a trap is
+        // an off-screen decoy. When anything is pending the whole chapter comes from the
+        // reader's own pages API instead.
+        val embedded = props.imageUrls.toReaderImages()
+        val images = if (embedded.any { it.pending }) fetchReaderImages(document, props) else embedded
+        val imageUrls = images.filterNot { it.isTrap }.map { it.url }
+
         val overlayData = props.overlayBlob?.let { OverlayCrypto.decryptHexBlob(it).parseAs<OverlayData>() }
-            ?: unlockOverlay(props)
+            ?: unlockOverlay(document, props)
 
         // page_number counts from 1 after the overlayPageOffset images
         val firstOverlayImage = props.overlayPageOffset ?: 0
         val overlaysByImage = overlayData?.pages.orEmpty()
             .associate { firstOverlayImage + it.pageNumber - 1 to it.overlays }
 
-        return props.imageUrls.mapIndexed { index, imageUrl ->
+        return imageUrls.mapIndexed { index, imageUrl ->
             val overlays = overlaysByImage[index]
 
             if (overlays.isNullOrEmpty()) {
@@ -178,24 +186,54 @@ abstract class MangaTek : KeiSource() {
         }
     }
 
-    private suspend fun unlockOverlay(props: ChapterProps): OverlayData? {
+    // Pending pages leave the embedded list incomplete, the pages call returns the whole chapter
+    private suspend fun fetchReaderImages(document: Document, props: ChapterProps): List<ReaderImage> {
+        val chapterId = props.chapterId!!
+        val token = props.unlockToken!!
+        val proof = OverlayCrypto.proof(readerSeeds(document).proofSalt, token, chapterId)
+        val request = PagesRequest(chapterId, props.mangaSlug!!, props.chapterRef!!, token, proof)
+        return client.post(PAGES_API_URL, body = request.toJsonRequestBody())
+            .parseAs<PagesResponse>().data.toReaderImages()
+    }
+
+    private suspend fun unlockOverlay(document: Document, props: ChapterProps): OverlayData? {
         if (props.textMode != "overlay") return null
         val chapterId = props.chapterId ?: return null
         val token = props.unlockToken ?: return null
-        val proof = OverlayCrypto.proof(token, chapterId)
-        val request = UnlockRequest(chapterId, token, proof, OverlayCrypto.esid)
+        val seeds = readerSeeds(document)
+        val proof = OverlayCrypto.proof(seeds.proofSalt, token, chapterId)
+        val esid = OverlayCrypto.esid(seeds.readerSeed)
+        val request = UnlockRequest(chapterId, token, proof, esid)
 
         var response = client.post(UNLOCK_API_URL, body = request.toJsonRequestBody()).parseAs<UnlockResponse>()
         val nonce = response.nonce
         if (response.needsChallenge && nonce != null) {
             val pow = response.powBits?.let { OverlayCrypto.pow(nonce, it) }
-            val retry = UnlockRequest(chapterId, token, proof, OverlayCrypto.esid, nonce, pow)
+            val retry = UnlockRequest(chapterId, token, proof, esid, nonce, pow)
             response = client.post(UNLOCK_API_URL, body = retry.toJsonRequestBody()).parseAs<UnlockResponse>()
         }
 
         val overlay = response.overlay ?: return null
-        return OverlayCrypto.decryptOverlay(overlay, response.ks, response.key, token, chapterId)
+        return OverlayCrypto.decryptOverlay(seeds.readerSeed, overlay, response.ks, response.key, token, chapterId)
             ?.parseAs<OverlayData>()
+    }
+
+    @Volatile
+    private var cachedSeeds: Pair<String, BundleSeeds.Seeds>? = null
+
+    // The reader's seeds rotate with each build of its bundle (v104, upstream vc 11): the
+    // /_astro/ChapterImageViewer.<hash>.js script is fetched and its obfuscated string array
+    // decoded in QuickJS (BundleSeeds). Cached per bundle URL — a new site build re-extracts.
+    private suspend fun readerSeeds(document: Document): BundleSeeds.Seeds {
+        val bundleUrl = document.selectFirst("astro-island[component-url*=ChapterImageViewer]")
+            ?.attr("abs:component-url")
+            ?: throw Exception("Unable to find the reader script")
+        cachedSeeds?.takeIf { it.first == bundleUrl }?.let { return it.second }
+
+        val script = client.get(bundleUrl).body.string()
+        val seeds = BundleSeeds.extract(script)
+        cachedSeeds = bundleUrl to seeds
+        return seeds
     }
 
     private fun Element.imgAttr(): String = when {
@@ -210,6 +248,7 @@ abstract class MangaTek : KeiSource() {
     companion object {
         val PAGE_REGEX = Regex(""".*?\.(webp|png|jpg|jpeg)(?:\?[^#]*)?#\[.*?]""", RegexOption.IGNORE_CASE)
         private const val API_BASE = "https://api.mangatek.com"
+        private const val PAGES_API_URL = "$API_BASE/api/reader/pages"
         private const val UNLOCK_API_URL = "$API_BASE/api/reader/unlock"
     }
 }

@@ -210,6 +210,25 @@ import kotlin.math.roundToInt
  *     way. Reader flights that arrive as a data-less app shell are
  *     retried through the router's own flight form (RSC header + the
  *     router's _rsc param), which still returns the payload stream.
+ *   - pages v128 (the "only the first three pages / pages not loading"
+ *     field verdict): live recon showed the WebView-free chain is ALIVE —
+ *     the flight still ships images[]/appImages[] (the public embed) plus
+ *     deferredMedia/imagePass, the exchange still validates real widget
+ *     tokens, the refresh endpoint is still ungated, the sitekey still
+ *     arrives live from public-settings. What was dead: (a) the MINT —
+ *     safe fetch's early return sat in front of it and safe fetch is the
+ *     default, so every chapter stopped at the public embed ("only the
+ *     first three"); (b) the reader SESSION — the anonymous reader mounts
+ *     exactly the public rows and never fires its own deferred walk, so
+ *     it added nothing while burning 20–110 s per open and tripping the
+ *     30-min fruitless breaker, whose cooldown shipped empty/short
+ *     chapters ("pages are not loading"). v128: the mint is its own
+ *     preference and DEFAULT ON (the hardened v113 solver — one solve
+ *     per open, wall, breaker); the session is demoted to the fallback
+ *     for chapters whose completeness the walk cannot prove (no-payload
+ *     flights — the dual-homed .pro catalog —, gate-held walks,
+ *     raw-host-only batches); signed-in devices keep their entitlement
+ *     through it.
  *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
@@ -1263,6 +1282,10 @@ abstract class ProComic :
         val deferred = payload.deferred
         latestImagePass = payload.imagePass
         var walkTrail: List<String> = emptyList()
+        // v128: did the deferred walk reach the server's own terminal answer?
+        // True means the chapter's deferred list was walked to its end — the
+        // strongest completeness proof the WebView-free chain can produce.
+        var deferredWalkComplete = false
         if (deferred?.token != null && upstreams.isNotEmpty()) {
             // v116: the full-list exchange WALKS THE BATCHES (the server
             // hands out the deferred list in redis-tracked batches; the
@@ -1271,20 +1294,26 @@ abstract class ProComic :
             // gate holds this yields whatever the session cleared plus a
             // legible diag trail (mirrored to /.diag) and the source
             // ships at least the public pages exactly as before.
-            val (extra, trail) = fetchDeferredPages(
+            val walk = fetchDeferredPages(
                 chapterId = ref.chapterId,
                 deferred = deferred,
                 imagePass = payload.imagePass,
                 referer = chapterPageUrl(ref),
             )
-            walkTrail = trail
+            walkTrail = walk.trail
+            deferredWalkComplete = walk.complete
+            val extra = walk.images
             if (extra.isNotEmpty()) {
                 val seen = upstreams.toHashSet()
                 upstreams = upstreams + extra.filter { it !in seen }
                 Log.i(TAG, "deferred: +${extra.size} pages (total ${upstreams.size})")
             } else {
-                trail.forEach { Log.i(TAG, "deferred: $it") }
+                walk.trail.forEach { Log.i(TAG, "deferred: $it") }
             }
+        } else if (deferred == null && upstreams.isNotEmpty()) {
+            // v128: the flight embedded the whole chapter (no deferred
+            // credentials at all) — the WebView-free list is provably whole.
+            deferredWalkComplete = true
         }
         payload.publicCount?.takeIf { it > upstreams.size }?.let { cap ->
             Log.i(TAG, "public embed capped at $cap pages by the site")
@@ -1314,25 +1343,25 @@ abstract class ProComic :
         }
         var finalUrls: List<String> = loadable
 
-        // The reader session (v124, the manhuarmtl architecture): the
-        // WebView-free list is usually empty now — the flight no longer
-        // carries pages. ONE bounded offscreen browser session opens the
-        // REAL reader (procomic.pro — the .net apex 308s away, detected
-        // and walked), waits through a Cloudflare challenge, and walks the
-        // chapter like a reading user while the site's own reader mounts
-        // its rows. Simple rows ship as proxied direct URLs; piece rows
-        // are re-assembled by the loopback server from the site's own
-        // freshly-signed piece URLs. The harvest is authoritative when it
-        // sees more pages than the plain chain.
-        // v126: the session runs on EVERY chapter open (the preference
-        // stays default-ON, the breaker still guards it). The flight can
-        // no longer prove completeness — it carries exactly the 3 public
-        // pages (publicCount == loadable, gated empty), which reads as
-        // "complete" to any comparison and is exactly the "only the first
-        // 3 pages" report. The reader is the only source of the truth:
-        // it unlocks, scrolls to the end, and its rows replace this list
-        // when it sees more.
-        if (readerSessionEnabled) {
+        // The reader session (v124, the manhuarmtl architecture): ONE bounded
+        // offscreen browser session opens the REAL reader, waits through a
+        // Cloudflare challenge, and walks the chapter like a reading user
+        // while the site's own reader mounts its rows. Simple rows ship as
+        // proxied direct URLs; piece rows are re-assembled by the loopback
+        // server from the site's own freshly-signed piece URLs. The harvest
+        // is authoritative when it sees more pages than the plain chain.
+        // v126 ran the session on EVERY chapter open. v128 demotes it to the
+        // FALLBACK it has become (live recon: the anonymous reader mounts
+        // exactly the public rows and never fires its own deferred walk, so
+        // the session cannot add pages the walk collected — it only burned
+        // 20–110 s per open and tripped the 30-min breaker, which is the
+        // "pages are not loading" stretch the field reported). The session
+        // now runs ONLY when the walk did not prove the chapter complete:
+        // flights with no payload (the dual-homed .pro catalog), walks that
+        // ended at the gate, and raw-host-only batches. Signed-in devices
+        // (the session shares the app's cookie store) still get their
+        // entitlement through it.
+        if (readerSessionEnabled && !deferredWalkComplete) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
                 Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")
                 runCatching {
@@ -1584,11 +1613,24 @@ abstract class ProComic :
         deferred: DeferredMediaDto,
         imagePass: String?,
         referer: String,
-    ): Pair<List<String>, List<String>> {
-        val (images, trail) = fetchDeferredPagesInner(chapterId, deferred, imagePass, referer)
+    ): DeferredWalk {
+        val (images, trail, complete) = fetchDeferredPagesInner(chapterId, deferred, imagePass, referer)
         runCatching { imageServer.recordDeferredTrail(chapterId, trail) }
-        return images to trail
+        return DeferredWalk(images, trail, complete)
     }
+
+    /** v128: the walk's outcome, plus whether it ENDED AT THE SERVER'S OWN
+     * TERMINAL ANSWER (empty images[] / replay-after-renewal) — the only
+     * proof the deferred list was walked to its end. The reader session is
+     * skipped when this is true: the anonymous reader cannot add anything
+     * the walk did not already collect (live-verified: it mounts exactly the
+     * public rows and never fires its own deferred walk), so running it only
+     * burns 20–110 s per open and feeds the failure breaker. */
+    private class DeferredWalk(
+        val images: List<String>,
+        val trail: List<String>,
+        val complete: Boolean,
+    )
 
     /**
      * The site's own reader flow for the pages beyond the public embed:
@@ -1613,12 +1655,12 @@ abstract class ProComic :
         deferred: DeferredMediaDto,
         imagePass: String?,
         referer: String,
-    ): Pair<List<String>, List<String>> {
+    ): Triple<List<String>, List<String>, Boolean> {
         val trail = mutableListOf<String>()
         val initialToken = deferred.token
         if (initialToken.isNullOrBlank()) {
             trail += "deferredMedia present without a token"
-            return emptyList<String>() to trail
+            return Triple(emptyList<String>(), trail, false)
         }
         trail += "deferredMedia split=${deferred.splitIndex} turnstile=${deferred.requireTurnstile}"
 
@@ -1680,7 +1722,7 @@ abstract class ProComic :
             exchanges++
             if (System.currentTimeMillis() > walkDeadline) {
                 trail += "deferred walk wall (${MAX_WALK_WALL_MS / 1000} s) reached — shipping ${collected.size} deferred pages"
-                return collected to trail
+                return Triple(collected, trail, false)
             }
             val (images, outcome) = deferredAttempt(
                 chapterId = chapterId,
@@ -1698,14 +1740,14 @@ abstract class ProComic :
                     if (fresh.isEmpty()) {
                         if (replayedAfterRenewal) {
                             trail += "the renewed token replayed the same slice — the deferred list is complete (${collected.size} pages beyond the public embed)"
-                            return collected to trail
+                            return Triple(collected, trail, true)
                         }
                         // Same slice again: advance the cursor the reader's
                         // way — renew the token, then exchange once more.
                         val renewed = renewForNextSlice()
                         if (renewed == null) {
                             trail += "the deferred list is complete (${collected.size} pages beyond the public embed)"
-                            return collected to trail
+                            return Triple(collected, trail, true)
                         }
                         token = renewed
                         replayedAfterRenewal = true
@@ -1729,7 +1771,7 @@ abstract class ProComic :
                             trail += "$MINT_FRUITLESS_LIMIT minted batches carried only browser-gated pages — solver cooling down for ${MINT_COOLDOWN_MS / 60000} min"
                         }
                         trail += "the batch's pages all ride the browser-only signed CDN route — ending the walk"
-                        return collected to trail
+                        return Triple(collected, trail, false)
                     }
                     // Refresh between slices so the server's cursor
                     // advances (the reader renews its token before every
@@ -1742,22 +1784,33 @@ abstract class ProComic :
                 DeferredOutcome.Kind.DONE -> {
                     trail += outcome.note
                     trail += "the deferred list is complete (${collected.size} pages beyond the public embed)"
-                    return collected to trail
+                    return Triple(collected, trail, true)
                 }
 
                 DeferredOutcome.Kind.TURNSTILE -> {
                     trail += outcome.note
-                    // v120: safe fetch never mints — the walk ships what
-                    // the session cleared and the chapter opens in
-                    // seconds, WebView-free (the library/own-WebView
-                    // crash class is structurally out of the fetch).
-                    if (preferences.getBoolean(PREF_SAFE_FETCH, true)) {
+                    // v128: the mint is the DEFAULT again — the field symptom
+                    // ("only the first three pages") is exactly this branch
+                    // shipping the public embed without ever trying, because
+                    // safe fetch's early return sat in front of the mint.
+                    // Live recon (1.6.41 era): the flight still carries the
+                    // deferred credentials, the exchange still validates real
+                    // widget tokens ("Turnstile verification failed" for a
+                    // bogus one), the refresh endpoint is still ungated, and
+                    // the sitekey still arrives live from public-settings —
+                    // the whole chain works, only the mint was switched off.
+                    // The solver is the v113 contract surface (image-blocked,
+                    // renderer-death consumed, HandlerThread firewall, hard
+                    // wall) — NOT the library interceptor safe fetch guards.
+                    // Mints stay ONE per chapter open (single-use token
+                    // economics) and the fruitless-mint breaker stays.
+                    if (!preferences.getBoolean(PREF_READER_GATE, true)) {
                         trail += if (collected.isEmpty()) {
-                            "safe fetch: challenge solving disabled (no WebView) — keeping the public pages"
+                            "reader-gate solving disabled — keeping the public pages"
                         } else {
-                            "safe fetch: challenge solving disabled (no WebView) — shipping ${collected.size} deferred pages"
+                            "reader-gate solving disabled — shipping ${collected.size} deferred pages"
                         }
-                        return collected to trail
+                        return Triple(collected, trail, false)
                     }
                     if (mints >= MAX_TURNSTILE_MINTS) {
                         // v118: ONE mint per chapter open — the widget token
@@ -1770,7 +1823,7 @@ abstract class ProComic :
                         } else {
                             "the gate re-armed after ${collected.size} deferred pages (the widget token is single-use per exchange) — shipping what was fetched"
                         }
-                        return collected to trail
+                        return Triple(collected, trail, false)
                     }
                     // v119: the wall must hold ACROSS the mint — a WebView
                     // ladder burns ~40 s and the deadline is only checked
@@ -1780,17 +1833,17 @@ abstract class ProComic :
                     // the session cleared.
                     if (System.currentTimeMillis() > walkDeadline) {
                         trail += "deferred walk wall reached before the mint — shipping ${collected.size} deferred pages"
-                        return collected to trail
+                        return Triple(collected, trail, false)
                     }
                     mints++
-                    // v120: the fruitless-mint cooldown (safe fetch OFF).
-                    // A mint ladder that yields no token (rotated sitekey,
-                    // hostile WebView stack) costs ~40 s of Chromium every
-                    // chapter open — after two consecutive dead ladders the
-                    // breaker pauses mints for the window.
+                    // v120/v128: the fruitless-mint cooldown (mint OFF, or a
+                    // dead ladder). A mint ladder that yields no token
+                    // (rotated sitekey, hostile WebView stack) costs ~40 s of
+                    // Chromium every chapter open — after two consecutive dead
+                    // ladders the breaker pauses mints for the window.
                     if (System.currentTimeMillis() < mintPausedUntil) {
                         trail += "turnstile solver cooling down after fruitless mints — shipping ${collected.size} deferred pages"
-                        return collected to trail
+                        return Triple(collected, trail, false)
                     }
                     // v119: a /.diag screenshot now names the mint moment —
                     // if a device death happens mid-mint, the trail shows
@@ -1827,7 +1880,7 @@ abstract class ProComic :
                             trail += "${MINT_FRUITLESS_LIMIT} fruitless mint ladders — solver cooling down for ${MINT_COOLDOWN_MS / 60000} min"
                         }
                         trail += "turnstile solver returned no token — keeping the public pages"
-                        return collected to trail
+                        return Triple(collected, trail, false)
                     }
                     mintFruitless = 0
                     turnstileToken = solved.first
@@ -1841,13 +1894,13 @@ abstract class ProComic :
                     if (tokenRenewals >= MAX_TOKEN_RENEWALS) {
                         trail += outcome.note
                         trail += "deferred renewals exhausted — shipping ${collected.size} deferred pages"
-                        return collected to trail
+                        return Triple(collected, trail, false)
                     }
                     tokenRenewals++
                     val renewed = renewDeferredToken(chapterId, token, referer)
                     if (renewed == null) {
                         trail += "refresh POST failed — keeping the public pages"
-                        return collected to trail
+                        return Triple(collected, trail, false)
                     }
                     trail += "refresh POST minted a new deferred token"
                     token = renewed
@@ -1875,14 +1928,14 @@ abstract class ProComic :
 
                 DeferredOutcome.Kind.UNREACHABLE -> {
                     trail += outcome.note
-                    if (collected.isEmpty()) return emptyList<String>() to trail
+                    if (collected.isEmpty()) return Triple(emptyList<String>(), trail, false)
                     trail += "deferred exchanges stopped — shipping ${collected.size} deferred pages"
-                    return collected to trail
+                    return Triple(collected, trail, false)
                 }
             }
         }
         trail += "deferred page bound reached — shipping ${collected.size} deferred pages"
-        return collected to trail
+        return Triple(collected, trail, false)
     }
 
     private class DeferredOutcome(
@@ -2164,27 +2217,38 @@ abstract class ProComic :
     // ========================= Preference screen =========================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        // ---- the reader session (default ON) ----
+        // ---- v128: the reader-gate mint (default ON, the full-chapter path) ----
+        SwitchPreferenceCompat(screen.context).apply {
+            key = PREF_READER_GATE
+            title = "Solve the reader gate (recommended)"
+            summary = "Recommended. Chapters embed their first pages publicly and serve " +
+                "the rest through a Cloudflare Turnstile gate. When this is ON, one " +
+                "bounded offscreen widget solve mints the token the site's own exchange " +
+                "validates and the whole chapter loads. Turn OFF to never spawn the " +
+                "solver WebView (public pages only, fastest opens)."
+            setDefaultValue(true)
+        }.let(screen::addPreference)
+
+        // ---- the reader session (default ON, fallback only since v128) ----
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_READER_SESSION
-            title = "Load gated pages with a browser session"
-            summary = "Recommended. When the chapter has pages the plain fetch " +
-                "cannot serve, one bounded offscreen browser session opens the " +
-                "chapter like a reader and collects the pages the site itself " +
-                "renders (fuller chapters, a few seconds slower). Turn OFF to " +
-                "stay browser-free (public pages only)."
+            title = "Browser-session fallback for unproven chapters"
+            summary = "Recommended. Runs only when the plain fetch cannot PROVE the " +
+                "chapter complete (no payload — part of the catalog lives on the " +
+                "other deployment — or the gate held): one bounded offscreen browser " +
+                "session opens the chapter like a reader and collects the pages the " +
+                "site itself renders. Signed-in devices get their entitlement through " +
+                "it. Turn OFF to stay browser-free."
             setDefaultValue(true)
         }.let(screen::addPreference)
 
         // ---- v120: the safe-fetch master switch (default ON) ----
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SAFE_FETCH
-            title = "Safe chapter fetch (no solver WebView)"
-            summary = "Recommended. The direct HTTP walk never mints challenge " +
-                "tokens with a WebView of its own — the reader session above " +
-                "(a separate, crash-hardened surface) covers the gated pages. " +
-                "Turn OFF to let the walk also solve challenges directly " +
-                "(legacy path, slower)."
+            title = "Safe flight fetch (no challenge solver on listings)"
+            summary = "Recommended. The flight fetch never spawns the library challenge " +
+                "solver — a challenged answer fails legibly instead. (The reader-gate " +
+                "solve above uses its own hardened, separately-switched surface.)"
             setDefaultValue(true)
         }.let(screen::addPreference)
 
@@ -2290,9 +2354,22 @@ abstract class ProComic :
         const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
         const val PREF_PREFERRED_SCANLATORS = "pref_preferred_scanlators"
 
-        /** v120: safe chapter fetch — the page-count fetch spawns NO
-         * WebView (no library challenge solve, no Turnstile mint). */
+        /** v120: safe chapter fetch — the page-count (flight) fetch spawns
+         * NO library-solver WebView. v128: the reader-gate mint is NOT part
+         * of this promise anymore — it has its own switch below (the mint
+         * WebView is the hardened v113 surface, not the library one). */
         const val PREF_SAFE_FETCH = "pref_safe_fetch"
+
+        /** v128: the reader-gate mint. When the deferred exchange answers
+         * "Turnstile token required", ONE bounded offscreen widget solve
+         * (TurnstileSolver — image-blocked, renderer-death consumed,
+         * HandlerThread firewall, hard wall) mints the real token the
+         * exchange validates. Default ON — this is the only WebView-free
+         * path to the pages beyond the public embed, and the "only the
+         * first three pages" field report was exactly this switch's
+         * absence (the mint used to sit behind safe fetch, off by
+         * default). */
+        const val PREF_READER_GATE = "pref_reader_gate_mint"
 
         /** The reader session: when the plain fetch cannot serve the whole
          * chapter, one bounded offscreen browser session collects the pages
@@ -2306,7 +2383,8 @@ abstract class ProComic :
         const val SESSION_FAILURE_LIMIT = 3
         const val SESSION_COOLDOWN_MS = 30L * 60_000L
 
-        /** v120: the fruitless-mint cooldown (safe fetch OFF only). */
+        /** v120: the fruitless-mint cooldown (reader-gate mint OFF or a
+         * dead ladder). */
         const val MINT_FRUITLESS_LIMIT = 2
         const val MINT_COOLDOWN_MS = 30L * 60_000L
 
