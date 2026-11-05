@@ -382,11 +382,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.10",
-      "versionCode": 10,
+      "version": "1.6.12",
+      "versionCode": 12,
       "baseUrl": "https://mangatek.com",
-      "apk": "tachiyomi-ar.mangatek-v1.6.10-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatek-v1.6.10-release.apk",
+      "apk": "tachiyomi-ar.mangatek-v1.6.12-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.mangatek-v1.6.12-release.apk",
       "icon": "../icons/mangatek.png",
       "note": "",
       "description": ""
@@ -450,11 +450,11 @@
       "langs": [
         "ar"
       ],
-      "version": "1.6.40",
-      "versionCode": 40,
+      "version": "1.6.41",
+      "versionCode": 41,
       "baseUrl": "https://procomic.net",
-      "apk": "tachiyomi-ar.procomic-v1.6.40-release.apk",
-      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.40-release.apk",
+      "apk": "tachiyomi-ar.procomic-v1.6.41-release.apk",
+      "apkUrl": "https://raw.githubusercontent.com/marbou92/MHRepo/main/apk/tachiyomi-ar.procomic-v1.6.41-release.apk",
       "icon": "../icons/procomic.png",
       "note": "",
       "description": ""
