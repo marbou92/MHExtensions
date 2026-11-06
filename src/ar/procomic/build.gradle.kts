@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 46
+    versionCode = 47
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -484,6 +484,50 @@ keiyoushi {
     // (sign refused / ancient WebView) keep the v132 contract: named in
     // logcat and /.diag, never a doomed 502 card; AVIF-capable devices
     // keep the v129 compose as the fallback.
+    //
+    // v134 (versionCode 47) — FIELD VERDICT on v133: "it's still just fetch
+    // the first 3 pages". Round-6 live recon (sandbox, 2026-11-06 evening)
+    // found WHY the rendered harvest could never deliver:
+    // (a) the sign endpoint REFUSES piece urls — POST /api/cdn-image/sign
+    //     with an img{1-4} piece answers 403 {"error":"forbidden_host"}
+    //     (verified from a cleared browser session with the fresh
+    //     x-chapter-pass), so sameOriginSrc always fell to the bare
+    //     /api/cdn-image?url proxy, which 403s pieces too — every in-page
+    //     capture parked 'failed', every piece row fell back, and on
+    //     Android 10 the row fell out of the list entirely: 3 pages again;
+    // (b) the site's anonymous reader never mounts the protected rows at
+    //     all — a REAL browser on a locked chapter renders ZERO
+    //     data-reader-image-row rows (the paywall text instead), so the
+    //     rendered harvest had nothing to capture even before (a);
+    // (c) the chain beneath all of it is PROVABLY ALIVE: the reader-signal
+    //     exchange answered 11 maps + a fresh pass (HTTP 200), the plan POST
+    //     answered 6 freshly-signed pieces + rects (HTTP 200), the piece
+    //     edge answered 200 image/avif to a browser UA with the chapter
+    //     referer — the ONLY broken link left is the on-device AVIF decode;
+    // (d) the walk terminal changed under v116's feet: the exchange now
+    //     re-mints the SAME slice with FRESH tokens (11 maps twice, ZERO
+    //     token overlap) — token dedup can never see the repeat, the walk
+    //     burned its full 14-exchange bound and duplicated pages 3..156.
+    // THE FIX, two parts:
+    //  1. THE WEBVIEW TRANSCODE TIER (WebAvifTranscoder.kt, NEW): one warm,
+    //     network-isolated offscreen WebView (blockNetworkLoads before any
+    //     load — the only input is a data: url) whose Chromium decodes each
+    //     AVIF piece inside its sandbox and answers canvas.toDataURL JPEG.
+    //     Wired into the loopback as the tier between BitmapFactory and
+    //     weserv (avifToJpeg + the composed-row decode fallback), the 410
+    //     decode wall lifts, and BOTH protected-page sources (the planned
+    //     maps AND the session-harvested piece rows) compose on EVERY
+    //     Android version. Renderer-death-safe (onRenderProcessGone →
+    //     true, the exact TurnstileSolver/ReaderSession contract),
+    //     per-piece latch timeout, 3-deaths breaker — the host app can
+    //     never crash-loop.
+    //  2. THE RE-MINT TERMINAL (ProComic.kt): the walk now terminates the
+    //     moment an images-empty exchange re-mints the same map count —
+    //     the deferred list is complete; planned pages dedup by pageIndex;
+    //     the walk proves completeness so the reader session no longer
+    //     burns 20–110 s on opens the exchange already answered.
+    // Nothing else changes: the 3 public pages, the session fallback, the
+    // legible diagnostics all ride as before.
 
     deeplink {
         host("procomic.net")

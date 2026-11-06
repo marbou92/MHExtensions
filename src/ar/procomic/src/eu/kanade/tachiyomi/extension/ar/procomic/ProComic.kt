@@ -269,6 +269,17 @@ abstract class ProComic :
             // offscreen WebView) is removed; the worst case is the
             // legible error card, never a crash.
             nativeCacheDir = applicationContext.cacheDir,
+            // v134: the WebView AVIF→JPEG transcode tier's context — the
+            // tier that ends the decode wall. The renderer's own Chromium
+            // (software AV1, every Android version) decodes the map
+            // pieces inside its sandbox and answers finished JPEG bytes;
+            // this process still never touches a codec. The tier is
+            // network-isolated (data: urls only), renderer-death-safe
+            // (onRenderProcessGone → true, the exact TurnstileSolver/
+            // ReaderSession contract) and breaker-ed at 3 renderer
+            // deaths — the full safety profile is WebAvifTranscoder's
+            // doc. Nullable so the JVM harness shape stays intact.
+            appContext = runCatching { applicationContext }.getOrNull(),
         ).apply {
             // v116: the loopback server fetches signed-proxy urls with the
             // exchange's chapter credential (x-chapter-pass, exactly the
@@ -1406,22 +1417,29 @@ abstract class ProComic :
         // retries per page — the exact field verdict on v131. The loadable
         // pages ship; the unrenderable ones are NAMED in logcat and /.diag
         // (the same contract the raw-host partition above follows).
-        val avifRenderable = ProComicImageServer.avifDecodable(android.os.Build.VERSION.SDK_INT)
-        if (plannedMaps.isNotEmpty() && !avifRenderable) {
-            Log.i(
-                TAG,
-                "decode wall: ${plannedMaps.size} protected map pages not listed " +
-                    "(AVIF map pieces are undecodable below Android 12; no transcoder can fetch the referer-gated piece edge)",
-            )
-            runCatching {
-                imageServer.recordDeferredTrail(
-                    ref.chapterId,
-                    walkTrail + "${plannedMaps.size} protected pages not listed — this device cannot decode the site's AVIF map pieces (needs Android 12+); " +
-                        "the ${finalUrls.size} loadable pages ship",
-                )
-            }
-        } else if (plannedMaps.isNotEmpty()) {
-            val plannedUrls = plannedMaps.mapIndexedNotNull { ordinal, planned ->
+        //
+        // v134 — THE WALL LIFTS. The decode wall's premise died twice in
+        // live recon (sandbox, 2026-11-06 evening): (1) the walk+plan+
+        // piece chain is provably alive — the exchange answers the full
+        // maps[] list, the plan POST answers freshly-signed piece urls +
+        // rects, and the img{1-4} edge answers 200 image/avif to a
+        // browser UA with the chapter referer; (2) the missing decoder
+        // EXISTS — the WebView's own Chromium (software AV1, every
+        // Android version), now wired in as the loopback's AVIF→JPEG
+        // transcode tier (WebAvifTranscoder: data-url in, JPEG out,
+        // network-isolated, renderer-death-safe, breaker-ed). Every
+        // planned page registers and ships on EVERY Android version;
+        // a device whose WebView stack cannot run the tier falls back
+        // to the legible v132 behavior inside the loopback (the 410 /
+        // named blank rects), never a doomed build.
+        val plannedDistinct = plannedMaps
+            .groupBy { it.pageIndex }
+            .map { (_, sameIndex) -> sameIndex.first() }
+        if (plannedDistinct.size != plannedMaps.size) {
+            Log.i(TAG, "dedup: ${plannedMaps.size} -> ${plannedDistinct.size} planned map pages")
+        }
+        if (plannedDistinct.isNotEmpty()) {
+            val plannedUrls = plannedDistinct.mapIndexedNotNull { ordinal, planned ->
                 runCatching {
                     imageServer.registerMapPage(
                         chapterId = planned.chapterId,
@@ -1441,14 +1459,15 @@ abstract class ProComic :
                 runCatching {
                     imageServer.recordDeferredTrail(
                         ref.chapterId,
-                        walkTrail + "planned ${plannedUrls.size} protected pages from the exchange's reconstruction maps",
+                        walkTrail + "planned ${plannedUrls.size} protected pages from the exchange's reconstruction maps" +
+                            "(composed on request; AVIF pieces decode through the WebView tier on this device)",
                     )
                 }
             } else {
                 runCatching {
                     imageServer.recordDeferredTrail(
                         ref.chapterId,
-                        walkTrail + "${plannedMaps.size} reconstruction-map tokens arrived but none could be registered",
+                        walkTrail + "${plannedDistinct.size} reconstruction-map tokens arrived but none could be registered",
                     )
                 }
             }
@@ -1511,14 +1530,19 @@ abstract class ProComic :
                                 // fetches + decodes the pieces itself); on an
                                 // older device it stays unlisted (v132's named
                                 // drop — never a doomed 502 card).
+                                // v134: the fallback is now UNCONDITIONAL —
+                                // the loopback compose runs on every Android
+                                // version (the WebView transcode tier decodes
+                                // the AVIF pieces the platform cannot); the
+                                // in-page capture stays the fast path when
+                                // it fires.
                                 val captured = harvest?.captured?.get(row.index)
                                 when {
                                     captured != null -> {
                                         capturedCount++
                                         imageServer.registerCapturedRow(ref.chapterId, row.index, captured)
                                     }
-                                    avifRenderable -> imageServer.composedProxyUrl(row)
-                                    else -> null
+                                    else -> imageServer.composedProxyUrl(row)
                                 }
                             } else {
                                 row.u?.let { imageServer.imageProxyUrl(it) }
@@ -1923,6 +1947,10 @@ abstract class ProComic :
         // v117: whether the CURRENT token is a fresh renewal that has
         // already been exchanged once and replayed the same slice.
         var replayedAfterRenewal = false
+        // v134: the previous exchange's fresh-maps count — the re-mint
+        // terminal compares against this (the exchange re-mints the same
+        // slice with fresh tokens when the deferred list is complete).
+        var lastMapsCount = 0
 
         // v117: one slice-advance renewal — the walk's between-batches
         // refresh (the reader's own economics: a fresh token per loader
@@ -2009,6 +2037,30 @@ abstract class ProComic :
                         replayedAfterRenewal = true
                         continue
                     }
+                    // v134 — THE RE-MINT TERMINAL. Live recon (sandbox,
+                    // 2026-11-06 evening, chapter 394 of series 311): the
+                    // exchange answers the SAME slice with FRESHLY MINTED
+                    // map tokens every call — 11 maps, then 11 maps again,
+                    // ZERO token overlap, images empty both times. The map
+                    // token payload is fully encrypted (v3/m/cid/iv/tag/
+                    // data — no page identity survives the mint), so token
+                    // dedup can never see the repeat and the v116 loop
+                    // would walk its full 14-exchange bound re-collecting
+                    // the same 11 pages 14 times (pageIndexes 3..156 — a
+                    // corrupted page list). The stable COUNT is the
+                    // terminal answer: when an images-empty exchange
+                    // re-mints exactly as many maps as the previous
+                    // exchange, the deferred list is complete. (The old
+                    // genuinely-batched server answered empty/empty on the
+                    // second call — that terminal still runs above.)
+                    if (freshImages.isEmpty() && freshMaps.isNotEmpty() &&
+                        freshMaps.size == lastMapsCount
+                    ) {
+                        trail += "the exchange re-minted the same ${freshMaps.size} map pages with fresh tokens — " +
+                            "the deferred list is complete (${collected.size + collectedMaps.size} pages beyond the public embed)"
+                        return WalkResult(collected, trail, true, collectedMaps, pass)
+                    }
+                    if (freshMaps.isNotEmpty()) lastMapsCount = freshMaps.size
                     collected += freshImages
                     collectedMaps += freshMaps
                     replayedAfterRenewal = false
