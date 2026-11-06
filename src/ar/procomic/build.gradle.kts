@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 44
+    versionCode = 45
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -427,6 +427,32 @@ keiyoushi {
     // ("http://127.0.0.1:" — the old "127.0.0.1/" prefix never matched a
     // ported loopback url; only imageProxyUrl's idempotency save kept the
     // v130 pages unwrapped).
+    // v132 (versionCode 45) — FIELD VERDICT on v131: "pages 4+ take 30
+    // seconds loading then HTTP 502 instead of 410". The 502 is the
+    // loopback server's OWN legible build-failure answer (v130's contract)
+    // — the request now reaches the REGISTERING process's buildMapPage
+    // (v131's owned-port split worked) and the BUILD ITSELF fails after
+    // ~30 s. Live recon (sandbox, 2026-11-06) walked the entire maps-era
+    // chain anonymous: deferred exchange 200 (62 maps, 1.2 s), plan POST
+    // 200 (6 pieces, 0.9 s, multi-use, pass-optional, pageIndex-agnostic),
+    // every piece 200 AVIF in ~1.5 s with ANY UA carrying the chapter
+    // referer — the pipeline is correct. The wall is the DECODE: the map
+    // pieces are AVIF on img{1-4}, the piece edge checks the Referer VALUE
+    // (wrong referer 403s, bare fetch 403s, weserv — which cannot send a
+    // referer — 404s the pieces), /api/cdn-image/sign refuses piece urls,
+    // Cloudflare transformations are off, the site's android API is
+    // signature-gated (minVersionCode 93), and the removed on-device tiers
+    // (WebView, libavif JNI, MediaCodec) each crashed the host app on the
+    // affected Android 10 device. On Android 10/11 every piece decodes
+    // null → "every piece failed" → the 502, and the ~30 s is the doomed
+    // fetch+transcode retry ladder × 6 sequential pieces + the one
+    // re-plan self-heal. The fix: the decode wall — the source no longer
+    // lists what the device cannot render (the map registration and the
+    // harvest's composed rows gate on avifDecodable, the loadable pages
+    // ship, the drop is named in logcat and /.diag), and the stateful
+    // routes answer a fast legible 410 (stage=decode-wall) for stale
+    // library urls instead of running the doomed build. Android 12+
+    // devices keep the exact v131 pipeline (verified end-to-end live).
 
     deeplink {
         host("procomic.net")

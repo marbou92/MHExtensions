@@ -127,6 +127,31 @@ class ProComicImageServer(
 
     private val startedAtMs = System.currentTimeMillis()
 
+    /**
+     * v132 — THE DECODE WALL. Android 12 (API 31) is the first platform
+     * whose BitmapFactory decodes AVIF. Below it, the stateful pipelines
+     * (/.map-page, /.composed) cannot turn the site's reconstruction-map
+     * pieces into pixels at all: the pieces are AVIF on img{1-4}, the piece
+     * edge checks the Referer VALUE (live recon 2026-11-06: ANY UA passes
+     * with the chapter referer, a wrong referer 403s, a bare fetch 403s),
+     * and the one remote transcoder this architecture can reach — weserv,
+     * the v111 production tier — cannot send a Referer at all (its fetcher
+     * 404s the pieces). The site's own android API is signature-gated
+     * (minVersionCode 93), Cloudflare transformations are off, and the
+     * removed on-device tiers (WebView, libavif JNI, MediaCodec) each
+     * crashed the host app on the affected device. So on Android 10/11
+     * every piece of every protected page decodes null → "every piece
+     * failed" → the legible 502 after ~30 s of doomed fetch+transcode
+     * retries — the exact field verdict.
+     *
+     * The wall answers FAST instead: stateful routes 410 with a legible
+     * body when the device cannot decode, and the source does not even
+     * list those pages (the decode-wall gate in getPageList).
+     */
+    private val avifRenderable: Boolean by lazy {
+        runCatching { avifDecodable(android.os.Build.VERSION.SDK_INT) }.getOrDefault(true)
+    }
+
     /** v116: the current x-chapter-pass credential (the pages-scope p1 JWT
      * the deferred exchange holds and renews). Attached to signed-proxy
      * fetches — the same header the site's own reader sends on protected
@@ -342,6 +367,21 @@ class ProComicImageServer(
         val cacheId = "map:$key"
         cachedResult(cacheId)?.let {
             writeImageBytes(output, it.first, it.second)
+            return
+        }
+        // v132: the decode wall — a device below Android 12 cannot decode
+        // the AVIF pieces the plan returns; run no doomed build (the field
+        // verdict: ~30 s of fetch+transcode retries, then "every piece
+        // failed"). A fast legible 410 covers stale library urls too.
+        if (!avifRenderable) {
+            writeResponse(
+                output,
+                410,
+                "Gone",
+                "text/plain",
+                "protected pages need an AVIF-capable device (Android 12+) — the site serves them as AVIF pieces no older decoder can render".toByteArray(),
+                stage = "decode-wall",
+            )
             return
         }
         // v130: the build's failures surface as a legible 502 (stage + diag
@@ -752,6 +792,19 @@ class ProComicImageServer(
         val cacheId = "cmp:$key"
         cachedResult(cacheId)?.let {
             writeImageBytes(output, it.first, it.second)
+            return
+        }
+        // v132: the decode wall — same guard serveMapPage carries (the
+        // composed rows are the same AVIF pieces through the harvest path).
+        if (!avifRenderable) {
+            writeResponse(
+                output,
+                410,
+                "Gone",
+                "text/plain",
+                "protected pages need an AVIF-capable device (Android 12+) — the site serves them as AVIF pieces no older decoder can render".toByteArray(),
+                stage = "decode-wall",
+            )
             return
         }
         // v130: the same legible-502 wrap serveMapPage got (a compose failure
@@ -1986,6 +2039,11 @@ class ProComicImageServer(
         /** The /.diag substring that identifies a sibling process of this
          * extension's image server (version-agnostic on purpose). */
         private const val SERVER_FAMILY_MARKER = "procomic-image"
+
+        /** v132: the platform AVIF decode gate — pure so the harness can
+         * pin it. Android 12 = API 31; that is the first release whose
+         * BitmapFactory decodes AVIF natively. */
+        internal fun avifDecodable(sdkInt: Int): Boolean = sdkInt >= 31
 
         private const val FAMILY_PROBE_TIMEOUT_MS = 750
 

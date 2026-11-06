@@ -1392,7 +1392,35 @@ abstract class ProComic :
         // urls + their rects, the loopback fetches every piece with the
         // chapter referer and stitches them onto one canvas. A registration
         // failure (registry bound) costs that one page, never the open.
-        if (plannedMaps.isNotEmpty()) {
+        //
+        // v132: THE DECODE WALL — the maps-era pages are grids of AVIF
+        // pieces on img{1-4} (referer-gated; live recon 2026-11-06: the
+        // edge checks the Referer VALUE, any UA passes with the chapter
+        // referer, and weserv — which cannot send a referer at all — 404s
+        // the pieces). Below Android 12 NOTHING turns those pieces into
+        // pixels: the platform has no AVIF decoder, the removed tiers
+        // (WebView, libavif JNI, MediaCodec) each crashed the host app,
+        // the site's android API is signature-gated (minVersionCode 93),
+        // and /api/cdn-image/sign refuses piece urls. Listing them rendered
+        // permanent 502 error cards after ~30 s of doomed fetch+transcode
+        // retries per page — the exact field verdict on v131. The loadable
+        // pages ship; the unrenderable ones are NAMED in logcat and /.diag
+        // (the same contract the raw-host partition above follows).
+        val avifRenderable = ProComicImageServer.avifDecodable(android.os.Build.VERSION.SDK_INT)
+        if (plannedMaps.isNotEmpty() && !avifRenderable) {
+            Log.i(
+                TAG,
+                "decode wall: ${plannedMaps.size} protected map pages not listed " +
+                    "(AVIF map pieces are undecodable below Android 12; no transcoder can fetch the referer-gated piece edge)",
+            )
+            runCatching {
+                imageServer.recordDeferredTrail(
+                    ref.chapterId,
+                    walkTrail + "${plannedMaps.size} protected pages not listed — this device cannot decode the site's AVIF map pieces (needs Android 12+); " +
+                        "the ${finalUrls.size} loadable pages ship",
+                )
+            }
+        } else if (plannedMaps.isNotEmpty()) {
             val plannedUrls = plannedMaps.mapIndexedNotNull { ordinal, planned ->
                 runCatching {
                     imageServer.registerMapPage(
@@ -1469,7 +1497,17 @@ abstract class ProComic :
                     sessionUrls = harvestedRows.mapIndexedNotNull { index, row ->
                         runCatching {
                             if (row.isPieces) {
-                                imageServer.composedProxyUrl(row)
+                                // v132: the decode wall — composed rows are the
+                                // same AVIF-piece canvases; below Android 12
+                                // they cannot render. Skip the row (simple rows
+                                // from the same harvest still ship; if nothing
+                                // grows past finalUrls the harvest is dropped
+                                // by the size check below).
+                                if (!avifRenderable) {
+                                    null
+                                } else {
+                                    imageServer.composedProxyUrl(row)
+                                }
                             } else {
                                 row.u?.let { imageServer.imageProxyUrl(it) }
                             }
