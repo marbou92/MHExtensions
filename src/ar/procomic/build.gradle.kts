@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 42
+    versionCode = 43
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -377,6 +377,33 @@ keiyoushi {
     // chapter referer and compose locally (AVIF→JPEG transcode, Android
     // 12+; older devices leave the rect blank, the page intact); one
     // re-plan self-heal redraws lapsed signatures' slots once.
+    // v130 (versionCode 43) — FIELD VERDICT on v129: "the right number of
+    // pages, but only the first three images load — the rest show an http
+    // error 400". The whole v129 chain worked: the walk collected the full
+    // maps[] payload, every protected page was registered, the page count
+    // was correct — and every page beyond the public embed 400'd. Root
+    // cause: ONE wrapping bug in the page loop. The planned pages are
+    // ALREADY loopback routes (http://127.0.0.1:<port>/.map-page/<key>);
+    // the v106 page loop ran every upstream through imageProxyUrl() again,
+    // so the reader fetched /.image-proxy/<base64 of the .map-page url>.
+    // The proxy decoded its own inner url, isAllowedImageUrl refused the
+    // non-https loopback host, and the route answered its own legible
+    // 400 "unusable image url" — the exact field verdict (the public
+    // app-host https urls passed the allow-list and loaded; every
+    // .map-page page 400'd). The fix, three layers deep:
+    // (1) the page loop ships loopback upstreams AS-IS (the same rule the
+    // preloader filter already applied);
+    // (2) imageProxyUrl() is IDEMPOTENT — a loopback route rides through
+    // unchanged, so no call site can mint the double-wrap again;
+    // (3) the .image-proxy route HEALS a stale double-wrap — a decoded
+    // inner url that is this server's own .map-page/.composed route is
+    // dispatched there directly (the route's 410 "expired — reopen"
+    // stays legible when the registry is gone).
+    // Plus the loopback contract repaired: serveMapPage/serveComposed now
+    // CATCH their build failures and answer the documented legible 502
+    // (stage + diag headers) — before, a plan/compose failure escaped the
+    // handler and closed the socket with no response, which the reader
+    // renders as a cryptic network error with the whole diag trail lost.
 
     deeplink {
         host("procomic.net")

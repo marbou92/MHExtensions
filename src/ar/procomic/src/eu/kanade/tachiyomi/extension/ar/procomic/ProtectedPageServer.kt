@@ -183,6 +183,12 @@ class ProComicImageServer(
      * or could not decode AVIF at all — still load every page.
      */
     fun imageProxyUrl(imageUrl: String): String {
+        // v130: idempotent — a loopback route of this server (.map-page,
+        // .composed, .image-proxy) is already fetchable as-is; wrapping it
+        // again would make the .image-proxy route decode its own inner url
+        // and refuse it in isAllowedImageUrl (the 400 "unusable image url"
+        // wave the field saw on every protected page in v129).
+        if (imageUrl.startsWith("http://127.0.0.1:")) return imageUrl
         val encoded = android.util.Base64.encodeToString(
             imageUrl.toByteArray(Charsets.UTF_8),
             android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
@@ -198,6 +204,8 @@ class ProComicImageServer(
      * URL query (?e=) so one route serves both shapes and the cache keys
      * stay distinct. */
     fun imageProxyUrl(imageUrl: String, maxEdge: Int = 0): String {
+        // v130: idempotent (see the 1-arg overload).
+        if (imageUrl.startsWith("http://127.0.0.1:")) return imageUrl
         val encoded = android.util.Base64.encodeToString(
             imageUrl.toByteArray(Charsets.UTF_8),
             android.util.Base64.URL_SAFE or android.util.Base64.NO_WRAP or android.util.Base64.NO_PADDING,
@@ -336,8 +344,37 @@ class ProComicImageServer(
             writeImageBytes(output, it.first, it.second)
             return
         }
-        val (contentType, bytes) = composedCoalesced(cacheId) {
-            buildMapPage(entry)
+        // v130: the build's failures surface as a legible 502 (stage + diag
+        // headers, the docstring's own contract) instead of a bare socket
+        // close — a dropped connection renders as a cryptic network error
+        // in the reader and hides the whole diag trail.
+        val (contentType, bytes) = try {
+            composedCoalesced(cacheId) {
+                buildMapPage(entry)
+            }
+        } catch (failure: ImageBuildFailure) {
+            Log.w(TAG, "map page $key failed at stage=${failure.stage}: ${failure.readerBody}")
+            recordFailure(cacheId, failure.stage, failure.diag)
+            writeResponse(
+                output,
+                502,
+                "Bad Gateway",
+                "text/plain",
+                failure.readerBody.toByteArray(),
+                stage = failure.stage,
+                diag = failure.diag,
+            )
+            return
+        } catch (t: Throwable) {
+            Log.w(TAG, "map page $key dispatch failed: ${t.javaClass.simpleName}")
+            writeResponse(
+                output,
+                502,
+                "Bad Gateway",
+                "text/plain",
+                "protected page build failed (${t.javaClass.simpleName})".toByteArray(),
+            )
+            return
         }
         writeImageBytes(output, contentType, bytes)
     }
@@ -671,8 +708,35 @@ class ProComicImageServer(
             writeImageBytes(output, it.first, it.second)
             return
         }
-        val (contentType, bytes) = composedCoalesced(cacheId) {
-            composeRow(spec)
+        // v130: the same legible-502 wrap serveMapPage got (a compose failure
+        // used to close the socket with no response at all).
+        val (contentType, bytes) = try {
+            composedCoalesced(cacheId) {
+                composeRow(spec)
+            }
+        } catch (failure: ImageBuildFailure) {
+            Log.w(TAG, "composed row $key failed at stage=${failure.stage}: ${failure.readerBody}")
+            recordFailure(cacheId, failure.stage, failure.diag)
+            writeResponse(
+                output,
+                502,
+                "Bad Gateway",
+                "text/plain",
+                failure.readerBody.toByteArray(),
+                stage = failure.stage,
+                diag = failure.diag,
+            )
+            return
+        } catch (t: Throwable) {
+            Log.w(TAG, "composed row $key dispatch failed: ${t.javaClass.simpleName}")
+            writeResponse(
+                output,
+                502,
+                "Bad Gateway",
+                "text/plain",
+                "composed row build failed (${t.javaClass.simpleName})".toByteArray(),
+            )
+            return
         }
         writeImageBytes(output, contentType, bytes)
     }
@@ -776,6 +840,24 @@ class ProComicImageServer(
             }.getOrNull()
         }
         if (decoded == null || !isAllowedImageUrl(decoded)) {
+            // v130: heal the stale double-wrap a v129 build minted — an inner
+            // url that is a loopback route of THIS server (.map-page,
+            // .composed) is dispatched to that route directly instead of the
+            // dead-end 400 (the route itself answers 410 when its registry
+            // entry is gone, which stays legible).
+            if (decoded != null && decoded.startsWith("http://127.0.0.1:")) {
+                val route = runCatching { decoded.toHttpUrl().encodedPath }.getOrNull()
+                when {
+                    route != null && route.startsWith("/$MAP_PAGE_PATH_PREFIX/") -> {
+                        serveMapPage(route, output)
+                        return
+                    }
+                    route != null && route.startsWith("/$COMPOSED_PATH_PREFIX/") -> {
+                        serveComposed(route, output)
+                        return
+                    }
+                }
+            }
             writeResponse(output, 400, "Bad Request", "text/plain", "unusable image url".toByteArray())
             return
         }

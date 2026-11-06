@@ -1496,13 +1496,30 @@ abstract class ProComic :
         upstreams = finalUrls
 
         val pages = upstreams.mapIndexed { index, upstream ->
-            Page(
-                index = index,
-                url = "$baseUrl$readerPath",
+            // v130 — FIELD VERDICT on v129: "the right number of pages, but
+            // only the first three images load — every page beyond shows
+            // HTTP 400". The planned protected pages ARE loopback routes
+            // already (/.map-page/<key>): wrapping them through the
+            // .image-proxy route again made the proxy decode its own inner
+            // url, refuse the non-https loopback host inside
+            // isAllowedImageUrl, and answer its legible 400 "unusable image
+            // url" — the exact field verdict (the public app-host pages
+            // passed the allow-list and loaded; every .map-page page 400'd).
+            // A loopback upstream ships AS-IS (the same rule the preloader's
+            // filter below already applies); every site url keeps the v106
+            // wrap + fallback.
+            val imageUrl = if (upstream.startsWith("http://127.0.0.1/")) {
+                upstream
+            } else {
                 // v106: if the loopback server cannot start at all, fall
                 // back to the raw upstream URL rather than failing the
                 // chapter — the app hosts serve plain clients fine.
-                imageUrl = runCatching { imageServer.imageProxyUrl(upstream) }.getOrDefault(upstream),
+                runCatching { imageServer.imageProxyUrl(upstream) }.getOrDefault(upstream)
+            }
+            Page(
+                index = index,
+                url = "$baseUrl$readerPath",
+                imageUrl = imageUrl,
             )
         }
 
