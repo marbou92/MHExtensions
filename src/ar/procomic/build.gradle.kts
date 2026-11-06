@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 45
+    versionCode = 46
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -453,6 +453,37 @@ keiyoushi {
     // routes answer a fast legible 410 (stage=decode-wall) for stale
     // library urls instead of running the doomed build. Android 12+
     // devices keep the exact v131 pipeline (verified end-to-end live).
+    // v133 (versionCode 46) — FIELD VERDICT on v132: "it came back to only
+    // fetching 3 pages". The decode wall dropped every protected page on
+    // the Android 10 device, which silently un-fixed the page count the
+    // field had celebrated in v129. Round-5 live recon (sandbox,
+    // 2026-11-06) re-verified every wall and found no new door:
+    // (a) the piece edge serves AVIF UNCONDITIONALLY — jpeg-first, webp-first,
+    //     plain */* and no-Accept all answer the same ftypavif bytes;
+    // (b) no external transcoder can carry the referer the img{1-4} edge
+    //     demands, so the weserv tier stays impossible for pieces;
+    // (c) the site's own Next.js /_next/image optimizer DOES transcode
+    //     chapter files to WebP (app.procomic.net w=640 → 200 image/webp,
+    //     live-verified) but its remotePatterns whitelist refuses every
+    //     *.procomic.im host — the pieces are unreachable through it (the
+    //     family's other deployments whitelist nothing new either);
+    // (d) the image edge sends no CORS headers, so a canvas of cross-origin
+    //     pieces taints — in-page readback needs a same-origin route.
+    // THE DOOR was in the session all along: the offscreen WebView RENDERS
+    // these exact pages — Chromium's own software AV1/AVIF decoder works on
+    // every Android version. So the harvest now CAPTURES THE PIXELS:
+    // each piece re-fetches SAME-ORIGIN through the site's own signed
+    // proxy (POST /api/cdn-image/sign from the cleared session — the site's
+    // own healing path for lapsed pieces — then /api/cdn-image?url=…),
+    // draws on a bounded canvas, and parks JPEG data urls in
+    // window.__mihonPix; the session pulls one row per tick and hands the
+    // tiles to the new /.captured loopback route, which stitches them with
+    // plain BitmapFactory draws. NO AVIF decode anywhere on the Java side,
+    // no third-party service, no new native code — pages 4+ ship again on
+    // the Android 10 device, and the count with them. Uncaptured rows
+    // (sign refused / ancient WebView) keep the v132 contract: named in
+    // logcat and /.diag, never a doomed 502 card; AVIF-capable devices
+    // keep the v129 compose as the fallback.
 
     deeplink {
         host("procomic.net")

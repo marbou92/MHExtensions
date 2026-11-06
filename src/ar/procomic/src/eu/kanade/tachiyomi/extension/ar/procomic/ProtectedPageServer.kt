@@ -773,6 +773,7 @@ class ProComicImageServer(
             path.startsWith("/$IMAGE_PROXY_PATH_PREFIX/") -> serveImageProxy(path, query, output)
             path.startsWith("/$COMPOSED_PATH_PREFIX/") -> serveComposed(path, output)
             path.startsWith("/$MAP_PAGE_PATH_PREFIX/") -> serveMapPage(path, output)
+            path.startsWith("/$CAPTURED_PATH_PREFIX/") -> serveCaptured(path, output)
             else -> writeResponse(output, 404, "Not Found", "text/plain", "unknown path".toByteArray())
         }
     }
@@ -796,6 +797,9 @@ class ProComicImageServer(
         }
         // v132: the decode wall — same guard serveMapPage carries (the
         // composed rows are the same AVIF pieces through the harvest path).
+        // v133: this guard only ever sees rows the session could NOT capture
+        // in-page (an old WebView without AVIF) — captured rows ride
+        // /.captured below and need no decoder at all.
         if (!avifRenderable) {
             writeResponse(
                 output,
@@ -912,6 +916,174 @@ class ProComicImageServer(
         }
     }
 
+    // ==================== captured rows (v133) =========================
+
+    /** One already-decoded tile of a captured row: image bytes + dest rect. */
+    internal class CapturedTileSpec(
+        val bytes: ByteArray,
+        val x: Int,
+        val y: Int,
+        val w: Int,
+        val h: Int,
+    )
+
+    /** A whole captured row: canvas size + the decoded tile layers. */
+    internal class CapturedRowSpec(
+        val w: Int,
+        val h: Int,
+        val tiles: List<CapturedTileSpec>,
+    )
+
+    private val capturedLock = Any()
+
+    private val capturedRows = LinkedHashMap<String, CapturedRowSpec>()
+
+    /**
+     * v133: registers one session-captured protected page (the rendered
+     * harvest — the WebView decoded the site's AVIF pieces and handed back
+     * JPEG data urls) and returns its loopback url. The tiles are decoded
+     * HERE (Base64 data urls → bytes) so the serving route never touches
+     * AVIF: the build is BitmapFactory(JPEG/PNG) draws onto one canvas —
+     * universal on every Android version. Registry bounded like the other
+     * stateful routes; a process restart re-harvests on the next open.
+     */
+    internal fun registerCapturedRow(
+        chapterId: Int,
+        pageIndex: Int,
+        captured: ProComicReaderSession.CapturedRow,
+    ): String? {
+        if (captured.tiles.isEmpty()) return null
+        val tiles = ArrayList<CapturedTileSpec>(captured.tiles.size)
+        for (tile in captured.tiles) {
+            val base64 = tile.d.substringAfter("base64,", "")
+            if (base64.isEmpty()) return null
+            val bytes = runCatching {
+                android.util.Base64.decode(base64, android.util.Base64.DEFAULT)
+            }.getOrNull() ?: return null
+            if (bytes.isEmpty() || bytes.size > MAX_CAPTURED_TILE_BYTES) return null
+            tiles.add(CapturedTileSpec(bytes, tile.x, tile.y, tile.w, tile.h))
+        }
+        if (tiles.isEmpty()) return null
+        val key = MessageDigest.getInstance("SHA-256")
+            .digest(
+                "$chapterId:$pageIndex:${captured.w}x${captured.h}:${tiles.sumOf { it.bytes.size }}"
+                    .toByteArray(Charsets.UTF_8),
+            )
+            .joinToString("") { "%02x".format(it) }
+            .take(24)
+        synchronized(capturedLock) {
+            capturedRows[key] = CapturedRowSpec(captured.w, captured.h, tiles)
+            val iterator = capturedRows.entries.iterator()
+            while (iterator.hasNext() && capturedRows.size > MAX_CAPTURED_ROWS) {
+                iterator.next()
+                iterator.remove()
+            }
+        }
+        return "http://127.0.0.1:${ensureOwnedPort()}/$CAPTURED_PATH_PREFIX/$key"
+    }
+
+    /**
+     * Serves one captured protected page: decode every tile with
+     * BitmapFactory (JPEG/PNG — the capture already did the AVIF work in
+     * the WebView), draw at the harvested rects, JPEG the canvas. No
+     * fetch, no referer, no AVIF decoder — the one page class that renders
+     * identically on every Android version. Coalesced per key; every
+     * failure surfaces as a legible 502 — never a crash.
+     */
+    private fun serveCaptured(path: String, output: java.io.OutputStream) {
+        val key = path.removePrefix("/$CAPTURED_PATH_PREFIX/").trim()
+        val spec = synchronized(capturedLock) { capturedRows[key] }
+        if (key.isEmpty() || spec == null) {
+            writeResponse(output, 410, "Gone", "text/plain", "captured page expired — reopen the chapter".toByteArray())
+            return
+        }
+        val cacheId = "cap:$key"
+        cachedResult(cacheId)?.let {
+            writeImageBytes(output, it.first, it.second)
+            return
+        }
+        val (contentType, bytes) = try {
+            composedCoalesced(cacheId) {
+                buildCapturedRow(spec)
+            }
+        } catch (failure: ImageBuildFailure) {
+            Log.w(TAG, "captured row $key failed at stage=${failure.stage}: ${failure.readerBody}")
+            recordFailure(cacheId, failure.stage, failure.diag)
+            writeResponse(
+                output,
+                502,
+                "Bad Gateway",
+                "text/plain",
+                failure.readerBody.toByteArray(),
+                stage = failure.stage,
+                diag = failure.diag,
+            )
+            return
+        } catch (t: Throwable) {
+            Log.w(TAG, "captured row $key dispatch failed: ${t.javaClass.simpleName}")
+            writeResponse(
+                output,
+                502,
+                "Bad Gateway",
+                "text/plain",
+                "captured page build failed (${t.javaClass.simpleName})".toByteArray(),
+            )
+            return
+        }
+        writeImageBytes(output, contentType, bytes)
+    }
+
+    /** Stitches the captured tiles at their rects — plain raster work. */
+    private fun buildCapturedRow(spec: CapturedRowSpec): Pair<String, ByteArray> {
+        val width = spec.w.coerceIn(8, MAX_COMPOSED_EDGE)
+        val height = spec.h.coerceIn(8, MAX_COMPOSED_EDGE * 2)
+        val bitmap = try {
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        } catch (t: Throwable) {
+            throw ImageBuildFailure(
+                "compose",
+                "ProComic: the captured page's canvas (${spec.w}x${spec.h}) could not be allocated " +
+                    "(${t.javaClass.simpleName})",
+                ProxyDiag(),
+            )
+        }
+        try {
+            val canvas = Canvas(bitmap)
+            canvas.drawColor(Color.WHITE)
+            var drawn = 0
+            for (tile in spec.tiles) {
+                runCatching {
+                    val decoded = BitmapFactory.decodeByteArray(tile.bytes, 0, tile.bytes.size)
+                        ?: return@runCatching
+                    try {
+                        canvas.drawBitmap(
+                            decoded,
+                            null,
+                            android.graphics.RectF(
+                                tile.x.toFloat().coerceIn(0f, width.toFloat()),
+                                tile.y.toFloat().coerceIn(0f, height.toFloat()),
+                                (tile.x + tile.w).toFloat().coerceIn(0f, width.toFloat()),
+                                (tile.y + tile.h).toFloat().coerceIn(0f, height.toFloat()),
+                            ),
+                            null,
+                        )
+                        drawn++
+                    } finally {
+                        decoded.recycle()
+                    }
+                }
+            }
+            if (drawn == 0) {
+                throw ImageBuildFailure("compose", "every captured tile failed to decode", ProxyDiag())
+            }
+            val out = ByteArrayOutputStream(spec.tiles.size * 32 * 1024)
+            bitmap.compress(Bitmap.CompressFormat.JPEG, JPEG_QUALITY, out)
+            return "image/jpeg" to out.toByteArray()
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
     // ====================== image fetch + transcode ======================
 
     /**
@@ -953,6 +1125,10 @@ class ProComicImageServer(
                     }
                     route != null && route.startsWith("/$COMPOSED_PATH_PREFIX/") -> {
                         serveComposed(route, output)
+                        return
+                    }
+                    route != null && route.startsWith("/$CAPTURED_PATH_PREFIX/") -> {
+                        serveCaptured(route, output)
                         return
                     }
                 }
@@ -2005,12 +2181,24 @@ class ProComicImageServer(
         const val DIAG_PATH_PREFIX = ".diag"
         const val MAP_PAGE_PATH_PREFIX = ".map-page"
 
+        /** v133: the captured protected pages (the rendered harvest —
+         * session-decoded tiles, stitched with plain BitmapFactory draws). */
+        const val CAPTURED_PATH_PREFIX = ".captured"
+
         /** Bounded registry for composed-row specs (one chapter ~= 40 rows). */
         private const val MAX_COMPOSED_SPECS = 256
 
         /** v129: bounded registry for planned protected pages (a full
          * chapter's maps[] — 50+ entries — must fit with room to spare). */
         private const val MAX_MAP_PAGES = 512
+
+        /** v133: the captured-row registry bound (a chapter's protected
+         * pages; each entry holds already-decoded tile bytes). */
+        private const val MAX_CAPTURED_ROWS = 256
+
+        /** v133: one captured tile may not exceed this (a bounded canvas at
+         * CAPTURE_MAX_EDGE encodes to a fraction of this as JPEG). */
+        private const val MAX_CAPTURED_TILE_BYTES = 6 * 1024 * 1024
 
         /** Composed canvas bounds (a reader row is ~800x1300 CSS px). */
         private const val MAX_COMPOSED_EDGE = 2600

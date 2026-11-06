@@ -1494,19 +1494,31 @@ abstract class ProComic :
                 runCatching { imageServer.recordDeferredTrail(ref.chapterId, harvest?.notes.orEmpty()) }
                 var sessionUrls: List<String>? = null
                 if (harvestedRows.isNotEmpty()) {
+                    var capturedCount = 0
                     sessionUrls = harvestedRows.mapIndexedNotNull { index, row ->
                         runCatching {
                             if (row.isPieces) {
-                                // v132: the decode wall — composed rows are the
-                                // same AVIF-piece canvases; below Android 12
-                                // they cannot render. Skip the row (simple rows
-                                // from the same harvest still ship; if nothing
-                                // grows past finalUrls the harvest is dropped
-                                // by the size check below).
-                                if (!avifRenderable) {
-                                    null
-                                } else {
-                                    imageServer.composedProxyUrl(row)
+                                // v133 — THE RENDERED HARVEST: a piece row the
+                                // session captured as pixels rides the new
+                                // /.captured route (the WebView decoded the
+                                // site's AVIF pieces; the loopback only stitches
+                                // plain JPEG tiles) — it renders on EVERY
+                                // Android version, which is exactly what the
+                                // field asked for after v132 dropped these rows
+                                // and the page count fell back to 3.
+                                // Fallbacks: an uncaptured row on an AVIF-capable
+                                // device keeps the v129 compose (the loopback
+                                // fetches + decodes the pieces itself); on an
+                                // older device it stays unlisted (v132's named
+                                // drop — never a doomed 502 card).
+                                val captured = harvest?.captured?.get(row.index)
+                                when {
+                                    captured != null -> {
+                                        capturedCount++
+                                        imageServer.registerCapturedRow(ref.chapterId, row.index, captured)
+                                    }
+                                    avifRenderable -> imageServer.composedProxyUrl(row)
+                                    else -> null
                                 }
                             } else {
                                 row.u?.let { imageServer.imageProxyUrl(it) }
@@ -1515,6 +1527,15 @@ abstract class ProComic :
                             Log.w(TAG, "row $index skipped: ${t.javaClass.simpleName}")
                             null
                         }.getOrNull()
+                    }
+                    if (capturedCount > 0) {
+                        Log.i(TAG, "reader session: $capturedCount protected pages captured as rendered pixels (no on-device AVIF decode)")
+                        runCatching {
+                            imageServer.recordDeferredTrail(
+                                ref.chapterId,
+                                listOf("reader session: $capturedCount protected pages captured in-page as rendered pixels"),
+                            )
+                        }
                     }
                 }
                 if (sessionUrls != null && sessionUrls.size > finalUrls.size) {
