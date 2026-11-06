@@ -239,7 +239,7 @@ class ProComicImageServer(
                 iterator.remove()
             }
         }
-        return "http://127.0.0.1:${ensureStarted()}/$COMPOSED_PATH_PREFIX/$key"
+        return "http://127.0.0.1:${ensureOwnedPort()}/$COMPOSED_PATH_PREFIX/$key"
     }
 
     /** One fetchable layer of a composed row: source + destination rect. */
@@ -318,7 +318,7 @@ class ProComicImageServer(
                 iterator.remove()
             }
         }
-        return "http://127.0.0.1:${ensureStarted()}/$MAP_PAGE_PATH_PREFIX/$key"
+        return "http://127.0.0.1:${ensureOwnedPort()}/$MAP_PAGE_PATH_PREFIX/$key"
     }
 
     /**
@@ -574,6 +574,11 @@ class ProComicImageServer(
      * THIS extension (a second host app) serves the identical stateless
      * route and is reused as-is; anything else falls back to an ephemeral
      * port exactly like the pre-v105 behavior.
+     *
+     * v131: this is now the STATELESS mint port only (/.image-proxy — the
+     * url carries its whole job, so any family process can answer it). The
+     * stateful routes (.map-page, .composed) mint through [ensureOwnedPort]
+     * — see there for the field verdict that forced the split.
      */
     private fun ensureStarted(): Int {
         machine.get()?.takeIf { !it.socket.isClosed }?.let { return it.socket.localPort }
@@ -590,6 +595,47 @@ class ProComicImageServer(
             runCatching {
                 val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
                 startAcceptor(socket)
+                return socket.localPort
+            }.getOrElse { throw java.io.IOException("ProComic: image server could not bind any loopback port", it) }
+        }
+    }
+
+    /** v131: the port the STATEFUL routes (/.map-page, /.composed) mint
+     * against — a socket THIS process owns.
+     *
+     * FIELD VERDICT on v130: "410 instead of 400 — that's the only
+     * difference". The 410 is this server's own registry-miss answer
+     * ("protected page expired") — and inside the process that REGISTERED
+     * the pages, that lookup cannot miss, so the answering socket belonged
+     * to a DIFFERENT process: v105's family-reuse hands out the preferred
+     * port whenever another process of this extension answers /.diag with
+     * the family marker (a second host app, an older test build still
+     * installed). That was sound while every route was stateless, but the
+     * v129 map pages and the v124 composed rows keep their payload in an
+     * IN-MEMORY registry — minting them against a foreign listener 410s
+     * every one of them while the stateless .image-proxy pages keep
+     * loading: the exact "first three load, the rest 410" split the field
+     * reported.
+     *
+     * So the stateful mints bind here: preferred port when free, otherwise
+     * an EPHEMERAL port this process owns — the foreign family listener is
+     * deliberately not probed. A sibling process keeps serving the
+     * stateless /.image-proxy flow without interference.
+     */
+    private fun ensureOwnedPort(): Int {
+        machine.get()?.takeIf { !it.socket.isClosed }?.let { return it.socket.localPort }
+        synchronized(startLock) {
+            machine.get()?.takeIf { !it.socket.isClosed }?.let { return it.socket.localPort }
+            runCatching {
+                val socket = ServerSocket(PREFERRED_PORT, BACKLOG, InetAddress.getByName("127.0.0.1"))
+                startAcceptor(socket)
+            }.onSuccess { return PREFERRED_PORT }
+            // v131: the family probe is deliberately ABSENT here — a family
+            // listener on the preferred port is another process's registry.
+            runCatching {
+                val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
+                startAcceptor(socket)
+                Log.i(TAG, "preferred port busy outside this process — stateful routes own ephemeral port ${socket.localPort}")
                 return socket.localPort
             }.getOrElse { throw java.io.IOException("ProComic: image server could not bind any loopback port", it) }
         }

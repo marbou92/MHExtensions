@@ -1508,7 +1508,18 @@ abstract class ProComic :
             // A loopback upstream ships AS-IS (the same rule the preloader's
             // filter below already applies); every site url keeps the v106
             // wrap + fallback.
-            val imageUrl = if (upstream.startsWith("http://127.0.0.1/")) {
+            // v131 — FIELD VERDICT on v130: "410 instead of 400 — that's the
+            // only difference". The 410 is the loopback server's own
+            // registry-miss answer, which the REGISTERING process cannot
+            // produce — the answer came from another process of the family
+            // that owns the preferred port (v105's reuse predates the
+            // stateful routes). The stateful mints now bind this process's
+            // own socket (ensureOwnedPort), and the ship-as-is test here is
+            // port-aware: the old "127.0.0.1/" prefix never matched a
+            // ported loopback url ("127.0.0.1:44097/…") — only
+            // imageProxyUrl's idempotency save kept the v130 pages
+            // unwrapped. Same correction in the preloader filter below.
+            val imageUrl = if (upstream.startsWith("http://127.0.0.1:")) {
                 upstream
             } else {
                 // v106: if the loopback server cannot start at all, fall
@@ -1529,7 +1540,7 @@ abstract class ProComic :
         // v124: composed loopback rows are skipped — they build+cache on
         // first request, and a self-call into the loopback server from the
         // preloader would be a pointless self-visit.
-        imageServer.preloadImages(ref.chapterId.toString(), upstreams.filterNot { it.startsWith("http://127.0.0.1/") })
+        imageServer.preloadImages(ref.chapterId.toString(), upstreams.filterNot { it.startsWith("http://127.0.0.1:") })
         return pages
     }
 

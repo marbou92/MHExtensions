@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 43
+    versionCode = 44
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -404,6 +404,29 @@ keiyoushi {
     // (stage + diag headers) — before, a plan/compose failure escaped the
     // handler and closed the socket with no response, which the reader
     // renders as a cryptic network error with the whole diag trail lost.
+    // v131 (versionCode 44) — FIELD VERDICT on v130: "410 instead of 400 —
+    // that's the only difference". The 400→410 flip PROVES the v130 fix
+    // landed: the request now reaches the loopback .map-page route — and
+    // the route's 410 is its own "protected page expired" REGISTRY MISS.
+    // Inside the process that registered the pages, that lookup cannot
+    // miss — so the answering socket belonged to a DIFFERENT process.
+    // Root cause: v105's family-reuse. When the preferred port 44097 is
+    // taken, ensureStarted() probes /.diag and reuses the listener of
+    // another process of this extension family (a second host app, an
+    // older test build still installed) — sound while every route was
+    // STATELESS (the url carries its whole job), but the v129 .map-page
+    // and v124 .composed routes keep their payload in an IN-MEMORY
+    // registry: minted against a foreign listener, every stateful page
+    // 410s against the foreign process's empty registry while the
+    // stateless .image-proxy pages (the first three) keep loading — the
+    // exact field split. The fix, two layers:
+    // (1) ensureOwnedPort() — the stateful mints bind a socket THIS
+    // process owns: preferred port when free, otherwise an ephemeral
+    // port; the foreign family listener is deliberately not probed;
+    // (2) the ship-as-is / preloader loopback checks are port-aware
+    // ("http://127.0.0.1:" — the old "127.0.0.1/" prefix never matched a
+    // ported loopback url; only imageProxyUrl's idempotency save kept the
+    // v130 pages unwrapped).
 
     deeplink {
         host("procomic.net")
