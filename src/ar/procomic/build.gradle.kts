@@ -6,7 +6,18 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 47
+    // v135 (versionCode 48): THE CRASH FIX — v134's offscreen WebView
+    // AVIF→JPEG transcode tier killed the host app the moment pages 4+
+    // were requested (the field device died inside this exact tier across
+    // v108–v110 too; the v1.6.47 crash report matched that verdict
+    // verbatim). The tier is OFF the ladder again — this process runs no
+    // on-device AVIF decoder below Android 12, ever. Pages 4+ render on
+    // every Android version through the reader session's captures
+    // instead (in-page canvas when the site's signed proxy allows,
+    // viewport draw otherwise — the session's own Chromium decodes the
+    // pieces, exactly like the user's browser); undecodable stragglers
+    // ship as fast, named 410 cards (no 30 s hang, no crash).
+    versionCode = 48
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

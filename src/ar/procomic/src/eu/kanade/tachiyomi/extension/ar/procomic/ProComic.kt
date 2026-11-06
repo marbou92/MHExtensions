@@ -261,25 +261,15 @@ abstract class ProComic :
             sessionClient = client,
             // v111: a writable cache dir for the crash-loop breaker's
             // best-effort marker files. The decode ladder no longer needs
-            // an APK path (the bundled .so is gone) or a context (the
-            // WebView tier is gone) — the AVIF transcode happens SERVER-
-            // SIDE through the weserv image proxy, so on Android 10/11
-            // NO AVIF decoder ever runs in this process. Every tier that
-            // could kill the host app (libavif JNI, MediaCodec, the
-            // offscreen WebView) is removed; the worst case is the
-            // legible error card, never a crash.
+            // an APK path (the bundled .so is gone) or a context — the
+            // AVIF transcode happens SERVER-SIDE through the weserv image
+            // proxy, so on Android 10/11 NO AVIF decoder ever runs in this
+            // process. Every tier that could kill the host app (libavif
+            // JNI, MediaCodec, the offscreen WebView) is removed — v134
+            // re-admitted the WebView tier and the field device died again
+            // (the v1.6.47 crash report) — the worst case is the legible
+            // error card, never a crash.
             nativeCacheDir = applicationContext.cacheDir,
-            // v134: the WebView AVIF→JPEG transcode tier's context — the
-            // tier that ends the decode wall. The renderer's own Chromium
-            // (software AV1, every Android version) decodes the map
-            // pieces inside its sandbox and answers finished JPEG bytes;
-            // this process still never touches a codec. The tier is
-            // network-isolated (data: urls only), renderer-death-safe
-            // (onRenderProcessGone → true, the exact TurnstileSolver/
-            // ReaderSession contract) and breaker-ed at 3 renderer
-            // deaths — the full safety profile is WebAvifTranscoder's
-            // doc. Nullable so the JVM harness shape stays intact.
-            appContext = runCatching { applicationContext }.getOrNull(),
         ).apply {
             // v116: the loopback server fetches signed-proxy urls with the
             // exchange's chapter credential (x-chapter-pass, exactly the
@@ -1418,20 +1408,24 @@ abstract class ProComic :
         // pages ship; the unrenderable ones are NAMED in logcat and /.diag
         // (the same contract the raw-host partition above follows).
         //
-        // v134 — THE WALL LIFTS. The decode wall's premise died twice in
-        // live recon (sandbox, 2026-11-06 evening): (1) the walk+plan+
-        // piece chain is provably alive — the exchange answers the full
-        // maps[] list, the plan POST answers freshly-signed piece urls +
-        // rects, and the img{1-4} edge answers 200 image/avif to a
-        // browser UA with the chapter referer; (2) the missing decoder
-        // EXISTS — the WebView's own Chromium (software AV1, every
-        // Android version), now wired in as the loopback's AVIF→JPEG
-        // transcode tier (WebAvifTranscoder: data-url in, JPEG out,
-        // network-isolated, renderer-death-safe, breaker-ed). Every
-        // planned page registers and ships on EVERY Android version;
-        // a device whose WebView stack cannot run the tier falls back
-        // to the legible v132 behavior inside the loopback (the 410 /
-        // named blank rects), never a doomed build.
+        // v135 — THE CRASH VERDICT. v134's wall-lift premise (2) died in
+        // the field: the offscreen WebView transcode tier killed the host
+        // app on the user's device the moment pages 4+ were requested
+        // (v1.6.47) — the exact v108–v110 field verdict it was re-admitted
+        // against. The tier is OFF the ladder again (this process runs no
+        // AVIF decoder below Android 12, ever). What remains, per device:
+        //  - Android 12+: the platform BitmapFactory decodes the AVIF
+        //    pieces; every planned page registers and ships.
+        //  - Android 10/11: the READER SESSION's in-page capture is the
+        //    decode path (the session's own Chromium decodes the pieces
+        //    in-page — the same renderer that renders the site in the
+        //    user's browser). v135 also makes the capture KEEP PACE: four
+        //    rows pulled per tick and the settle waits for the last
+        //    pending capture, so a long chapter no longer out-runs the
+        //    puller. A piece row that is neither captured nor platform-
+        //    decodable still LISTS — the loopback answers a fast, legible
+        //    410 card (no 30 s hang, no crash) so the page count stays
+        //    whole and the gap is named.
         val plannedDistinct = plannedMaps
             .groupBy { it.pageIndex }
             .map { (_, sameIndex) -> sameIndex.first() }
@@ -1460,7 +1454,7 @@ abstract class ProComic :
                     imageServer.recordDeferredTrail(
                         ref.chapterId,
                         walkTrail + "planned ${plannedUrls.size} protected pages from the exchange's reconstruction maps" +
-                            "(composed on request; AVIF pieces decode through the WebView tier on this device)",
+                            "(composed on request; AVIF pieces decode via the platform on Android 12+, via the reader session's capture below)",
                     )
                 }
             } else {
@@ -1491,7 +1485,16 @@ abstract class ProComic :
         // ended at the gate, and raw-host-only batches. Signed-in devices
         // (the session shares the app's cookie store) still get their
         // entitlement through it.
-        if (readerSessionEnabled && !deferredWalkComplete) {
+        // v135: ONE more reason to run it — the walk can prove the LIST
+        // complete while the device still cannot RENDER its planned pages
+        // (Android 10/11 has no AVIF decoder; the removed on-device tiers
+        // are the v108–v110 native killers). The session's viewport-draw
+        // capture renders those pages through the session's own Chromium —
+        // the exact renderer the user's browser uses — so a decode-less
+        // device with planned map pages runs it too.
+        val avifRenderable = ProComicImageServer.avifDecodable(android.os.Build.VERSION.SDK_INT)
+        val needsSessionRendering = plannedDistinct.isNotEmpty() && !avifRenderable
+        if (readerSessionEnabled && (!deferredWalkComplete || needsSessionRendering)) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
                 Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")
                 runCatching {
@@ -1512,30 +1515,30 @@ abstract class ProComic :
                 harvest?.notes?.forEach { Log.i(TAG, it) }
                 runCatching { imageServer.recordDeferredTrail(ref.chapterId, harvest?.notes.orEmpty()) }
                 var sessionUrls: List<String>? = null
+                var capturedRowsCount = 0
                 if (harvestedRows.isNotEmpty()) {
                     var capturedCount = 0
                     sessionUrls = harvestedRows.mapIndexedNotNull { index, row ->
                         runCatching {
                             if (row.isPieces) {
                                 // v133 — THE RENDERED HARVEST: a piece row the
-                                // session captured as pixels rides the new
-                                // /.captured route (the WebView decoded the
-                                // site's AVIF pieces; the loopback only stitches
-                                // plain JPEG tiles) — it renders on EVERY
-                                // Android version, which is exactly what the
-                                // field asked for after v132 dropped these rows
-                                // and the page count fell back to 3.
-                                // Fallbacks: an uncaptured row on an AVIF-capable
-                                // device keeps the v129 compose (the loopback
-                                // fetches + decodes the pieces itself); on an
-                                // older device it stays unlisted (v132's named
-                                // drop — never a doomed 502 card).
-                                // v134: the fallback is now UNCONDITIONAL —
-                                // the loopback compose runs on every Android
-                                // version (the WebView transcode tier decodes
-                                // the AVIF pieces the platform cannot); the
-                                // in-page capture stays the fast path when
-                                // it fires.
+                                // session captured as pixels rides the
+                                // /.captured route (the session's WebView
+                                // decoded the site's AVIF pieces; the loopback
+                                // only stitches plain JPEG tiles) — it renders
+                                // on EVERY Android version, which is exactly
+                                // what the field asked for after v132 dropped
+                                // these rows and the page count fell back to 3.
+                                // v135: the capture has two engines — the
+                                // in-page canvas (fast, when the site's own
+                                // signed proxy allows) and the viewport draw
+                                // (the session's composited output — no page
+                                // canvas, no taint, no sign endpoint).
+                                // Fallback: an uncaptured row keeps the v129
+                                // compose — and on a decode-less device the
+                                // loopback answers the fast, legible 410 card
+                                // (no doomed 30 s build, no crash — the page
+                                // count stays whole and the gap is named).
                                 val captured = harvest?.captured?.get(row.index)
                                 when {
                                     captured != null -> {
@@ -1552,19 +1555,32 @@ abstract class ProComic :
                             null
                         }.getOrNull()
                     }
+                    capturedRowsCount = capturedCount
                     if (capturedCount > 0) {
                         Log.i(TAG, "reader session: $capturedCount protected pages captured as rendered pixels (no on-device AVIF decode)")
                         runCatching {
                             imageServer.recordDeferredTrail(
                                 ref.chapterId,
-                                listOf("reader session: $capturedCount protected pages captured in-page as rendered pixels"),
+                                listOf(
+                                    "reader session: $capturedCount protected pages captured as rendered pixels " +
+                                        "(in-page or viewport-draw — the session's Chromium decoded the site's AVIF)",
+                                ),
                             )
                         }
                     }
                 }
-                if (sessionUrls != null && sessionUrls.size > finalUrls.size) {
-                    Log.i(TAG, "reader session: ${finalUrls.size} -> ${sessionUrls.size} pages")
-                    finalUrls = sessionUrls
+                // v135: the session list wins when it has MORE pages — or
+                // when it MATCHES the walk's count while carrying REAL
+                // rendered pixels (a decode-less device: the walk's 14 pages
+                // are 3 renders + 11 doomed cards; the session's 14 are 14
+                // renders — same count, strictly better).
+                val sessionWins = sessionUrls != null && (
+                    sessionUrls!!.size > finalUrls.size ||
+                        (sessionUrls!!.size >= finalUrls.size && capturedRowsCount > 0)
+                    )
+                if (sessionWins) {
+                    Log.i(TAG, "reader session: ${finalUrls.size} -> ${sessionUrls!!.size} pages ($capturedRowsCount captured)")
+                    finalUrls = sessionUrls!!
                     sessionFailures = 0
                 }
                 if (finalUrls.size <= loadable.size) {

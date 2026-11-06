@@ -118,13 +118,6 @@ class ProComicImageServer(
      * without touching the network defaults.
      */
     private val proxyHosts: List<String> = DEFAULT_PROXY_HOSTS,
-    /**
-     * v134: an application context — the WebView AVIF→JPEG transcode
-     * tier's constructor dependency. Null keeps the v111 JVM-harness
-     * shape (the tier simply never runs; the ladder degrades exactly as
-     * v132 shipped it).
-     */
-    private val appContext: android.content.Context? = null,
 ) {
 
     private class Machine(val socket: ServerSocket)
@@ -380,13 +373,14 @@ class ProComicImageServer(
         // the AVIF pieces the plan returns; run no doomed build (the field
         // verdict: ~30 s of fetch+transcode retries, then "every piece
         // failed"). A fast legible 410 covers stale library urls too.
-        // v134: the wall LIFTS — the WebView transcode tier decodes the
-        // pieces on every Android version (the renderer's own Chromium,
-        // the decoder that has rendered the site's AVIF all along). The
-        // 410 only answers when the tier genuinely cannot run (no
-        // context, or the breaker tripped) — the build then degrades to
-        // exactly the v132 behavior.
-        if (!avifRenderable && (appContext == null || !WebAvifTranscoder.isAvailable())) {
+        // v135: the ban list stands — v134's offscreen WebView tier died
+        // inside the field device AGAIN (the v1.6.47 crash report: the
+        // app died the moment pages 4+ were requested), exactly as it
+        // died across v108–v110. The rendered harvest (the reader
+        // session's in-page capture) is the decode path that works below
+        // Android 12; this route answers fast and legibly when the
+        // device genuinely cannot decode.
+        if (!avifRenderable) {
             writeResponse(
                 output,
                 410,
@@ -886,19 +880,6 @@ class ProComicImageServer(
         }
     }
 
-    /** v134: the decode fallback for one piece the platform BitmapFactory
-     * cannot decode (AVIF below Android 12): the WebView transcode tier
-     * turns the bytes into plain JPEG and the decode retries. Null when
-     * the tier cannot run — the caller keeps its blank-rect contract. */
-    private fun decodeViaWebTier(bytes: ByteArray): android.graphics.Bitmap? {
-        val ctx = appContext ?: return null
-        if (!WebAvifTranscoder.isAvailable()) return null
-        val jpeg = runCatching { WebAvifTranscoder.toJpeg(ctx, bytes, 0, JPEG_QUALITY) }
-            .onFailure { Log.i(TAG, "web tier decode failed: ${it.javaClass.simpleName}") }
-            .getOrNull() ?: return null
-        return BitmapFactory.decodeByteArray(jpeg, 0, jpeg.size)
-    }
-
     /** Fetches every piece (through the full proxy ladder — signed wraps
      * included), draws them at their harvested rects, JPEGs the canvas.
      * A single failed piece leaves its rect blank (the page stays
@@ -915,12 +896,13 @@ class ProComicImageServer(
             for (piece in spec.pieces) {
                 runCatching {
                     val (_, bytes) = buildImageBytes(piece.u, diag)
-                    // v134: the WebView tier backs the direct decode — a
-                    // piece the platform cannot decode (AVIF below
-                    // Android 12) rides the renderer's Chromium and
-                    // comes back as plain JPEG bytes.
+                    // v135: the platform decode only — the offscreen
+                    // WebView tier is on the ban list (it died inside the
+                    // field device across v108–v110 AND again on v1.6.47).
+                    // A piece the platform cannot decode leaves its rect
+                    // blank; the capture path owns these pixels on
+                    // Android 10/11.
                     val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
-                        ?: decodeViaWebTier(bytes)
                         ?: return@runCatching
                     canvas.drawBitmap(
                         decoded,
@@ -1530,30 +1512,12 @@ class ProComicImageServer(
                 bitmap.recycle()
             }
         }
-        // v134: THE WEBVIEW DECODE TIER — the tier that ends the decode
-        // wall. The renderer's Chromium decodes the AVIF (software AV1,
-        // every Android version) inside its sandbox and hands back
-        // finished JPEG bytes; this process never touches the codec.
-        // Live-verified 2026-11-06: the sign endpoint refuses piece urls
-        // (403 forbidden_host) and weserv cannot send the chapter
-        // referer the img{1-4} piece edge demands, so on Android 10/11
-        // this tier is the ONLY thing between a protected page and the
-        // legible 502 — and it is exactly the decoder that has been
-        // rendering the site's own AVIF all along. Guarded + breaker-ed
-        // (WebAvifTranscoder's doc has the full safety profile).
-        if (appContext != null && WebAvifTranscoder.isAvailable()) {
-            val webBytes = try {
-                WebAvifTranscoder.toJpeg(appContext, bytes, maxEdge, quality)
-            } catch (t: Throwable) {
-                diag.add("webview tier threw ${t.javaClass.simpleName}")
-                null
-            }
-            if (webBytes != null) {
-                diag.add("webview tier: decoded ${bytes.size}B -> ${webBytes.size}B jpeg")
-                return webBytes
-            }
-            diag.add("webview tier: unavailable (breaker or null)")
-        }
+        // v135: the v134 WebView detour is REVERTED — the field device died
+        // inside this exact tier on v1.6.47 (the crash report: pages 4+
+        // killed the process), matching the v108–v110 verdict verbatim. A
+        // native crash has no Java guard; the tier stays banned no matter
+        // how clean its design looks. The rendered harvest owns these
+        // pixels below Android 12.
         // v111: the server-side transcode tier — weserv decodes the AVIF
         // in its datacenter and hands back a plain JPEG this process CAN
         // decode (BitmapFactory handles JPEG on every Android version).

@@ -5,6 +5,7 @@ import android.app.Activity
 import android.content.Context
 import android.content.res.Resources
 import android.graphics.Bitmap
+import android.graphics.Canvas
 import android.os.Handler
 import android.os.Looper
 import android.os.SystemClock
@@ -232,6 +233,75 @@ class WebViewScope<T> internal constructor(
             if (!destroyed) {
                 webView.stopLoading()
             }
+        }
+    }
+
+    /**
+     * Draws the WebView's CURRENT viewport into a fresh ARGB_8888 bitmap and
+     * hands it to [block] on the main thread (the caller owns and recycles
+     * it). This captures what the page actually renders — composited tiles,
+     * canvas layers, everything visible — with NO page-side canvas API, so
+     * cross-origin image taint is irrelevant.
+     *
+     * A hardware-accelerated view can answer a software-canvas draw with a
+     * blank frame on some OEM stacks, so the draw is verified: an all-
+     * transparent result re-draws once through a temporary software layer.
+     * Every failure answers null — never a throw into the caller's loop.
+     */
+    fun captureView(block: (Bitmap?) -> Unit) {
+        runOnMain {
+            if (destroyed) {
+                block(null)
+                return@runOnMain
+            }
+            val view = webView
+            fun drawToBitmap(layerSoftware: Boolean): Bitmap? = try {
+                if (layerSoftware) {
+                    view.setLayerType(View.LAYER_TYPE_SOFTWARE, null)
+                }
+                val bmp = Bitmap.createBitmap(
+                    view.width.coerceAtLeast(1),
+                    view.height.coerceAtLeast(1),
+                    Bitmap.Config.ARGB_8888,
+                )
+                view.draw(Canvas(bmp))
+                if (layerSoftware) {
+                    view.setLayerType(View.LAYER_TYPE_NONE, null)
+                }
+                bmp
+            } catch (t: Throwable) {
+                runCatching { view.setLayerType(View.LAYER_TYPE_NONE, null) }
+                null
+            }
+            val first = drawToBitmap(layerSoftware = false)
+            if (first == null) {
+                block(null)
+                return@runOnMain
+            }
+            val blank = runCatching {
+                val w = first.width
+                val h = first.height
+                val pixels = IntArray(w * h)
+                first.getPixels(pixels, 0, w, 0, 0, w, h)
+                // sample a sparse grid — every fully-transparent pixel means
+                // the compositor skipped the software draw
+                var idx = 0
+                var allTransparent = true
+                while (idx < pixels.size) {
+                    if (pixels[idx] != 0) {
+                        allTransparent = false
+                        break
+                    }
+                    idx += (w * h / 64).coerceAtLeast(1)
+                }
+                allTransparent && w * h > 0
+            }.getOrDefault(false)
+            if (!blank) {
+                block(first)
+                return@runOnMain
+            }
+            first.recycle()
+            block(drawToBitmap(layerSoftware = true))
         }
     }
 

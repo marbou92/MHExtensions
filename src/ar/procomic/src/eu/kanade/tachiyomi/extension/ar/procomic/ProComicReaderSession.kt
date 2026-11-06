@@ -1,5 +1,6 @@
 package eu.kanade.tachiyomi.extension.ar.procomic
 
+import android.graphics.Bitmap
 import android.webkit.WebResourceResponse
 import keiyoushi.utils.runWebView
 import kotlinx.coroutines.runBlocking
@@ -60,8 +61,12 @@ internal object ProComicReaderSession {
     /** Quiet ticks (no growth in mounted rows) before the session resolves. */
     private const val QUIET_TICKS = 5
 
-    /** Hard tick cap — the session never outlives ~110 s of polling. */
-    private const val MAX_TICKS = 150
+    /** Hard tick cap — the session never outlives ~225 s of polling.
+     * v135: raised from 150 — long chapters need the capture puller to
+     * out-live the site's own lazy loader (four pulls per tick keep the
+     * bridge bounded, but a 150+ piece row chapter needs more ticks than
+     * the old cap allowed). */
+    private const val MAX_TICKS = 300
 
     /** Ticks of a Cloudflare challenge before the session calls it unwinnable. */
     private const val CHALLENGE_TICK_CAP = 60
@@ -95,13 +100,37 @@ internal object ProComicReaderSession {
     private const val DIAG_TAG = "reader-session"
 
     /** v133: bounded captured-row registry per session (a chapter's
-     * protected pages; the same scale as MAX_DEFERRED_PAGES). */
-    private const val MAX_CAPTURED_ROWS = 128
+     * protected pages; the same scale as MAX_DEFERRED_PAGES). v135: 128 →
+     * 224 — the field chapter's 154 piece rows over-ran the old cap, and
+     * every row past it fell back to the loopback compose (the decode-less
+     * device's error cards). 224 covers the deferred-walk scale end to
+     * end; the rows are ~250 KB JPEG tiles, so the registry stays well
+     * under the reader's own bitmap budget. */
+    private const val MAX_CAPTURED_ROWS = 224
 
     /** v133: ticks a pending capture keeps being pulled before the row
-     * gives up (30 s at POLL_MS — the in-page capture is fast, but a
-     * signed-proxy retry ladder can lag a beat). */
-    private const val PIX_PULL_ATTEMPTS = 40
+     * gives up (the in-page capture is fast, but a signed-proxy retry
+     * ladder can lag a beat). v135: raised to 120 — four pulls happen
+     * per tick now, so this still bounds a stuck row to ~22 s of pulls
+     * while genuine laggards get their full window. */
+    private const val PIX_PULL_ATTEMPTS = 120
+
+    /** v135: capture pulls per poll tick — the one-per-tick puller could
+     * not keep pace with the site's own lazy loader on long chapters
+     * (a 154-piece-row chapter needs ~115 s of pulls; the old 100 s
+     * session cap expired first). Four per tick keeps each poll's
+     * bridge traffic ~4 MB while out-running the loader 4:1. */
+    private const val MAX_PIX_PULLS_PER_TICK = 4
+
+    /** v135: ticks a draw-capture target keeps being scrolled into view
+     * before the row gives up (22 s at POLL_MS — a piece row whose imgs
+     * never finish loading). */
+    private const val DRAW_TICK_CAP = 30
+
+    /** v135: ticks with ZERO harvest progress (no new rows, no new
+     * captured pixels) before the session settles despite pending work —
+     * the failing path's bound (~30 s instead of the full tick cap). */
+    private const val NO_PROGRESS_TICK_CAP = 40
 
     /** v133: the capture canvas's longest edge — pieces are bounded tiles;
      * this keeps every data url well under the bridge's comfortable size. */
@@ -147,7 +176,7 @@ internal object ProComicReaderSession {
 
         notes += "$DIAG_TAG: start (${readerApexes.size} apexes)"
 
-        runWebView<Unit>(timeout = 100.seconds) {
+        runWebView<Unit>(timeout = 240.seconds) {
             javaScriptEnabled = true
             domStorageEnabled = true
             // v124: the piece pixels MUST flow — the protected rows are
@@ -196,6 +225,13 @@ internal object ProComicReaderSession {
             var quietTicks = 0
             var lastGrowthKey = ""
             var ticks = 0
+            // v135: no-progress bound — a capture pipeline making NO headway
+            // (no new rows, no new captured pixels) for NO_PROGRESS_TICK_CAP
+            // straight ticks settles even with pending work, so a stalled
+            // reader never pins the open to the full tick cap.
+            var noProgressTicks = 0
+            var lastProgressKey = ""
+
             var apexIndex = 0
             var loginTicks = 0
             var unlockClicked = false
@@ -270,12 +306,71 @@ internal object ProComicReaderSession {
 
                     absorbRows(state, rows)
 
-                    // v133: pull ONE finished pixel capture per tick (bounded
-                    // bridge payloads — a captured row is ~1 MB of JPEG data
-                    // urls). The in-page capture lands asynchronously; absent
-                    // keys retry on later ticks until the attempts cap.
-                    nextPendingPixKey(rows)?.let { key ->
-                        pullCapture(key) { script, callback -> evaluateJs(script) { raw -> callback(raw) } }
+                    // v133: pull finished pixel captures out of the page
+                    // store (bounded bridge payloads — a captured row is
+                    // ~1 MB of JPEG data urls). v135: pull up to FOUR rows
+                    // per tick — one-per-tick could not keep pace with the
+                    // site's own lazy loader on a long chapter (154 piece
+                    // rows needed ~115 s of pulls; the old 100 s session
+                    // cap expired first, every uncaptured row fell back
+                    // to the loopback compose, and on the decode-less
+                    // devices that was the road to the error cards). Four
+                    // per tick keeps each poll's bridge traffic ~4 MB
+                    // while out-running the loader 4:1; absent keys retry
+                    // on later ticks until the attempts cap.
+                    repeat(MAX_PIX_PULLS_PER_TICK) {
+                        nextPendingPixKey(rows)?.let { key ->
+                            pullCapture(key) { script, callback -> evaluateJs(script) { raw -> callback(raw) } }
+                        }
+                    }
+
+                    // v135 — THE VIEWPORT-DRAW CAPTURE. One row per tick:
+                    // the next piece row whose in-page capture definitively
+                    // failed is scrolled into view (the script honors
+                    // window.__mihonTarget), and once it sits fully visible
+                    // with every piece loaded, the WebView's composited
+                    // output is drawn into a bitmap and the row's viewport
+                    // rect is cropped out. No page-side canvas, no taint,
+                    // no data url of piece pixels — the renderer already
+                    // decoded everything the user's browser shows.
+                    if (!drawInFlight) {
+                        val vh = state["vh"]?.toFloatOrNull() ?: 0f
+                        val dpr = state["dpr"]?.toFloatOrNull()?.takeIf { it > 0f } ?: 1f
+                        val next = nextDrawCaptureRow(rows)
+                        if (next == null) {
+                            if (drawTargetIndex != -1) {
+                                drawTargetIndex = -1
+                                evaluateJs("window.__mihonTarget = -1;")
+                            }
+                        } else {
+                            val row = rows[next]!!
+                            val fullyVisible = row.h in 8..vh.toInt() &&
+                                row.vy >= 0 && row.vy + row.h <= vh.toInt()
+                            val piecesLoaded = (row.total == 0 && row.pieces.size >= 2) ||
+                                (row.total in 1..row.pieces.size)
+                            if (fullyVisible && piecesLoaded) {
+                                drawInFlight = true
+                                captureView { bmp ->
+                                    try {
+                                        storeDrawCapture(row, bmp, dpr)
+                                    } finally {
+                                        bmp?.recycle()
+                                        drawInFlight = false
+                                    }
+                                }
+                            } else if (drawTargetIndex != next) {
+                                drawTargetIndex = next
+                                drawTargetTicks = 0
+                                evaluateJs("window.__mihonTarget = $next;")
+                            } else {
+                                drawTargetTicks++
+                                if (drawTargetTicks >= DRAW_TICK_CAP) {
+                                    drawFailed.add(next)
+                                    drawTargetIndex = -1
+                                    evaluateJs("window.__mihonTarget = -1;")
+                                }
+                            }
+                        }
                     }
 
                     val growthKey = "${state["rows"]}:${state["loaded"]}"
@@ -295,10 +390,28 @@ internal object ProComicReaderSession {
                     val atEnd = state["atEnd"] == "1"
                     if (atEnd && rows.isNotEmpty()) endTicks++ else endTicks = 0
                     val walkQuiet = System.currentTimeMillis() - lastWalkAt.get() >= WALK_ACTIVE_MS
+                    // v135: the settle waits for the CAPTURES TOO — resolving
+                    // while piece rows still hold pending pulls or a
+                    // viewport-draw target shipped an incomplete captured
+                    // set (their rows fell back to the loopback compose; on
+                    // decode-less devices those pages turned into error
+                    // cards). Both queues are bounded (PIX_PULL_ATTEMPTS,
+                    // DRAW_TICK_CAP, MAX_TICKS) — never an unbounded wait.
+                    val progressKey = "${rows.size}:${capturedRows.size}"
+                    if (progressKey != lastProgressKey) {
+                        lastProgressKey = progressKey
+                        noProgressTicks = 0
+                    } else {
+                        noProgressTicks++
+                    }
+                    val capturesPending = nextPendingPixKey(rows) != null
+                    val drawPending = drawInFlight || nextDrawCaptureRow(rows) != null || drawTargetIndex != -1
+                    val stalled = noProgressTicks >= NO_PROGRESS_TICK_CAP
                     if (ticks >= MAX_TICKS ||
                         (
                             quietTicks >= QUIET_TICKS && rows.isNotEmpty() && atEnd &&
-                                endTicks >= WALK_GRACE_TICKS && walkQuiet
+                                endTicks >= WALK_GRACE_TICKS && walkQuiet &&
+                                ((!capturesPending && !drawPending) || stalled)
                             )
                     ) {
                         resolve(Unit)
@@ -313,11 +426,16 @@ internal object ProComicReaderSession {
         notes += "$DIAG_TAG: ${ordered.size} reader rows harvested"
         if (capturedRows.isNotEmpty()) {
             notes += "$DIAG_TAG: ${capturedRows.size} protected rows captured as rendered pixels " +
-                "(the WebView decoded the site's AVIF pieces — no on-device AVIF decode needed)"
+                "($drawCapturedCount via the viewport draw — the WebView decoded the site's AVIF pieces; " +
+                "no on-device AVIF decode needed)"
         }
         val failedCount = failedPix.size
         if (failedCount > 0) {
-            notes += "$DIAG_TAG: $failedCount protected rows could not be captured in-page (they fall back to the loopback compose on AVIF-capable devices, or stay unlisted)"
+            notes += "$DIAG_TAG: $failedCount protected rows could not be captured in-page"
+        }
+        if (drawFailed.isNotEmpty()) {
+            notes += "$DIAG_TAG: ${drawFailed.size} rows gave up the viewport draw after $DRAW_TICK_CAP ticks " +
+                "(they fall back to the loopback compose on AVIF-capable devices, or a named 410 card)"
         }
         return ReaderSessionHarvest(ordered, notes, capturedRows.toMap())
     }
@@ -377,6 +495,23 @@ internal object ProComicReaderSession {
     /** Rows whose in-page capture answered the 'failed' tombstone. */
     private val failedPix = HashSet<String>()
 
+    /** v135 — the viewport-draw capture state. The in-page capture needs
+     * a same-origin piece fetch (the site's signed proxy), and the sign
+     * endpoint refuses piece hosts (live re-verified this round: 403
+     * forbidden even with fresh credentials) — every piece row's JS
+     * capture parks the 'failed' tombstone. The draw capture is the
+     * fallback that cannot taint: scroll the row into view, draw the
+     * WebView's composited output (the session renderer already decoded
+     * the pieces — it renders exactly what the user's browser shows),
+     * crop the row's viewport rect. One row per tick, bounded. */
+    private val drawFailed = HashSet<Int>()
+    private var drawTargetIndex = -1
+    private var drawTargetTicks = 0
+
+    @Volatile
+    private var drawInFlight = false
+    private var drawCapturedCount = 0
+
     /** Pull attempts per pending key (a capture that never lands stops trying). */
     private val pixAttempts = HashMap<String, Int>()
 
@@ -384,6 +519,11 @@ internal object ProComicReaderSession {
         capturedRows.clear()
         failedPix.clear()
         pixAttempts.clear()
+        drawFailed.clear()
+        drawTargetIndex = -1
+        drawTargetTicks = 0
+        drawInFlight = false
+        drawCapturedCount = 0
     }
 
     /** The next row key whose capture is ready to pull, or null. */
@@ -401,6 +541,57 @@ internal object ProComicReaderSession {
             return key
         }
         return null
+    }
+
+    /** The next row queued for the viewport-draw capture (ordered by row
+     * index): piece rows whose in-page capture definitively failed (the
+     * sign-refusal tombstone — or a row that never reported a slot), are
+     * not yet captured, and have not exhausted their draw attempts. */
+    private fun nextDrawCaptureRow(rows: LinkedHashMap<Int, HarvestRow>): Int? {
+        if (capturedRows.size >= MAX_CAPTURED_ROWS) return null
+        for (row in rows.values) {
+            if (!row.isPieces) continue
+            if (capturedRows.containsKey(row.index)) continue
+            if (row.index in drawFailed) continue
+            val pixFailed = row.pix == null || row.pix in failedPix
+            if (!pixFailed) continue
+            return row.index
+        }
+        return null
+    }
+
+    /** Crops [row] out of the viewport bitmap ([dpr] scales CSS px to
+     * view px) and stores it as a captured row (one full-row tile — the
+     * /.captured stitch maps it 1:1 onto the row box). */
+    private fun storeDrawCapture(row: HarvestRow, bmp: Bitmap?, dpr: Float) {
+        if (bmp == null || row.w < 8 || row.h < 8) {
+            drawFailed.add(row.index)
+            return
+        }
+        runCatching {
+            val left = (row.vx * dpr).toInt().coerceIn(0, bmp.width - 8)
+            val top = (row.vy * dpr).toInt().coerceIn(0, bmp.height - 8)
+            val width = (row.w * dpr).toInt().coerceAtMost(bmp.width - left)
+            val height = (row.h * dpr).toInt().coerceAtMost(bmp.height - top)
+            if (width < 8 || height < 8) {
+                drawFailed.add(row.index)
+                return
+            }
+            val crop = Bitmap.createBitmap(bmp, left, top, width, height)
+            val out = java.io.ByteArrayOutputStream()
+            crop.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            crop.recycle()
+            val dataUrl = "data:image/jpeg;base64," +
+                android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
+            capturedRows[row.index] = CapturedRow(
+                w = row.w,
+                h = row.h,
+                tiles = listOf(CapturedTile(dataUrl, 0, 0, row.w, row.h)),
+            )
+            drawCapturedCount++
+        }.onFailure {
+            drawFailed.add(row.index)
+        }
     }
 
     /** Pulls one capture out of the page store (one evaluate per tick). */
@@ -449,10 +640,10 @@ internal object ProComicReaderSession {
     private fun absorbRows(state: Map<String, String>, rows: LinkedHashMap<Int, HarvestRow>) {
         val rawRows = state["rowsJson"] ?: return
         runCatching {
-            val arr = Json.parseToJsonElement(rawRows)
+            val arr = json.parseToJsonElement(rawRows)
             (arr as? kotlinx.serialization.json.JsonArray)?.forEach { element ->
                 runCatching {
-                    val row = Json.decodeFromJsonElement(HarvestRow.serializer(), element)
+                    val row = json.decodeFromJsonElement(HarvestRow.serializer(), element)
                     if (row.index >= 0 && (row.u != null || row.pieces.isNotEmpty())) {
                         rows[row.index] = row
                     }
@@ -482,6 +673,12 @@ internal object ProComicReaderSession {
         val h: Int = 0,
         val pieces: List<Piece> = emptyList(),
         val pix: String? = null,
+        /** v135: the row's viewport-relative rect (CSS px) and its total
+         * <img> count — the viewport-draw capture's visibility + load
+         * probes. Zero when the script predates the field. */
+        val vx: Int = 0,
+        val vy: Int = 0,
+        val total: Int = 0,
     ) {
         val isPieces: Boolean get() = pieces.isNotEmpty()
     }
