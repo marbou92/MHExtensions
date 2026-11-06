@@ -6,7 +6,7 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    versionCode = 41
+    versionCode = 42
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -342,6 +342,41 @@ keiyoushi {
     // chapter's completeness is unproven (no-payload flights — the
     // dual-homed .pro catalog —, gate-held walks, raw-host-only
     // batches); signed-in devices keep their entitlement through it.
+    // v129 (versionCode 42) — FIELD VERDICT on v128: "it just loads the
+    // first three pages of the chapter every time". Reader-chunk
+    // dissection (app/chapter/[chapterKey]/page-04cf2dc109faf097.js) +
+    // sandbox replication of every hop (2026-11-06):
+    // (1) THE WIRE CHANGED SHAPE — the deferred exchange now answers
+    // {images:[], maps:[N × {token, method}], mapDelivery:"proxy-plan",
+    // pieceRenderMode:"img", pass:"p1…"}: the pages beyond the public
+    // embed moved from plain urls into ENCRYPTED reconstruction-map
+    // tokens, one per page. v128 read only images[]: the empty-but-present
+    // array meant "batch done", the walk declared the chapter complete on
+    // the FIRST answer, and the 3 public pages shipped — the exact field
+    // symptom. The walk now parses the FULL answer, collects BOTH page
+    // classes (plain urls AND map tokens — each token becomes a PLANNED
+    // loopback /.map-page page, registered instantly at listing time; the
+    // plan POST fires on the page's first image request and names
+    // freshly-signed piece urls on img{1-4}.procomic.im plus their rects;
+    // the loopback stitches them onto one canvas), and the terminal
+    // answer is BOTH arrays empty. The answer's own pass renews the
+    // x-chapter-pass the plan POSTs ride.
+    // (2) THE GATE CHANGED DIALECT — the site's own anonymous reader
+    // never mints a Turnstile token: its page JS runs a DOM probe on the
+    // reader's own row mount and sends the probe's BAKED success constant
+    // as the readerSignal query param, and the exchange WAIVES the gate
+    // for it. Live-verified: tokenless + reader-slot-script-v1 → HTTP 200
+    // with the full 13-map payload; the same request without the signal →
+    // 403 "Turnstile token required"; the fallback zoom-placeholder-v2 →
+    // 200 as well. The walk speaks the dialect (primary signal → fallback
+    // signal → and only then the v114–v118 mint ladder, unchanged) — the
+    // normal path opens chapters with NO WebView at all.
+    // (3) THE PIECES — the plan response's signed piece urls (verified
+    // live: multi-use within their window, 200 for a browser UA + the
+    // CHAPTER referer, 403 bare, 403/404 through weserv) fetch with the
+    // chapter referer and compose locally (AVIF→JPEG transcode, Android
+    // 12+; older devices leave the rect blank, the page intact); one
+    // re-plan self-heal redraws lapsed signatures' slots once.
 
     deeplink {
         host("procomic.net")

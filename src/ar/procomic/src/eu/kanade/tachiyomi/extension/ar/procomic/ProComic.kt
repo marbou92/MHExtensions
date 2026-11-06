@@ -279,6 +279,12 @@ abstract class ProComic :
             // the server bare.
             chapterPassProvider = { latestImagePass }
             deferredResigner = { rejected -> resignDeferredImageUrl(rejected) }
+            // v129: the loopback server plans a protected map page's
+            // reconstruction map (freshly-signed piece urls + rects) on the
+            // page's first image request — the plan POST is a source-level
+            // operation (client, apex ladder, the chapter pass), so it rides
+            // this hook exactly like the two above.
+            mapPlanner = { request -> planChapterMap(request) }
         }
     }
 
@@ -1266,6 +1272,7 @@ abstract class ProComic :
                         deferred = parseDeferredMedia(flight),
                         imagePass = parseImagePass(flight),
                         publicCount = parsePublicImageCount(flight),
+                        cdnPath = parseCdnPath(flight),
                     )
                 }
             }
@@ -1286,28 +1293,61 @@ abstract class ProComic :
         // True means the chapter's deferred list was walked to its end — the
         // strongest completeness proof the WebView-free chain can produce.
         var deferredWalkComplete = false
+        // v129: the walk's PLANNED protected pages — one reconstruction-map
+        // token per page beyond the public embed, registered with the loopback
+        // server below and composed from the site's own freshly-signed piece
+        // urls on first request.
+        var plannedMaps: List<PlannedMap> = emptyList()
         if (deferred?.token != null && upstreams.isNotEmpty()) {
             // v116: the full-list exchange WALKS THE BATCHES (the server
             // hands out the deferred list in redis-tracked batches; the
             // loop re-calls with the reader's constant split until the
-            // answer is an empty images[]). While the site's turnstile
-            // gate holds this yields whatever the session cleared plus a
-            // legible diag trail (mirrored to /.diag) and the source
-            // ships at least the public pages exactly as before.
+            // answer is terminal). v129: the exchange speaks the site's own
+            // reader-signal dialect (no Turnstile mint on the normal path)
+            // and the walk collects BOTH page classes: plain images[] urls
+            // AND maps[] reconstruction tokens. While the gate holds this
+            // yields whatever the session cleared plus a legible diag trail
+            // (mirrored to /.diag) and the source ships at least the public
+            // pages exactly as before.
             val walk = fetchDeferredPages(
                 chapterId = ref.chapterId,
                 deferred = deferred,
                 imagePass = payload.imagePass,
                 referer = chapterPageUrl(ref),
+                cdnPath = payload.cdnPath,
             )
             walkTrail = walk.trail
             deferredWalkComplete = walk.complete
+            latestImagePass = latestImagePass ?: walk.imagePass
             val extra = walk.images
             if (extra.isNotEmpty()) {
                 val seen = upstreams.toHashSet()
                 upstreams = upstreams + extra.filter { it !in seen }
                 Log.i(TAG, "deferred: +${extra.size} pages (total ${upstreams.size})")
-            } else {
+            }
+            if (walk.maps.isNotEmpty()) {
+                // The maps are the chapter's protected pages IN ORDER after
+                // the public embed (the site's own reader renders them at
+                // absoluteIndex = publicBase + ordinal — the exact pageIndex
+                // its plan POST sends). The public count from the flight is
+                // the base; the walk's own image batches (when any) extend it.
+                val mapBase = (payload.publicCount ?: upstreams.size).coerceAtLeast(upstreams.size)
+                plannedMaps = walk.maps.mapIndexedNotNull { ordinal, entry ->
+                    val token = entry.token?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
+                    runCatching {
+                        PlannedMap(
+                            chapterId = ref.chapterId,
+                            pageIndex = mapBase + ordinal,
+                            token = token,
+                            method = entry.method,
+                            cdnPath = payload.cdnPath,
+                            referer = chapterPageUrl(ref),
+                        )
+                    }.getOrNull()
+                }
+                Log.i(TAG, "deferred: +${plannedMaps.size} planned map pages (base $mapBase)")
+            }
+            if (extra.isEmpty() && plannedMaps.isEmpty()) {
                 walk.trail.forEach { Log.i(TAG, "deferred: $it") }
             }
         } else if (deferred == null && upstreams.isNotEmpty()) {
@@ -1342,6 +1382,49 @@ abstract class ProComic :
             }
         }
         var finalUrls: List<String> = loadable
+
+        // v129: register the planned protected pages with the loopback server
+        // (in-memory, listing time — the list stays fast) and append their
+        // loopback urls AFTER the app-host partition (loopback urls are not
+        // site hosts; the partition is about which SITE hosts can render).
+        // The reconstruction map is planned on the page's first image request:
+        // POST /chapter-map-proxy-plan/{id} names the freshly-signed piece
+        // urls + their rects, the loopback fetches every piece with the
+        // chapter referer and stitches them onto one canvas. A registration
+        // failure (registry bound) costs that one page, never the open.
+        if (plannedMaps.isNotEmpty()) {
+            val plannedUrls = plannedMaps.mapIndexedNotNull { ordinal, planned ->
+                runCatching {
+                    imageServer.registerMapPage(
+                        chapterId = planned.chapterId,
+                        pageIndex = planned.pageIndex,
+                        token = planned.token,
+                        method = planned.method,
+                        cdnPath = planned.cdnPath,
+                        referer = planned.referer,
+                    )
+                }.onFailure { t ->
+                    Log.w(TAG, "map page ${planned.pageIndex} not registered: ${t.javaClass.simpleName}")
+                }.getOrNull()
+            }
+            if (plannedUrls.isNotEmpty()) {
+                finalUrls = finalUrls + plannedUrls
+                Log.i(TAG, "planned ${plannedUrls.size} protected map pages (total ${finalUrls.size})")
+                runCatching {
+                    imageServer.recordDeferredTrail(
+                        ref.chapterId,
+                        walkTrail + "planned ${plannedUrls.size} protected pages from the exchange's reconstruction maps",
+                    )
+                }
+            } else {
+                runCatching {
+                    imageServer.recordDeferredTrail(
+                        ref.chapterId,
+                        walkTrail + "${plannedMaps.size} reconstruction-map tokens arrived but none could be registered",
+                    )
+                }
+            }
+        }
 
         // The reader session (v124, the manhuarmtl architecture): ONE bounded
         // offscreen browser session opens the REAL reader, waits through a
@@ -1561,7 +1644,37 @@ abstract class ProComic :
         val deferred: DeferredMediaDto?,
         val imagePass: String?,
         val publicCount: Int?,
+        /** v129: the flight's `"cdnPath":"cdn{N}"` — the CDN path class the
+         * plan POST needs for the map tokens (the chapters API metadata
+         * carries the same value; the flight is authoritative). */
+        val cdnPath: String? = null,
     )
+
+    /** v129: one PLANNED protected page — a map token registered with the
+     * loopback server at listing time; its reconstruction map (piece urls +
+     * rects) is planned on the first image request. */
+    internal class PlannedMap(
+        val chapterId: Int,
+        /** The page's ABSOLUTE index in the chapter (public base + ordinal) —
+         * exactly the `pageIndex` the site's own plan POST sends. */
+        val pageIndex: Int,
+        val token: String,
+        val method: String?,
+        val cdnPath: String?,
+        /** The chapter route — the Referer the piece edge requires
+         * (live-verified: pieces 403 without it, 200 with it). */
+        val referer: String,
+    )
+
+    /** The reader-signal dialect (v129): the exchange accepts the site's own
+     * reader probe constants as the `readerSignal` query param and WAIVES
+     * the Turnstile gate — the anonymous reader never mints a widget token.
+     * Live-verified 2026-11-06: tokenless + the primary signal → HTTP 200
+     * with the full maps[] payload; without a signal → 403 Turnstile token
+     * required; the fallback signal answers the same payload. The constants
+     * live in the companion (ktlint: SCREAMING_SNAKE only for const). */
+    internal val readerSignalPrimary: String get() = READER_SIGNAL_PRIMARY
+    internal val readerSignalFallback: String get() = READER_SIGNAL_FALLBACK
 
     /** The flight's `"deferredMedia":{...}` object, when the chapter ships
      * one (unlocked chapters above the public-image cap). */
@@ -1600,6 +1713,21 @@ abstract class ProComic :
         return flight.substring(start, end).toIntOrNull()
     }
 
+    /** v129: the flight's `"cdnPath":"cdn{N}"` — the CDN path class the
+     * plan POST needs for the reconstruction-map tokens (the chapters API
+     * metadata carries the same value; observed live: "cdn2"). Null when
+     * the flight ships none — the plan body then omits the field exactly
+     * like the site's own `JSON.stringify` does for undefined. */
+    internal fun parseCdnPath(flight: String): String? {
+        val key = "\"cdnPath\":\""
+        val index = flight.indexOf(key)
+        if (index < 0) return null
+        val end = flight.indexOf('"', index + key.length)
+        if (end < 0) return null
+        val value = flight.substring(index + key.length, end).trim()
+        return value.takeIf { Regex("cdn[1-9]").matches(it) }
+    }
+
     /**
      * v115: thin wrapper — runs the deferred exchange and mirrors the
      * attempt trail into the image server's /.diag state, so the trail
@@ -1613,10 +1741,11 @@ abstract class ProComic :
         deferred: DeferredMediaDto,
         imagePass: String?,
         referer: String,
+        cdnPath: String? = null,
     ): DeferredWalk {
-        val (images, trail, complete) = fetchDeferredPagesInner(chapterId, deferred, imagePass, referer)
+        val (images, trail, complete, maps, pass) = fetchDeferredPagesInner(chapterId, deferred, imagePass, referer, cdnPath)
         runCatching { imageServer.recordDeferredTrail(chapterId, trail) }
-        return DeferredWalk(images, trail, complete)
+        return DeferredWalk(images, trail, complete, maps, pass)
     }
 
     /** v128: the walk's outcome, plus whether it ENDED AT THE SERVER'S OWN
@@ -1625,42 +1754,66 @@ abstract class ProComic :
      * skipped when this is true: the anonymous reader cannot add anything
      * the walk did not already collect (live-verified: it mounts exactly the
      * public rows and never fires its own deferred walk), so running it only
-     * burns 20–110 s per open and feeds the failure breaker. */
+     * burns 20–110 s per open and feeds the failure breaker.
+     *
+     * v129: the walk also carries the answer's RECONSTRUCTION MAPS (one
+     * token per protected page — each becomes a planned loopback page) and
+     * the answer's own `pass` (the freshest pages-scope credential; the
+     * plan POSTs ride it). */
     private class DeferredWalk(
         val images: List<String>,
         val trail: List<String>,
         val complete: Boolean,
+        val maps: List<ChapterMapTokenDto> = emptyList(),
+        val imagePass: String? = null,
     )
 
     /**
      * The site's own reader flow for the pages beyond the public embed:
      * GET /chapter-deferred-media/{id}?token={deferredMedia JWT}&split=N
      * with the x-chapter-pass header, renewing either credential through
-     * its open POST endpoint when the answer names it expired. When the
-     * endpoint answers `Turnstile token required`, the solver mints the
-     * real widget token (TurnstileSolver — offscreen, image-blocked,
-     * renderer-death-safe) and the exchange retries with the reader's
-     * exact headers. v114: the sitekey and the widget mode are fetched
-     * LIVE (public-settings + the gate's own 403 answer) instead of
-     * baked constants — the rotation that silently killed the v113 mint.
-     * v115: the solver walks a mode ladder (server's mode first, then
-     * the opposite — the token validates the same either way) and masks
-     * the WebView's `; wv)` UA tell with the chain's forced browser UA.
-     * Any solver failure returns an empty list plus a legible diag
-     * trail (now mirrored to /.diag); the source ships the public
-     * pages exactly as before. Never throws: every failure is a row.
+     * its open POST endpoint when the answer names it expired.
+     *
+     * v129 — THE READER-SIGNAL DIALECT: the site's own anonymous reader
+     * never mints a Turnstile token. Its page JS runs a DOM probe on the
+     * reader's own row mount (a querySelector trap + the zoom-placeholder
+     * shape check) and sends the probe's BAKED success constant as the
+     * `readerSignal` query param — the exchange waives the gate for those
+     * constants (live-verified from the sandbox, 2026-11-06: tokenless +
+     * `reader-slot-script-v1` → HTTP 200 with the full payload; the same
+     * request without a signal → 403 "Turnstile token required"; the
+     * fallback `zoom-placeholder-v2` → 200 with the same payload). The
+     * walk sends the primary signal first, the fallback second, and only
+     * then — the day the site starts validating real probes again —
+     * falls back to the v114–v118 mint ladder, unchanged (one mint,
+     * breaker, wall).
+     *
+     * v129 — THE MAPS ERA: the answer now ships
+     * `{images:[…], maps:[N × {token, method}]}` — the pages beyond the
+     * public embed moved from plain urls into ENCRYPTED reconstruction-map
+     * tokens (`mapDelivery:"proxy-plan"`), one per page. v128 read only
+     * `images[]`: the empty-but-present array meant "batch done", the walk
+     * declared the chapter complete on the FIRST answer and the 3 public
+     * pages shipped (the field verdict). The walk now collects BOTH
+     * classes — plain image urls (the legacy shape) and map tokens (each
+     * becomes a PLANNED loopback page, composed from the site's own
+     * freshly-signed piece urls on first request). The terminal answer is
+     * BOTH arrays empty. The answer's own `pass` (a fresh pages-scope
+     * credential) updates [latestImagePass] so the plan POSTs ride the
+     * freshest x-chapter-pass. Never throws: every failure is a row.
      */
     private suspend fun fetchDeferredPagesInner(
         chapterId: Int,
         deferred: DeferredMediaDto,
         imagePass: String?,
         referer: String,
-    ): Triple<List<String>, List<String>, Boolean> {
+        cdnPath: String? = null,
+    ): WalkResult {
         val trail = mutableListOf<String>()
         val initialToken = deferred.token
         if (initialToken.isNullOrBlank()) {
             trail += "deferredMedia present without a token"
-            return Triple(emptyList<String>(), trail, false)
+            return WalkResult(emptyList(), trail, false)
         }
         trail += "deferredMedia split=${deferred.splitIndex} turnstile=${deferred.requireTurnstile}"
 
@@ -1674,6 +1827,12 @@ abstract class ProComic :
         var turnstileWidget: String? = null
         val collected = mutableListOf<String>()
         val seen = HashSet<String>()
+        val collectedMaps = mutableListOf<ChapterMapTokenDto>()
+        val mapSeen = HashSet<String>()
+        // v129: the reader-signal ladder — the primary constant, then the
+        // fallback, then (and only then) the mint.
+        var readerSignal: String? = READER_SIGNAL_PRIMARY
+        var fallbackSignalTried = false
         // v117: whether the CURRENT token is a fresh renewal that has
         // already been exchanged once and replayed the same slice.
         var replayedAfterRenewal = false
@@ -1699,30 +1858,26 @@ abstract class ProComic :
             return renewed
         }
 
-        // v116 introduced the batch walk; v117 fixes its economics. LIVE
-        // RECON (the decisive test, run from the sandbox): the refresh
-        // endpoint is UNGATED (200 with just the token, no Turnstile, no
-        // cookies) and re-issues the SAME split claim — so the exchange's
-        // slice cursor is tracked server-side per session, and the site's
-        // own reader advances it by calling the loader with a RENEWED
-        // token each time (its promise memo makes same-token repeats
-        // impossible). v116 repeated the exchange with the same token: the
-        // server replayed the same slice, the dedup guard saw an empty
-        // delta and declared the list "complete" after the FIRST batch —
-        // exactly the field symptom (3 public + one batch = 5 pages). The
-        // walk now RENEWS the token between slices (the reader's own
-        // economics) and only terminates on: an empty images[] ARRAY (the
-        // server's terminal answer), a replay AFTER a renewal, bounds, or
-        // the v118 wall-clock budget (a Turnstile token is single-use —
-        // the second exchange re-arms the gate, and every re-arm used to
-        // cost a full WebView mint; the wall keeps the fetch bounded no
-        // matter how the gate behaves).
+        // v116 introduced the batch walk; v117 fixed its economics; v129
+        // speaks the signal dialect and collects the maps era. LIVE RECON
+        // (the decisive test, run from the sandbox, 2026-11-06): the
+        // tokenless exchange with the primary reader signal answers HTTP
+        // 200 with the WHOLE remaining chapter as reconstruction maps (one
+        // exchange — the server echoes the token's split and hands out
+        // every remaining page at once), the answer carries a fresh
+        // `pass`, and the immediate next exchange answers empty/empty —
+        // the terminal answer. The walk renews between slices exactly as
+        // before and only terminates on: the terminal answer (both arrays
+        // empty), a replay AFTER a renewal, bounds, or the wall-clock
+        // budget.
         val walkDeadline = System.currentTimeMillis() + MAX_WALK_WALL_MS
-        while (exchanges < MAX_DEFERRED_EXCHANGES && collected.size < MAX_DEFERRED_PAGES) {
+        while (exchanges < MAX_DEFERRED_EXCHANGES &&
+            collected.size + collectedMaps.size < MAX_DEFERRED_PAGES
+        ) {
             exchanges++
             if (System.currentTimeMillis() > walkDeadline) {
-                trail += "deferred walk wall (${MAX_WALK_WALL_MS / 1000} s) reached — shipping ${collected.size} deferred pages"
-                return Triple(collected, trail, false)
+                trail += "deferred walk wall (${MAX_WALK_WALL_MS / 1000} s) reached — shipping ${collected.size + collectedMaps.size} deferred pages"
+                return WalkResult(collected, trail, false, collectedMaps, pass)
             }
             val (images, outcome) = deferredAttempt(
                 chapterId = chapterId,
@@ -1732,46 +1887,64 @@ abstract class ProComic :
                 split = deferred.splitIndex,
                 turnstileToken = turnstileToken,
                 turnstileWidget = turnstileWidget,
+                readerSignal = readerSignal,
             )
             when (outcome.kind) {
                 DeferredOutcome.Kind.OK -> {
                     trail += outcome.note
-                    val fresh = images.filter { seen.add(it) }
-                    if (fresh.isEmpty()) {
+                    // v129: the answer's own pass is the freshest pages
+                    // credential — the plan POSTs (and any signed re-fetch)
+                    // ride it.
+                    outcome.pass?.takeIf { it.isNotBlank() && it != pass }?.let {
+                        pass = it
+                        latestImagePass = it
+                        trail += "the answer carried a fresh pages pass (x-chapter-pass renewed)"
+                    }
+                    val freshImages = images.filter { seen.add(it) }
+                    val freshMaps = outcome.maps.filter { entry ->
+                        val entryToken = entry.token
+                        entryToken != null && entryToken.isNotBlank() && mapSeen.add(entryToken)
+                    }
+                    if (freshImages.isEmpty() && freshMaps.isEmpty()) {
                         if (replayedAfterRenewal) {
-                            trail += "the renewed token replayed the same slice — the deferred list is complete (${collected.size} pages beyond the public embed)"
-                            return Triple(collected, trail, true)
+                            trail += "the renewed token replayed the same slice — the deferred list is complete " +
+                                "(${collected.size + collectedMaps.size} pages beyond the public embed)"
+                            return WalkResult(collected, trail, true, collectedMaps, pass)
                         }
                         // Same slice again: advance the cursor the reader's
                         // way — renew the token, then exchange once more.
                         val renewed = renewForNextSlice()
                         if (renewed == null) {
-                            trail += "the deferred list is complete (${collected.size} pages beyond the public embed)"
-                            return Triple(collected, trail, true)
+                            trail += "the deferred list is complete (${collected.size + collectedMaps.size} pages beyond the public embed)"
+                            return WalkResult(collected, trail, true, collectedMaps, pass)
                         }
                         token = renewed
                         replayedAfterRenewal = true
                         continue
                     }
-                    collected += fresh
-                    trail += "deferred batch: +${fresh.size} pages (running total ${collected.size})"
+                    collected += freshImages
+                    collectedMaps += freshMaps
                     replayedAfterRenewal = false
-                    // The site-gated CDN era: a batch whose pages ALL ride
-                    // the raw cdn hosts can never be displayed (their
+                    trail += "deferred batch: +${freshImages.size} pages, +${freshMaps.size} map pages " +
+                        "(running total ${collected.size + collectedMaps.size})"
+                    // The site-gated CDN era: a batch whose IMAGE pages all
+                    // ride the raw cdn hosts can never be displayed (their
                     // signed route needs a browser session the WebView-free
                     // chain cannot mint) — the WebView mint that bought it
-                    // was fruitless. Count it against the breaker and end
-                    // the walk: every further batch costs another mint and
-                    // dies the same way. The page-list partition drops
-                    // these pages downstream.
-                    if (fresh.none { isAppHostImageUrl(it) }) {
+                    // was fruitless. Map pages are NOT subject to this: a
+                    // reconstruction map composes from the site's own
+                    // freshly-signed piece urls, no raw-host fetch at all.
+                    // The page-list partition drops raw pages downstream.
+                    if (freshImages.isNotEmpty() && freshMaps.isEmpty() &&
+                        freshImages.none { isAppHostImageUrl(it) }
+                    ) {
                         mintFruitless++
                         if (mintFruitless >= MINT_FRUITLESS_LIMIT && mintPausedUntil == 0L) {
                             mintPausedUntil = System.currentTimeMillis() + MINT_COOLDOWN_MS
                             trail += "$MINT_FRUITLESS_LIMIT minted batches carried only browser-gated pages — solver cooling down for ${MINT_COOLDOWN_MS / 60000} min"
                         }
                         trail += "the batch's pages all ride the browser-only signed CDN route — ending the walk"
-                        return Triple(collected, trail, false)
+                        return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     // Refresh between slices so the server's cursor
                     // advances (the reader renews its token before every
@@ -1783,34 +1956,32 @@ abstract class ProComic :
 
                 DeferredOutcome.Kind.DONE -> {
                     trail += outcome.note
-                    trail += "the deferred list is complete (${collected.size} pages beyond the public embed)"
-                    return Triple(collected, trail, true)
+                    trail += "the deferred list is complete (${collected.size + collectedMaps.size} pages beyond the public embed)"
+                    return WalkResult(collected, trail, true, collectedMaps, pass)
                 }
 
                 DeferredOutcome.Kind.TURNSTILE -> {
                     trail += outcome.note
-                    // v128: the mint is the DEFAULT again — the field symptom
-                    // ("only the first three pages") is exactly this branch
-                    // shipping the public embed without ever trying, because
-                    // safe fetch's early return sat in front of the mint.
-                    // Live recon (1.6.41 era): the flight still carries the
-                    // deferred credentials, the exchange still validates real
-                    // widget tokens ("Turnstile verification failed" for a
-                    // bogus one), the refresh endpoint is still ungated, and
-                    // the sitekey still arrives live from public-settings —
-                    // the whole chain works, only the mint was switched off.
-                    // The solver is the v113 contract surface (image-blocked,
-                    // renderer-death consumed, HandlerThread firewall, hard
-                    // wall) — NOT the library interceptor safe fetch guards.
-                    // Mints stay ONE per chapter open (single-use token
-                    // economics) and the fruitless-mint breaker stays.
+                    // v129: the signal ladder comes FIRST — the primary
+                    // reader signal already waived this gate once; the
+                    // fallback constant gets one retry before any mint.
+                    if (readerSignal != null && !fallbackSignalTried) {
+                        fallbackSignalTried = true
+                        readerSignal = READER_SIGNAL_FALLBACK
+                        trail += "the primary reader signal was rejected — retrying the exchange with the fallback signal"
+                        continue
+                    }
+                    // The day the site validates real probes again: the
+                    // v128 mint ladder, unchanged (the hardened v113
+                    // solver — one solve per open, wall, breaker).
+                    readerSignal = null
                     if (!preferences.getBoolean(PREF_READER_GATE, true)) {
-                        trail += if (collected.isEmpty()) {
+                        trail += if (collected.isEmpty() && collectedMaps.isEmpty()) {
                             "reader-gate solving disabled — keeping the public pages"
                         } else {
-                            "reader-gate solving disabled — shipping ${collected.size} deferred pages"
+                            "reader-gate solving disabled — shipping ${collected.size + collectedMaps.size} deferred pages"
                         }
-                        return Triple(collected, trail, false)
+                        return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     if (mints >= MAX_TURNSTILE_MINTS) {
                         // v118: ONE mint per chapter open — the widget token
@@ -1818,12 +1989,12 @@ abstract class ProComic :
                         // cannot be walked for free; every extra mint costs
                         // a full WebView ladder (the v117 crash). Ship what
                         // the session cleared.
-                        trail += if (collected.isEmpty()) {
+                        trail += if (collected.isEmpty() && collectedMaps.isEmpty()) {
                             "a minted turnstile token did not clear the gate — keeping the public pages"
                         } else {
-                            "the gate re-armed after ${collected.size} deferred pages (the widget token is single-use per exchange) — shipping what was fetched"
+                            "the gate re-armed after ${collected.size + collectedMaps.size} deferred pages (the widget token is single-use per exchange) — shipping what was fetched"
                         }
-                        return Triple(collected, trail, false)
+                        return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     // v119: the wall must hold ACROSS the mint — a WebView
                     // ladder burns ~40 s and the deadline is only checked
@@ -1832,8 +2003,8 @@ abstract class ProComic :
                     // verdict called a dead app. Past the wall: ship what
                     // the session cleared.
                     if (System.currentTimeMillis() > walkDeadline) {
-                        trail += "deferred walk wall reached before the mint — shipping ${collected.size} deferred pages"
-                        return Triple(collected, trail, false)
+                        trail += "deferred walk wall reached before the mint — shipping ${collected.size + collectedMaps.size} deferred pages"
+                        return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     mints++
                     // v120/v128: the fruitless-mint cooldown (mint OFF, or a
@@ -1842,8 +2013,8 @@ abstract class ProComic :
                     // Chromium every chapter open — after two consecutive dead
                     // ladders the breaker pauses mints for the window.
                     if (System.currentTimeMillis() < mintPausedUntil) {
-                        trail += "turnstile solver cooling down after fruitless mints — shipping ${collected.size} deferred pages"
-                        return Triple(collected, trail, false)
+                        trail += "turnstile solver cooling down after fruitless mints — shipping ${collected.size + collectedMaps.size} deferred pages"
+                        return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     // v119: a /.diag screenshot now names the mint moment —
                     // if a device death happens mid-mint, the trail shows
@@ -1880,7 +2051,7 @@ abstract class ProComic :
                             trail += "${MINT_FRUITLESS_LIMIT} fruitless mint ladders — solver cooling down for ${MINT_COOLDOWN_MS / 60000} min"
                         }
                         trail += "turnstile solver returned no token — keeping the public pages"
-                        return Triple(collected, trail, false)
+                        return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     mintFruitless = 0
                     turnstileToken = solved.first
@@ -1893,14 +2064,14 @@ abstract class ProComic :
                 DeferredOutcome.Kind.TOKEN_EXPIRED -> {
                     if (tokenRenewals >= MAX_TOKEN_RENEWALS) {
                         trail += outcome.note
-                        trail += "deferred renewals exhausted — shipping ${collected.size} deferred pages"
-                        return Triple(collected, trail, false)
+                        trail += "deferred renewals exhausted — shipping ${collected.size + collectedMaps.size} deferred pages"
+                        return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     tokenRenewals++
                     val renewed = renewDeferredToken(chapterId, token, referer)
                     if (renewed == null) {
                         trail += "refresh POST failed — keeping the public pages"
-                        return Triple(collected, trail, false)
+                        return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     trail += "refresh POST minted a new deferred token"
                     token = renewed
@@ -1928,15 +2099,27 @@ abstract class ProComic :
 
                 DeferredOutcome.Kind.UNREACHABLE -> {
                     trail += outcome.note
-                    if (collected.isEmpty()) return Triple(emptyList<String>(), trail, false)
-                    trail += "deferred exchanges stopped — shipping ${collected.size} deferred pages"
-                    return Triple(collected, trail, false)
+                    if (collected.isEmpty() && collectedMaps.isEmpty()) {
+                        return WalkResult(emptyList(), trail, false)
+                    }
+                    trail += "deferred exchanges stopped — shipping ${collected.size + collectedMaps.size} deferred pages"
+                    return WalkResult(collected, trail, false, collectedMaps, pass)
                 }
             }
         }
-        trail += "deferred page bound reached — shipping ${collected.size} deferred pages"
-        return Triple(collected, trail, false)
+        trail += "deferred page bound reached — shipping ${collected.size + collectedMaps.size} deferred pages"
+        return WalkResult(collected, trail, false, collectedMaps, pass)
     }
+
+    /** v129: the walk's five-part outcome (a data class so the caller can
+     * destructure it). */
+    private data class WalkResult(
+        val images: List<String>,
+        val trail: List<String>,
+        val complete: Boolean,
+        val maps: List<ChapterMapTokenDto> = emptyList(),
+        val imagePass: String? = null,
+    )
 
     private class DeferredOutcome(
         val kind: Kind,
@@ -1944,6 +2127,14 @@ abstract class ProComic :
         /** v114: the server's own turnstileMode from the gate's 403
          * answer ("hidden"/"visible") — drives the solver's widget. */
         val mode: String? = null,
+        /** v129: the answer's reconstruction-map tokens (one per protected
+         * page) when the exchange answered OK. */
+        val maps: List<ChapterMapTokenDto> = emptyList(),
+        /** v129: the answer's own pages-scope credential — the freshest
+         * x-chapter-pass. */
+        val pass: String? = null,
+        val mapDelivery: String? = null,
+        val pieceRenderMode: String? = null,
     ) {
         enum class Kind { OK, DONE, TURNSTILE, TOKEN_EXPIRED, PASS_EXPIRED, UNREACHABLE }
     }
@@ -1951,7 +2142,12 @@ abstract class ProComic :
     /** One GET across the reader apexes; verdicts, never exceptions.
      * v113 carries the reader's exact shape: the split query param plus
      * the x-turnstile-token / x-turnstile-widget headers once a real
-     * widget token exists. */
+     * widget token exists. v129: the reader-signal dialect — the
+     * `readerSignal` query param rides the URL exactly like the site's
+     * own reader JS sends it (`token`, then `readerSignal`, then
+     * `split`), and the Turnstile headers ride ONLY when a minted token
+     * exists (the signal path is tokenless — matching the site's own
+     * anonymous reader, verified live). */
     private fun deferredAttempt(
         chapterId: Int,
         token: String,
@@ -1960,6 +2156,7 @@ abstract class ProComic :
         split: Int?,
         turnstileToken: String?,
         turnstileWidget: String?,
+        readerSignal: String?,
     ): Pair<List<String>, DeferredOutcome> {
         var lastNote = "no apex answered"
         for (apex in readerApexes) {
@@ -1969,7 +2166,10 @@ abstract class ProComic :
                     .toHttpUrl()
                     .newBuilder()
                     .addQueryParameter("token", token)
-                    .apply { split?.let { addQueryParameter("split", it.toString()) } }
+                    .apply {
+                        readerSignal?.let { addQueryParameter("readerSignal", it) }
+                        split?.let { addQueryParameter("split", it.toString()) }
+                    }
                     .build()
                     .toString()
                 val request = GET(url, headers).newBuilder()
@@ -1993,8 +2193,8 @@ abstract class ProComic :
                             response.code == 403 && bodyText.contains("Turnstile", ignoreCase = true) ->
                                 return emptyList<String>() to DeferredOutcome(
                                     DeferredOutcome.Kind.TURNSTILE,
-                                    "the gate answers '${errorNote(bodyText)}' — minting the widget " +
-                                        "token the site's own reader solves ($host)",
+                                    "the gate answers '${errorNote(bodyText)}' — the reader-signal ladder walks " +
+                                        "next (fallback signal, then the mint the site's own reader no longer runs) ($host)",
                                     parseDeferredTurnstileMode(bodyText),
                                 )
 
@@ -2004,24 +2204,59 @@ abstract class ProComic :
                         }
                         return@use
                     }
-                    val images = parseDeferredImages(bodyText)
-                    if (images.isEmpty()) {
-                        // v116: an empty images[] ARRAY is the reader's
-                        // terminal answer — the server has handed out every
-                        // deferred page for this session (batch walk done).
-                        if (hasDeferredImagesArray(bodyText)) {
+                    // v129: parse the FULL answer — images[], maps[], the
+                    // delivery meta and the fresh pass. The terminal answer
+                    // is BOTH arrays empty (the maps era's "done" — v128
+                    // saw only images[] and read the empty-but-present
+                    // array as done on the FIRST answer, which is exactly
+                    // the 3-pages field verdict).
+                    val answer = parseDeferredAnswer(bodyText)
+                    if (answer != null) {
+                        val images = answer.images
+                            .map { it.trim() }
+                            .filter { it.startsWith("https://") && isReaderImageUrl(it) }
+                            .distinct()
+                        val maps = answer.maps.filter { entry ->
+                            !entry.token.isNullOrBlank() &&
+                                (
+                                    entry.method == null ||
+                                        entry.method == "browser" ||
+                                        entry.method == "browser_session"
+                                    )
+                        }
+                        if (images.isEmpty() && maps.isEmpty()) {
                             return emptyList<String>() to DeferredOutcome(
                                 DeferredOutcome.Kind.DONE,
-                                "HTTP 200 from $host with an empty images[] — the deferred list is complete",
+                                "HTTP 200 from $host with empty images[] and maps[] — the deferred list is complete",
                             )
                         }
-                        lastNote = "HTTP 200 from $host without a usable images[] payload"
-                        return@use
+                        val delivery = answer.mapDelivery
+                        return images to DeferredOutcome(
+                            DeferredOutcome.Kind.OK,
+                            buildString {
+                                append("deferred media answered via $host: ${images.size} additional pages")
+                                if (maps.isNotEmpty()) {
+                                    append(" + ${maps.size} reconstruction maps")
+                                    if (delivery != null) append(" (mapDelivery=$delivery)")
+                                }
+                            },
+                            maps = maps,
+                            pass = answer.pass?.takeIf { it.startsWith("p1.") },
+                            mapDelivery = delivery,
+                            pieceRenderMode = answer.pieceRenderMode?.takeIf { it == "img" },
+                        )
                     }
-                    return images to DeferredOutcome(
-                        DeferredOutcome.Kind.OK,
-                        "deferred media answered ${images.size} additional pages via $host",
-                    )
+                    // Legacy shape without a parseable data object but with
+                    // an images[] array present: the pre-v129 terminal
+                    // answer.
+                    if (hasDeferredImagesArray(bodyText)) {
+                        return emptyList<String>() to DeferredOutcome(
+                            DeferredOutcome.Kind.DONE,
+                            "HTTP 200 from $host with an empty images[] — the deferred list is complete",
+                        )
+                    }
+                    lastNote = "HTTP 200 from $host without a usable payload"
+                    return@use
                 }
             } catch (e: IOException) {
                 lastNote = "$host: ${e.message ?: "connection failed"}"
@@ -2030,6 +2265,18 @@ abstract class ProComic :
             }
         }
         return emptyList<String>() to DeferredOutcome(DeferredOutcome.Kind.UNREACHABLE, lastNote)
+    }
+
+    /** v129: the deferred exchange's answer object — `{data:{…}}` (or the
+     * same shape top-level) with BOTH page classes plus the delivery meta
+     * and the fresh pass. Null when the body carries no such object. */
+    internal fun parseDeferredAnswer(bodyText: String): DeferredAnswerDto? {
+        if (bodyText.isBlank()) return null
+        return runCatching {
+            val root = json.parseToJsonElement(bodyText).jsonObject
+            val data = (root["data"] as? kotlinx.serialization.json.JsonObject) ?: root
+            json.decodeFromString(DeferredAnswerDto.serializer(), data.toString())
+        }.getOrNull()
     }
 
     /** `{data:{images:[…]}}` (or the same shape top-level) — the reader
@@ -2166,6 +2413,64 @@ abstract class ProComic :
             response.code to response.body?.string().orEmpty()
         }
     }.getOrNull()
+
+    /**
+     * v129: the protected page's plan POST — POST /chapter-map-proxy-plan/{id}
+     * with `{token, method, cdnPath, pageIndex}` and the freshest
+     * x-chapter-pass header. LIVE-VERIFIED (sandbox, 2026-11-06, anonymous
+     * session): 200 `{success,data:{map:{dim,mode,pieces,order,rects}}}` —
+     * the map's pieces are FRESHLY-SIGNED absolute urls on img{1-4}.procomic.im
+     * (multi-use within their window, ~200 for a browser UA + the chapter
+     * referer, 403 bare) and the rects are absolute pixel rects aligned with
+     * the draw order. This is the site's own reader flow for the maps era
+     * (its chunk calls the same endpoint with the same body). Runs on the
+     * loopback server's worker thread on the page's first image request;
+     * every failure is null (the server names the stage in its diag trail).
+     * The walk's ONE re-plan self-heal lives server-side: when pieces lapse
+     * mid-build, the server plans ONCE more with this same hook.
+     */
+    internal fun planChapterMap(request: ProComicImageServer.MapPageRequest): ProComicImageServer.MapPagePlanResult? {
+        val pass = latestImagePass
+        val body = buildString {
+            append("{\"token\":\"").append(request.token.replace("\\", "\\\\").replace("\"", "\\\\\""))
+            append("\",\"method\":\"").append(request.method ?: "browser_session")
+            if (!request.cdnPath.isNullOrBlank()) append("\",\"cdnPath\":\"").append(request.cdnPath)
+            append("\",\"pageIndex\":").append(request.pageIndex)
+            append("}")
+        }
+        for (apex in readerApexes) {
+            val answer = postJson(
+                url = "$apex/chapter-map-proxy-plan/${request.chapterId}",
+                jsonBody = body,
+                referer = request.referer,
+                passHeader = pass,
+            ) ?: continue
+            if (answer.first != 200) continue
+            val map = runCatching {
+                val root = json.parseToJsonElement(answer.second).jsonObject
+                val data = (root["data"] as? kotlinx.serialization.json.JsonObject) ?: root
+                val mapJson = (data["map"] as? kotlinx.serialization.json.JsonObject) ?: return@runCatching null
+                json.decodeFromString(ChapterMapPlanDto.serializer(), mapJson.toString())
+            }.getOrNull() ?: continue
+            val width = (map.dim.getOrNull(0) ?: 0.0).toInt()
+            val height = (map.dim.getOrNull(1) ?: 0.0).toInt()
+            if (width <= 0 || height <= 0) continue
+            if (map.pieces.isEmpty()) continue
+            val rects = map.effectiveRects(width, height)
+            if (rects.size < map.pieces.size) continue
+            // The server draws slot i at rects[i]; the site's own renderer
+            // draws pieces[order[i]] there — hand it the DRAW-ORDERED
+            // pieces (identity in the observed live shape).
+            val drawPieces = map.drawOrder().map { map.pieces[it] }
+            return ProComicImageServer.MapPagePlanResult(
+                width = width,
+                height = height,
+                pieces = drawPieces,
+                rects = rects.take(drawPieces.size),
+            )
+        }
+        return null
+    }
 
     /**
      * v116: mint a fresh signed-proxy URL for one the edge rejected (410
@@ -2312,6 +2617,12 @@ abstract class ProComic :
     private companion object {
         const val TAG = "ProComic"
         const val PAGE_LIMIT = 24
+
+        /** v129: the reader-signal dialect constants — the site's own
+         * reader probe success values (see the fetchDeferredPagesInner
+         * doc). */
+        private const val READER_SIGNAL_PRIMARY = "reader-slot-script-v1"
+        private const val READER_SIGNAL_FALLBACK = "zoom-placeholder-v2"
 
         /** v116: the deferred exchange is BATCHED server-side (redis
          * progression — the reader re-calls with the same split value and

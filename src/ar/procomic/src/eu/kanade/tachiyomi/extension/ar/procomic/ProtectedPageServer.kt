@@ -141,6 +141,15 @@ class ProComicImageServer(
     @Volatile
     var deferredResigner: ((String) -> String?)? = null
 
+    /** v129: plans one protected map page's reconstruction map — the
+     * freshly-signed piece urls plus their rects. The source owns the
+     * POST /chapter-map-proxy-plan/{id} call (client, apex ladder, the
+     * chapter pass); the server calls this on the page's first image
+     * request and once more for the re-plan self-heal. Optional so the
+     * JVM harness can drive the server bare. */
+    @Volatile
+    internal var mapPlanner: ((MapPageRequest) -> MapPagePlanResult?)? = null
+
     /** Fair 2-wide semaphore over the TRANSCODE stage only (decode + JPEG
      * encode of tall pages). Fairness keeps a reader's preloaded pages from
      * being starved by late requests; the network fetch happens OUTSIDE the
@@ -232,6 +241,286 @@ class ProComicImageServer(
     /** A whole composed row: canvas size + the piece layers. */
     @kotlinx.serialization.Serializable
     internal data class ComposedSpec(val w: Int, val h: Int, val pieces: List<ComposedPiece>)
+
+    // ==================== protected map pages (v129) ======================
+
+    /** v129: the plan request the server hands the source's [mapPlanner]
+     * when a protected page's reconstruction map is needed. Fields are
+     * exactly the plan POST body's own: token, method, cdnPath, pageIndex —
+     * plus the chapter route (the Referer the piece edge requires). */
+    internal class MapPageRequest(
+        val chapterId: Int,
+        val pageIndex: Int,
+        val token: String,
+        val method: String?,
+        val cdnPath: String?,
+        val referer: String,
+    )
+
+    /** v129: the planned reconstruction map — the canvas size, the
+     * DRAW-ORDERED freshly-signed piece urls and their slot-aligned pixel
+     * rects (draw slot i composes [pieces][MapPagePlanResult.pieces][i] at
+     * [rects][MapPagePlanResult.rects][i]). */
+    internal class MapPagePlanResult(
+        val width: Int,
+        val height: Int,
+        val pieces: List<String>,
+        val rects: List<eu.kanade.tachiyomi.extension.ar.procomic.ChapterMapRectDto>,
+    )
+
+    private class MapPageEntry(
+        val chapterId: Int,
+        val pageIndex: Int,
+        val token: String,
+        val method: String?,
+        val cdnPath: String?,
+        val referer: String,
+    )
+
+    private val mapPagesLock = Any()
+
+    private val mapPages = LinkedHashMap<String, MapPageEntry>()
+
+    /**
+     * v129: registers one planned protected page (an exchange maps[] token)
+     * at listing time and returns its loopback url. Listing stays fast —
+     * the plan POST (freshly-signed piece urls) fires on the page's FIRST
+     * image request, inside [serveMapPage]. The registry is keyed by a hash
+     * of the page's identity (chapter + index + token), bounded like the
+     * composed-row registry; a process restart simply re-walks on the next
+     * chapter open.
+     */
+    internal fun registerMapPage(
+        chapterId: Int,
+        pageIndex: Int,
+        token: String,
+        method: String?,
+        cdnPath: String?,
+        referer: String,
+    ): String {
+        val key = MessageDigest.getInstance("SHA-256")
+            .digest("$chapterId:$pageIndex:$token".toByteArray(Charsets.UTF_8))
+            .joinToString("") { "%02x".format(it) }
+            .take(24)
+        synchronized(mapPagesLock) {
+            mapPages[key] = MapPageEntry(chapterId, pageIndex, token, method, cdnPath, referer)
+            val iterator = mapPages.entries.iterator()
+            while (iterator.hasNext() && mapPages.size > MAX_MAP_PAGES) {
+                iterator.next()
+                iterator.remove()
+            }
+        }
+        return "http://127.0.0.1:${ensureStarted()}/$MAP_PAGE_PATH_PREFIX/$key"
+    }
+
+    /**
+     * Serves one protected map page: plan (the source's [mapPlanner] hook
+     * — the freshly-signed piece urls + rects) → fetch every piece with the
+     * CHAPTER referer (live-verified: the img{1-4} piece edge 403s without
+     * it) → local AVIF→JPEG transcode → stitch onto the map's canvas → JPEG.
+     * Coalesced per page; ONE re-plan self-heal when the short-lived piece
+     * signatures lapse between listing and the first request (fresh plan,
+     * only the failed slots redrawn — the site's own reader heals the same
+     * way, re-planning a lapsed map mid-read). Every failure surfaces as a
+     * legible 502 or a partially-blank canvas — never a crash.
+     */
+    private fun serveMapPage(path: String, output: java.io.OutputStream) {
+        val key = path.removePrefix("/$MAP_PAGE_PATH_PREFIX/").trim()
+        val entry = synchronized(mapPagesLock) { mapPages[key] }
+        if (key.isEmpty() || entry == null) {
+            writeResponse(output, 410, "Gone", "text/plain", "protected page expired — reopen the chapter".toByteArray())
+            return
+        }
+        val cacheId = "map:$key"
+        cachedResult(cacheId)?.let {
+            writeImageBytes(output, it.first, it.second)
+            return
+        }
+        val (contentType, bytes) = composedCoalesced(cacheId) {
+            buildMapPage(entry)
+        }
+        writeImageBytes(output, contentType, bytes)
+    }
+
+    /** Plan + compose one protected page. The re-plan self-heal lives
+     * here (one extra planner call, failed slots only). */
+    private fun buildMapPage(entry: MapPageEntry): Pair<String, ByteArray> {
+        val diag = ProxyDiag()
+        val planner = mapPlanner
+            ?: throw ImageBuildFailure("plan", "ProComic: the reconstruction planner is unavailable", diag)
+        val request = MapPageRequest(
+            chapterId = entry.chapterId,
+            pageIndex = entry.pageIndex,
+            token = entry.token,
+            method = entry.method,
+            cdnPath = entry.cdnPath,
+            referer = entry.referer,
+        )
+        var plan = runCatching { planner(request) }
+            .onFailure { diag.add("plan threw: ${it.javaClass.simpleName}") }
+            .getOrNull()
+        if (plan == null) {
+            diag.add("plan: no answer — one re-plan before failing")
+            plan = runCatching { planner(request) }.getOrNull()
+        }
+        if (plan == null || plan.pieces.isEmpty() || plan.pieces.size != plan.rects.size) {
+            throw ImageBuildFailure(
+                "plan",
+                "ProComic: the protected page's reconstruction plan failed [${diag.summary()}]",
+                diag,
+            )
+        }
+        val width = plan.width.coerceIn(8, MAX_COMPOSED_EDGE)
+        val height = plan.height.coerceIn(8, MAX_COMPOSED_EDGE * 2)
+        val bitmap = try {
+            Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888)
+        } catch (t: Throwable) {
+            throw ImageBuildFailure(
+                "decode",
+                "ProComic: the protected page's canvas (${plan.width}x${plan.height}) could not be allocated " +
+                    "(${t.javaClass.simpleName})",
+                diag,
+            )
+        }
+        try {
+            val canvas = Canvas(bitmap)
+            canvas.drawColor(Color.WHITE)
+            var failed = drawMapPieces(canvas, plan.pieces, plan.rects, null, entry.referer, diag)
+            if (failed.isNotEmpty()) {
+                // v129: the ONE re-plan self-heal. The piece signatures are
+                // short-lived; a lapse between the listing and this first
+                // request re-plans once (a fresh plan POST mints fresh
+                // signatures) and redraws ONLY the failed slots.
+                diag.add("compose: ${failed.size}/${plan.pieces.size} pieces failed — one re-plan self-heal")
+                val healed = runCatching { planner(request) }.getOrNull()
+                if (healed != null && healed.pieces.size == plan.pieces.size && healed.pieces != plan.pieces) {
+                    failed = drawMapPieces(canvas, healed.pieces, plan.rects, failed, entry.referer, diag)
+                    if (failed.isEmpty()) {
+                        diag.add("compose: the re-plan healed every failed piece")
+                    } else {
+                        diag.add("compose: ${failed.size} pieces still failed after the re-plan")
+                    }
+                } else {
+                    diag.add("compose: the re-plan answered no compatible map")
+                }
+            }
+            if (failed.size == plan.pieces.size) {
+                throw ImageBuildFailure(
+                    "compose",
+                    "ProComic: every piece of the protected page failed [${diag.summary()}]",
+                    diag,
+                )
+            }
+            val out = ByteArrayOutputStream(plan.pieces.size * 32 * 1024)
+            bitmap.compress(Bitmap.CompressFormat.JPEG, 85, out)
+            return "image/jpeg" to out.toByteArray()
+        } finally {
+            bitmap.recycle()
+        }
+    }
+
+    /** Draws [pieces] at their rects; [only] restricts the work to the
+     * given slot indices (the self-heal's failed set). Returns the slots
+     * that still failed (a failed piece leaves its rect blank — the page
+     * stays readable). */
+    private fun drawMapPieces(
+        canvas: Canvas,
+        pieces: List<String>,
+        rects: List<ChapterMapRectDto>,
+        only: Set<Int>?,
+        referer: String,
+        diag: ProxyDiag,
+    ): Set<Int> {
+        val failed = LinkedHashSet<Int>()
+        val width = canvas.width.toFloat()
+        val height = canvas.height.toFloat()
+        for (slot in pieces.indices) {
+            if (only != null && slot !in only) continue
+            val url = pieces[slot]
+            val rect = rects.getOrNull(slot)
+            if (rect == null || !isAllowedImageUrl(url)) {
+                diag.add("piece $slot: unusable (${isAllowedImageUrl(url)})")
+                failed.add(slot)
+                continue
+            }
+            try {
+                val (_, raw) = fetchPieceBytes(url, referer, diag)
+                val decoded = BitmapFactory.decodeByteArray(raw, 0, raw.size)
+                if (decoded == null) {
+                    diag.add("piece $slot: decode null")
+                    failed.add(slot)
+                    continue
+                }
+                try {
+                    canvas.drawBitmap(
+                        decoded,
+                        null,
+                        android.graphics.RectF(
+                            rect.left.toFloat().coerceIn(0f, width),
+                            rect.top.toFloat().coerceIn(0f, height),
+                            (rect.left + rect.width).toFloat().coerceIn(0f, width),
+                            (rect.top + rect.height).toFloat().coerceIn(0f, height),
+                        ),
+                        null,
+                    )
+                } finally {
+                    decoded.recycle()
+                }
+            } catch (t: Throwable) {
+                diag.add("piece $slot: ${t.message ?: t.javaClass.simpleName}".take(120))
+                failed.add(slot)
+            }
+        }
+        return failed
+    }
+
+    /** v129: the piece ladder — the img{1-4} signed piece urls answer 200
+     * to a BROWSER UA carrying the CHAPTER referer and 403 to anything
+     * else (live-verified; weserv cannot fetch them either — no referer —
+     * so the server-side transcode tier is out for pieces and the local
+     * transcode runs: Android 12+ decodes the AVIF natively, older
+     * devices leave the rect blank, the rest of the page intact). The
+     * inner client goes first, the session client retries (the reading
+     * session the walk established). */
+    private fun fetchPieceBytes(pieceUrl: String, referer: String, diag: ProxyDiag): Pair<String, ByteArray> {
+        val tiers = listOf(innerClient to "inner") +
+            (sessionClient?.let { listOf(it to "session") } ?: emptyList())
+        var last: IOException? = null
+        for ((client, tag) in tiers) {
+            try {
+                val request = Request.Builder()
+                    .url(pieceUrl)
+                    .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                    .header("Referer", referer)
+                    .header("User-Agent", BROWSER_UA)
+                    .header("sec-fetch-dest", "image")
+                    .header("sec-fetch-mode", "no-cors")
+                    .header("sec-fetch-site", "cross-site")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        throw IOException("ProComic: piece download failed with HTTP ${response.code}")
+                    }
+                    val contentType = response.header("Content-Type").orEmpty()
+                    val raw = response.body.bytes()
+                    if (isAvif(contentType, raw)) {
+                        return "image/jpeg" to transcodeUnderPermit(raw, pieceUrl, diag, 0)
+                    }
+                    return contentType.ifBlank { "application/octet-stream" } to raw
+                }
+            } catch (e: IOException) {
+                last = e
+                diag.add("piece fetch $tag: ${describe(e)}")
+                try {
+                    Thread.sleep(RETRY_DELAY_MS)
+                } catch (_: InterruptedException) {
+                    Thread.currentThread().interrupt()
+                    throw last ?: IOException("ProComic: piece fetch interrupted")
+                }
+            }
+        }
+        throw last ?: IOException("ProComic: piece fetch failed")
+    }
 
     private val composedLock = Any()
 
@@ -360,6 +649,7 @@ class ProComicImageServer(
             path.startsWith("/$DIAG_PATH_PREFIX") -> serveDiag(path, output)
             path.startsWith("/$IMAGE_PROXY_PATH_PREFIX/") -> serveImageProxy(path, query, output)
             path.startsWith("/$COMPOSED_PATH_PREFIX/") -> serveComposed(path, output)
+            path.startsWith("/$MAP_PAGE_PATH_PREFIX/") -> serveMapPage(path, output)
             else -> writeResponse(output, 404, "Not Found", "text/plain", "unknown path".toByteArray())
         }
     }
@@ -1532,9 +1822,14 @@ class ProComicImageServer(
         const val IMAGE_PROXY_PATH_PREFIX = ".image-proxy"
         const val COMPOSED_PATH_PREFIX = ".composed"
         const val DIAG_PATH_PREFIX = ".diag"
+        const val MAP_PAGE_PATH_PREFIX = ".map-page"
 
         /** Bounded registry for composed-row specs (one chapter ~= 40 rows). */
         private const val MAX_COMPOSED_SPECS = 256
+
+        /** v129: bounded registry for planned protected pages (a full
+         * chapter's maps[] — 50+ entries — must fit with room to spare). */
+        private const val MAX_MAP_PAGES = 512
 
         /** Composed canvas bounds (a reader row is ~800x1300 CSS px). */
         private const val MAX_COMPOSED_EDGE = 2600
