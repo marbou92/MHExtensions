@@ -6,48 +6,35 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    // v137 (versionCode 50): THE GRID THAT FINALLY DREW — the field verdict
-    // on v136 was "the pages after 4 still gives 410", and the round-10
-    // archaeology + a fresh sandbox walk of the whole chain (2026-11-07)
-    // finally named every layer of the wall:
-    //  (1) THE DEVICE IS ANDROID 10 (the round-8 recon's own words) — the
-    //      platform BitmapFactory decodes every AVIF piece null, so the
-    //      v129 compose path could never answer the protected rows and the
-    //      loopback's fast legible 410 card became the reader-visible
-    //      verdict on v1.6.48/v1.6.49 alike;
-    //  (2) THE CAPTURE HAD NOTHING TO CAPTURE (the round-8 recon stands):
-    //      the site's ANONYMOUS reader never mounts the protected rows at
-    //      all — zero reader rows, the paywall text instead — so the two
-    //      capture rewrites of v1.6.48/v1.6.49 walked pages that never
-    //      contained their targets on signed-out devices;
-    //  (3) THE CHAIN ITSELF IS ALIVE (live re-walk): the reader-signal
-    //      exchange answered 5 maps + a fresh pass (200), the plan POST
-    //      answered a 1600x893 grid_2x3 map with 6 freshly-signed pieces
-    //      + rects (200), and the img{1-4} piece edge answered 200
-    //      image/avif to a browser UA + chapter referer (403 without the
-    //      referer; the pieces are AVIF under every Accept header — no
-    //      negotiation escape).
-    // The fix — THE OFFSCREEN RASTER TIER (ProComicMapRasterizer): the
-    // one decoder that always worked is the WebView's own Chromium, and
-    // the v134 tier died not of the decoder but of its ALLOCATION
-    // PROFILE (full-page canvases per piece + toDataURL strings across
-    // the JS bridge, several pages at a time). The raster tier keeps the
-    // decoder and changes everything else: the plan becomes ONE synthetic
-    // page of absolutely-positioned <img>s (percent rects — density-
-    // proof), every piece streams in through shouldInterceptRequest from
-    // the server's own OkHttp ladder (browser UA + chapter referer — the
-    // exact 200 request), no canvas ever exists in JS, and ONE bounded
-    // view draw (<=1400x4000 device px, aspect preserved) composes the
-    // page into a software bitmap that is JPEG-encoded and recycled —
-    // peak memory ~4 MB at the observed page shape, one page at a time
-    // under a lock. onRenderProcessGone is absorbed behind a 3-strike
-    // breaker: a hostile stack degrades to the legible 410, never a
-    // crash. The site's DOM is not involved, so no login is needed (the
-    // plan POST is anonymous — live-verified) and the reader session's
-    // render purpose is retired (it re-arms automatically if the tier
-    // ever dies out). On Android 12+ the platform compose path is
-    // unchanged.
-    versionCode = 50
+    // v138 (versionCode 51): THE PIECE-BY-PIECE TRANSCODE — the field
+    // verdict on v137 was "pages after the 4 page like their images just
+    // crashs the reader": the offscreen raster tier's ONE view draw is a
+    // WebView draw() of a SOFTWARE-LAYER WebView — Chromium's rasterizer
+    // runs IN THE APP PROCESS there, the exact v108-v111 kill pattern no
+    // Java guard can catch. v138 deletes the raster tier and goes back
+    // behind the sandbox wall with a profile this build has never field-
+    // tested: the v134-era per-piece data-url decode, whose ONLY field
+    // death was its ALLOCATION PROFILE (full-page canvases per piece +
+    // toDataURL strings, several pages at a time). The math that was
+    // never tried: a plan's pieces are ~800x298 (the observed grid_2x3),
+    // so ONE piece = a 0.95 MB canvas inside Chromium's SANDBOXED
+    // renderer + a ~46 KB JPEG string across the bridge (sandbox-walk
+    // 2026-11-07: decode + draw + encode of a REAL freshly-signed piece
+    // answered 800x298 / 46 KB in 25 ms). One piece at a time behind the
+    // transcoder's own global lock, one page at a time through the
+    // compose path's existing coalescing, canvas edge capped at 1280
+    // whatever the piece claims, the renderer never destroyed between
+    // pieces, renderer death absorbed behind the 3-strike breaker. The
+    // app process only ever sees finished JPEG bytes it decodes with
+    // BitmapFactory — the ONE decoder that is safe on every Android
+    // version. NO view.draw, NO software layer, NO full-page canvas, NO
+    // toDataURL of a whole page — every allocation profile the field
+    // device ever died of is structurally absent. The plan POST, the
+    // piece ladder (browser UA + chapter referer), the compose path and
+    // its re-plan self-heal are untouched — v138 changes ONLY where the
+    // AVIF bytes turn into pixels. On Android 12+ the platform compose
+    // path is unchanged (the WebView tier never runs there).
+    versionCode = 51
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

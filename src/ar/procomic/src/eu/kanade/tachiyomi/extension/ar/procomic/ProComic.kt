@@ -295,26 +295,26 @@ abstract class ProComic :
             // operation (client, apex ladder, the chapter pass), so it rides
             // this hook exactly like the two above.
             mapPlanner = { request -> planChapterMap(request) }
-            // v137: THE OFFSCREEN RASTER TIER. On a device below Android 12
-            // (the field's Android 10), the platform cannot decode the AVIF
-            // pieces and v1.6.48/v1.6.49 answered those rows with the
-            // legible 410 card — the field verdict "the pages after 4 still
-            // gives 410". The tier boots ONE bounded offscreen WebView whose
-            // every request the intercept answers: the plan becomes an <img>
-            // grid (percent rects), pieces stream in as raw bytes from this
-            // server's own OkHttp ladder (browser UA + the chapter referer
-            // — live re-verified 2026-11-07: the piece edge answers 200
-            // image/avif to that exact request), Chromium decodes, and ONE
-            // view draw composes the page into a bounded software bitmap.
-            // No canvas ever crosses the JS bridge and no full-page canvas
-            // is ever allocated (the v1.6.47 tier died of exactly that);
-            // renderer death is absorbed and counts a 3-strike breaker, so
-            // a hostile WebView stack degrades to the legible 410 — never
-            // a crash. The site's DOM is not involved (the anonymous reader
-            // never mounts the protected rows — the round-8 recon), so the
-            // v1.6.48/v1.6.49 capture walks are retired for rendering.
-            rasterContext = applicationContext
-            rasterPieceFetcher = { url, referer -> fetchRawPieceForRaster(url, referer) }
+            // v138: THE PIECE-BY-PIECE TRANSCODE TIER. On a device below
+            // Android 12 (the field's Android 10) the platform cannot
+            // decode the AVIF pieces and v1.6.48/v1.6.49 answered those
+            // rows with the legible 410 card — while v1.6.50's view-draw
+            // raster tier CRASHED the reader (its ONE view draw ran
+            // Chromium's rasterizer in the app process, the v108-v111
+            // kill pattern). That tier is deleted. The compose path now
+            // decodes each piece through WebAvifTranscoder's SANDBOXED
+            // renderer instead: one ~800x298 data-url canvas per piece
+            // (0.95 MB, edge-capped at 1280 whatever the piece claims),
+            // one toDataURL JPEG string (~46 KB) at a time behind the
+            // tier's global lock, BitmapFactory re-decoding finished JPEG
+            // in this process. Sandbox-walk 2026-11-07: a REAL freshly-
+            // signed piece answered 800x298 / 46 KB in 25 ms. No
+            // view.draw, no software layer, no full-page canvas — the
+            // allocation profiles the field device died of are
+            // structurally absent. Renderer death is absorbed behind the
+            // 3-strike breaker, so a hostile stack degrades to the
+            // legible 410 — never a crash.
+            transcodeContext = applicationContext
         }
     }
 
@@ -1546,7 +1546,7 @@ abstract class ProComic :
         // render purpose re-arms automatically (belt and braces).
         val avifRenderable = ProComicImageServer.avifDecodable(android.os.Build.VERSION.SDK_INT)
         val needsSessionRendering = plannedDistinct.isNotEmpty() && !avifRenderable &&
-            !ProComicImageServer.rasterTierAvailable()
+            !ProComicImageServer.webTierAvailable()
         if (readerSessionEnabled && (!deferredWalkComplete || needsSessionRendering)) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
                 Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")

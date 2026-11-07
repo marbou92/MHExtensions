@@ -16,41 +16,51 @@ import java.util.concurrent.atomic.AtomicInteger
 import java.util.concurrent.atomic.AtomicReference
 
 /**
- * v134 — THE WEBVIEW AVIF→JPEG TRANSCODER: the tier that ends the decode
- * wall. Live recon (sandbox, 2026-11-06, the night the page count fell
- * back to 3):
+ * v138 — THE WEBVIEW AVIF→JPEG TRANSCODER, RE-ARMED PIECE-SIZED: the
+ * decode tier that ends the wall WITHOUT the profiles the field device
+ * ever died of. History the design answers:
  *
- *  - the reconstruction-map chain is provably alive end to end — the
- *    reader-signal exchange answered 11 maps + a fresh pass (HTTP 200),
- *    the plan POST answered 6 freshly-signed piece urls + rects (HTTP
- *    200), and the img{1-4} piece edge answered 200 image/avif to a
- *    browser UA carrying the chapter referer;
- *  - the sign endpoint refuses piece urls (403 forbidden_host — the
- *    v133 in-page "same-origin re-fetch" can never fire for them), and
- *    the site's anonymous reader never mounts the protected rows at all
- *    (verified in a real browser: zero data-reader-image-row rows, the
- *    paywall text instead) — so the rendered harvest had nothing to
- *    capture;
+ *  - the site's reconstruction-map chain is provably alive end to end —
+ *    the reader-signal exchange answers maps + a fresh pass (HTTP 200),
+ *    the plan POST answers a 1600x893 `grid_2x3` map with 6 freshly
+ *    signed piece urls + absolute rects (HTTP 200), and the img{1-4}
+ *    piece edge answers 200 `image/avif` to a browser UA carrying ANY
+ *    procomic referer (403 bare, 403 with a foreign referer — the edge
+ *    checks the referer's HOST, live re-verified 2026-11-07);
  *  - on the affected Android 10 device BitmapFactory decodes every AVIF
- *    piece null and weserv — which cannot send a Referer — 404s the
- *    pieces, so EVERY protected page failed to compose and the decode
- *    wall's "loadable pages only" contract shipped 3 pages.
+ *    null, and weserv — which cannot send a Referer — 404s the pieces,
+ *    so the v111 remote-transcode ladder has no answer for them;
+ *  - the one decoder that HAS been rendering the site's AVIF all along
+ *    is the WebView's own Chromium (software AV1/AVIF, every Android
+ *    version) — but the field device died on EVERY prior attempt to use
+ *    it in-process: v108–v110 (MediaCodec, then full-size view draws,
+ *    then bounded ~9 MB draws), v134 (full-page canvases PER PIECE +
+ *    toDataURL strings, several pages at a time), v137 (ONE view draw
+ *    of a software-layer WebView — Chromium's rasterizer runs in the
+ *    APP process there). Every death was an ALLOCATION profile; none
+ *    was the canvas decode itself.
  *
- * The one decoder that HAS been rendering the site's AVIF all along is
- * the WebView's own Chromium (software AV1/AVIF, every Android version).
- * This transcoder uses it through the narrowest possible door:
+ * v138's profile — the math that was never field-tested:
  *
- *  1. one warm, offscreen, network-ISOLATED WebView on its own
+ *  1. ONE warm, offscreen, network-ISOLATED WebView on its own
  *     HandlerThread (blockNetworkLoads + blockNetworkImage BEFORE any
  *     load — the v104–v110 lesson: this renderer never touches the
- *     network; the only input is a data: url);
+ *     network; the only input is a data: url), never destroyed between
+ *     pieces, NEVER drawn as a view (no draw(), no software layer —
+ *     the v137 vector is structurally absent);
  *  2. per piece: evaluateJavascript draws the data-url AVIF onto a
- *     bounded canvas and returns canvas.toDataURL('image/jpeg') —
- *     Chromium decodes the AVIF inside its sandboxed renderer, this
- *     process only ever sees finished JPEG bytes;
- *  3. data: urls are same-origin-safe — the canvas never taints, the
- *     piece edge's no-CORS posture is irrelevant, no site cookies or
- *     credentials are involved;
+ *     canvas sized to THAT PIECE (the observed grid_2x3 shape is
+ *     800x298 ≈ 0.95 MB; the edge is capped at 1280 whatever the
+ *     piece claims — a hostile 4000x6000 decodes at 1280 edge ≈ 5.9 MB,
+ *     still 15x under v110's fatal profile) and returns ONE
+ *     canvas.toDataURL('image/jpeg') — Chromium decodes inside its
+ *     SANDBOXED renderer process; this process only ever sees finished
+ *     JPEG bytes (sandbox-walk 2026-11-07: a REAL freshly-signed piece
+ *     answered 800x298 / 46 KB in 25 ms);
+ *  3. STRICTLY ONE decode at a time process-wide (the tier's own
+ *     lock) — no "several pages at a time" (the v134 profile is
+ *     structurally absent); data: urls are same-origin-safe — the
+ *     canvas never taints, no site cookies or credentials are involved;
  *  4. everything is bounded and guarded: a hard per-piece latch
  *     timeout (a wedged renderer poisons and recreates the WebView),
  *     onRenderProcessGone returns true (the host app survives — the
@@ -60,8 +70,7 @@ import java.util.concurrent.atomic.AtomicReference
  *
  * Failure profile: every failure answers null — the caller falls
  * through to the next tier (weserv for referer-free hosts, the legible
- * 502 / blank-rect paths for pieces) exactly like v132's contract,
- * minus the "doomed" part: the tier that used to be missing now exists.
+ * 502 / blank-rect paths for pieces) exactly like v132's contract.
  */
 internal object WebAvifTranscoder {
 
@@ -78,6 +87,13 @@ internal object WebAvifTranscoder {
 
     /** Warm-page wall — the first load is the slowest (renderer boot). */
     private const val WARM_TIMEOUT_MS = 20_000L
+
+    /** v138: the canvas edge cap for natural-size decodes (maxEdge = 0).
+     * The observed grid_2x3 pieces are 800x298 — the cap never touches
+     * them; a hostile oversized piece decodes at 1280 edge (≈5.9 MB
+     * ARGB worst case) instead of its natural size, and the compose
+     * draws it into the rect at ANY size (drawBitmap scales). */
+    internal const val NATURAL_DECODE_EDGE_CAP = 1280
 
     private val disabled = AtomicBoolean(false)
     private val deaths = AtomicInteger(0)
@@ -114,7 +130,10 @@ internal object WebAvifTranscoder {
             if (handler == null && !bootRenderer(context)) return null
             val latch = CountDownLatch(1)
             val answer = AtomicReference<ByteArray?>(null)
-            val script = pieceScript(b64, maxEdge, quality)
+            // v138: a natural-size request (maxEdge = 0) still caps the
+            // canvas edge — the allocation profile the field device ever
+            // died of never re-appears, whatever the piece claims.
+            val script = pieceScript(b64, if (maxEdge > 0) maxEdge else NATURAL_DECODE_EDGE_CAP, quality)
             val dispatched = AtomicBoolean(false)
             try {
                 handler?.post {
