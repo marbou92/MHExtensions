@@ -6,36 +6,48 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    // v136 (versionCode 49): THE DRAW THAT NEVER DREW — the field verdict on
-    // v135 was "no crash, but after page 3 the other pages say HTTP 410",
-    // and the round-9 code archaeology found why the session's viewport-draw
-    // capture never delivered a single page: it was DEAD ON ARRIVAL.
-    // (a) the Kotlin read state["vh"]/state["dpr"], but the harvest script
-    //     never reported them — vh parsed 0 and "row.h in 8..0" is an empty
-    //     range, so "fullyVisible" was false on every tick;
-    //     (b) the Kotlin set window.__mihonTarget (its comment promised "the
-    //     script honors window.__mihonTarget") but the script never READ it —
-    //     it kept scrolling the LAST row into view, so no target row ever sat
-    //     in the viewport even with a correct vh. Every piece row sat 30
-    //     ticks unplaced, fell to drawFailed, rode the loopback compose, and
-    //     the decode-less device answered its fast legible 410 — the exact
-    //     field verdict, ~30 s after open.
-    // The fix: a SEGMENTED BAND capture — the script now reports vh/dpr and
-    // per-row totals, honors __mihonTarget + a new __mihonSeg (it PLACES the
-    // requested band of the target row at the viewport top — window first,
-    // then inner scrollable ancestors — and reports the placed rect), and the
-    // Kotlin drives BANDS: rows taller than the viewport capture in seamless
-    // viewport-sized segments the /.captured stitcher already composes, and
-    // a segment draws only once it is verifiably placed and every piece img
-    // has loaded. Draws start only after the walk reaches the end (latched)
-    // so the two scroll passes never fight; the poll tightened to 600 ms,
-    // the tick cap rose to 480, and give-ups count as progress so a wedged
-    // row cannot truncate the pass. On the list side the session no longer
-    // replaces the walk list all-or-nothing — the captured-overlay merge
-    // upgrades the walk list per page (captured pixels replace their own
-    // index, plain renders replace planned composes, rows beyond the walk's
-    // plan append) so the list can only upgrade, never shrink.
-    versionCode = 49
+    // v137 (versionCode 50): THE GRID THAT FINALLY DREW — the field verdict
+    // on v136 was "the pages after 4 still gives 410", and the round-10
+    // archaeology + a fresh sandbox walk of the whole chain (2026-11-07)
+    // finally named every layer of the wall:
+    //  (1) THE DEVICE IS ANDROID 10 (the round-8 recon's own words) — the
+    //      platform BitmapFactory decodes every AVIF piece null, so the
+    //      v129 compose path could never answer the protected rows and the
+    //      loopback's fast legible 410 card became the reader-visible
+    //      verdict on v1.6.48/v1.6.49 alike;
+    //  (2) THE CAPTURE HAD NOTHING TO CAPTURE (the round-8 recon stands):
+    //      the site's ANONYMOUS reader never mounts the protected rows at
+    //      all — zero reader rows, the paywall text instead — so the two
+    //      capture rewrites of v1.6.48/v1.6.49 walked pages that never
+    //      contained their targets on signed-out devices;
+    //  (3) THE CHAIN ITSELF IS ALIVE (live re-walk): the reader-signal
+    //      exchange answered 5 maps + a fresh pass (200), the plan POST
+    //      answered a 1600x893 grid_2x3 map with 6 freshly-signed pieces
+    //      + rects (200), and the img{1-4} piece edge answered 200
+    //      image/avif to a browser UA + chapter referer (403 without the
+    //      referer; the pieces are AVIF under every Accept header — no
+    //      negotiation escape).
+    // The fix — THE OFFSCREEN RASTER TIER (ProComicMapRasterizer): the
+    // one decoder that always worked is the WebView's own Chromium, and
+    // the v134 tier died not of the decoder but of its ALLOCATION
+    // PROFILE (full-page canvases per piece + toDataURL strings across
+    // the JS bridge, several pages at a time). The raster tier keeps the
+    // decoder and changes everything else: the plan becomes ONE synthetic
+    // page of absolutely-positioned <img>s (percent rects — density-
+    // proof), every piece streams in through shouldInterceptRequest from
+    // the server's own OkHttp ladder (browser UA + chapter referer — the
+    // exact 200 request), no canvas ever exists in JS, and ONE bounded
+    // view draw (<=1400x4000 device px, aspect preserved) composes the
+    // page into a software bitmap that is JPEG-encoded and recycled —
+    // peak memory ~4 MB at the observed page shape, one page at a time
+    // under a lock. onRenderProcessGone is absorbed behind a 3-strike
+    // breaker: a hostile stack degrades to the legible 410, never a
+    // crash. The site's DOM is not involved, so no login is needed (the
+    // plan POST is anonymous — live-verified) and the reader session's
+    // render purpose is retired (it re-arms automatically if the tier
+    // ever dies out). On Android 12+ the platform compose path is
+    // unchanged.
+    versionCode = 50
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

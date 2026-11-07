@@ -269,6 +269,15 @@ abstract class ProComic :
             // re-admitted the WebView tier and the field device died again
             // (the v1.6.47 crash report) — the worst case is the legible
             // error card, never a crash.
+            // v137: the WebView RETURNS as the raster tier — but with the
+            // crash profile turned inside-out: one renderer, one job at a
+            // time, the plan laid out as percent-positioned <img>s whose
+            // bytes stream in through the intercept (no JS canvas, no
+            // toDataURL bridge, no full-page canvas allocations — the
+            // allocations that killed the field device), one bounded view
+            // draw per page, onRenderProcessGone absorbed behind a
+            // 3-strike breaker. A hostile stack degrades to the legible
+            // 410 card; it cannot take the host app down.
             nativeCacheDir = applicationContext.cacheDir,
         ).apply {
             // v116: the loopback server fetches signed-proxy urls with the
@@ -286,6 +295,26 @@ abstract class ProComic :
             // operation (client, apex ladder, the chapter pass), so it rides
             // this hook exactly like the two above.
             mapPlanner = { request -> planChapterMap(request) }
+            // v137: THE OFFSCREEN RASTER TIER. On a device below Android 12
+            // (the field's Android 10), the platform cannot decode the AVIF
+            // pieces and v1.6.48/v1.6.49 answered those rows with the
+            // legible 410 card — the field verdict "the pages after 4 still
+            // gives 410". The tier boots ONE bounded offscreen WebView whose
+            // every request the intercept answers: the plan becomes an <img>
+            // grid (percent rects), pieces stream in as raw bytes from this
+            // server's own OkHttp ladder (browser UA + the chapter referer
+            // — live re-verified 2026-11-07: the piece edge answers 200
+            // image/avif to that exact request), Chromium decodes, and ONE
+            // view draw composes the page into a bounded software bitmap.
+            // No canvas ever crosses the JS bridge and no full-page canvas
+            // is ever allocated (the v1.6.47 tier died of exactly that);
+            // renderer death is absorbed and counts a 3-strike breaker, so
+            // a hostile WebView stack degrades to the legible 410 — never
+            // a crash. The site's DOM is not involved (the anonymous reader
+            // never mounts the protected rows — the round-8 recon), so the
+            // v1.6.48/v1.6.49 capture walks are retired for rendering.
+            rasterContext = applicationContext
+            rasterPieceFetcher = { url, referer -> fetchRawPieceForRaster(url, referer) }
         }
     }
 
@@ -1505,8 +1534,19 @@ abstract class ProComic :
         // capture renders those pages through the session's own Chromium —
         // the exact renderer the user's browser uses — so a decode-less
         // device with planned map pages runs it too.
+        // v137: THAT RENDER PURPOSE IS RETIRED. Two facts (round-8 recon
+        // + the sandbox re-walk of 2026-11-07) closed it: the site's
+        // ANONYMOUS reader never mounts the protected rows (zero reader
+        // rows — the paywall text instead), so the capture had nothing to
+        // capture on signed-out devices — exactly why v1.6.48/v1.6.49
+        // delivered nothing; and the offscreen raster tier now renders the
+        // plans directly (the plan POST needs no login — live-verified).
+        // The session runs ONLY for its completeness/entitlement roles
+        // again; the moment the raster tier dies its 3-strike death, the
+        // render purpose re-arms automatically (belt and braces).
         val avifRenderable = ProComicImageServer.avifDecodable(android.os.Build.VERSION.SDK_INT)
-        val needsSessionRendering = plannedDistinct.isNotEmpty() && !avifRenderable
+        val needsSessionRendering = plannedDistinct.isNotEmpty() && !avifRenderable &&
+            !ProComicImageServer.rasterTierAvailable()
         if (readerSessionEnabled && (!deferredWalkComplete || needsSessionRendering)) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
                 Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")

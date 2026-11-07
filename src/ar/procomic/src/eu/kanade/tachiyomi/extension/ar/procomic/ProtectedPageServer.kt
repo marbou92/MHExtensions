@@ -175,6 +175,19 @@ class ProComicImageServer(
     @Volatile
     internal var mapPlanner: ((MapPageRequest) -> MapPagePlanResult?)? = null
 
+    /** v137: the application context the offscreen raster tier boots its
+     * WebView with. Optional so the JVM harness can drive the server bare
+     * (the tier then stays out and the legible 410 stands). */
+    @Volatile
+    internal var rasterContext: android.content.Context? = null
+
+    /** v137: the raster tier's piece supplier — raw AVIF bytes for one
+     * freshly-signed piece url (the compose path's own fetch ladder,
+     * minus the on-device transcode: the tier's Chromium decodes). The
+     * chapter referer rides the second argument. */
+    @Volatile
+    internal var rasterPieceFetcher: ((String, String) -> ByteArray?)? = null
+
     /** Fair 2-wide semaphore over the TRANSCODE stage only (decode + JPEG
      * encode of tall pages). Fairness keeps a reader's preloaded pages from
      * being starved by late requests; the network fetch happens OUTSIDE the
@@ -370,23 +383,62 @@ class ProComicImageServer(
             return
         }
         // v132: the decode wall — a device below Android 12 cannot decode
-        // the AVIF pieces the plan returns; run no doomed build (the field
-        // verdict: ~30 s of fetch+transcode retries, then "every piece
-        // failed"). A fast legible 410 covers stale library urls too.
-        // v135: the ban list stands — v134's offscreen WebView tier died
-        // inside the field device AGAIN (the v1.6.47 crash report: the
-        // app died the moment pages 4+ were requested), exactly as it
-        // died across v108–v110. The rendered harvest (the reader
-        // session's in-page capture) is the decode path that works below
-        // Android 12; this route answers fast and legibly when the
-        // device genuinely cannot decode.
+        // the AVIF pieces the plan returns with its own BitmapFactory; a
+        // doomed on-device build answers nothing (the field verdict: ~30 s
+        // of fetch+transcode retries, then "every piece failed").
+        // v137: THE RASTER TIER — "cannot decode" no longer means "cannot
+        // render": the offscreen rasterizer lays the freshly-signed plan
+        // out as an <img> grid (percent rects), feeds every piece through
+        // shouldInterceptRequest from this server's own OkHttp ladder
+        // (browser UA + chapter referer — the exact request the edge
+        // answers 200), and draws the view into one bounded software
+        // bitmap. Chromium decodes the AVIF; no canvas ever crosses the
+        // JS bridge; the peak memory profile is one view-sized bitmap
+        // (the v1.6.47 tier died of full-page canvases + toDataURL
+        // strings — this tier allocates neither). The site's DOM is not
+        // involved — the round-8 recon stands (the anonymous reader never
+        // mounts the protected rows, so there was never anything to
+        // capture). When the tier is out (renderer deaths, no context or
+        // fetcher), the legible 410 stands.
+        if (!avifRenderable && rasterReady()) {
+            val (contentType, bytes) = try {
+                composedCoalesced(cacheId) {
+                    rasterizeMapPage(entry)
+                }
+            } catch (failure: ImageBuildFailure) {
+                Log.w(TAG, "map page $key raster failed at stage=${failure.stage}: ${failure.readerBody}")
+                recordFailure(cacheId, failure.stage, failure.diag)
+                writeResponse(
+                    output,
+                    502,
+                    "Bad Gateway",
+                    "text/plain",
+                    failure.readerBody.toByteArray(),
+                    stage = failure.stage,
+                    diag = failure.diag,
+                )
+                return
+            } catch (t: Throwable) {
+                Log.w(TAG, "map page $key raster dispatch failed: ${t.javaClass.simpleName}")
+                writeResponse(
+                    output,
+                    502,
+                    "Bad Gateway",
+                    "text/plain",
+                    "protected page raster failed (${t.javaClass.simpleName})".toByteArray(),
+                )
+                return
+            }
+            writeImageBytes(output, contentType, bytes)
+            return
+        }
         if (!avifRenderable) {
             writeResponse(
                 output,
                 410,
                 "Gone",
                 "text/plain",
-                "protected pages need an AVIF-capable device (Android 12+) — the site serves them as AVIF pieces no older decoder can render".toByteArray(),
+                "protected pages need an AVIF-capable device (Android 12+) or the offscreen raster tier (unavailable) — the site serves them as AVIF pieces no installed decoder can render".toByteArray(),
                 stage = "decode-wall",
             )
             return
@@ -424,6 +476,111 @@ class ProComicImageServer(
             return
         }
         writeImageBytes(output, contentType, bytes)
+    }
+
+    /** v137: true when the offscreen raster tier may serve this build. */
+    private fun rasterReady(): Boolean = rasterContext != null && rasterPieceFetcher != null && ProComicMapRasterizer.isAvailable()
+
+    /** v137: plan + raster one protected page through the offscreen tier
+     * — the compose path's planner and its one re-plan self-heal, then
+     * the Chromium-powered draw. Answers "image/jpeg" to bytes. */
+    private fun rasterizeMapPage(entry: MapPageEntry): Pair<String, ByteArray> {
+        val context = rasterContext
+            ?: throw ImageBuildFailure("raster", "ProComic: the raster tier has no context", ProxyDiag())
+        val fetcher = rasterPieceFetcher
+            ?: throw ImageBuildFailure("raster", "ProComic: the raster tier has no piece fetcher", ProxyDiag())
+        val diag = ProxyDiag()
+        val planner = mapPlanner
+            ?: throw ImageBuildFailure("plan", "ProComic: the reconstruction planner is unavailable", diag)
+        val request = MapPageRequest(
+            chapterId = entry.chapterId,
+            pageIndex = entry.pageIndex,
+            token = entry.token,
+            method = entry.method,
+            cdnPath = entry.cdnPath,
+            referer = entry.referer,
+        )
+        var plan = runCatching { planner(request) }
+            .onFailure { diag.add("plan threw: ${it.javaClass.simpleName}") }
+            .getOrNull()
+        if (plan == null) {
+            diag.add("plan: no answer — one re-plan before failing")
+            plan = runCatching { planner(request) }.getOrNull()
+        }
+        if (plan == null || plan.pieces.isEmpty() || plan.pieces.size != plan.rects.size) {
+            throw ImageBuildFailure(
+                "plan",
+                "ProComic: the protected page's reconstruction plan failed [${diag.summary()}]",
+                diag,
+            )
+        }
+        val jpeg = runCatching {
+            ProComicMapRasterizer.raster(
+                context = context,
+                plan = plan,
+                referer = entry.referer,
+                fetchPiece = { url -> fetcher(url, entry.referer) },
+            )
+        }.getOrElse { t ->
+            diag.add("raster threw: ${t.javaClass.simpleName}")
+            null
+        }
+        if (jpeg == null) {
+            throw ImageBuildFailure(
+                "raster",
+                "ProComic: the offscreen raster could not draw the protected page [${diag.summary()}]",
+                diag,
+            )
+        }
+        return "image/jpeg" to jpeg
+    }
+
+    /** v137: the compose path's piece ladder WITHOUT the on-device
+     * transcode — raw bytes for the raster tier's intercept (its own
+     * Chromium does the decoding). Same tiers, headers and retry as
+     * [fetchPieceBytes]. */
+    internal fun fetchRawPieceForRaster(pieceUrl: String, referer: String): ByteArray? {
+        val diag = ProxyDiag()
+        return try {
+            fetchRawPiece(pieceUrl, referer, diag)
+        } catch (t: Throwable) {
+            diag.add("raw fetch: ${(t.message ?: t.javaClass.simpleName).take(120)}")
+            null
+        }
+    }
+
+    private fun fetchRawPiece(pieceUrl: String, referer: String, diag: ProxyDiag): ByteArray {
+        val tiers = listOf(innerClient to "inner") +
+            (sessionClient?.let { listOf(it to "session") } ?: emptyList())
+        var last: IOException? = null
+        for ((client, tag) in tiers) {
+            try {
+                val request = Request.Builder()
+                    .url(pieceUrl)
+                    .header("Accept", "image/avif,image/webp,image/apng,image/svg+xml,image/*,*/*;q=0.8")
+                    .header("Referer", referer)
+                    .header("User-Agent", BROWSER_UA)
+                    .header("sec-fetch-dest", "image")
+                    .header("sec-fetch-mode", "no-cors")
+                    .header("sec-fetch-site", "cross-site")
+                    .build()
+                client.newCall(request).execute().use { response ->
+                    if (!response.isSuccessful) {
+                        throw IOException("ProComic: piece download failed with HTTP ${response.code}")
+                    }
+                    return response.body.bytes()
+                }
+            } catch (e: IOException) {
+                last = e
+                diag.add("piece fetch $tag: ${describe(e)}")
+                try {
+                    Thread.sleep(RETRY_DELAY_MS)
+                } catch (_: InterruptedException) {
+                    throw (last ?: IOException("ProComic: piece fetch interrupted"))
+                }
+            }
+        }
+        throw last ?: IOException("ProComic: piece unreachable")
     }
 
     /** Plan + compose one protected page. The re-plan self-heal lives
@@ -2252,6 +2409,12 @@ class ProComicImageServer(
          * pin it. Android 12 = API 31; that is the first release whose
          * BitmapFactory decodes AVIF natively. */
         internal fun avifDecodable(sdkInt: Int): Boolean = sdkInt >= 31
+
+        /** v137: the offscreen raster tier's gate — pure so the harness
+         * can pin it. True while the tier may still boot a renderer; the
+         * source consults it before sending the reader session to walk
+         * for renders the tier now draws. */
+        internal fun rasterTierAvailable(): Boolean = ProComicMapRasterizer.isAvailable()
 
         private const val FAMILY_PROBE_TIMEOUT_MS = 750
 
