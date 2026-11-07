@@ -3,22 +3,38 @@ package eu.kanade.tachiyomi.extension.ar.procomic
 import java.nio.ByteBuffer
 
 /**
- * Framework-only AVIF decoder (v108, demoted to DEBUG-ONLY in v109):
- * parses the ISOBMFF container in pure Kotlin and pushes the embedded AV1
- * OBU stream through MediaCodec's platform "video/av1" software decoder
- * (c2.android.av1 — shipped with Android 10).
+ * Framework-only AVIF decoder (v108, demoted to DEBUG-ONLY in v109,
+ * RE-ARMED PIECE-SIZED in v139): parses the ISOBMFF container in pure
+ * Kotlin and pushes the embedded AV1 OBU stream through MediaCodec's
+ * platform "video/av1" software decoder (c2.android.av1 — shipped with
+ * Android 10).
  *
  * v109 FIELD VERDICT: this tier KILLED the host app on the Android 10
  * field device — configuring Android 10's brand-new software AV1 codec at
  * a still image's full size (pages 800x5000, "originals" covers to
  * 4000x6000) is a native-crash/OOM-kill surface no Java guard can catch,
- * and the app crashed on every page and cover load. The tier is REMOVED
- * from the decode ladder (see ProtectedPageServer.avifToJpeg — the WebView
- * tier replaces it) and survives only behind the debugMediaCodecTier hook
- * so the harness can keep pinning its decline behavior. The pure-Kotlin
- * parts remain LOAD-BEARING: parseAvifImage is the WebView tier's up-front
- * pixel-budget gate, and the NV21/pack pins keep guarding the container
- * logic.
+ * and the app crashed on every page and cover load. The tier was REMOVED
+ * from the decode ladder and survived only behind the debugMediaCodecTier
+ * hook.
+ *
+ * v139 — THE RE-ARMING, WITH THE MATH THAT CHANGED: the site's protected
+ * pages now arrive as reconstruction-plan PIECES — the observed grid_2x3
+ * shape is 800x298 (~0.24 MP), three orders of magnitude under every
+ * full-size config the field device ever died of. At that size the
+ * software AV1 decode is the profile of an ordinary video thumbnail
+ * (1080p video is ~2 MP — every Android 10 device runs it). The piece
+ * ladder calls [decodePieceToJpeg], which refuses any tile or output
+ * past 1280 edge / 1.3 MP in PURE KOTLIN — before a single codec
+ * allocation — so the v108 kill profile is structurally unreachable.
+ * The WebView transcode tiers are gone for good (the field device died
+ * inside every one of them, v109-v138), and the attempt-marker breaker
+ * around the ladder bounds even a hostile codec: one handled-late death
+ * disables the tier for the session, two for the install — the floor is
+ * the legible 410 card, never a crash loop. The full-size [decodeToJpeg]
+ * entry survives for the harness's decline pins only; the production
+ * ladder never calls it. The pure-Kotlin parts remain LOAD-BEARING:
+ * parseAvifImage is the piece gate's up-front container parse, and the
+ * NV21/pack pins keep guarding the container logic.
  *
  * Container support (verified against live app.<host> files):
  *  - single-item AVIF ('av01' primary item): full support
@@ -58,10 +74,49 @@ internal object AvifMediaCodecDecoder {
     // ============================== entry ================================
 
     /**
-     * Full AVIF -> JPEG pipeline. Returns the finished JPEG bytes or null
-     * (every reason lands in [log]; the caller falls through to its other
-     * decode tiers). Never throws.
+     * v139 — THE PIECE-GATED ENTRY (the ONLY entry the map-piece ladder
+     * may use). The whole point of the site's reconstruction-plan pieces
+     * is that they are SMALL: the observed grid_2x3 shape is 800x298
+     * (~0.24 MP), three orders of magnitude under the full-size configs
+     * (pages 800x5000, "originals" covers 4000x6000) that killed the
+     * v108 field device. This entry enforces that BEFORE any MediaCodec
+     * allocation: the container is parsed in pure Kotlin (no codec, no
+     * native surface), and every tile — plus the composed output — must
+     * fit [MAX_PIECE_EDGE] / [MAX_PIECE_PIXELS]. A file that does not
+     * fit is not a decode, it is the old kill profile — refused on
+     * sight, the ladder falls through, the worst case stays the legible
+     * card. Never throws.
      */
+    fun decodePieceToJpeg(avif: ByteArray, log: (String) -> Unit, quality: Int): ByteArray? = try {
+        val layout = parseAvifImage(avif) ?: run {
+            log("container parse refused")
+            return null
+        }
+        val oversizedTile = layout.tiles.firstOrNull { tile ->
+            maxOf(tile.width, tile.height) > MAX_PIECE_EDGE ||
+                tile.width.toLong() * tile.height.toLong() > MAX_PIECE_PIXELS
+        }
+        if (oversizedTile != null) {
+            log(
+                "piece gate refused: tile ${oversizedTile.width}x${oversizedTile.height} " +
+                    "exceeds $MAX_PIECE_EDGE edge / $MAX_PIECE_PIXELS px",
+            )
+            return null
+        }
+        if (layout.outputWidth.toLong() * layout.outputHeight.toLong() > MAX_PIECE_PIXELS) {
+            log("piece gate refused: output ${layout.outputWidth}x${layout.outputHeight} exceeds $MAX_PIECE_PIXELS px")
+            return null
+        }
+        log("piece gate ok: ${layout.outputWidth}x${layout.outputHeight} tiles=${layout.tiles.size}")
+        decodeToJpeg(avif, log, quality)
+    } catch (t: Throwable) {
+        log("piece gate threw ${t.javaClass.simpleName}: ${t.message?.take(60)}")
+        null
+    }
+
+    /** Full AVIF -> JPEG pipeline. Returns the finished JPEG bytes or null
+     * (every reason lands in [log]; the caller falls through to its other
+     * decode tiers). Never throws. */
     fun decodeToJpeg(avif: ByteArray, log: (String) -> Unit, quality: Int): ByteArray? = try {
         val layout = parseAvifImage(avif) ?: run {
             log("container parse refused")
@@ -743,4 +798,14 @@ internal object AvifMediaCodecDecoder {
     /** Composited grid ceiling (ARGB_8888): 50 MP ~ 200 MB — above this
      * the tier refuses rather than OOM-ing the host app. */
     private const val MAX_COMPOSE_PIXELS = 50_000_000L
+
+    /** v139: the PIECE budget — the map-piece ladder's hard pre-alloc
+     * gate. The observed grid_2x3 piece is 800x298 (~0.24 MP); anything
+     * past a 1280-long-edge / 1.3 MP tile is the v108 kill profile
+     * (full pages 800x5000, covers 4000x6000) and is refused before a
+     * single codec allocation happens. */
+    internal const val MAX_PIECE_EDGE = 1280
+
+    /** v139: the piece pixel budget (see [MAX_PIECE_EDGE]). */
+    internal const val MAX_PIECE_PIXELS = 1_300_000L
 }

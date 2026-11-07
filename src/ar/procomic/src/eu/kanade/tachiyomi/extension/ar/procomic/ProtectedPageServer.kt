@@ -175,19 +175,22 @@ class ProComicImageServer(
     @Volatile
     internal var mapPlanner: ((MapPageRequest) -> MapPagePlanResult?)? = null
 
-    /** v138: the application context the WebView AVIF transcoder boots
-     * its offscreen renderer with (the compose path's piece decode tier
-     * on devices below Android 12). Optional so the JVM harness can
-     * drive the server bare (the tier then stays out and the legible
-     * 410 stands). */
-    @Volatile
-    internal var transcodeContext: android.content.Context? = null
-
-    /** v138: true when the WebView piece-decode tier may run for this
-     * build (a context is wired and the tier is under its death
-     * breaker). The decode-wall gate and the session-render arming both
-     * read this. */
-    internal fun webTranscodeReady(): Boolean = transcodeContext != null && WebAvifTranscoder.isAvailable()
+    /** v139 — THE PIECE CODEC GATE. The map-piece decode tier is the
+     * FRAMEWORK's own software AV1 codec (c2.android.av1, shipped with
+     * Android 10 = API 29) behind AvifMediaCodecDecoder's PIECE-SIZED
+     * gate: the plan's pieces are 800x298 (~0.24 MP) — the profile of an
+     * ordinary video thumbnail, three orders of magnitude under the
+     * full-size configs (pages 800x5000, covers 4000x6000) that killed
+     * the v108 field device. The WebView transcode tier is DELETED — the
+     * field device died inside every WebView decode profile across
+     * v109–v138, the fifth being v1.6.51's sandboxed-renderer tier — and
+     * the codec tier answers only while the attempt-marker crash breaker
+     * holds: one handled-late native death disables it for the session,
+     * two for the install, so the worst case degrades to the legible 410
+     * card, never a crash loop. No context is needed (MediaCodec is not a
+     * view) — the harness drives the server bare and the gate simply
+     * stays closed there. */
+    internal fun codecPieceTierReady(): Boolean = android.os.Build.VERSION.SDK_INT >= 29 && nativeCrashState.startsWith("ok")
 
     /** Fair 2-wide semaphore over the TRANSCODE stage only (decode + JPEG
      * encode of tall pages). Fairness keeps a reader's preloaded pages from
@@ -388,28 +391,27 @@ class ProComicImageServer(
         // doomed on-device build answers nothing (the field verdict: ~30 s
         // of fetch+transcode retries, then "every piece failed").
         // v138: THE PIECE-BY-PIECE TRANSCODE — "cannot decode" no longer
-        // means "cannot render", and the v137 view-draw raster tier is
-        // DELETED (its ONE view draw ran Chromium's rasterizer in the app
-        // process — the v108-v111 kill pattern; the field verdict on v137
-        // was "their images just crash the reader"). The compose path now
-        // answers every device: each piece's raw AVIF bytes ride the
-        // normal fetch ladder (browser UA + chapter referer — the exact
-        // 200 request), and the decode goes through WebAvifTranscoder's
-        // SANDBOXED renderer — one ~800x298 data-url canvas per piece
-        // (0.95 MB), one toDataURL JPEG string (~46 KB) at a time behind
-        // the tier's global lock, BitmapFactory re-decoding finished JPEG
-        // in this process (the ONE decoder safe on every Android). No
-        // view.draw, no software layer, no full-page canvas — the
-        // allocation profiles the field device died of are structurally
-        // absent. When the tier is out (3-strike renderer-death breaker,
-        // no context), the legible 410 stands — never a crash.
-        if (!avifRenderable && !webTranscodeReady()) {
+        // means "cannot render". The v137 view-draw raster tier was deleted
+        // (its ONE view draw ran Chromium's rasterizer in the app process —
+        // the v108-v111 kill pattern; the field verdict on v137 was "their
+        // images just crash the reader"), and v1.6.51's sandboxed-renderer
+        // WebView tier died in the field TOO — the FIFTH WebView decode
+        // death. v139: the piece decode is the FRAMEWORK's own software
+        // AV1 codec (c2.android.av1, Android 10+) behind the PIECE-SIZED
+        // gate — the plan's pieces are 800x298 (~0.24 MP, an ordinary
+        // video thumbnail's profile), the 1280-edge / 1.3 MP pre-alloc
+        // gate refuses the v108 kill profile in pure Kotlin before any
+        // codec allocation, and the attempt-marker breaker bounds even a
+        // hostile codec to one session disable + one install disable.
+        // When the gate is closed (below Android 10, breaker tripped),
+        // the legible 410 stands — never a crash.
+        if (!avifRenderable && !codecPieceTierReady()) {
             writeResponse(
                 output,
                 410,
                 "Gone",
                 "text/plain",
-                "protected pages need an AVIF-capable device (Android 12+) or the WebView piece-decode tier (unavailable) — the site serves them as AVIF pieces no installed decoder can render".toByteArray(),
+                "protected pages need an AVIF-capable device (Android 12+), the framework AV1 codec tier (Android 10+, breaker untripped) — the site serves them as AVIF pieces no available decoder can render".toByteArray(),
                 stage = "decode-wall",
             )
             return
@@ -1551,47 +1553,34 @@ class ProComicImageServer(
                 bitmap.recycle()
             }
         }
-        // v138: THE PIECE-BY-PIECE WEBVIEW TIER — the decode the platform
-        // cannot do, done inside Chromium's SANDBOXED renderer and re-
-        // decoded here as finished JPEG. Armed ONLY where the caller asks
-        // (the map-piece ladder) and ONLY below Android 12 (this whole
-        // tier sits behind the BitmapFactory null): one ~800x298 data-url
-        // canvas per piece, one toDataURL string at a time behind the
-        // transcoder's global lock — never the profiles the field device
-        // died of (full-size draws v108-v110, full-page canvases per piece
-        // v134, the v137 view draw of a software-layer WebView whose
-        // rasterizer ran in this process). Failure answers null and the
-        // ladder continues to weserv — the worst case stays the legible
-        // card, never a crash.
+        // v139 — THE PIECE-GATED FRAMEWORK CODEC TIER. The decode the
+        // platform BitmapFactory cannot do below Android 12, done by
+        // Android 10's OWN software AV1 codec (c2.android.av1) at PIECE
+        // size: the plan's pieces are 800x298 (~0.24 MP — the observed
+        // grid_2x3), and the 1280-edge / 1.3 MP pre-alloc gate runs in
+        // PURE KOTLIN before any codec allocation, so the full-size
+        // configs that killed the v108 field device are structurally
+        // unreachable. Armed ONLY where the caller asks (the map-piece
+        // ladder — never covers, never pages 1-3) and ONLY below Android
+        // 12 (this tier sits behind the BitmapFactory null). The
+        // attempt-marker breaker bounds even a hostile codec: one
+        // handled-late native death disables the tier for the session,
+        // two for the install — the floor is the legible card, never a
+        // crash loop.
+        // The WebView decode tiers are DELETED: the field device died
+        // inside every one of them (v109-v110 view draws, v134 full-page
+        // canvases, v137 software-layer draw, v138/v1.6.51 sandboxed
+        // renderer — five field deaths), and no Java guard can catch a
+        // native kill. The framework codec at piece size has no renderer
+        // process to lose, no view, no canvas bridge — the allocation
+        // profile is a video thumbnail's.
         if (allowWebViewDecode && !avifRenderable) {
-            val context = transcodeContext
-            if (context != null && WebAvifTranscoder.isAvailable()) {
-                try {
-                    val webJpeg = WebAvifTranscoder.toJpeg(context, bytes, maxEdge, quality)
-                    if (webJpeg != null) {
-                        diag.add("webview tier: ${webJpeg.size}B JPEG")
-                        return webJpeg
-                    }
-                    diag.add("webview tier: no answer")
-                } catch (t: Throwable) {
-                    diag.add("webview tier threw ${t.javaClass.simpleName}")
-                }
-            } else {
-                diag.add("webview tier: unavailable (context=${context != null})")
+            val codecJpeg = decodeWithMediaCodecFramework(bytes, diag, maxEdge, pieceGated = true)
+            if (codecJpeg != null) {
+                diag.add("mediacodec piece tier: ${codecJpeg.size}B JPEG")
+                return codecJpeg
             }
         }
-        // v135: the v134 WebView detour is REVERTED — the field device died
-        // inside this exact tier on v1.6.47 (the crash report: pages 4+
-        // killed the process), matching the v108–v110 verdict verbatim. A
-        // native crash has no Java guard; the tier stays banned no matter
-        // how clean its design looks. The rendered harvest owns these
-        // pixels below Android 12.
-        // v138 correction: the v134 tier's field death was its ALLOCATION
-        // PROFILE (full-page canvases per piece, several pages at a time),
-        // and the general-ladder ban stands — the piece-sized, locked,
-        // capped tier above is the ONLY WebView decode in this build, it
-        // never runs for covers/pages, and its renderer lives in its own
-        // sandboxed process.
         // v111: the server-side transcode tier — weserv decodes the AVIF
         // in its datacenter and hands back a plain JPEG this process CAN
         // decode (BitmapFactory handles JPEG on every Android version).
@@ -1762,7 +1751,7 @@ class ProComicImageServer(
      * codec is native too — a c2 crash kills the process exactly like a
      * dav1d one) and the same pixel budget.
      */
-    private fun decodeWithMediaCodecFramework(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int): ByteArray? {
+    private fun decodeWithMediaCodecFramework(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int, pieceGated: Boolean = false): ByteArray? {
         val crashState = nativeCrashState
         if (!crashState.startsWith("ok")) {
             diag.add("mediacodec tier gated: $crashState")
@@ -1771,7 +1760,18 @@ class ProComicImageServer(
         val marker = attemptMarker()
         return try {
             marker?.writeText(System.currentTimeMillis().toString())
-            val jpeg = AvifMediaCodecDecoder.decodeToJpeg(bytes, { row -> diag.add("mediacodec: ${row.take(48)}") }, if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY)
+            // v139: the production ladder (pieceGated = true) decodes
+            // through the PIECE-GATED entry — the 1280-edge / 1.3 MP
+            // pre-alloc gate refuses the v108 kill profile in pure
+            // Kotlin, before any codec allocation. The debug hook
+            // (pieceGated = false) keeps the full-size entry for the
+            // harness's decline pins.
+            val jpeg =
+                if (pieceGated) {
+                    AvifMediaCodecDecoder.decodePieceToJpeg(bytes, { row -> diag.add("mediacodec: ${row.take(48)}") }, if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY)
+                } else {
+                    AvifMediaCodecDecoder.decodeToJpeg(bytes, { row -> diag.add("mediacodec: ${row.take(48)}") }, if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY)
+                }
             when {
                 jpeg == null -> null
                 maxEdge > 0 -> downscaleJpeg(jpeg, maxEdge, diag)
@@ -2327,11 +2327,11 @@ class ProComicImageServer(
          * BitmapFactory decodes AVIF natively. */
         internal fun avifDecodable(sdkInt: Int): Boolean = sdkInt >= 31
 
-        /** v138: the WebView piece-decode tier's gate — pure so the
-         * harness can pin it. True while the tier may still boot a
-         * renderer; the source consults it before sending the reader
-         * session to walk for renders the tier now decodes. */
-        internal fun webTierAvailable(): Boolean = WebAvifTranscoder.isAvailable()
+        /** v139: the piece codec tier's platform gate (pure, so the
+         * harness can pin it): Android 10+ ships c2.android.av1. The
+         * breaker half of the gate lives on the instance
+         * ([codecPieceTierReady]). */
+        internal fun codecTierPlatformSupported(sdkInt: Int): Boolean = sdkInt >= 29
 
         private const val FAMILY_PROBE_TIMEOUT_MS = 750
 

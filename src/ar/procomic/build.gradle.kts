@@ -6,35 +6,38 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    // v138 (versionCode 51): THE PIECE-BY-PIECE TRANSCODE — the field
-    // verdict on v137 was "pages after the 4 page like their images just
-    // crashs the reader": the offscreen raster tier's ONE view draw is a
-    // WebView draw() of a SOFTWARE-LAYER WebView — Chromium's rasterizer
-    // runs IN THE APP PROCESS there, the exact v108-v111 kill pattern no
-    // Java guard can catch. v138 deletes the raster tier and goes back
-    // behind the sandbox wall with a profile this build has never field-
-    // tested: the v134-era per-piece data-url decode, whose ONLY field
-    // death was its ALLOCATION PROFILE (full-page canvases per piece +
-    // toDataURL strings, several pages at a time). The math that was
-    // never tried: a plan's pieces are ~800x298 (the observed grid_2x3),
-    // so ONE piece = a 0.95 MB canvas inside Chromium's SANDBOXED
-    // renderer + a ~46 KB JPEG string across the bridge (sandbox-walk
-    // 2026-11-07: decode + draw + encode of a REAL freshly-signed piece
-    // answered 800x298 / 46 KB in 25 ms). One piece at a time behind the
-    // transcoder's own global lock, one page at a time through the
-    // compose path's existing coalescing, canvas edge capped at 1280
-    // whatever the piece claims, the renderer never destroyed between
-    // pieces, renderer death absorbed behind the 3-strike breaker. The
-    // app process only ever sees finished JPEG bytes it decodes with
-    // BitmapFactory — the ONE decoder that is safe on every Android
-    // version. NO view.draw, NO software layer, NO full-page canvas, NO
-    // toDataURL of a whole page — every allocation profile the field
-    // device ever died of is structurally absent. The plan POST, the
-    // piece ladder (browser UA + chapter referer), the compose path and
-    // its re-plan self-heal are untouched — v138 changes ONLY where the
-    // AVIF bytes turn into pixels. On Android 12+ the platform compose
-    // path is unchanged (the WebView tier never runs there).
-    versionCode = 51
+    // v139 (versionCode 52): THE PIECE CODEC TIER — the field verdict on
+    // v138 was "the extension crashs when it try to load it": the
+    // sandboxed-renderer WebView tier was the FIFTH WebView decode death
+    // (v109-v110 view draws, v134 full-page canvases, v137 software-layer
+    // draw, v138 data-url renderer — the field device dies inside every
+    // one of them, and no Java guard catches a native kill). This round
+    // also walked the site's reader LIVE (headless browser + curl,
+    // chapter 51 of series 261): the anonymous reader-signal exchange
+    // answers 12 maps (mapDelivery "proxy-plan", pieceRenderMode "img"),
+    // the plan POST answers grid_2x3 / dim 1600x893 / 6 pieces of 800x298
+    // with fresh img{1-4}.procomic.im/i/<token> urls (200 ONLY with a
+    // procomic.pro referer — bare 403, .im referer 403, so weserv stays
+    // out of the piece ladder), and the reader mounts the pieces as
+    // percent-positioned <img>s inside an aspect-ratio wrapper div (the
+    // field's "div div thing"). The math that finally fits: a PIECE is
+    // ~0.24 MP — the profile of an ordinary video thumbnail, three orders
+    // of magnitude under the full-size configs (pages 800x5000, covers
+    // 4000x6000) that killed the v108 MediaCodec tier. So the piece
+    // decode is the FRAMEWORK's own software AV1 codec (c2.android.av1,
+    // shipped with the field device's Android 10) behind a PIECE-SIZED
+    // gate: AvifMediaCodecDecoder.decodePieceToJpeg parses the container
+    // in PURE KOTLIN first and refuses any tile or output past 1280 edge
+    // / 1.3 MP BEFORE a single codec allocation — the v108 kill profile
+    // is structurally unreachable. The WebView transcode tier and its
+    // file are DELETED; the attempt-marker breaker around the codec tier
+    // bounds even a hostile stack (one handled-late death = disabled for
+    // the session, two = disabled for the install); the walk, the plan
+    // POST, the piece fetch ladder (browser UA + chapter referer), the
+    // compose path and its re-plan self-heal are untouched; the worst
+    // case stays the legible 410 card — never a crash. On Android 12+
+    // the platform BitmapFactory compose path is unchanged.
+    versionCode = 52
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -556,6 +559,27 @@ keiyoushi {
     //     burns 20–110 s on opens the exchange already answered.
     // Nothing else changes: the 3 public pages, the session fallback, the
     // legible diagnostics all ride as before.
+    //
+    // v139 (versionCode 52) — FIELD VERDICT on v138: "the extension crashs
+    // when it try to load it". v138's sandboxed-renderer WebView tier was
+    // the FIFTH WebView decode death. This round ALSO walked the site's
+    // reader live (the field asked for exactly this: "try using inspect on
+    // the chapter site"): the reader-signal exchange answers 12 maps
+    // (proxy-plan / pieceRenderMode "img"), the plan POST answers
+    // grid_2x3 / 1600x893 / 6 pieces of 800x298 on img{1-4}.procomic.im/i/
+    // tokens that answer 200 ONLY with a procomic.pro referer (bare 403,
+    // .im referer 403 — weserv stays impossible for pieces), and the
+    // reader mounts the pieces as percent-positioned <img>s inside an
+    // aspect-ratio wrapper div. The decisive re-arming: a PIECE is
+    // ~0.24 MP — three orders of magnitude under the full-size configs
+    // (pages 800x5000, covers 4000x6000) that killed the v108 MediaCodec
+    // tier — so the piece decode is the FRAMEWORK's own c2.android.av1
+    // software codec (Android 10+) behind a pure-Kotlin pre-alloc gate
+    // (1280 edge / 1.3 MP, refused before any codec allocation) and the
+    // attempt-marker crash breaker. WebAvifTranscoder.kt is DELETED —
+    // no WebView decodes anything in this build, ever again. The worst
+    // case degrades to the legible 410 card; the likely case is pages 4+
+    // finally rendering.
 
     deeplink {
         host("procomic.net")

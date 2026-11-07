@@ -295,26 +295,24 @@ abstract class ProComic :
             // operation (client, apex ladder, the chapter pass), so it rides
             // this hook exactly like the two above.
             mapPlanner = { request -> planChapterMap(request) }
-            // v138: THE PIECE-BY-PIECE TRANSCODE TIER. On a device below
-            // Android 12 (the field's Android 10) the platform cannot
-            // decode the AVIF pieces and v1.6.48/v1.6.49 answered those
-            // rows with the legible 410 card — while v1.6.50's view-draw
-            // raster tier CRASHED the reader (its ONE view draw ran
-            // Chromium's rasterizer in the app process, the v108-v111
-            // kill pattern). That tier is deleted. The compose path now
-            // decodes each piece through WebAvifTranscoder's SANDBOXED
-            // renderer instead: one ~800x298 data-url canvas per piece
-            // (0.95 MB, edge-capped at 1280 whatever the piece claims),
-            // one toDataURL JPEG string (~46 KB) at a time behind the
-            // tier's global lock, BitmapFactory re-decoding finished JPEG
-            // in this process. Sandbox-walk 2026-11-07: a REAL freshly-
-            // signed piece answered 800x298 / 46 KB in 25 ms. No
-            // view.draw, no software layer, no full-page canvas — the
-            // allocation profiles the field device died of are
-            // structurally absent. Renderer death is absorbed behind the
-            // 3-strike breaker, so a hostile stack degrades to the
-            // legible 410 — never a crash.
-            transcodeContext = applicationContext
+            // v139: THE PIECE CODEC TIER — no hook to wire. The field
+            // verdict on v1.6.51 (v138's sandboxed-renderer WebView tier)
+            // was the FIFTH WebView decode death ("the extension crashs
+            // when it try to load it"), so every WebView decode is gone
+            // for good. The piece decode is now the FRAMEWORK's own
+            // software AV1 codec (c2.android.av1, shipped with the field
+            // device's Android 10) behind AvifMediaCodecDecoder's
+            // PIECE-SIZED gate: the live plan (re-walked this round on
+            // chapter 51 of series 261) answers grid_2x3 pieces of
+            // 800x298 — ~0.24 MP, the profile of an ordinary video
+            // thumbnail, three orders of magnitude under the full-size
+            // configs (pages 800x5000, covers 4000x6000) that killed the
+            // v108 field device. The 1280-edge / 1.3 MP gate runs in pure
+            // Kotlin BEFORE any codec allocation, and the attempt-marker
+            // breaker bounds even a hostile codec: one handled-late death
+            // disables the tier for the session, two for the install —
+            // the worst case degrades to the legible 410 card, never a
+            // crash loop. No context is needed (MediaCodec is not a view).
         }
     }
 
@@ -1545,8 +1543,11 @@ abstract class ProComic :
         // again; the moment the raster tier dies its 3-strike death, the
         // render purpose re-arms automatically (belt and braces).
         val avifRenderable = ProComicImageServer.avifDecodable(android.os.Build.VERSION.SDK_INT)
+        // v139: the render purpose re-arms when the piece codec tier is
+        // OUT (below Android 10, or the attempt-marker breaker tripped —
+        // belt and braces, exactly like the v138 raster tier's re-arm).
         val needsSessionRendering = plannedDistinct.isNotEmpty() && !avifRenderable &&
-            !ProComicImageServer.webTierAvailable()
+            !imageServer.codecPieceTierReady()
         if (readerSessionEnabled && (!deferredWalkComplete || needsSessionRendering)) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
                 Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")
