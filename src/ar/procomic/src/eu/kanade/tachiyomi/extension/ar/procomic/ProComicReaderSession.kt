@@ -56,17 +56,24 @@ import kotlin.time.Duration.Companion.seconds
  */
 internal object ProComicReaderSession {
 
-    private const val POLL_MS = 750L
+    // v136: 750 → 600 ms — the draw pass re-places its target band every
+    // tick while it waits for placement + piece loads, so a tighter poll
+    // shortens the dead time between a band becoming visible and its draw
+    // (the pull budget is per-tick, so the bridge pressure is unchanged).
+    private const val POLL_MS = 600L
 
     /** Quiet ticks (no growth in mounted rows) before the session resolves. */
     private const val QUIET_TICKS = 5
 
-    /** Hard tick cap — the session never outlives ~225 s of polling.
+    /** Hard tick cap — the session never outlives its polling budget.
      * v135: raised from 150 — long chapters need the capture puller to
      * out-live the site's own lazy loader (four pulls per tick keep the
      * bridge bounded, but a 150+ piece row chapter needs more ticks than
-     * the old cap allowed). */
-    private const val MAX_TICKS = 300
+     * the old cap allowed). v136: 300 → 480 — at the tighter 600 ms poll
+     * this is the same wall-clock as the old 300×750 ms, and the draw pass
+     * (which starts only after the walk's end) needs the extra ticks to
+     * place, verify and crop every band of a tall chapter. */
+    private const val MAX_TICKS = 480
 
     /** Ticks of a Cloudflare challenge before the session calls it unwinnable. */
     private const val CHALLENGE_TICK_CAP = 60
@@ -124,8 +131,26 @@ internal object ProComicReaderSession {
 
     /** v135: ticks a draw-capture target keeps being scrolled into view
      * before the row gives up (22 s at POLL_MS — a piece row whose imgs
-     * never finish loading). */
+     * never finish loading). v136: the cap is PER BAND now — a tall row's
+     * next segment gets a fresh window, so one slow band cannot spend the
+     * whole row's patience. */
     private const val DRAW_TICK_CAP = 30
+
+    /** v136: overlap between consecutive capture bands (CSS px) — the
+     * /.captured stitcher draws tiles at their harvested rects, so a small
+     * overdraw between bands is invisible while a GAP would show as a white
+     * strip. */
+    private const val BAND_OVERLAP_PX = 48
+
+    /** v136: how close the placed band's top must sit to its expected
+     * viewport position (CSS px) before the draw fires — placement within
+     * this tolerance is "verifiably placed". */
+    private const val BAND_PLACE_TOLERANCE_PX = 6
+
+    /** v136: the smallest viewport that bands against — below this the
+     * geometry is nonsense (a challenge screen, a collapsed WebView) and
+     * the draw pass simply waits for a real viewport. */
+    private const val MIN_BAND_VIEWPORT_PX = 200
 
     /** v135: ticks with ZERO harvest progress (no new rows, no new
      * captured pixels) before the session settles despite pending work —
@@ -324,50 +349,94 @@ internal object ProComicReaderSession {
                         }
                     }
 
-                    // v135 — THE VIEWPORT-DRAW CAPTURE. One row per tick:
-                    // the next piece row whose in-page capture definitively
-                    // failed is scrolled into view (the script honors
-                    // window.__mihonTarget), and once it sits fully visible
-                    // with every piece loaded, the WebView's composited
-                    // output is drawn into a bitmap and the row's viewport
-                    // rect is cropped out. No page-side canvas, no taint,
-                    // no data url of piece pixels — the renderer already
-                    // decoded everything the user's browser shows.
-                    if (!drawInFlight) {
-                        val vh = state["vh"]?.toFloatOrNull() ?: 0f
-                        val dpr = state["dpr"]?.toFloatOrNull()?.takeIf { it > 0f } ?: 1f
-                        val next = nextDrawCaptureRow(rows)
+                    // v136 — THE SEGMENTED BAND CAPTURE (behind the
+                    // walk-to-end latch): the draw pass starts only after
+                    // the walk reached the absolute end, so its placement
+                    // scroll never fights the walk's mounting scroll. One
+                    // BAND per tick: the next piece row whose in-page
+                    // capture definitively failed contributes its next
+                    // viewport-sized segment — the script places that band
+                    // of window.__mihonTarget at the viewport top (window
+                    // first, then inner scrollable ancestors) and reports
+                    // the placed rect (tvy); once the placement verifies
+                    // and every piece img has loaded, the WebView's
+                    // composited output is drawn into a bitmap and the
+                    // band is cropped out. The /.captured stitcher
+                    // composes the bands at their rects into the whole
+                    // row. No page-side canvas, no taint, no data url of
+                    // piece pixels — the renderer already decoded
+                    // everything the user's browser shows.
+                    val vh = state["vh"]?.toFloatOrNull() ?: 0f
+                    val dpr = state["dpr"]?.toFloatOrNull()?.takeIf { it > 0f } ?: 1f
+                    if (!drawsLatched && state["atEnd"] == "1" && rows.isNotEmpty()) {
+                        drawsLatched = true
+                        notes += "$DIAG_TAG: the walk reached the end — the band draw pass starts"
+                    }
+                    if (drawsLatched && !drawInFlight) {
+                        val next = nextDrawTarget(rows, vh.toInt())
                         if (next == null) {
                             if (drawTargetIndex != -1) {
                                 drawTargetIndex = -1
-                                evaluateJs("window.__mihonTarget = -1;")
+                                evaluateJs("window.__mihonTarget = -1; window.__mihonSeg = 0;")
                             }
                         } else {
-                            val row = rows[next]!!
-                            val fullyVisible = row.h in 8..vh.toInt() &&
-                                row.vy >= 0 && row.vy + row.h <= vh.toInt()
+                            val (rowIndex, segTop, bandH) = next
+                            val row = rows[rowIndex]!!
+                            // v136: the band is drawn only once it is
+                            // VERIFIABLY placed — the script's report of
+                            // THIS tick puts the band's top inside the
+                            // viewport (within tolerance) — and every
+                            // piece img of the row has loaded.
+                            val placed = state["tvy"]?.toIntOrNull()
+                            val placedOk = placed != null &&
+                                drawTargetIndex == rowIndex &&
+                                drawTargetBand == (drawBandNext[rowIndex] ?: 0) &&
+                                placed >= -BAND_PLACE_TOLERANCE_PX &&
+                                placed + bandH <= vh.toInt() + BAND_PLACE_TOLERANCE_PX
                             val piecesLoaded = (row.total == 0 && row.pieces.size >= 2) ||
                                 (row.total in 1..row.pieces.size)
-                            if (fullyVisible && piecesLoaded) {
+                            if (placedOk && piecesLoaded) {
                                 drawInFlight = true
                                 captureView { bmp ->
                                     try {
-                                        storeDrawCapture(row, bmp, dpr)
+                                        val stored = storeDrawBand(
+                                            row,
+                                            segTop,
+                                            bandH,
+                                            vh.toInt(),
+                                            placed ?: 0,
+                                            bmp,
+                                            dpr,
+                                        )
+                                        if (!stored) failDrawRow(rowIndex)
                                     } finally {
                                         bmp?.recycle()
                                         drawInFlight = false
                                     }
                                 }
-                            } else if (drawTargetIndex != next) {
-                                drawTargetIndex = next
+                                // release the target now — the store lands
+                                // on this tick's main-thread queue and the
+                                // next tick plans the following band.
+                                drawTargetIndex = -1
+                                evaluateJs("window.__mihonTarget = -1; window.__mihonSeg = 0;")
+                            } else if (drawTargetIndex != rowIndex ||
+                                drawTargetBand != (drawBandNext[rowIndex] ?: 0)
+                            ) {
+                                drawTargetIndex = rowIndex
+                                drawTargetBand = drawBandNext[rowIndex] ?: 0
                                 drawTargetTicks = 0
-                                evaluateJs("window.__mihonTarget = $next;")
+                                evaluateJs("window.__mihonTarget = $rowIndex; window.__mihonSeg = $segTop;")
                             } else {
                                 drawTargetTicks++
                                 if (drawTargetTicks >= DRAW_TICK_CAP) {
-                                    drawFailed.add(next)
+                                    // v136: the ROW gives up (its planned
+                                    // compose or a named 410 card takes
+                                    // over) and the give-up counts as
+                                    // progress — a wedged row cannot
+                                    // truncate the pass.
+                                    failDrawRow(rowIndex)
                                     drawTargetIndex = -1
-                                    evaluateJs("window.__mihonTarget = -1;")
+                                    evaluateJs("window.__mihonTarget = -1; window.__mihonSeg = 0;")
                                 }
                             }
                         }
@@ -397,7 +466,11 @@ internal object ProComicReaderSession {
                     // decode-less devices those pages turned into error
                     // cards). Both queues are bounded (PIX_PULL_ATTEMPTS,
                     // DRAW_TICK_CAP, MAX_TICKS) — never an unbounded wait.
-                    val progressKey = "${rows.size}:${capturedRows.size}"
+                    // v136: give-ups count as progress — a wedged row that
+                    // exhausts its band window (or a pull that exhausts its
+                    // attempts) bumps this key, so the no-progress bound
+                    // judges the PASS, never one stuck row.
+                    val progressKey = "${rows.size}:${capturedRows.size}:$giveUpCount:${failedPix.size}"
                     if (progressKey != lastProgressKey) {
                         lastProgressKey = progressKey
                         noProgressTicks = 0
@@ -405,7 +478,9 @@ internal object ProComicReaderSession {
                         noProgressTicks++
                     }
                     val capturesPending = nextPendingPixKey(rows) != null
-                    val drawPending = drawInFlight || nextDrawCaptureRow(rows) != null || drawTargetIndex != -1
+                    val drawPending = drawInFlight ||
+                        nextDrawTarget(rows, vh.toInt()) != null ||
+                        drawTargetIndex != -1
                     val stalled = noProgressTicks >= NO_PROGRESS_TICK_CAP
                     if (ticks >= MAX_TICKS ||
                         (
@@ -434,7 +509,7 @@ internal object ProComicReaderSession {
             notes += "$DIAG_TAG: $failedCount protected rows could not be captured in-page"
         }
         if (drawFailed.isNotEmpty()) {
-            notes += "$DIAG_TAG: ${drawFailed.size} rows gave up the viewport draw after $DRAW_TICK_CAP ticks " +
+            notes += "$DIAG_TAG: ${drawFailed.size} rows gave up the band draw (per-band cap $DRAW_TICK_CAP ticks) " +
                 "(they fall back to the loopback compose on AVIF-capable devices, or a named 410 card)"
         }
         return ReaderSessionHarvest(ordered, notes, capturedRows.toMap())
@@ -503,10 +578,44 @@ internal object ProComicReaderSession {
      * fallback that cannot taint: scroll the row into view, draw the
      * WebView's composited output (the session renderer already decoded
      * the pieces — it renders exactly what the user's browser shows),
-     * crop the row's viewport rect. One row per tick, bounded. */
+     * crop the row's viewport rect.
+     *
+     * v136 — THE SEGMENTED BAND CAPTURE. v135's draw was dead on arrival:
+     * the script never reported vh/dpr (the Kotlin's "fullyVisible" range
+     * was empty on every tick) and never read __mihonTarget (the walk kept
+     * scrolling the LAST row into view, so no target row ever sat in the
+     * viewport). Now the Kotlin drives BANDS: a row taller than the
+     * viewport captures in seamless viewport-sized segments (48 px
+     * overlap — the /.captured stitcher composes tiles at their rects),
+     * each band placed by the script (window first, then inner scrollable
+     * ancestors), reported (tvy), and drawn only once verifiably placed
+     * with every piece img loaded. Draws start only after the walk
+     * reaches the end ([drawsLatched]) so the two scroll passes never
+     * fight; give-ups count as progress ([giveUpCount]) so a wedged row
+     * cannot truncate the pass. */
     private val drawFailed = HashSet<Int>()
     private var drawTargetIndex = -1
+
+    /** v136: the band ordinal currently targeted (per row) and the row's
+     * planned band list — the target's fresh window per band. */
+    private var drawTargetBand = 0
     private var drawTargetTicks = 0
+
+    /** v136: per-row accumulated band tiles + row dims (finalized into
+     * [capturedRows] once every planned band is stored). */
+    private val drawBandTiles = HashMap<Int, MutableList<CapturedTile>>()
+    private val drawBandDims = HashMap<Int, Pair<Int, Int>>()
+    private val drawBandNext = HashMap<Int, Int>()
+
+    /** v136: the walk-to-end latch — the draw pass starts only after the
+     * harvest's scroll reached the absolute end with rows mounted, so the
+     * draw's placement scroll never fights the walk's mounting scroll. */
+    private var drawsLatched = false
+
+    /** v136: give-ups (a band exhausting its window, a pull exhausting its
+     * attempts) — counted as PROGRESS so the no-progress bound judges the
+     * pass, never one wedged row. */
+    private var giveUpCount = 0
 
     @Volatile
     private var drawInFlight = false
@@ -521,7 +630,13 @@ internal object ProComicReaderSession {
         pixAttempts.clear()
         drawFailed.clear()
         drawTargetIndex = -1
+        drawTargetBand = 0
         drawTargetTicks = 0
+        drawBandTiles.clear()
+        drawBandDims.clear()
+        drawBandNext.clear()
+        drawsLatched = false
+        giveUpCount = 0
         drawInFlight = false
         drawCapturedCount = 0
     }
@@ -543,55 +658,131 @@ internal object ProComicReaderSession {
         return null
     }
 
-    /** The next row queued for the viewport-draw capture (ordered by row
-     * index): piece rows whose in-page capture definitively failed (the
-     * sign-refusal tombstone — or a row that never reported a slot), are
-     * not yet captured, and have not exhausted their draw attempts. */
-    private fun nextDrawCaptureRow(rows: LinkedHashMap<Int, HarvestRow>): Int? {
+    /** v136: plans one row's capture bands — viewport-sized segments with
+     * a small overlap (the /.captured stitcher draws tiles at their rects,
+     * so the overlap is invisible; a GAP would show as a white strip).
+     * Returns (segTop, bandH) pairs in row coordinates. */
+    private fun bandPlan(rowH: Int, vh: Int): List<Pair<Int, Int>> {
+        if (vh < MIN_BAND_VIEWPORT_PX) return emptyList()
+        if (rowH <= vh) return listOf(0 to rowH)
+        val step = (vh - BAND_OVERLAP_PX).coerceAtLeast(1)
+        val bands = ArrayList<Pair<Int, Int>>()
+        var top = 0
+        while (top < rowH) {
+            if (top + step >= rowH) {
+                bands.add(top to (rowH - top))
+                break
+            }
+            bands.add(top to vh)
+            top += step
+        }
+        return bands
+    }
+
+    /** v136: the next draw target — the first piece row whose in-page
+     * capture definitively failed and whose bands are not all captured
+     * yet, with the band to place next: (rowIndex, segTop, bandH). */
+    private fun nextDrawTarget(rows: LinkedHashMap<Int, HarvestRow>, vh: Int): Triple<Int, Int, Int>? {
         if (capturedRows.size >= MAX_CAPTURED_ROWS) return null
+        if (vh < MIN_BAND_VIEWPORT_PX) return null
         for (row in rows.values) {
             if (!row.isPieces) continue
             if (capturedRows.containsKey(row.index)) continue
             if (row.index in drawFailed) continue
             val pixFailed = row.pix == null || row.pix in failedPix
             if (!pixFailed) continue
-            return row.index
+            if (row.w < 8 || row.h < 8) continue
+            val bands = bandPlan(row.h, vh)
+            if (bands.isEmpty()) continue
+            val ordinal = drawBandNext[row.index] ?: 0
+            if (ordinal >= bands.size) {
+                // defensive: every planned band stored — finalize now so
+                // the row can never wedge between the tile store and the
+                // registry move (a vh drift between ticks, for instance).
+                finalizeDrawRow(row.index)
+                continue
+            }
+            val (segTop, bandH) = bands[ordinal]
+            return Triple(row.index, segTop, bandH)
         }
         return null
     }
 
-    /** Crops [row] out of the viewport bitmap ([dpr] scales CSS px to
-     * view px) and stores it as a captured row (one full-row tile — the
-     * /.captured stitch maps it 1:1 onto the row box). */
-    private fun storeDrawCapture(row: HarvestRow, bmp: Bitmap?, dpr: Float) {
-        if (bmp == null || row.w < 8 || row.h < 8) {
-            drawFailed.add(row.index)
-            return
-        }
-        runCatching {
-            val left = (row.vx * dpr).toInt().coerceIn(0, bmp.width - 8)
-            val top = (row.vy * dpr).toInt().coerceIn(0, bmp.height - 8)
+    /** v136: moves a row's accumulated band tiles into the captured
+     * registry — the /.captured stitcher composes them at their rects
+     * into the whole row (plain BitmapFactory draws, JPEG in/JPEG out). */
+    private fun finalizeDrawRow(rowIndex: Int) {
+        val tiles = drawBandTiles.remove(rowIndex) ?: return
+        val dims = drawBandDims.remove(rowIndex) ?: return
+        drawBandNext.remove(rowIndex)
+        if (tiles.isEmpty() || rowIndex in drawFailed) return
+        capturedRows[rowIndex] = CapturedRow(
+            w = dims.first,
+            h = dims.second,
+            tiles = tiles.toList(),
+        )
+        drawCapturedCount++
+    }
+
+    /** v136: drops a row's partial band work and fails the row — its
+     * planned compose (or the named 410 card) takes over, and the give-up
+     * counts as progress so the pass moves on to the other rows. */
+    private fun failDrawRow(rowIndex: Int) {
+        drawFailed.add(rowIndex)
+        drawBandTiles.remove(rowIndex)
+        drawBandDims.remove(rowIndex)
+        drawBandNext.remove(rowIndex)
+        giveUpCount++
+    }
+
+    /** Crops one placed BAND out of the viewport bitmap ([dpr] scales CSS
+     * px to view px) and appends it to the row's tile list; the row
+     * finalizes when every planned band is stored. [segTop]/[bandH] are
+     * the requested band in row coordinates; [tvy] is the placed band top
+     * the script reported (viewport coordinates) — the crop maps the
+     * visible part back onto row coordinates so the /.captured stitcher
+     * always draws the pixels at their true rects. Returns false when the
+     * band could not be stored (the row fails as a whole). */
+    private fun storeDrawBand(
+        row: HarvestRow,
+        segTop: Int,
+        bandH: Int,
+        vh: Int,
+        tvy: Int,
+        bmp: Bitmap?,
+        dpr: Float,
+    ): Boolean {
+        if (bmp == null || row.w < 8 || bandH < 8 || vh < MIN_BAND_VIEWPORT_PX) return false
+        return runCatching {
+            // viewport → row mapping: row coordinate segTop sits at
+            // viewport y = tvy, so viewport y maps to row coordinate
+            // segTop + (y - tvy). Clamped at both viewport edges — a band
+            // hanging past the document's end crops to what is visible.
+            val cropVTop = tvy.coerceAtLeast(0)
+            val cropVBottom = (tvy + bandH).coerceAtMost(vh)
+            val tileY = segTop + (cropVTop - tvy)
+            val tileH = cropVBottom - cropVTop
+            val left = (row.vx * dpr).toInt().coerceIn(0, (bmp.width - 8).coerceAtLeast(0))
+            val top = (cropVTop * dpr).toInt().coerceIn(0, (bmp.height - 8).coerceAtLeast(0))
             val width = (row.w * dpr).toInt().coerceAtMost(bmp.width - left)
-            val height = (row.h * dpr).toInt().coerceAtMost(bmp.height - top)
-            if (width < 8 || height < 8) {
-                drawFailed.add(row.index)
-                return
-            }
+            val height = (tileH * dpr).toInt().coerceAtMost(bmp.height - top)
+            if (width < 8 || height < 8 || tileH < 8) return@runCatching false
             val crop = Bitmap.createBitmap(bmp, left, top, width, height)
             val out = java.io.ByteArrayOutputStream()
             crop.compress(Bitmap.CompressFormat.JPEG, 85, out)
             crop.recycle()
             val dataUrl = "data:image/jpeg;base64," +
                 android.util.Base64.encodeToString(out.toByteArray(), android.util.Base64.NO_WRAP)
-            capturedRows[row.index] = CapturedRow(
-                w = row.w,
-                h = row.h,
-                tiles = listOf(CapturedTile(dataUrl, 0, 0, row.w, row.h)),
-            )
-            drawCapturedCount++
-        }.onFailure {
-            drawFailed.add(row.index)
-        }
+            drawBandTiles.getOrPut(row.index) { mutableListOf() } +=
+                CapturedTile(dataUrl, 0, tileY, row.w, tileH)
+            drawBandDims[row.index] = row.w to row.h
+            val ordinal = drawBandNext[row.index] ?: 0
+            drawBandNext[row.index] = ordinal + 1
+            if (ordinal + 1 >= bandPlan(row.h, vh).size || tileY + tileH >= row.h - BAND_PLACE_TOLERANCE_PX) {
+                finalizeDrawRow(row.index)
+            }
+            true
+        }.getOrDefault(false)
     }
 
     /** Pulls one capture out of the page store (one evaluate per tick). */
@@ -869,8 +1060,13 @@ internal object ProComicReaderSession {
                     var s = im.currentSrc || im.src || '';
                     if (s && s.indexOf('data:') !== 0 && im.complete && im.naturalWidth > 0) loaded.push(im);
                 }
-                if (loaded.length === 1) {
-                    out.push({ index: idx, u: abs(loaded[0].currentSrc || loaded[0].src) });
+                // v136: the row's total <img> count rides every report —
+                // the half-loaded guard uses it. A row with more than one
+                // <img> must NEVER ship a single loaded piece as a whole
+                // page: the simple branch fires only when the row HAS one
+                // img, and a piece row reports as a piece assembly.
+                if (imgs.length === 1 && loaded.length === 1) {
+                    out.push({ index: idx, u: abs(loaded[0].currentSrc || loaded[0].src), total: 1 });
                 } else if (loaded.length > 1) {
                     try {
                         var rr = row.getBoundingClientRect();
@@ -897,7 +1093,16 @@ internal object ProComicReaderSession {
                             busy[key] = 1;
                             window.__mihonCapture(key, row, loaded, rects);
                         }
-                        out.push({ index: idx, w: Math.round(rr.width), h: Math.round(rr.height), pieces: pieces, pix: key });
+                        out.push({
+                            index: idx,
+                            w: Math.round(rr.width),
+                            h: Math.round(rr.height),
+                            vx: Math.round(rr.left),
+                            vy: Math.round(rr.top),
+                            total: imgs.length,
+                            pieces: pieces,
+                            pix: key
+                        });
                     } catch (e) {}
                 }
             }
@@ -912,19 +1117,65 @@ internal object ProComicReaderSession {
             for (var q = 0; q < nodeList.length; q++) {
                 if (nodeList[q].querySelector('img')) loadedRows++;
             }
+            var tvyOut = null;
             try {
-                var sc = document.scrollingElement || document.body;
+                // v136: the script honors window.__mihonTarget +
+                // window.__mihonSeg. With a target set (the band draw
+                // pass — latched until the walk reached the end), the
+                // requested band of that row is PLACED at the viewport
+                // top — window first, then inner scrollable ancestors —
+                // and the placed top is reported (tvy). Without a target
+                // the walk continues: the last row into view, one beat
+                // deeper every tick, so the site's reader mounts its rows
+                // all the way down.
+                var target = -1;
+                var segTop = 0;
+                try { target = parseInt(window.__mihonTarget, 10); } catch (e0) {}
+                if (isNaN(target)) target = -1;
+                try { segTop = parseInt(window.__mihonSeg, 10); } catch (e1) {}
+                if (isNaN(segTop) || segTop < 0) segTop = 0;
                 var step = Math.max(600, Math.round(window.innerHeight * 1.2));
-                var lastRow = nodeList.length > 0 ? nodeList[nodeList.length - 1] : null;
-                if (lastRow) {
-                    try { lastRow.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e3) { lastRow.scrollIntoView(true); }
-                }
-                window.scrollBy(0, step);
-                var groups = document.querySelectorAll('div,section,main');
-                for (var g = 0; g < groups.length; g++) {
-                    var el = groups[g];
-                    if (el.scrollHeight > el.clientHeight + 200 && el.clientHeight > 300) {
-                        el.scrollTop = el.scrollTop + step;
+                if (target >= 0) {
+                    var trow = null;
+                    for (var t = 0; t < nodeList.length; t++) {
+                        var tIdx = parseInt(nodeList[t].getAttribute('data-reader-image-row'), 10);
+                        if (tIdx === target) { trow = nodeList[t]; break; }
+                    }
+                    if (trow) {
+                        var tr = trow.getBoundingClientRect();
+                        var cur = tr.top + segTop;
+                        if (Math.abs(cur) > 1) {
+                            try { window.scrollBy(0, cur); } catch (e5) {}
+                            tr = trow.getBoundingClientRect();
+                            cur = tr.top + segTop;
+                        }
+                        if (Math.abs(cur) > 1) {
+                            var groupsP = document.querySelectorAll('div,section,main');
+                            for (var g = 0; g < groupsP.length; g++) {
+                                var el = groupsP[g];
+                                if (el.scrollHeight > el.clientHeight + 200 && el.clientHeight > 300 && el.contains(trow)) {
+                                    el.scrollTop += cur;
+                                    tr = trow.getBoundingClientRect();
+                                    cur = tr.top + segTop;
+                                    if (Math.abs(cur) <= 1) break;
+                                }
+                            }
+                        }
+                        var trr = trow.getBoundingClientRect();
+                        tvyOut = Math.round(trr.top + segTop);
+                    }
+                } else {
+                    var lastRow = nodeList.length > 0 ? nodeList[nodeList.length - 1] : null;
+                    if (lastRow) {
+                        try { lastRow.scrollIntoView({ block: 'center', behavior: 'instant' }); } catch (e3) { lastRow.scrollIntoView(true); }
+                    }
+                    window.scrollBy(0, step);
+                    var groups = document.querySelectorAll('div,section,main');
+                    for (var g2 = 0; g2 < groups.length; g2++) {
+                        var el2 = groups[g2];
+                        if (el2.scrollHeight > el2.clientHeight + 200 && el2.clientHeight > 300) {
+                            el2.scrollTop = el2.scrollTop + step;
+                        }
                     }
                 }
             } catch (e) {}
@@ -939,6 +1190,9 @@ internal object ProComicReaderSession {
                 rows: nodeList.length,
                 loaded: loadedRows,
                 atEnd: atEnd,
+                vh: window.innerHeight,
+                dpr: window.devicePixelRatio || 1,
+                tvy: tvyOut,
                 rowsJson: JSON.stringify(out)
             });
         })();

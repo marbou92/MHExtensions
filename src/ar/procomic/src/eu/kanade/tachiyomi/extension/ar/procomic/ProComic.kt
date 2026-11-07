@@ -546,6 +546,19 @@ abstract class ProComic :
      */
     private fun coverProxyUrl(resolved: String): String = runCatching { imageServer.imageProxyUrl(resolved, ProComicImageServer.COVER_PROXY_MAX_EDGE) }.getOrDefault(resolved)
 
+    /**
+     * v136: true when the url is one of the loopback routes that still
+     * needs a build/compose at read time — a PLANNED page (the walk's
+     * reconstruction-map compose) — as opposed to a finished render
+     * (/.captured) or a real proxied direct url (/.image-proxy). The
+     * captured-overlay merge upgrades exactly these slots: a captured
+     * render or a plainly-rendered simple row beats a compose that still
+     * has to be built (and on a decode-less device, a planned compose is
+     * the fast legible 410 card — the thing the field called out).
+     */
+    private fun isPlannedLoopbackUrl(url: String): Boolean = url.contains("/${ProComicImageServer.MAP_PAGE_PATH_PREFIX}/") ||
+        url.contains("/${ProComicImageServer.COMPOSED_PATH_PREFIX}/")
+
     // ============================== Search ===============================
 
     override suspend fun getSearchMangaList(page: Int, query: String, filters: FilterList): MangasPage {
@@ -1514,12 +1527,17 @@ abstract class ProComic :
                 val harvestedRows = harvest?.rows.orEmpty()
                 harvest?.notes?.forEach { Log.i(TAG, it) }
                 runCatching { imageServer.recordDeferredTrail(ref.chapterId, harvest?.notes.orEmpty()) }
-                var sessionUrls: List<String>? = null
+                // v136: per-row session results kept beside their rows —
+                // the captured-overlay merge needs to know WHICH row
+                // produced which url (its own index, captured render vs
+                // plain render) instead of a take-it-all list.
                 var capturedRowsCount = 0
-                if (harvestedRows.isNotEmpty()) {
+                val sessionEntries: List<Pair<ProComicReaderSession.HarvestRow, String?>> = if (harvestedRows.isEmpty()) {
+                    emptyList()
+                } else {
                     var capturedCount = 0
-                    sessionUrls = harvestedRows.mapIndexedNotNull { index, row ->
-                        runCatching {
+                    val entries = harvestedRows.mapIndexed { index, row ->
+                        val url = runCatching {
                             if (row.isPieces) {
                                 // v133 — THE RENDERED HARVEST: a piece row the
                                 // session captured as pixels rides the
@@ -1531,8 +1549,8 @@ abstract class ProComic :
                                 // these rows and the page count fell back to 3.
                                 // v135: the capture has two engines — the
                                 // in-page canvas (fast, when the site's own
-                                // signed proxy allows) and the viewport draw
-                                // (the session's composited output — no page
+                                // signed proxy allows) and the band draw (the
+                                // session's composited output — no page
                                 // canvas, no taint, no sign endpoint).
                                 // Fallback: an uncaptured row keeps the v129
                                 // compose — and on a decode-less device the
@@ -1548,12 +1566,18 @@ abstract class ProComic :
                                     else -> imageServer.composedProxyUrl(row)
                                 }
                             } else {
-                                row.u?.let { imageServer.imageProxyUrl(it) }
+                                // v136: the half-loaded guard — a simple url
+                                // is only a page when the row truly HAS one
+                                // <img>; a piece row that reported early can
+                                // never masquerade as a whole page (the
+                                // script enforces this too — belt and braces).
+                                if (row.total > 1) null else row.u?.let { imageServer.imageProxyUrl(it) }
                             }
                         }.onFailure { t ->
                             Log.w(TAG, "row $index skipped: ${t.javaClass.simpleName}")
                             null
                         }.getOrNull()
+                        row to url
                     }
                     capturedRowsCount = capturedCount
                     if (capturedCount > 0) {
@@ -1563,25 +1587,83 @@ abstract class ProComic :
                                 ref.chapterId,
                                 listOf(
                                     "reader session: $capturedCount protected pages captured as rendered pixels " +
-                                        "(in-page or viewport-draw — the session's Chromium decoded the site's AVIF)",
+                                        "(in-page or band draw — the session's Chromium decoded the site's AVIF)",
                                 ),
                             )
                         }
                     }
+                    entries
                 }
-                // v135: the session list wins when it has MORE pages — or
-                // when it MATCHES the walk's count while carrying REAL
-                // rendered pixels (a decode-less device: the walk's 14 pages
-                // are 3 renders + 11 doomed cards; the session's 14 are 14
-                // renders — same count, strictly better).
-                val sessionWins = sessionUrls != null && (
-                    sessionUrls!!.size > finalUrls.size ||
-                        (sessionUrls!!.size >= finalUrls.size && capturedRowsCount > 0)
-                    )
-                if (sessionWins) {
-                    Log.i(TAG, "reader session: ${finalUrls.size} -> ${sessionUrls!!.size} pages ($capturedRowsCount captured)")
-                    finalUrls = sessionUrls!!
-                    sessionFailures = 0
+                // v136 — THE CAPTURED-OVERLAY MERGE. v135's gate was
+                // all-or-nothing: the session list could only replace the
+                // walk list whole (sessionWins), so with zero captures it
+                // never won, the walk's planned pages — the only thing a
+                // decode-less device cannot render — rode the decode-wall
+                // 410s, and rows the site mounted beyond the walk's plan
+                // were discarded with it (the "I don't think all of them"
+                // page-count gap). The merge upgrades the walk list PER
+                // PAGE instead:
+                //
+                //  · the walk list stays the BASE — the list can only
+                //    upgrade, never shrink;
+                //  · each captured row replaces the page AT ITS OWN INDEX
+                //    with its /.captured url — a render beats a plan;
+                //  · a simple row (the site renders that page plainly)
+                //    replaces a slot that still holds a PLANNED loopback
+                //    url (/.map-page, /.composed) — a real url beats a
+                //    compose that still has to be built;
+                //  · rows beyond the walk's count APPEND — the site can
+                //    mount pages the walk never planned, and the list must
+                //    carry them;
+                //  · uncaptured piece rows keep their planned compose (the
+                //    legible 410 below Android 12, the real compose on 12+).
+                if (sessionEntries.isNotEmpty()) {
+                    val merged = finalUrls.toMutableList()
+                    var replacedCaptured = 0
+                    var replacedPlain = 0
+                    var appended = 0
+                    for ((row, url) in sessionEntries) {
+                        if (url == null) continue
+                        val capturedRender = row.isPieces &&
+                            harvest?.captured?.containsKey(row.index) == true
+                        val plainRender = !row.isPieces && row.total <= 1
+                        when {
+                            capturedRender && row.index in merged.indices -> {
+                                if (merged[row.index] != url) {
+                                    merged[row.index] = url
+                                    replacedCaptured++
+                                }
+                            }
+                            plainRender && row.index in merged.indices &&
+                                isPlannedLoopbackUrl(merged[row.index]) -> {
+                                merged[row.index] = url
+                                replacedPlain++
+                            }
+                            row.index >= merged.size -> {
+                                merged.add(url)
+                                appended++
+                            }
+                            else -> Unit // keep the walk's slot — the list never shrinks
+                        }
+                    }
+                    if (replacedCaptured + replacedPlain + appended > 0) {
+                        Log.i(
+                            TAG,
+                            "reader session overlay: $replacedCaptured captured, $replacedPlain plain, " +
+                                "$appended appended (${finalUrls.size} -> ${merged.size} pages, $capturedRowsCount captured)",
+                        )
+                        runCatching {
+                            imageServer.recordDeferredTrail(
+                                ref.chapterId,
+                                listOf(
+                                    "captured-overlay merge: $replacedCaptured captured + $replacedPlain plain " +
+                                        "upgraded in place, $appended appended (${finalUrls.size} -> ${merged.size})",
+                                ),
+                            )
+                        }
+                        finalUrls = merged
+                        sessionFailures = 0
+                    }
                 }
                 if (finalUrls.size <= loadable.size) {
                     sessionFailures++

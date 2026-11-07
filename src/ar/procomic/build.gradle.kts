@@ -6,18 +6,36 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    // v135 (versionCode 48): THE CRASH FIX — v134's offscreen WebView
-    // AVIF→JPEG transcode tier killed the host app the moment pages 4+
-    // were requested (the field device died inside this exact tier across
-    // v108–v110 too; the v1.6.47 crash report matched that verdict
-    // verbatim). The tier is OFF the ladder again — this process runs no
-    // on-device AVIF decoder below Android 12, ever. Pages 4+ render on
-    // every Android version through the reader session's captures
-    // instead (in-page canvas when the site's signed proxy allows,
-    // viewport draw otherwise — the session's own Chromium decodes the
-    // pieces, exactly like the user's browser); undecodable stragglers
-    // ship as fast, named 410 cards (no 30 s hang, no crash).
-    versionCode = 48
+    // v136 (versionCode 49): THE DRAW THAT NEVER DREW — the field verdict on
+    // v135 was "no crash, but after page 3 the other pages say HTTP 410",
+    // and the round-9 code archaeology found why the session's viewport-draw
+    // capture never delivered a single page: it was DEAD ON ARRIVAL.
+    // (a) the Kotlin read state["vh"]/state["dpr"], but the harvest script
+    //     never reported them — vh parsed 0 and "row.h in 8..0" is an empty
+    //     range, so "fullyVisible" was false on every tick;
+    //     (b) the Kotlin set window.__mihonTarget (its comment promised "the
+    //     script honors window.__mihonTarget") but the script never READ it —
+    //     it kept scrolling the LAST row into view, so no target row ever sat
+    //     in the viewport even with a correct vh. Every piece row sat 30
+    //     ticks unplaced, fell to drawFailed, rode the loopback compose, and
+    //     the decode-less device answered its fast legible 410 — the exact
+    //     field verdict, ~30 s after open.
+    // The fix: a SEGMENTED BAND capture — the script now reports vh/dpr and
+    // per-row totals, honors __mihonTarget + a new __mihonSeg (it PLACES the
+    // requested band of the target row at the viewport top — window first,
+    // then inner scrollable ancestors — and reports the placed rect), and the
+    // Kotlin drives BANDS: rows taller than the viewport capture in seamless
+    // viewport-sized segments the /.captured stitcher already composes, and
+    // a segment draws only once it is verifiably placed and every piece img
+    // has loaded. Draws start only after the walk reaches the end (latched)
+    // so the two scroll passes never fight; the poll tightened to 600 ms,
+    // the tick cap rose to 480, and give-ups count as progress so a wedged
+    // row cannot truncate the pass. On the list side the session no longer
+    // replaces the walk list all-or-nothing — the captured-overlay merge
+    // upgrades the walk list per page (captured pixels replace their own
+    // index, plain renders replace planned composes, rows beyond the walk's
+    // plan append) so the list can only upgrade, never shrink.
+    versionCode = 49
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
