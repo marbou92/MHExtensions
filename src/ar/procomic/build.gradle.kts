@@ -35,7 +35,29 @@ keiyoushi {
     // map pages below Android 12 take the fast legible 410, the reader
     // session re-arms as their fallback, and NO native codec ever runs.
     // The leftover WebAvifTranscoder.kt is dead code — DELETE it on GitHub.
-    versionCode = 53
+    //
+    // v141 (versionCode 54): THE DRAW THAT FINALLY DREW — the field
+    // verdict on v140: "when it tries to load the pages it just crashs".
+    // The codec retirement RE-ARMED the session's render purpose
+    // (needsSessionRendering held !codecPieceTierReady() — always true
+    // now), and the user's chapter is FREE-AGAIN: its rows REALLY mount
+    // (the anonymous reader never mounted them on paywalled chapters —
+    // that is why the v136 draw was "the draw that never drew"). The
+    // re-armed session ran the v136 band draw — lib captureView answers
+    // view.draw(Canvas) with a software-layer retry: the EXACT
+    // v109/v110/v137 in-process rasterization profile, against a page
+    // full of the site's AVIF. No Java guard catches that death. This
+    // round DELETES the draw machinery from the module (the session
+    // harvests URLS only — pixels belong to the page's own canvas or to
+    // nobody), retires the render purpose permanently, and arms a NEW
+    // bounded URL-harvest role: a maps-only-complete walk on a free
+    // chapter runs ONE 120 s session pass that collects the reader's
+    // REAL signed image rows — the plain-row merge upgrades the planned
+    // loopback slots with the bare-fetchable signed class, so pages 4+
+    // ride the SAME weserv transcode as pages 1-3. No draw, no capture,
+    // no codec, no in-process rasterization — a load error can answer,
+    // a crash cannot.
+    versionCode = 54
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -593,6 +615,24 @@ keiyoushi {
     // loadable partition (weserv — the pages 1-3 pipeline), ONE minted-token
     // upgrade re-exchange for the images tier, maps dropped when images
     // answer, and NO native codec ever again.
+    //
+    // v141 (versionCode 54) — FIELD VERDICT on v140: "when it tries to
+    // load the pages it just crashs". The codec retirement silently
+    // RE-ARMED the session's render purpose (needsSessionRendering held
+    // !codecPieceTierReady() — always true now), and the user's chapter
+    // is FREE-AGAIN: its rows REALLY mount (on paywalled chapters the
+    // anonymous reader mounts nothing — why the v136 draw was "the draw
+    // that never drew"). The re-armed session ran the band draw — lib
+    // captureView = view.draw(Canvas) + a software-layer retry, the EXACT
+    // v109/v110/v137 in-process rasterization profile against a page full
+    // of AVIF; no Java guard catches that death. v141 DELETES the whole
+    // band-draw machinery (the session harvests URLS only), retires the
+    // render purpose permanently, and adds the bounded URL-harvest role:
+    // a maps-only-complete walk on a free chapter runs ONE 120 s pass
+    // that collects the reader's REAL signed image rows — the plain-row
+    // merge upgrades the planned loopback slots with the bare-fetchable
+    // signed class, so pages 4+ ride the SAME weserv road as pages 1-3.
+    // Nothing in this app rasterizes in-process any more.
 
     deeplink {
         host("procomic.net")

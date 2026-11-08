@@ -1600,12 +1600,32 @@ abstract class ProComic :
         // again; the moment the raster tier dies its 3-strike death, the
         // render purpose re-arms automatically (belt and braces).
         val avifRenderable = ProComicImageServer.avifDecodable(android.os.Build.VERSION.SDK_INT)
-        // v139: the render purpose re-arms when the piece codec tier is
-        // OUT (below Android 10, or the attempt-marker breaker tripped —
-        // belt and braces, exactly like the v138 raster tier's re-arm).
-        val needsSessionRendering = plannedDistinct.isNotEmpty() && !avifRenderable &&
-            !imageServer.codecPieceTierReady()
-        if (readerSessionEnabled && (!deferredWalkComplete || needsSessionRendering)) {
+        // v141 — THE RENDER PURPOSE IS GONE FOR GOOD. v135 armed the session
+        // to RENDER pages a decode-less device cannot, and v139/v140 re-armed
+        // it whenever the codec tier was out — on the field device that is
+        // now ALWAYS (v140 retired the codec tier for good). The re-armed
+        // session ran the band draw (lib captureView: view.draw(Canvas)
+        // with a software-layer retry — the EXACT v109/v110/v137 in-process
+        // rasterization profile) against a page full of the site's AVIF,
+        // and the field verdict was the old one verbatim: "when it tries to
+        // load the pages it just crashs". The draw pass is structurally
+        // retired (ProComicReaderSession) and the render purpose with it:
+        // map pages below Android 12 answer the legible 410 card and
+        // NOTHING ever rasterizes in this process again.
+        val needsSessionRendering = false
+        // v141 — THE URL-HARVEST ROLE. A maps-only-complete walk ships
+        // planned loopback pages this device can never decode — but on a
+        // FREE chapter the site's own reader mounts the REAL signed image
+        // rows (the field user's browser reads them — that is exactly the
+        // copied cdn-image class). One bounded session pass collects those
+        // rows as URLS — never pixels, no draw, no capture: the plain-row
+        // merge upgrades the planned slots with the signed cdn-image class
+        // (bare-fetchable, weserv-transcodeable — the same road as pages
+        // 1-3) and rows beyond the walk's plan append. Bounded at 120 s,
+        // with the session breaker and its 30-min cooldown as the
+        // economics — a fruitless pass never pins the open.
+        val needsUrlHarvest = deferredWalkComplete && plannedDistinct.isNotEmpty() && !avifRenderable
+        if (readerSessionEnabled && (!deferredWalkComplete || needsUrlHarvest)) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
                 Log.i(TAG, "reader session cooling down after fruitless sessions — keeping the WebView-free list")
                 runCatching {
@@ -1616,7 +1636,15 @@ abstract class ProComic :
                 }
             } else {
                 val harvest = runCatching {
-                    ProComicReaderSession.harvest(readerApexes, readerPath, ProComicImageServer.BROWSER_UA)
+                    ProComicReaderSession.harvest(
+                        readerApexes,
+                        readerPath,
+                        ProComicImageServer.BROWSER_UA,
+                        // v141: the URL-harvest role bounds the session
+                        // tighter — it upgrades an already-usable list,
+                        // it is never the only road to the open.
+                        timeoutSeconds = if (deferredWalkComplete) 120L else 240L,
+                    )
                 }
                     .onFailure { t ->
                         Log.e(TAG, "reader session survived: ${t.javaClass.simpleName}: ${t.message?.take(140)}")
