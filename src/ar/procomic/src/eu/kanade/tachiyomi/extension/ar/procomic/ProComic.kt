@@ -309,6 +309,33 @@ import kotlin.math.roundToInt
  *     its 30-min cooldown as the economics — an explicit, informed
  *     choice, not a default. A load error can answer; a crash cannot.
  *
+ *   - pages v143 / v1.6.56 ("no browser, ever, by default" — the field
+ *     verdict on v1.6.55 was the same sentence a FOURTH time: "procomic
+ *     openning a chapiter and the load of a page crasgs"). The audit
+ *     that came with it closed the case: v142 retired the browser WALK
+ *     but MISSED the v140 token-upgrade MINT — a TurnstileSolver WebView
+ *     wired inside the deferred walk behind the DEFAULT-ON "reader gate"
+ *     switch. The tokenless exchange answers maps-only on EVERY open
+ *     (live-proven: 13 maps, zero images), so `freshImages.isEmpty() &&
+ *     freshMaps.isNotEmpty()` fired on every chapter open and booted the
+ *     solver WebView on the default path — the one browser-bearing
+ *     profile left, exactly the shape the field device dies in, and the
+ *     reason covers (which never open the walk) always rendered while
+ *     chapter pages always died. v143 (the user's own prescription,
+ *     taken to its end: "use the cover methods on the images of the
+ *     chapter"): BOTH mints ride the OPT-IN browser switch now — the
+ *     default open path runs ZERO WebViews on every preference state.
+ *     The maps tier IS the cover road: the loopback composes protected
+ *     pages server-side from the site's own pieces (AVIF-detected,
+ *     transcoded JPEG like every other image) and the reader receives
+ *     plain JPEG — the identical pipeline that renders covers and pages
+ *     1-3 on every device. The default-ON gate switch is retired; one
+ *     opt-in switch now governs every WebView in the extension (both
+ *     mints + the URL harvest). The image server reconstruction also
+ *     closes the one raw-AVIF leak the audit found (the signed ladder's
+ *     rung 3 served AVIF bytes labeled jpeg — now transcoded like
+ *     everywhere else). A load error can answer; a crash cannot.
+ *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
  * behind the same options the Comix source ships — tag and blocked-genre
@@ -2393,14 +2420,32 @@ abstract class ProComic :
                     // TURNSTILE verdict, never ran). When the answer is
                     // maps-only, spend the v128 mint NOW and re-exchange
                     // with the token: the images tier if the server honors
-                    // it, the maps as the floor if not. Same bounds as the
-                    // gate branch: the preference, one mint per open, the
-                    // fruitless breaker, the wall.
+                    // it, the maps as the floor if not.
+                    //
+                    // v143 — THE MINT LEAVES THE DEFAULT PATH. The field
+                    // verdict on v1.6.55 was the same sentence a FOURTH
+                    // time ("openning a chapiter and the load of a page
+                    // crashs") — and the audit that came with it found the
+                    // one WebView v142's "zero WebViews" claim missed: THIS
+                    // mint. v142 retired the browser walk but left the
+                    // default-ON reader-gate mint wired here — and the
+                    // tokenless exchange answers maps-only on EVERY open
+                    // (live-proven), so the mint booted a solver WebView on
+                    // the default path of EVERY chapter open. The field
+                    // device has died inside every browser-bearing profile
+                    // this extension ever shipped; a default-on WebView is
+                    // a crash, not a feature. The maps tier IS the cover
+                    // road (pieces compose server-side into JPEG — the
+                    // identical pipeline that renders covers and pages 1-3
+                    // on every device), so the mint buys nothing on the
+                    // default path. Both mints now ride the OPT-IN browser
+                    // switch: OFF by default — a load error can answer; a
+                    // crash cannot.
                     if (freshImages.isEmpty() && freshMaps.isNotEmpty() &&
                         turnstileToken == null && mints == 0 &&
                         System.currentTimeMillis() <= walkDeadline &&
                         System.currentTimeMillis() >= mintPausedUntil &&
-                        preferences.getBoolean(PREF_READER_GATE, true)
+                        readerSessionEnabled
                     ) {
                         trail += "the exchange degraded to the maps tier — minting one widget token for the images tier (the reader's own shape)"
                         val (siteKey, siteKeyNote) = fetchTurnstileGateConfig(referer)
@@ -2493,14 +2538,17 @@ abstract class ProComic :
                         continue
                     }
                     // The day the site validates real probes again: the
-                    // v128 mint ladder, unchanged (the hardened v113
-                    // solver — one solve per open, wall, breaker).
+                    // v128 mint ladder (the hardened v113 solver — one
+                    // solve per open, wall, breaker).
+                    // v143: the mint rides the OPT-IN browser switch — the
+                    // default answer to a TURNSTILE verdict is the maps
+                    // tier (the cover road), never a WebView.
                     readerSignal = null
-                    if (!preferences.getBoolean(PREF_READER_GATE, true)) {
+                    if (!readerSessionEnabled) {
                         trail += if (collected.isEmpty() && collectedMaps.isEmpty()) {
-                            "reader-gate solving disabled — keeping the public pages"
+                            "reader-gate solving is opt-in (Browser page walk) — keeping the public pages (the maps tier stays on the cover road)"
                         } else {
-                            "reader-gate solving disabled — shipping ${collected.size + collectedMaps.size} deferred pages"
+                            "reader-gate solving is opt-in (Browser page walk) — shipping ${collected.size + collectedMaps.size} deferred pages"
                         }
                         return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
@@ -3043,30 +3091,25 @@ abstract class ProComic :
     // ========================= Preference screen =========================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        // ---- v128: the reader-gate mint (default ON, the full-chapter path) ----
-        SwitchPreferenceCompat(screen.context).apply {
-            key = PREF_READER_GATE
-            title = "Solve the reader gate (recommended)"
-            summary = "Recommended. Chapters embed their first pages publicly and serve " +
-                "the rest through a Cloudflare Turnstile gate. When this is ON, one " +
-                "bounded offscreen widget solve mints the token the site's own exchange " +
-                "validates and the whole chapter loads. Turn OFF to never spawn the " +
-                "solver WebView (public pages only, fastest opens)."
-            setDefaultValue(true)
-        }.let(screen::addPreference)
-
-        // ---- v142: the browser walk (default OFF, opt-in) ----
+        // ---- v142/v143: the browser road (default OFF, opt-in) ----
+        // v143: this switch now governs EVERY WebView in the extension —
+        // the URL-harvest session AND both Turnstile mints (the old
+        // default-ON "Solve the reader gate" switch is retired: with the
+        // tokenless exchange answering maps-only on every open, that mint
+        // booted a solver WebView on the default path of every chapter
+        // open — the exact profile the field device dies in). OFF means
+        // zero WebViews, ever: pages ride the cover road and the maps tier.
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_READER_SESSION
             title = "Browser page walk (opt-in)"
             summary = "OFF by default — chapter pages ride the cover pipeline " +
                 "(server-side JPEG transcode; on Android 12+ the platform decoder " +
                 "that already renders the covers). No browser ever opens. Turn ON " +
-                "only if pages beyond the public embed stay error cards and you " +
-                "accept a bounded offscreen browser session at chapter open: it " +
-                "collects the pages the site's own reader renders (URLs, plus the " +
-                "bounded in-page capture), with a breaker that pauses it after " +
-                "fruitless runs."
+                "to allow the bounded offscreen browser road: the Turnstile token " +
+                "mints plus one bounded page-walk session at chapter open (it " +
+                "collects the pages the site's own reader renders), with a " +
+                "breaker that pauses it after fruitless runs. Only flip this if " +
+                "pages beyond the public embed stay error cards on the cover road."
             setDefaultValue(false)
         }.let(screen::addPreference)
 
@@ -3193,17 +3236,6 @@ abstract class ProComic :
          * of this promise anymore — it has its own switch below (the mint
          * WebView is the hardened v113 surface, not the library one). */
         const val PREF_SAFE_FETCH = "pref_safe_fetch"
-
-        /** v128: the reader-gate mint. When the deferred exchange answers
-         * "Turnstile token required", ONE bounded offscreen widget solve
-         * (TurnstileSolver — image-blocked, renderer-death consumed,
-         * HandlerThread firewall, hard wall) mints the real token the
-         * exchange validates. Default ON — this is the only WebView-free
-         * path to the pages beyond the public embed, and the "only the
-         * first three pages" field report was exactly this switch's
-         * absence (the mint used to sit behind safe fetch, off by
-         * default). */
-        const val PREF_READER_GATE = "pref_reader_gate_mint"
 
         /** v142: the reader session, OPT-IN. When the plain fetch cannot
          * serve the whole chapter, one bounded offscreen browser session

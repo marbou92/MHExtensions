@@ -77,7 +77,28 @@ keiyoushi {
     // new "Browser page walk" switch re-arms the session (URL harvest +
     // bounded in-page capture) with the breaker economics. A load error
     // can answer; a crash cannot.
-    versionCode = 55
+    //
+    // v143 (versionCode 56) — FIELD VERDICT on v1.6.55, same words a
+    // FOURTH time ("openning a chapiter and the load of a page crasgs").
+    // The audit closed the case: v142 retired the browser WALK but
+    // MISSED the v140 token-upgrade MINT — a TurnstileSolver WebView
+    // wired inside the deferred walk behind the DEFAULT-ON "Solve the
+    // reader gate" switch. The tokenless exchange answers maps-only on
+    // EVERY open (live-proven: 13 maps, zero images), so the mint booted
+    // a solver WebView on the default path of every chapter open — the
+    // one browser-bearing profile left, exactly what the field device
+    // dies in, and the reason covers always rendered while chapter
+    // pages always died. v143 = the user's prescription taken to its
+    // end ("use the cover methods on the images of the chapter"): BOTH
+    // mints ride the OPT-IN browser switch, the default-ON gate switch
+    // is retired, and the default open path runs ZERO WebViews on every
+    // preference state. The maps tier IS the cover road: the loopback
+    // composes protected pages server-side into JPEG (AVIF detected and
+    // transcoded like every other image; the signed ladder's raw-AVIF
+    // leak is closed too), the reader receives plain JPEG — the
+    // identical pipeline that renders covers and pages 1-3 on every
+    // device. A load error can answer; a crash cannot.
+    versionCode = 56
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 

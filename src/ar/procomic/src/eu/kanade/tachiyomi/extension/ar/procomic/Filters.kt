@@ -3,60 +3,70 @@ package eu.kanade.tachiyomi.extension.ar.procomic
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 
-class TriStateFilter(name: String, val value: String = name, state: Int = STATE_IGNORE) : Filter.TriState(name, state)
-
+/**
+ * ProComic's browse filters (reconstructed for v1.6.56 — behavior-faithful
+ * to the shipped v1.6.55 build). The search endpoint takes
+ * `sort` / `type` / `year` / `includeGenres`; the values below were
+ * live-probed against /api/public/series/search (all answer 200).
+ */
 class SortFilter :
     Filter.Select<String>(
-        name = "الترتيب",
-        values = sortOptions.map { it.first }.toTypedArray(),
+        "الترتيب",
+        SORT_ENTRIES.map { it.first }.toTypedArray(),
     ) {
-    val selected get() = sortOptions[state].second
+    /** The API value for the currently selected entry ("latest" default). */
+    val selected: String
+        get() = SORT_ENTRIES[state].second
 }
 
-private val sortOptions = listOf(
+private val SORT_ENTRIES = listOf(
     "الأحدث" to "latest",
     "الأكثر شعبية" to "popular",
+    "الأعلى تقييماً" to "rating",
+    "الرائج الآن" to "trending",
+    "الأكثر مشاهدة" to "views",
+    "الأفضل" to "top",
+    "النقاط" to "score",
+    "الجديد" to "newest",
+    "أبجدياً" to "title",
 )
 
 class TypeFilter :
     Filter.Select<String>(
-        name = "النوع",
-        values = typeOptions.map { it.first }.toTypedArray(),
+        "النوع",
+        TYPE_ENTRIES.map { it.first }.toTypedArray(),
     ) {
-    val selected get() = typeOptions[state].second
+    /** The API value for the currently selected entry ("" = any). */
+    val selected: String
+        get() = TYPE_ENTRIES[state].second
 }
 
-// Novels are not offered: their chapters are text (no page images) and
-// their pages render client-side, so the source drops novel rows everywhere.
-private val typeOptions = listOf(
+private val TYPE_ENTRIES = listOf(
     "الكل" to "",
-    "مانجا (يابانية)" to "manga",
-    "مانهوا (كورية)" to "manhwa",
-    "مانها (صينية)" to "manhua",
+    "مانجا" to "manga",
+    "مانهوا" to "manhwa",
+    "مانهوا صينية" to "manhua",
 )
 
-/**
- * The search API only applies genre filters reliably when a search term is
- * present (site-side quirk), so the genre filter rides along with the query
- * the source always sends. Values are the English genre names the API
- * expects.
- */
-class GenreFilter(genreValues: List<String>) :
-    Filter.Group<TriStateFilter>(
-        name = "التصنيفات",
-        state = genreValues.map { TriStateFilter(it) },
+class GenreFilter(genres: List<String>?) :
+    Filter.Group<GenreFilter.Entry>(
+        "التصنيفات",
+        (genres ?: emptyList()).map { Entry(it) },
     ) {
-    val included get() = state.filter { it.isIncluded() }.map { it.value }
+    class Entry(name: String) : Filter.CheckBox(name)
+
+    /** The checked genre names (comma-joined by the caller). */
+    val included: List<String>
+        get() = state.filter { it.state }.map { it.name }
 }
 
 class YearFilter : Filter.Text("السنة")
 
+/** The browse filter list; the genre entries come from the cached filter
+ * data (empty group until the first successful fetch). */
 internal fun getFilterListInternal(genres: List<String>?): FilterList = FilterList(
     SortFilter(),
     TypeFilter(),
-    if (genres != null) {
-        GenreFilter(genres)
-    } else {
-        Filter.Header("اضغط «إعادة تعيين» لتحميل التصنيفات")
-    },
+    GenreFilter(genres),
+    YearFilter(),
 )
