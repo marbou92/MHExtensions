@@ -277,6 +277,38 @@ import kotlin.math.roundToInt
  *     still carry is dead code (no references since v1.6.52) — delete it
  *     from the repo on the next upload.
  *
+ *   - pages v142 / v1.6.55 ("the cover road" — the field verdict on
+ *     v1.6.54 was the same sentence a third time, "when we try to load
+ *     the pages of a chapter it just crashs", plus the user's own
+ *     prescription: "if it's avif problem why don't we use the cover
+ *     methods on the images of the chapiter"). The prescription is
+ *     adopted verbatim. The audit that came with it found one plain
+ *     fact: after the draw deletion and the codec retirement, the ONLY
+ *     browser left on the chapter-open path is the reader session
+ *     itself — a maps-only-complete walk on a decode-less device arms
+ *     `needsUrlHarvest` and boots the offscreen browser against the
+ *     reader page, and the field device has died inside every
+ *     browser-bearing profile this module ever shipped (v109, v110,
+ *     v134, v137, v1.6.51, v1.6.53's re-armed draw). Meanwhile the
+ *     pipeline the user names — the cover method — has never crashed a
+ *     single time in the field: covers and pages 1-3 have ridden the
+ *     loopback's weserv transcode (server-side JPEG) since v1.6.42,
+ *     and on Android 12+ the same pipeline decodes through the
+ *     platform BitmapFactory — the exact decoder that already renders
+ *     the covers on those devices.
+ *     v142 therefore: THE BROWSER WALK IS OPT-IN, DEFAULT OFF (a fresh
+ *     pref key so no stale persisted value re-arms it). The default
+ *     open path runs ZERO WebViews and every page rides the cover
+ *     road: app-host pages through the loopback's weserv transcode
+ *     (server-side JPEG), map pages composed by the loopback with the
+ *     platform BitmapFactory on Android 12+ — the exact decoder that
+ *     already renders the covers on those devices — and the fast
+ *     legible 410 card below it, named in /.diag. Flipping the new
+ *     "Browser page walk" switch re-arms the session (the URL harvest
+ *     plus its bounded in-page capture) with the session breaker and
+ *     its 30-min cooldown as the economics — an explicit, informed
+ *     choice, not a default. A load error can answer; a crash cannot.
+ *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
  * behind the same options the Comix source ships — tag and blocked-genre
@@ -414,7 +446,11 @@ abstract class ProComic :
     private var sessionPausedUntil = 0L
 
     private val readerSessionEnabled: Boolean
-        get() = preferences.getBoolean(PREF_READER_SESSION, true)
+        // v142: the browser walk is OPT-IN, default OFF — the open path
+        // runs zero WebViews and every page rides the cover road. The
+        // fresh key ignores any stale value persisted under the old
+        // always-on switch.
+        get() = preferences.getBoolean(PREF_READER_SESSION, false)
 
     /**
      * The site's WAF answers 403 to non-browser User-Agents — including the
@@ -3019,17 +3055,19 @@ abstract class ProComic :
             setDefaultValue(true)
         }.let(screen::addPreference)
 
-        // ---- the reader session (default ON, fallback only since v128) ----
+        // ---- v142: the browser walk (default OFF, opt-in) ----
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_READER_SESSION
-            title = "Browser-session fallback for unproven chapters"
-            summary = "Recommended. Runs only when the plain fetch cannot PROVE the " +
-                "chapter complete (no payload — part of the catalog lives on the " +
-                "other deployment — or the gate held): one bounded offscreen browser " +
-                "session opens the chapter like a reader and collects the pages the " +
-                "site itself renders. Signed-in devices get their entitlement through " +
-                "it. Turn OFF to stay browser-free."
-            setDefaultValue(true)
+            title = "Browser page walk (opt-in)"
+            summary = "OFF by default — chapter pages ride the cover pipeline " +
+                "(server-side JPEG transcode; on Android 12+ the platform decoder " +
+                "that already renders the covers). No browser ever opens. Turn ON " +
+                "only if pages beyond the public embed stay error cards and you " +
+                "accept a bounded offscreen browser session at chapter open: it " +
+                "collects the pages the site's own reader renders (URLs, plus the " +
+                "bounded in-page capture), with a breaker that pauses it after " +
+                "fruitless runs."
+            setDefaultValue(false)
         }.let(screen::addPreference)
 
         // ---- v120: the safe-fetch master switch (default ON) ----
@@ -3167,11 +3205,17 @@ abstract class ProComic :
          * default). */
         const val PREF_READER_GATE = "pref_reader_gate_mint"
 
-        /** The reader session: when the plain fetch cannot serve the whole
-         * chapter, one bounded offscreen browser session collects the pages
-         * the site's own reader renders. Default ON — it is the only path
-         * to the gated pages. */
-        const val PREF_READER_SESSION = "pref_reader_session"
+        /** v142: the reader session, OPT-IN. When the plain fetch cannot
+         * serve the whole chapter, one bounded offscreen browser session
+         * collects the pages the site's own reader renders. Default OFF —
+         * after the draw deletion and the codec retirement this session is
+         * the last browser on the chapter-open path, and the field device
+         * has died inside every browser-bearing profile; the default open
+         * now runs zero WebViews and every page rides the cover road
+         * (weserv server-side JPEG, the platform decoder on Android 12+).
+         * The fresh key value discards any stale always-on value an older
+         * build persisted. */
+        const val PREF_READER_SESSION = "pref_reader_session_optin_v142"
 
         /** The reader-session failure breaker: N consecutive sessions that
          * yielded nothing pause the session for the cooldown window —

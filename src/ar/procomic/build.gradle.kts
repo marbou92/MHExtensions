@@ -57,7 +57,27 @@ keiyoushi {
     // ride the SAME weserv transcode as pages 1-3. No draw, no capture,
     // no codec, no in-process rasterization — a load error can answer,
     // a crash cannot.
-    versionCode = 54
+    //
+    // v142 (versionCode 55): THE COVER ROAD — the field verdict on v1.6.54
+    // was the same sentence a third time ("when we try to load the pages
+    // of a chapter it just crashs") plus the user's own prescription:
+    // "use the cover methods on the images of the chapter". Adopted
+    // verbatim: after the draw deletion and the codec retirement the ONLY
+    // browser left on the open path was the reader session itself (a
+    // maps-only-complete walk on a decode-less device arms needsUrlHarvest
+    // and boots the offscreen browser), and the field device has died
+    // inside every browser-bearing profile this module shipped. So the
+    // browser walk becomes OPT-IN on a fresh pref key (default OFF — no
+    // stale persisted value can re-arm it): the default open runs ZERO
+    // WebViews and every page rides the cover method — app-host pages
+    // through the loopback's weserv transcode (server-side JPEG), map
+    // pages composed by the loopback with the platform BitmapFactory on
+    // Android 12+ (the exact decoder that already renders the covers on
+    // those devices), the fast legible 410 card below — and flipping the
+    // new "Browser page walk" switch re-arms the session (URL harvest +
+    // bounded in-page capture) with the breaker economics. A load error
+    // can answer; a crash cannot.
+    versionCode = 55
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
