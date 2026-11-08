@@ -6,38 +6,36 @@ plugins {
 
 keiyoushi {
     name = "ProComic"
-    // v139 (versionCode 52): THE PIECE CODEC TIER — the field verdict on
-    // v138 was "the extension crashs when it try to load it": the
-    // sandboxed-renderer WebView tier was the FIFTH WebView decode death
-    // (v109-v110 view draws, v134 full-page canvases, v137 software-layer
-    // draw, v138 data-url renderer — the field device dies inside every
-    // one of them, and no Java guard catches a native kill). This round
-    // also walked the site's reader LIVE (headless browser + curl,
-    // chapter 51 of series 261): the anonymous reader-signal exchange
-    // answers 12 maps (mapDelivery "proxy-plan", pieceRenderMode "img"),
-    // the plan POST answers grid_2x3 / dim 1600x893 / 6 pieces of 800x298
-    // with fresh img{1-4}.procomic.im/i/<token> urls (200 ONLY with a
-    // procomic.pro referer — bare 403, .im referer 403, so weserv stays
-    // out of the piece ladder), and the reader mounts the pieces as
-    // percent-positioned <img>s inside an aspect-ratio wrapper div (the
-    // field's "div div thing"). The math that finally fits: a PIECE is
-    // ~0.24 MP — the profile of an ordinary video thumbnail, three orders
-    // of magnitude under the full-size configs (pages 800x5000, covers
-    // 4000x6000) that killed the v108 MediaCodec tier. So the piece
-    // decode is the FRAMEWORK's own software AV1 codec (c2.android.av1,
-    // shipped with the field device's Android 10) behind a PIECE-SIZED
-    // gate: AvifMediaCodecDecoder.decodePieceToJpeg parses the container
-    // in PURE KOTLIN first and refuses any tile or output past 1280 edge
-    // / 1.3 MP BEFORE a single codec allocation — the v108 kill profile
-    // is structurally unreachable. The WebView transcode tier and its
-    // file are DELETED; the attempt-marker breaker around the codec tier
-    // bounds even a hostile stack (one handled-late death = disabled for
-    // the session, two = disabled for the install); the walk, the plan
-    // POST, the piece fetch ladder (browser UA + chapter referer), the
-    // compose path and its re-plan self-heal are untouched; the worst
-    // case stays the legible 410 card — never a crash. On Android 12+
-    // the platform BitmapFactory compose path is unchanged.
-    versionCode = 52
+    // v140 (versionCode 53): THE SIGNED CLASS — the field verdict on
+    // v1.6.52 was "the extension crashs when it try to load it" (pages 4+)
+    // plus the user's decisive observation: "we were encoding the cover
+    // and the first three pages perfectly fine and they are avif so why
+    // have problems for page 4+". The user was right — decode was NEVER
+    // the problem for what they could see — and the live recon of their
+    // own test chapter (series 261 chapter 1, sandbox 2026-11-08) closes
+    // the case: the flight embeds exactly publicImageCount=3 pages on the
+    // wide-open app hosts (weserv renders them on every device — that is
+    // why 1-3 and covers always worked); the TOKENLESS deferred exchange
+    // answers 200 with the rest as reconstruction MAPS (13 maps, images[]
+    // EMPTY — the server silently degrades and never ASKS for Turnstile,
+    // so the old mint never ran); the site's own reader always carries a
+    // real widget token and WITH x-turnstile-token the exchange answers
+    // the IMAGES tier — raw cdn urls the reader signs in-page into
+    // /api/cdn-image?url=&token=&expires=&es= — the EXACT class the user
+    // copied for pages 4+, and their two specimens are 900x2398 FULL
+    // pages answering 200 BARE for ~15 min. v140: sign every raw deferred
+    // image at collection time (device cookies ride the shared cookie
+    // store — the clearance the session earned), admit the signed class
+    // into the loadable partition (pages 4+ ride the SAME weserv
+    // transcode as pages 1-3 — zero on-device decode), upgrade a maps-only
+    // walk with ONE minted widget token + one re-exchange (fruitless
+    // upgrades feed the breaker), and RETIRE the v139 piece codec tier FOR
+    // GOOD — the device died inside c2.android.av1 at 800x298 exactly like
+    // v108's full-size death, so codecPieceTierReady() is always false:
+    // map pages below Android 12 take the fast legible 410, the reader
+    // session re-arms as their fallback, and NO native codec ever runs.
+    // The leftover WebAvifTranscoder.kt is dead code — DELETE it on GitHub.
+    versionCode = 53
     contentWarning = ContentWarning.MIXED
     libVersion = "1.6"
 
@@ -580,6 +578,21 @@ keiyoushi {
     // no WebView decodes anything in this build, ever again. The worst
     // case degrades to the legible 410 card; the likely case is pages 4+
     // finally rendering.
+    //
+    // v140 (versionCode 53) — FIELD VERDICT on v139: "the extension crashs
+    // when it try to load it" (pages 4+), plus the user's own physics:
+    // "we were encoding the cover and the first three pages perfectly fine
+    // and they are avif so why have problems for page 4+". The c2.android.av1
+    // piece bet died exactly like v108's full-size bet — the codec tier is
+    // RETIRED (codecPieceTierReady()=false). The live recon of the user's
+    // own chapter (261/11685) closed the real case: tokenless exchange =
+    // 13 maps / 0 images (the server never ASKS for Turnstile), the site's
+    // reader signs raw cdn urls in-page into /api/cdn-image?… (the user's
+    // copied page-4+ class; specimens are 900x2398 full pages, 200 BARE,
+    // ~15-min TTL). v140: walk-time signing, the signed class joins the
+    // loadable partition (weserv — the pages 1-3 pipeline), ONE minted-token
+    // upgrade re-exchange for the images tier, maps dropped when images
+    // answer, and NO native codec ever again.
 
     deeplink {
         host("procomic.net")

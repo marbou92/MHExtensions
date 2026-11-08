@@ -230,6 +230,53 @@ import kotlin.math.roundToInt
  *     raw-host-only batches); signed-in devices keep their entitlement
  *     through it.
  *
+ *   - pages v140 / v1.6.53 ("the signed class" — the field verdict on
+ *     v1.6.52: "the extension crashs when it try to load it" on pages 4+,
+ *     plus the user's decisive observation: "we were encoding the cover
+ *     and the first three pages perfectly fine and they are avif so why
+ *     have problems for page 4+"). The user is right, and the live recon
+ *     (sandbox, 2026-11-08, chapter 1 of series 261 — their own test
+ *     chapter) finally makes the whole pipeline add up:
+ *     (1) the flight embeds exactly `publicImageCount` (3) pages on the
+ *     wide-open app hosts — those ride weserv and render on every device,
+ *     which is why pages 1-3 and covers NEVER had a decode problem;
+ *     (2) the tokenless deferred exchange answers 200 with the REST of
+ *     the chapter as reconstruction MAPS (13 for that chapter, images[]
+ *     EMPTY) — the server silently degrades cookie-less/tokenless
+ *     sessions to the maps tier and never ASKS for Turnstile, so the old
+ *     mint (which only fired on a TURNSTILE verdict) never ran;
+ *     (3) the site's own reader always carries a real widget token (its
+ *     invisible Turnstile solves in-page) and WITH the
+ *     `x-turnstile-token` header the exchange answers the IMAGES tier —
+ *     raw cdn{1-4} urls the reader signs in-page (POST /api/cdn-image/sign
+ *     + x-chapter-pass, credentials same-origin) into
+ *     `/api/cdn-image?url=&token=&expires=&es=` urls — the EXACT class the
+ *     field user copied from their reader for pages 4+ ("this an example
+ *     of a page after 4"), and their two specimens are 900x2398 FULL
+ *     pages that answer 200 BARE for ~15 min (the token IS the auth);
+ *     (4) the sign endpoint 403s a genuinely cookie-less client (curl,
+ *     re-verified) but the device client shares the host cookie store —
+ *     the clearance the reader session earns is the client's clearance —
+ *     so the device-side mint rides the same cookies the site's own
+ *     reader signs with.
+ *     v140 therefore: SIGNS every raw deferred image at collection time
+ *     (a refusal keeps the raw url and the partition drops it exactly as
+ *     before); ADMITS the signed class (`/api/cdn-image?url=&token=` on a
+ *     site-owned host) into the loadable partition — bare-fetchable, so
+ *     pages 4+ ride the SAME weserv transcode as pages 1-3 with zero
+ *     on-device decode; UPGRADES a maps-only walk with ONE minted widget
+ *     token + one re-exchange (the reader's own shape) so the images tier
+ *     is actually attempted, with the fruitless-mint breaker counting
+ *     upgrades that bought nothing; and RETIRES the v139 piece codec tier
+ *     for good — the field device died inside c2.android.av1 at piece
+ *     size exactly like it died at full size in v108 (the user's crash),
+ *     so `codecPieceTierReady()` is now always false: map pages below
+ *     Android 12 answer the fast legible 410 card, the reader session
+ *     re-arms as their render fallback, and NO native codec ever runs in
+ *     this process again. The leftover WebAvifTranscoder.kt some builds
+ *     still carry is dead code (no references since v1.6.52) — delete it
+ *     from the repo on the next upload.
+ *
  * Details follow the Comix description layout: the star score and a bold
  * info line rendered once in the configured position, the synopsis, and —
  * behind the same options the Comix source ships — tag and blocked-genre
@@ -1366,14 +1413,24 @@ abstract class ProComic :
                 upstreams = upstreams + extra.filter { it !in seen }
                 Log.i(TAG, "deferred: +${extra.size} pages (total ${upstreams.size})")
             }
-            if (walk.maps.isNotEmpty()) {
+            // v140: the maps are the DEGRADED tier of the same pages the
+            // images tier covers. When the walk collected actual images
+            // (the token upgrade's tier — renderable everywhere), the maps
+            // would double-register the same page indexes, so they are
+            // dropped with a named trail row; a maps-only walk keeps them
+            // exactly as before.
+            val walkMaps = walk.maps.takeIf { walk.images.isEmpty() }.orEmpty()
+            if (walk.images.isNotEmpty() && walk.maps.isNotEmpty()) {
+                Log.i(TAG, "deferred: the images tier answered — dropping ${walk.maps.size} redundant map tokens")
+            }
+            if (walkMaps.isNotEmpty()) {
                 // The maps are the chapter's protected pages IN ORDER after
                 // the public embed (the site's own reader renders them at
                 // absoluteIndex = publicBase + ordinal — the exact pageIndex
                 // its plan POST sends). The public count from the flight is
                 // the base; the walk's own image batches (when any) extend it.
                 val mapBase = (payload.publicCount ?: upstreams.size).coerceAtLeast(upstreams.size)
-                plannedMaps = walk.maps.mapIndexedNotNull { ordinal, entry ->
+                plannedMaps = walkMaps.mapIndexedNotNull { ordinal, entry ->
                     val token = entry.token?.takeIf { it.isNotBlank() } ?: return@mapIndexedNotNull null
                     runCatching {
                         PlannedMap(
@@ -1822,18 +1879,33 @@ abstract class ProComic :
         httpUrl.isHttps && httpUrl.host.startsWith("app.") && isReaderImageUrl(url)
     }.getOrDefault(false)
 
-    /** The loadable/gated partition of a page list. App-host pages ship;
-     * raw cdn{1-4} pages are the site's browser-gated CDN class — the
-     * origin 403s every non-browser fetch (browser UA + referer
-     * included, live-verified) and their lawful route (/api/cdn-image)
-     * needs a session-signed token a cookie-less client cannot mint, so
-     * listing them only renders error cards. Legacy guard: when NOTHING
-     * is loadable the whole list ships unchanged — a maybe-dead page
-     * beats a guaranteed-empty chapter (a flight that predates the app
-     * hosts, or a future site change that re-opens the raw hosts). Pure
-     * so the harness can pin it. */
+    /** v140: the site's signed-proxy image class — `/api/cdn-image?url=&token=…`
+     * on a site-owned host. The signature IS the fetch credential: these
+     * answer 200 BARE (no cookies, no referer, any client — live-verified
+     * with the field user's own page-4+ urls; ~15-min TTL, and the loopback's
+     * deferredResigner re-signs a lapsed one mid-read), so they are exactly
+     * as loadable as the app-host class. Pure so the harness can pin it. */
+    internal fun isSignedProxyImageUrl(url: String): Boolean = runCatching {
+        val httpUrl = url.toHttpUrl()
+        httpUrl.isHttps &&
+            httpUrl.encodedPath == "/api/cdn-image" &&
+            !httpUrl.queryParameter("url").isNullOrBlank() &&
+            !httpUrl.queryParameter("token").isNullOrBlank() &&
+            isReaderImageUrl(url)
+    }.getOrDefault(false)
+
+    /** The loadable/gated partition of a page list. v140: app-host pages
+     * AND signed-proxy pages ship; raw cdn{1-4} pages remain the site's
+     * browser-gated CDN class — the origin 403s every non-browser fetch
+     * (browser UA + referer included, live-verified) and their lawful
+     * route needs a signature this list did not get, so listing them
+     * only renders error cards. Legacy guard: when NOTHING is loadable
+     * the whole list ships unchanged — a maybe-dead page beats a
+     * guaranteed-empty chapter (a flight that predates the app hosts,
+     * or a future site change that re-opens the raw hosts). Pure so the
+     * harness can pin it. */
     internal fun partitionLoadablePages(upstreams: List<String>): Pair<List<String>, List<String>> {
-        val loadable = upstreams.filter { isAppHostImageUrl(it) }
+        val loadable = upstreams.filter { isAppHostImageUrl(it) || isSignedProxyImageUrl(it) }
         if (loadable.isEmpty() || loadable.size == upstreams.size) return upstreams to emptyList()
         val kept = loadable.toHashSet()
         return loadable to upstreams.filterNot { it in kept }
@@ -2125,6 +2197,21 @@ abstract class ProComic :
         // empty), a replay AFTER a renewal, bounds, or the wall-clock
         // budget.
         val walkDeadline = System.currentTimeMillis() + MAX_WALK_WALL_MS
+
+        // v140: an upgrade mint whose tokened exchange still answered the
+        // maps tier bought nothing — count it against the fruitless breaker
+        // so two such opens pause the solver and opens stay fast.
+        fun noteUpgradeVerdict(where: String) {
+            if (turnstileToken != null && collected.isEmpty()) {
+                mintFruitless++
+                if (mintFruitless >= MINT_FRUITLESS_LIMIT && mintPausedUntil == 0L) {
+                    mintPausedUntil = System.currentTimeMillis() + MINT_COOLDOWN_MS
+                    trail += "$MINT_FRUITLESS_LIMIT upgrade mints bought no images tier — solver cooling down for ${MINT_COOLDOWN_MS / 60000} min"
+                } else {
+                    trail += "$where: the upgrade token still drew no images tier"
+                }
+            }
+        }
         while (exchanges < MAX_DEFERRED_EXCHANGES &&
             collected.size + collectedMaps.size < MAX_DEFERRED_PAGES
         ) {
@@ -2154,12 +2241,44 @@ abstract class ProComic :
                         latestImagePass = it
                         trail += "the answer carried a fresh pages pass (x-chapter-pass renewed)"
                     }
-                    val freshImages = images.filter { seen.add(it) }
+                    // v140 — THE SIGNED CLASS. The exchange's image pages
+                    // ride the raw cdn{1-4} hosts (403 to every bare
+                    // fetch) whose lawful route is the site's own signed
+                    // proxy: POST /api/cdn-image/sign {url} with the
+                    // chapter pass mints {token, expires, es?, host?} and
+                    // the signed /api/cdn-image?url=… answers 200 BARE —
+                    // the EXACT class the field user copies from their
+                    // reader for pages 4+ (their two specimens are
+                    // 900x2398 FULL pages through it). The device client
+                    // shares the host cookie store — the clearance the
+                    // reader session earned is the client's clearance —
+                    // so the mint rides the same cookies the site's own
+                    // reader signs with. Sign at collection time; a
+                    // refusal keeps the raw url (the partition drops it
+                    // exactly as before — the walk loses nothing).
+                    val freshImages = images
+                        .filter { seen.add(it) }
+                        .map { url ->
+                            when {
+                                isAppHostImageUrl(url) || isSignedProxyImageUrl(url) -> url
+                                else -> {
+                                    val signed = runCatching { resignDeferredImageUrl(url) }.getOrNull()
+                                    if (signed != null) {
+                                        trail += "signed a raw deferred page for the bare cdn-image route"
+                                        signed
+                                    } else {
+                                        trail += "the sign endpoint refused a raw deferred page — it stays unlisted"
+                                        url
+                                    }
+                                }
+                            }
+                        }
                     val freshMaps = outcome.maps.filter { entry ->
                         val entryToken = entry.token
                         entryToken != null && entryToken.isNotBlank() && mapSeen.add(entryToken)
                     }
                     if (freshImages.isEmpty() && freshMaps.isEmpty()) {
+                        noteUpgradeVerdict("terminal answer")
                         if (replayedAfterRenewal) {
                             trail += "the renewed token replayed the same slice — the deferred list is complete " +
                                 "(${collected.size + collectedMaps.size} pages beyond the public embed)"
@@ -2192,14 +2311,74 @@ abstract class ProComic :
                     // exchange, the deferred list is complete. (The old
                     // genuinely-batched server answered empty/empty on the
                     // second call — that terminal still runs above.)
+                    // v134: the stable COUNT is the terminal answer — pin it
+                    // BEFORE the upgrade so the post-upgrade exchange (same
+                    // slice, fresh map tokens) still hits the re-mint
+                    // terminal instead of double-collecting the maps.
+                    if (freshMaps.isNotEmpty()) lastMapsCount = freshMaps.size
+                    // v140 — THE TOKEN UPGRADE. The site's own reader
+                    // always carries a real widget token (its invisible
+                    // Turnstile solves in-page), and WITH the
+                    // x-turnstile-token header the exchange answers the
+                    // IMAGES tier — the raw page urls the reader signs
+                    // into the field user's copied cdn-image class. WITHOUT
+                    // it the server silently degrades to the maps tier and
+                    // never ASKS for Turnstile (live recon 2026-11-08,
+                    // chapter 1 of series 261: tokenless 200 with 13 maps /
+                    // zero images — so the old mint, which only fired on a
+                    // TURNSTILE verdict, never ran). When the answer is
+                    // maps-only, spend the v128 mint NOW and re-exchange
+                    // with the token: the images tier if the server honors
+                    // it, the maps as the floor if not. Same bounds as the
+                    // gate branch: the preference, one mint per open, the
+                    // fruitless breaker, the wall.
+                    if (freshImages.isEmpty() && freshMaps.isNotEmpty() &&
+                        turnstileToken == null && mints == 0 &&
+                        System.currentTimeMillis() <= walkDeadline &&
+                        System.currentTimeMillis() >= mintPausedUntil &&
+                        preferences.getBoolean(PREF_READER_GATE, true)
+                    ) {
+                        trail += "the exchange degraded to the maps tier — minting one widget token for the images tier (the reader's own shape)"
+                        val (siteKey, siteKeyNote) = fetchTurnstileGateConfig(referer)
+                        trail += siteKeyNote
+                        val solved = runCatching {
+                            TurnstileSolver.solve(
+                                applicationContext,
+                                siteKey,
+                                null,
+                                ProComicImageServer.BROWSER_UA,
+                            )
+                        }
+                            .onFailure { trail += "turnstile solver crashed safely: ${it.javaClass.simpleName}" }
+                            .getOrNull()
+                        if (solved == null) {
+                            mintFruitless++
+                            if (mintFruitless >= MINT_FRUITLESS_LIMIT && mintPausedUntil == 0L) {
+                                mintPausedUntil = System.currentTimeMillis() + MINT_COOLDOWN_MS
+                                trail += "$MINT_FRUITLESS_LIMIT fruitless mint ladders — solver cooling down for ${MINT_COOLDOWN_MS / 60000} min"
+                            }
+                            trail += "the upgrade mint produced no token — keeping the maps tier"
+                        } else {
+                            mintFruitless = 0
+                            mints++
+                            turnstileToken = solved.first
+                            // Reader parity: the visible-mode widget is
+                            // rendered from the login sitekey, so the
+                            // header is "login" — the gate branch's exact
+                            // pairing.
+                            turnstileWidget = "login"
+                            trail += "upgrade token minted offscreen — re-exchanging with the images tier requested"
+                            continue
+                        }
+                    }
                     if (freshImages.isEmpty() && freshMaps.isNotEmpty() &&
                         freshMaps.size == lastMapsCount
                     ) {
+                        noteUpgradeVerdict("re-mint terminal")
                         trail += "the exchange re-minted the same ${freshMaps.size} map pages with fresh tokens — " +
                             "the deferred list is complete (${collected.size + collectedMaps.size} pages beyond the public embed)"
                         return WalkResult(collected, trail, true, collectedMaps, pass)
                     }
-                    if (freshMaps.isNotEmpty()) lastMapsCount = freshMaps.size
                     collected += freshImages
                     collectedMaps += freshMaps
                     replayedAfterRenewal = false
