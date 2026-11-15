@@ -18,61 +18,6 @@ import java.util.concurrent.CountDownLatch
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
-/**
- * Protection-token ("vrf") generator for mangafire.to.
- *
- * The site's React SPA signs every protected /api call with a `vrf` query
- * parameter produced by an obfuscated, VM-protected script (the "polyfill"
- * chunk: a bytecode VM with WASM-backed transforms, XOR keys derived from
- * native function arity fingerprints and navigator.appCodeName — all values
- * that are identical on every JS engine, so the exact bytes of the site's
- * script can run offline inside a plain WebView).
- *
- * This generator ships the site's polyfill chunk (transformed: its ESM
- * export is re-pointed at a global) inside a self-contained HTML asset,
- * drives it with the same mock axios the SPA bootstraps it with
- * (`extendClient(instance)` registers the site's own request interceptor),
- * and asks that interceptor for the token — the site's code does the signing.
- *
- * v78 (WebView-only): the v75 build preferred an embedded QuickJS engine.
- * Live probes proved that path can NEVER produce a server-valid token here —
- * the site's VM resolves `document`, timers, TextEncoder and atob at init
- * (QuickJS throws on every one of them, so the engine was permanently
- * self-disabling), and once fed shims it still minted tokens the API rejects
- * with 403 "Invalid token." while the identical input signed through a V8
- * (Chromium/WebView) engine returns 200. The site's verification is
- * V8-compatible, so the only correct engine is a real WebView. Removing
- * QuickJS also removes the poisoned fast path that made every request pay a
- * 403 round-trip before the self-heal could recover it.
- *
- * v78 also fixes the WebView bridge itself: `evaluateJavascript` returns the
- * glue result as a JSON *object* text (`{"ok":true,"vrf":...}`), and the old
- * bridge called `.jsonPrimitive` on it — which always throws, so every sign
- * attempt failed and surfaced as "could not sign the request (the site's
- * protection script failed to initialize)" no matter how healthy the page
- * was. The bridge now parses the object directly, probes the page for real
- * readiness (`typeof window.__mfVrf === "function"`), reports page-side
- * diagnostics in failures, and rebuilds a suspect WebView instead of
- * hammering a dead renderer.
- *
- * The glue expects the params as a JSON *string* (it `JSON.parse()`s its
- * input) — an object literal makes that parse throw, the canonical collapses
- * to the bare path, and every signed listing comes back 403 "Invalid token.".
- *
- * For a call with path P and params K→V the interceptor computes:
- *
- *   canonical = P + "?" + sorted("k=v" pairs; arrays as "k[i]=v", objects
- *                            as "k[key]=v"; raw, unencoded values)
- *   vrf       = dynamicEncrypt(canonical)
- *
- * and the wire request carries the same params in standard encoding plus
- * `&vrf=<token>`; the server rebuilds the canonical from its parsed query
- * and compares. `dynamicEncrypt` is length-preserving byte mixing over a
- * static key with unpadded base64url output.
- *
- * The WebView is created once and kept warm; tokens are cached per canonical
- * request (the algorithm is a pure function of the input).
- */
 @SuppressLint("SetJavaScriptEnabled")
 internal object VrfGenerator {
 
@@ -112,7 +57,7 @@ internal object VrfGenerator {
     internal fun obj(values: Map<String, String>) = Param.MapValue(values)
 
     /**
-     * Computes the `vrf` token for [path] with [params]. Blocks the caller —
+     * Computes the `vrf` token for [path] with [params]. Blocks the caller. 
      * call from a worker thread only. Set [forceWebView] (the 403 self-heal
      * re-sign path) to bypass the token cache and mint a fresh token.
      */
@@ -128,7 +73,7 @@ internal object VrfGenerator {
             }
         }
 
-        // The site's glue does `JSON.parse(paramsJson)` — the params must
+        // The site's glue does `JSON.parse(paramsJson)`. The params must
         // arrive as a JSON *string*, not an object literal. `JsonPrimitive(...)
         // .toString()` produces exactly that: a properly escaped string literal.
         val pathJson = JsonPrimitive(path)
@@ -148,7 +93,7 @@ internal object VrfGenerator {
         }
 
         // Three null results in a row means the WebView itself is suspect
-        // (dead renderer, crashed page). Rebuild it once and try again —
+        // (dead renderer, crashed page). Rebuild it once and try again. 
         // this is what recovers a signing machine that died mid-session.
         resetWebView()
         awaitReady()
@@ -164,7 +109,7 @@ internal object VrfGenerator {
         )
     }
 
-    /** Drops every cached token — used by the 403 self-heal before a re-sign. */
+    /** Drops every cached token. Used by the 403 self-heal before a re-sign. */
     fun invalidate() {
         synchronized(lock) {
             cache.clear()
@@ -182,7 +127,7 @@ internal object VrfGenerator {
 
     /**
      * Destroys the current WebView (if any) so the next [awaitReady] builds a
-     * fresh one. Called after repeated evaluation failures — a dead renderer
+     * fresh one. Called after repeated evaluation failures. A dead renderer
      * never answers `evaluateJavascript`, and only a rebuild un-sticks it.
      */
     private fun resetWebView() {
@@ -210,7 +155,7 @@ internal object VrfGenerator {
                 "MangaFire: the signing WebView did not initialize in time" + detailSuffix(),
             )
         }
-        // initialize() releases the latch early on failure too — with the
+        // initialize() releases the latch early on failure too. With the
         // reason recorded. surface it instead of signing against nothing.
         synchronized(lock) { initError }?.let { error ->
             throw IOException(
@@ -250,12 +195,12 @@ internal object VrfGenerator {
                             } else if (attempt < READY_POLL_ATTEMPTS) {
                                 mainHandler.postDelayed({ poll(attempt + 1) }, READY_POLL_INTERVAL_MS)
                             } else {
-                                // Poll exhausted: never leave waiters hanging —
+                                // Poll exhausted: never leave waiters hanging. 
                                 // fail them now with what the page reported,
                                 // and drop the machine so the NEXT request
                                 // rebuilds a fresh WebView instead of
                                 // inheriting this failure forever. (The
-                                // destroy is deferred out of this callback —
+                                // destroy is deferred out of this callback. 
                                 // destroying a view from inside its own
                                 // client callback is not safe.)
                                 val stale = view
@@ -313,11 +258,6 @@ internal object VrfGenerator {
                 }
                 wv.evaluateJavascript(script) { value ->
                     try {
-                        // evaluateJavascript hands back the result object
-                        // serialized as JSON text (`{"ok":true,"vrf":"..."}`).
-                        // Parse it AS AN OBJECT — unwrapping it through
-                        // `.jsonPrimitive` (as v75 did) throws on every
-                        // successful sign and made the whole bridge look dead.
                         parseVrfResult(value)?.let(result::set)
                     } finally {
                         latch.countDown()
@@ -332,7 +272,7 @@ internal object VrfGenerator {
     }
 
     /**
-     * The readiness probe: returns a JSON STRING (so it crosses
+     * The readiness probe: returns a JSON string (so it crosses
      * `evaluateJavascript` as a quoted string literal, not an object).
      */
     private const val READY_PROBE =

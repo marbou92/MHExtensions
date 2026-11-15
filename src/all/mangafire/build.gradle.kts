@@ -4,7 +4,7 @@ plugins {
     alias(kei.plugins.extension)
 }
 
-// One source per content language — language switching happens in Mihon's own
+// One source per content language. Language switching happens in Mihon's own
 // UI (Browse → Languages → pick a language → MangaFire), exactly like the
 // MangaDot extension does for mangadot.net. The site's editions:
 // en, fr, es, es-la (Latin America), pt, pt-br, ja.

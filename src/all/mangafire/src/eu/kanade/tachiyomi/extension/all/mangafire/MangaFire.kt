@@ -36,7 +36,7 @@ import java.util.concurrent.TimeUnit
  * MangaFire (mangafire.to).
  *
  * React SPA backed by a clean JSON API. Every protected endpoint requires a
- * `vrf` protection token computed by the site's own obfuscated script — this
+ * `vrf` protection token computed by the site's own obfuscated script. This
  * extension runs that exact script offline inside an app WebView (see
  * [VrfGenerator] for why the WebView is the only engine that can sign here)
  * and signs each request the way the site does:
@@ -68,10 +68,6 @@ abstract class MangaFire :
         // are shared back to okhttp through this interceptor's solver).
         .addInterceptor(CloudflareSolverInterceptor(setOf("mangafire.to")))
         .rateLimit(3)
-        // v75 self-heal: when the API rejects a carried token (site rotated
-        // its keys, stale cache entry), drop every cached token, re-sign THE
-        // SAME canonical fresh through the WebView engine and replay the
-        // request once.
         .addInterceptor(::selfHealInvalidToken)
         .build()
 
@@ -92,12 +88,12 @@ abstract class MangaFire :
 
     override fun popularMangaRequest(page: Int) = titlesRequest(page) {
         put("limit", VrfGenerator.scalar("24"))
-        // 2026-10: the server rebuilds the signed canonical from the PARSED
-        // query and PHP re-indexes `languages[]` into `languages[0]` — a
+        // The server rebuilds the signed canonical from the parsed
+        // query and PHP re-indexes `languages[]` into `languages[0]`. A
         // `languages[]=`-style wire form no longer matches the token and every
         // listing dies with 403 "Invalid token.". Send the language as an
         // indexed object so BOTH the canonical and the wire carry
-        // `languages[0]=<lang>` (verified live: 200 with this shape, 403 with
+        // `languages[0]=<lang>` (200 with this shape, 403 with
         // the old one).
         put("languages", VrfGenerator.obj(mapOf("0" to lang)))
         put("order", VrfGenerator.obj(mapOf("trending" to "desc")))
@@ -108,7 +104,7 @@ abstract class MangaFire :
 
     override fun latestUpdatesRequest(page: Int) = titlesRequest(page) {
         put("limit", VrfGenerator.scalar("24"))
-        // Same indexed-language rule as popular — see the note there.
+        // Same indexed-language rule as popular. See the note there.
         put("languages", VrfGenerator.obj(mapOf("0" to lang)))
         put("order", VrfGenerator.obj(mapOf("chapter_updated_at" to "desc")))
         put("page", VrfGenerator.scalar(page.toString()))
@@ -128,7 +124,7 @@ abstract class MangaFire :
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request = titlesRequest(page) {
         put("limit", VrfGenerator.scalar("24"))
         put("page", VrfGenerator.scalar(page.toString()))
-        // Same indexed-language rule as popular — see the note there.
+        // Same indexed-language rule as popular. See the note there.
         put("languages", VrfGenerator.obj(mapOf("0" to lang)))
 
         val trimmed = query.trim()
