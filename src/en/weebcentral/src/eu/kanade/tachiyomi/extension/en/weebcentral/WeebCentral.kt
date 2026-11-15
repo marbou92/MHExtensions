@@ -26,17 +26,17 @@ import java.util.Locale
 import java.util.TimeZone
 
 /**
- * WeebCentral (https://weebcentral.com) — server-rendered HTMX/Alpine site, no JSON API.
+ * WeebCentral (https://weebcentral.com). Server-rendered HTMX/Alpine site, no JSON API.
  *
- * Endpoints used (verified live):
+ * Endpoints used:
  * - Browse/search: GET /search/data (HTML fragment) with text, sort, order, official,
  *   anime, adult, display_mode, limit, offset and multi-value included_status /
  *   included_type / included_tag / excluded_tag parameters. The next-page control is
  *   a trailing button[hx-get] element; its absence (or an empty body) marks the end.
- * - Latest: GET /latest-updates/{page} — same card markup, empty body past the end.
+ * - Latest: GET /latest-updates/{page}. Same card markup, empty body past the end.
  * - Details: GET /series/{ULID} (the slug part of the URL is optional).
- * - Chapters: GET /series/{ULID}/full-chapter-list — one request returns every row.
- * - Pages: GET /chapters/{ULID}/images?is_prev=False — section#chapter-images img[src].
+ * - Chapters: GET /series/{ULID}/full-chapter-list. One request returns every row.
+ * - Pages: GET /chapters/{ULID}/images?is_prev=False. Section#chapter-images img[src].
  *
  * The site sits behind Cloudflare but only challenges non-browser User-Agents, so
  * every request MUST send a desktop Chrome UA (see [USER_AGENT]); no Cloudflare
