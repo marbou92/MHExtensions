@@ -35,44 +35,6 @@ import java.util.Collections
 import java.util.Locale
 import java.util.TimeZone
 
-/**
- * Swarm (swarm.ws) — Next.js front-end over a MongoDB-backed aggregator API
- * (web APIs on swarm.ws/api, backend on api.swarm.ws — NOT behind Cloudflare).
- * Content is multi-source (MangaPark-style ids, Comick ULIDs, numeric ids), so
- * chapters carry a per-chapter `lang` and group/quality ranks. v74: one
- * source per content language (like MangaDot) — the source's `lang` is the
- * chapter language; Mihon's language picker switches.
- *
- * Endpoints (all live-verified 2026-09, no Cloudflare challenges):
- *  - Popular    GET /api/analytics/popular?window=all&limit=50&offset=N
- *  - Latest     GET /api/manga/filtered?order=last_updated&limit=50&offset=N
- *  - Search     GET /api/comic/search?title=&limit=50&offset=&nsfw=&suggestive=
- *               (+genres=&types=&yearStartMin/Max=&minChapters= — exact case)
- *  - Details    SSR page /comic/{slug} → Next.js flight payload {manga, chapters}
- *               (fallback: light backend search → api.swarm.ws/api/manga/{id})
- *  - Chapters   api.swarm.ws/api/chapter?manga={id}&limit=9999 as PLAIN JSON
- *               (slug → id resolved via the light backend search and cached;
- *               fixed sort: number desc → rank asc; hard cap ~10k rows).
- *               SSR flight payload stays as the last-resort fallback.
- *  - Pages      POST /api/sp  body {"payload":"<hex iv>:<hex ct>"} — AES-256-CBC
- *               over {"chapterId":…}, key = SHA-256(SECRET) (see SwarmCrypto);
- *               answer {baseUrl, chapter:{data:[urls]}} → MangaDex@Home shape.
- *               Fallback: the SSR reader page /comic/{slug}/chapter/{number}
- *               embeds {"chapterId","baseUrl","paths":[...]} directly.
- *
- * Chapter urls carry "id|number|slug" so the page-list fallback can rebuild
- * the reader page without extra state.
- *
- * NSFW: search/latest are filtered server-side; popular has no server-side
- * nsfw parameter, so flagged rows are dropped client-side (see cardListParse).
- * Chapters are STRICTLY language-filtered — a series without chapters in the
- * preferred language gets an empty list, never a mixed-language dump.
- *
- * Caveats inherited from the recon: `order=created` 500s server-side (never
- * used here); listing `total` is flaky under filters (hasNext uses the row
- * count); covers on cum.swarm.ws 404 directly and are rewritten to
- * swarm.ws/covers/. Images on cash.swarm.ws need no hotlink headers.
- */
 @Source
 abstract class Swarm :
     HttpSource(),
@@ -177,7 +139,7 @@ abstract class Swarm :
             }
 
         // NSFW: search and latest are filtered server-side, but the popular
-        // listing has NO server-side nsfw parameter at all — and the app's
+        // listing has NO server-side nsfw parameter at all. And the app's
         // browse suggestions are drawn from it, so NSFW titles kept showing
         // up even with the setting off. Popular rows carry a reliable `nsfw`
         // flag, so drop flagged rows client-side (rows from the other
@@ -189,7 +151,7 @@ abstract class Swarm :
         // The aggregator indexes the same series once per upstream source, so
         // listings (and therefore the app's search suggestions) can repeat a
         // title many times under different ids. Keep the first occurrence of
-        // each distinct title — listings are relevance-ordered, so the first
+        // each distinct title. Listings are relevance-ordered, so the first
         // row is the most complete record.
         val deduped = cards.distinctBy { it.title?.trim()?.lowercase() ?: it.url ?: it.id }
 
@@ -203,7 +165,7 @@ abstract class Swarm :
         status = statusStringToSManga(this@toSManga.status)
     }
 
-    /** cum.swarm.ws covers 404 directly — the site itself serves /covers/. */
+    /** cum.swarm.ws covers 404 directly. The site itself serves /covers/. */
     private fun rewriteCover(cover: String?): String? {
         val value = cover?.takeIf { it.isNotBlank() } ?: return null
         return when {
@@ -234,13 +196,13 @@ abstract class Swarm :
             ?: response.request.url.pathSegments.filter { it.isNotBlank() }.lastOrNull().orEmpty()
 
         // Primary: the flight payload row that carries BOTH the manga object
-        // and the chapters array (explicit predicate — the DTO fields are all
+        // and the chapters array (explicit predicate. The DTO fields are all
         // optional, so predicate inference is not possible).
         val series = document.extractNextJs<SwarmRscSeriesDto> { element: JsonElement ->
             element is JsonObject && element.containsKey("manga") && element.containsKey("chapters")
         }
 
-        // Free id for the chapter fast path — saves the resolver round-trip.
+        // Free id for the chapter fast path. Saves the resolver round-trip.
         series?.manga?.id?.takeIf { it.isNotBlank() }?.let { id ->
             mangaIdCache[slug] = id
         }
@@ -263,7 +225,7 @@ abstract class Swarm :
     /**
      * Komikku's "Related mangas" (the suggestions rail on the details screen)
      * used to fall back to the app's own implementation: it keyword-searches
-     * the title — every word of the title fires a broad search, and plenty of
+     * the title. Every word of the title fires a broad search, and plenty of
      * NSFW records on this aggregator carry no nsfw flag at all, so NSFW
      * manhua dominated the rail no matter what. Disabled.
      *
@@ -274,7 +236,7 @@ abstract class Swarm :
      * series (+1 per matching genre, +5 for a shared author), sort and take
      * the top 10 after excluding the series itself. The previous replacement
      * ("other records of the same series" from the backend) deduplicated
-     * down to nothing — every same-series record carries the same title — so
+     * down to nothing. Every same-series record carries the same title. So
      * the rail ended up empty and suggestions never showed up at all.
      */
     override val disableRelatedMangasBySearch: Boolean
@@ -441,7 +403,7 @@ abstract class Swarm :
      * payload carries the id) and by [resolveMangaId]. Makes the chapter list
      * a single straight JSON call instead of "download the 2 MB series page
      * again and re-parse the whole flight payload". LRU with a 150-entry
-     * budget — the old 30-slot cache was wiped wholesale whenever it filled,
+     * budget. The old 30-slot cache was wiped wholesale whenever it filled,
      * which re-introduced a resolver round-trip before every chapter refresh
      * once a library sweep touched more than 30 series.
      */
@@ -462,24 +424,6 @@ abstract class Swarm :
         return mangaDetailsRequest(manga)
     }
 
-    /**
-     * Chapter list, speed-tuned. The backend chapter API has no server-side
-     * language or field filter, and the biggest series index ~4.7k rows
-     * (~1.2 MB, ~1.9 s for one full request). Two things keep this fast AND
-     * complete:
-     *
-     *  1. The slug→id resolver result is LRU-cached (see [mangaIdCache]),
-     *     so repeated refreshes stop paying an extra round-trip per series.
-     *  2. ONE request with limit=9999 covers every series that exists today.
-     *     v1.4.4 downloaded rows in parallel 2000-row windows instead — and
-     *     silently DROPPED any window whose two attempts failed while a
-     *     sibling window signalled the end (offsets advanced 3×2000 whether
-     *     or not every page had succeeded). That race was the recurring
-     *     "sometimes the chapter list is incomplete" report. A single request
-     *     cannot skip a window; the sequential overflow path below only runs
-     *     for future monster series (>9999 rows) and never advances past a
-     *     page that didn't succeed.
-     */
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = Observable
         .defer {
             Observable.just(
@@ -519,12 +463,6 @@ abstract class Swarm :
         return buildChapterList(rows, manga.url)
     }
 
-    /**
-     * Downloads ALL chapter rows for a manga id. One `limit=9999` request
-     * covers the largest known series; only a hypothetical bigger index
-     * falls through to sequential paging, which NEVER skips a failed window
-     * (the v1.4.4 parallel windows did — that was the truncated-list bug).
-     */
     private fun fetchAllChapterRows(id: String): List<SwarmChapterDto> {
         val rows = LinkedHashMap<String, SwarmChapterDto>()
 
@@ -544,7 +482,7 @@ abstract class Swarm :
         return rows.values.toList()
     }
 
-    /** Up to three rounds (with a pause between) — throws nothing, returns
+    /** Up to three rounds (with a pause between). Throws nothing, returns
      * null only when every attempt failed, so the caller can surface an
      * honest error instead of silently missing rows. */
     private fun fetchPageUntilSuccess(id: String, offset: Int, limit: Int): List<SwarmChapterDto>? {
@@ -577,9 +515,6 @@ abstract class Swarm :
             throw IOException("Swarm: no chapters found for this series.")
         }
 
-        // v74: the source language IS the chapter language — one Swarm source
-        // per language now (like MangaDot), so the old "Chapter language"
-        // setting is gone and Mihon's language picker decides instead.
         val preferredLang = lang.lowercase()
         val dedupe = preferences.deduplicateChapters()
 
@@ -646,8 +581,8 @@ abstract class Swarm :
      * site branding is dropped:
      *  - "Chapter 202" (restates the number → names like "Ch. 202 - Chapter 202")
      *  - the scanlation group / upstream source name itself
-     *  - ALL-CAPS branding rows ("ANIME-SAMA", "OFFICIAL TRANSLATION",
-     *    "LEERCAPITULO", …) — the largest non-title noise source in the data
+     *  - ALL-CAPS branding rows ("ANIME-SAMA", "official translation",
+     *    "LEERCAPITULO", …). The largest non-title noise source in the data
      *  - stray newlines/whitespace inside otherwise usable titles
      */
     private fun cleanupChapterTitle(raw: String?, scanGroup: String?, source: String?): String {
