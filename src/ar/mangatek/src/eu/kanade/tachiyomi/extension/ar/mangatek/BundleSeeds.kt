@@ -195,12 +195,15 @@ object BundleSeeds {
      */
     private fun evaluateScript(script: String): String? {
         var failure: Throwable? = null
-        for (engine in listOf<() -> String?>(::evaluateWithQuickJs, ::evaluateWithGraalJs)) {
-            try {
-                engine(script)?.let { return it }
-            } catch (t: Throwable) {
-                if (failure == null) failure = t
-            }
+        try {
+            evaluateWithQuickJs(script)?.let { return it }
+        } catch (t: Throwable) {
+            failure = t
+        }
+        try {
+            evaluateWithGraalJs(script)?.let { return it }
+        } catch (t: Throwable) {
+            if (failure == null) failure = t
         }
         failure?.let { throw it }
         return null
