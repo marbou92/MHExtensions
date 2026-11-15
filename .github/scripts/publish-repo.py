@@ -58,7 +58,8 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 
 # CDN base URLs (matching Keiyoushi's approach)
 APK_BASE_URL = f"https://cdn.jsdelivr.net/gh/{REPO_OWNER}/{REPO_NAME}@main/apk"
-JAR_BASE_URL = f"https://cdn.jsdelivr.net/gh/{REPO_OWNER}/{REPO_NAME}@main/jar"
+# jsDelivr answers 403 for .jar (blocked file type), so jars come from raw.githubusercontent.com
+JAR_BASE_URL = f"https://raw.githubusercontent.com/{REPO_OWNER}/{REPO_NAME}/main/jar"
 ICON_BASE_URL = f"https://cdn.jsdelivr.net/gh/{SOURCE_OWNER}/{SOURCE_NAME}@main"
 
 SIGNING_FINGERPRINT = os.environ.get("SIGNING_FINGERPRINT", "")
