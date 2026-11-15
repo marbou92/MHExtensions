@@ -11,37 +11,6 @@ import okio.Buffer
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-/**
- * The real-page tee — the bridge that stops depending on the site's bundle.
- *
- * WHY THIS EXISTS
- *
- * The v48 chunk-import bridge drove the site's own signed axios client from
- * a synthetic document: it found the api-client chunk by a plain-text
- * `baseURL:"/api/…"` marker, patched its export table and imported the
- * module graph. Live-verified against the current build: every chunk is now
- * string-table VM-obfuscated — the `baseURL:"/api` marker appears in NO
- * chunk (only a minified defaults object `"baseURL":E` survives), so the
- * patch step silently no-ops and the instance hunt is back to fragile
- * duck-typing. Every native call 403s (`missing_token`) because the signer
- * the extension replicates belongs to the retired env-*.js scheme — so the
- * whole extension was down, browse included.
- *
- * The tee lets the site's OWN page do all of it instead — the same
- * architecture the manhuarmtl harvest runs: load the REAL page (title page,
- * browse page, reader page) in a window-attached offscreen WebView and wrap
- * `XMLHttpRequest` + `fetch` before the SPA boots. The SPA fires its own
- * signed, valid API calls; the tee records the response bodies verbatim and
- * bridges them back. No client discovery, no chunk patching, no signature
- * replication — whatever the page renders, we capture.
- *
- * Safety profile mirrors the manhuarmtl harvest: the core helper attaches
- * the WebView to a real window offscreen with a renderer-death handler and
- * a hard timeout, images are blocked (only JSON metadata flows), the request
- * allow-list admits comix hosts + the Cloudflare challenge frame, and every
- * failure resolves with whatever was captured — callers keep their native
- * error, never a throw into the host.
- */
 internal object ComixPageTee {
 
     private const val POLL_MS = 600L
@@ -49,27 +18,15 @@ internal object ComixPageTee {
     /** Quiet ticks (no new captured payload) before the session resolves. */
     private const val QUIET_TICKS = 5
 
-    /** Hard tick cap — a session never outlives ~85 s of polling. */
+    /** Hard tick cap. A session never outlives ~85 s of polling. */
     private const val MAX_TICKS = 140
 
     /** Ticks of a Cloudflare challenge before the session reports and gives up. */
     private const val CHALLENGE_TICK_CAP = 90
 
-    /** v126: a held challenge gets RELOADED at these ticks — live-verified
-     * that a second/third load of the same URL passes after the first one
-     * challenges (the managed challenge clears on the reload, not the
-     * first paint). Two bounded reloads, then the original cap stands. */
     private const val CHALLENGE_RELOAD_AT_1 = 25
     private const val CHALLENGE_RELOAD_AT_2 = 60
 
-    /** v127 — SPA-DRIVE. The title page SSRs the detail into the island
-     * and fires NO chapters XHR on its own: the chapter list mounts from
-     * client-side state only after interaction (a tab/section click or a
-     * chapter-route navigation), and the SPA's router intercepts every
-     * click on the document — so a dispatched click on a real control IS
-     * an SPA navigation. [PRIME_EVERY_TICKS] paces the drive, [PRIME_MAX]
-     * bounds it (each round clicks the current best controls once; the
-     * SPA's own code does the rest). */
     private const val PRIME_EVERY_TICKS = 4
     private const val PRIME_MAX_ROUNDS = 10
 
@@ -84,21 +41,6 @@ internal object ComixPageTee {
     @Serializable
     internal class TeeItem(val u: String, val b: String)
 
-    /**
-     * Loads [pageUrl] in the offscreen WebView with an XHR/fetch tee
-     * injected before the SPA boots, and returns every response whose URL
-     * matches [urlPattern]. [autoScroll] drives lazy loading (chapter
-     * lists, browse feeds) one scroll step per poll tick.
-     * [clickDrive] (v127) additionally DISPATCHES REAL CLICKS on the
-     * page's chapter controls — tabs, load-more buttons, the first
-     * chapter link — so the SPA navigates/renders the list and fires the
-     * API call the tee is waiting for (the title page alone never does).
-     * [navigateToSlug] (first page-list run) locates the chapter's own
-     * link on the rendered page and follows it — the tee re-injects on the
-     * reader page and captures there; [onResolvedLink] receives the href
-     * so the caller can learn the route template. Never throws. Blocking;
-     * must not run on the main thread.
-     */
     fun capture(
         pageUrl: String,
         userAgent: String,
@@ -181,9 +123,6 @@ internal object ComixPageTee {
 
             poll(POLL_MS.milliseconds) {
                 ticks++
-                // v124: watch the challenge instead of blind-polling through
-                // it — while "Just a moment" holds, the SPA cannot have fired
-                // anything; wait (bounded) rather than resolve empty.
                 evaluateJs("document.title || ''") { raw ->
                     val title = decodeEval(raw).orEmpty()
                     if (title.contains("just a moment", true) || title.contains("attention required", true)) {
@@ -194,10 +133,6 @@ internal object ComixPageTee {
                     }
                 }
                 if (challengeTicks == CHALLENGE_RELOAD_AT_1 || challengeTicks == CHALLENGE_RELOAD_AT_2) {
-                    // v126: the reload dance — a fresh load of the SAME url
-                    // after the challenge has held for a while clears it
-                    // (observed live: the first paint challenges, the
-                    // reload passes). Bounded to two per session.
                     challengeReloads++
                     loadUrl(pageUrl)
                 }
@@ -216,16 +151,11 @@ internal object ComixPageTee {
                         }
                     }
                 }
-                // v127: SPA-drive — pace real clicks through the page's own
-                // chapter controls so the SPA fires the calls the tee waits
-                // for. The router's global click handler turns each click
-                // into an SPA navigation/render; the tee wrapper persists
-                // across pushState navigations and keeps recording.
                 if (clickDrive && challengeTicks == 0 && ticks >= 4 &&
                     primeRounds < PRIME_MAX_ROUNDS && (ticks - 4) % PRIME_EVERY_TICKS == 0
                 ) {
                     primeRounds++
-                    // The action label is not tracked — the captured payloads
+                    // The action label is not tracked. The captured payloads
                     // are the truth; the click only nudges the SPA.
                     evaluateJs(primeScript()) { _ -> }
                 }
@@ -244,8 +174,6 @@ internal object ComixPageTee {
                         lastCount = items.size
                         quietTicks = 0
                     } else {
-                        // v124: a challenge tick is not a quiet tick — the
-                        // SPA simply has not booted yet.
                         if (challengeTicks == 0) quietTicks++
                     }
                     if (ticks >= MAX_TICKS || items.size >= maxPayloads || (quietTicks >= QUIET_TICKS && items.isNotEmpty())) {
@@ -274,7 +202,7 @@ internal object ComixPageTee {
 
     /**
      * The tee: wraps XHR + fetch once, records every matching response body
-     * (longest body wins per URL — SPA retries dedupe), dumps the current
+     * (longest body wins per URL. SPA retries dedupe), dumps the current
      * list, and optionally scrolls one step deeper.
      */
     private fun teeScript(pattern: String, max: Int): String {
@@ -353,20 +281,6 @@ internal object ComixPageTee {
         })();
     """.trimIndent()
 
-    /**
-     * v127: the SPA-drive — one round of real clicks through the page's
-     * own chapter controls, in escalating order:
-     * 1. a tab/section/button whose text names the chapter list
-     *    ("Chapters", "Chapter list", "فصول" — bounded length, no nav
-     *    away from the page),
-     * 2. a "load more / show more / view all" control (paged lists),
-     * 3. the first anchor that navigates INTO a chapter route
-     *    (`/…-chapter-…` — the SPA boots its reader route, whose own
-     *    client code fetches what the route needs; the tee keeps
-     *    recording across the pushState navigation).
-     * Returns the action taken ("clicked:<label>" / "none") — the settle
-     * logic does not depend on it; the captured payloads are the truth.
-     */
     internal fun primeScript(): String = """
         (function () {
             var clicked = function (el, label) {

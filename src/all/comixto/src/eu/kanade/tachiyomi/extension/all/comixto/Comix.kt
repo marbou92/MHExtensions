@@ -55,27 +55,10 @@ abstract class Comix :
         .readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         .writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
         .apply {
-            // v45: comix.to raised managed Cloudflare challenges on the API
-            // (chapter-list calls answered 403 "Just a moment…" while the
-            // site itself kept loading in a browser). Header hardening of
-            // plain OkHttp can never pass a managed challenge — the shared
-            // solver does: window-attached WebView solve, Turnstile tap,
-            // self-heal verify, single-flight for parallel calls. Installed
-            // FIRST so its solve-retry re-enters the hardening + signing
-            // interceptors below with the fresh clearance.
             addInterceptor(CloudflareSolverInterceptor(setOf("comix.to")))
 
-            // v45: browser fingerprint headers + WebView cookie sync (the
-            // old hard block/retry loop was folded into the solver — see
-            // CloudflareBypass for the split).
             CloudflareBypass(setOf("comix.to")).install(this)
         }
-        // v46: comix.to's origin answers flaky 502/503/522/523 behind Cloudflare
-        // (the official extension added the identical retry on Sep 25 after the
-        // same field reports). Single-shot calls surface those as "HTTP 5xx" in
-        // the app; this retries with an r= cache-buster, then walks the image
-        // CDN's scramble-path variants. Managed challenges are skipped — the
-        // solver above owns them.
         .addInterceptor(::retryInterceptor)
         .addInterceptor(::signRequestInterceptor)
         .addInterceptor(::decryptResponseInterceptor)
@@ -86,7 +69,7 @@ abstract class Comix :
     override fun headersBuilder() = super.headersBuilder()
         .add("Referer", "$baseUrl/")
 
-    // API-specific headers (JSON + XHR) — used only for /api/v1/ calls
+    // API-specific headers (JSON + XHR). Used only for /api/v1/ calls
     private val apiHeaders by lazy {
         headersBuilder()
             .set("Accept", "application/json")
@@ -94,31 +77,6 @@ abstract class Comix :
             .build()
     }
 
-    // ========================================================================
-    // WebView bridge (v48) — the site's own chunk graph signs + decrypts
-    // ========================================================================
-    //
-    // Late 2026: the site rebuilt its API protection. The old env bundle
-    // (3×S-box chain, base64-decoded at boot — natively replicated and
-    // self-healed by v46) is GONE: a VM-protected "secure-<build>.js" chunk
-    // now computes the `_` token with a hash/MAC inside its bytecode VM —
-    // no material ever materialises for capture, so the native signer can
-    // no longer be taught new keys. Instead of chasing it, every /api/v1
-    // call can run through the WebView where the site's OWN chunk graph
-    // (axios + api client + secure signer) self-wires and does the work —
-    // the same environment the user sees working when they open the site.
-    //
-    // v48: the build under analysis exports only a thin facade with minified
-    // method names (`{Oo, EN, xG, ...}`) — no get/post object for the old
-    // detection to find (that is why v47 kept surfacing the native 403). The
-    // bridge now patch-serves the api-client chunk with an extra
-    // `__MH_CLIENT__` export pointing at the signed axios instance itself.
-    //
-    // Strategy per call: try the fast native path first (it may work again
-    // if the site ever reverts); on ANY failure — token 403s included —
-    // rerun through the WebView bridge. One native round-trip is paid per
-    // call type, at most. If BOTH paths fail, the combined error (native
-    // code + bridge reason) surfaces instead of a bare "HTTP 403".
 
     private val webViewUserAgent: String
         get() = headers["User-Agent"] ?: FALLBACK_UA
@@ -144,9 +102,6 @@ abstract class Comix :
         return teeResponse(request, payload)
     }
 
-    // ========================================================================
-    // The real-page tee (v50) — the site's own SPA answers the API
-    // ========================================================================
 
     private val teeJson = Json { ignoreUnknownKeys = true }
 
@@ -177,15 +132,6 @@ abstract class Comix :
         .body(payload.toResponseBody("application/json".toMediaType()))
         .build()
 
-    /**
-     * Runs the real-page tee for a native request's endpoint: maps the API
-     * path to the site page that fires it (browse → /browse, details and
-     * chapter lists → /title/<hid>), captures the SPA's own exchanges and
-     * re-serves them as the response the parser expects. v124: the capture
-     * pattern is deliberately broad (any /api/ exchange) and the payloads
-     * are ROUTED BY SHAPE below — the site has renamed endpoints before
-     * and the URL-keyed filter was the single point of blindness.
-     */
     private fun teeForRequest(request: Request): Response {
         val url = request.url
         val path = url.encodedPath
@@ -210,13 +156,6 @@ abstract class Comix :
 
             path.startsWith("/api/v1/manga/") && path.endsWith("/chapters") -> {
                 val hid = path.removePrefix("/api/v1/manga/").removeSuffix("/chapters")
-                // v127: the title page SSRs the detail but fires NO chapters
-                // XHR on its own — the list mounts from client-side state
-                // after interaction. clickDrive dispatches REAL clicks on the
-                // page's chapter controls (tabs, load-more, the first
-                // chapter route link — the SPA's router intercepts every
-                // click), so the SPA's own signed client fires the call the
-                // tee is here to capture.
                 val items = ComixPageTee.capture(
                     "$baseUrl/title/$hid",
                     webViewUserAgent,
@@ -231,11 +170,6 @@ abstract class Comix :
 
             path.startsWith("/api/v1/manga/") -> {
                 val hid = path.removePrefix("/api/v1/manga/")
-                // v126 rung 1: the SSR island. The title page now embeds the
-                // FULL detail in a plain `initial-data` JSON island — the SPA
-                // hydrates from it and fires NO details XHR, so the tee can
-                // wait forever and see nothing. One plain HTTP GET (no
-                // signature, no challenge on these routes) carries it.
                 detailFromIsland(hid)?.let { detail ->
                     val payload = teeJson.encodeToString(ComixMangaDetailDto.serializer(), detail)
                     CloudflareSolverDiagnostics.record("COMIX detail island OK ($hid)")
@@ -268,13 +202,6 @@ abstract class Comix :
         teeJson.decodeFromString(kotlinx.serialization.serializer<T>(), body)
     }.getOrNull()
 
-    /**
-     * v126: the SSR detail island. `GET /title/<hid>` serves the full detail
-     * embedded in `<script type="application/json" id="initial-data">` under
-     * the query key `["manga","detail","<hid>"]` — plain JSON, no signature,
-     * no WebView, no challenge dance. Returns the mapped DTO or null (the
-     * caller falls back to the page tee).
-     */
     private fun detailFromIsland(hid: String): ComixMangaDetailDto? = runCatching {
         val html = client.newCall(GET("$baseUrl/title/$hid")).execute().body.string()
         val island = islandRegex.find(html)?.groupValues?.get(1) ?: return@runCatching null
@@ -298,10 +225,6 @@ abstract class Comix :
     /** A captured payload held together with the request it answers. */
     private class TeeItemHolder(val request: Request, val payload: String)
 
-    /** Merges browse/search captures into one catalog payload (site order, deduped by hid).
-     * v124: shape-routed — a captured payload counts when it parses as the
-     * list DTO, or when it contains manga-shaped objects anywhere inside
-     * (endpoint renames cannot blind the parse anymore). */
     private fun mergeListCaptures(items: List<ComixPageTee.TeeItem>): String {
         if (items.isEmpty()) throw IOException("page-tee captured no catalog payloads")
         val seen = LinkedHashSet<ComixMangaListItemDto>()
@@ -363,8 +286,6 @@ abstract class Comix :
         }.distinctBy { it.hid }
     }
 
-    /** Merges chapter-list captures in page order into one payload.
-     * v124: shape-routed like the catalog merge. */
     private fun mergeChapterCaptures(items: List<ComixPageTee.TeeItem>): String {
         if (items.isEmpty()) throw IOException("page-tee captured no chapter-list payloads")
         val ordered = items.sortedBy { ComixPageTee.capturedPage(it.u) }
@@ -419,7 +340,7 @@ abstract class Comix :
     private fun percentEncode(value: String): String = java.net.URLEncoder.encode(value, "UTF-8")
 
     // ------------------------------------------------------------------
-    // The chapter route map (lib 1.4 has no per-chapter memo — the
+    // The chapter route map (lib 1.4 has no per-chapter memo. The
     // page-tee's hid+slug pairs live in one bounded preference, newest
     // chapter first, oldest evicted past the cap).
     // ------------------------------------------------------------------
@@ -456,7 +377,7 @@ abstract class Comix :
     /**
      * Shared fetch shape: native call through the FULL source client first
      * (solver + retry + signing interceptors ride along), then the REAL-PAGE
-     * tee (the site's own SPA fires and answers the API call — no signature
+     * tee (the site's own SPA fires and answers the API call. No signature
      * replication, no chunk discovery), then the legacy chunk-import bridge.
      * The request is built once and reused by all three paths.
      */
@@ -575,8 +496,6 @@ abstract class Comix :
 
     // ============================= Chapters =============================
 
-    // v47: native attempt first, then ONE WebView session sweeps ALL
-    // chapter-list pages (the site's own client signs every call in-JS).
     override fun fetchChapterList(manga: SManga): Observable<List<SChapter>> = fetchWithWebViewFallback(chapterListRequest(manga)) { response ->
         chapterListParse(response)
     }.onErrorResumeNext { error ->
@@ -661,7 +580,7 @@ abstract class Comix :
 
         var chapters = items.map { it.toSChapter(hid) }
 
-        // Deduplicate chapters by number — keep the best version of each
+        // Deduplicate chapters by number. Keep the best version of each
         if (preferences.deduplicateChapters()) {
             // Build a map of chapter_number -> best DTO, then preserve original order
             val bestByKey = mutableMapOf<Float, ComixChapterDto>()
@@ -741,7 +660,7 @@ abstract class Comix :
         val aVotes = a.votes ?: 0
         val bVotes = b.votes ?: 0
         if (aVotes != bVotes) return aVotes > bVotes
-        // Then more recent (by relative date — can't parse exact, so keep original order)
+        // Then more recent (by relative date. Can't parse exact, so keep original order)
         return false
     }
 
@@ -752,9 +671,6 @@ abstract class Comix :
         return GET("$apiBaseUrl/chapters/$chapterId", apiHeaders)
     }
 
-    // v50: native first, then the real-page tee on the chapter's own site
-    // route (memo carries hid + slug from the last list refresh), then the
-    // legacy chunk-import bridge.
     override fun fetchPageList(chapter: SChapter): Observable<List<Page>> = Observable.fromCallable {
         client.newCall(pageListRequest(chapter)).execute().use { resp ->
             if (!resp.isSuccessful) throw IOException("HTTP ${resp.code}")
@@ -781,7 +697,7 @@ abstract class Comix :
 
     /**
      * Page list via the real-page tee: the reader page's own SPA fires the
-     * signed /chapters/{id} call — the tee records its response verbatim.
+     * signed /chapters/{id} call. The tee records its response verbatim.
      * The reader route comes from the learnt template, or (first run) from
      * following the chapter's own link on the rendered title page.
      */
@@ -827,14 +743,6 @@ abstract class Comix :
         return buildPageList(data.pages)
     }
 
-    /**
-     * v46: mirrors the official Comix extension's page-URL handling. The old
-     * code stripped the ENTIRE query string from image URLs — fine when the
-     * site put nothing there, but today's URLs carry parameters and the grid
-     * scramble is gated on a `v3` flag (without it the server does not send
-     * the x-scramble-* headers our descrambler needs). Legacy byte-XOR pages
-     * (every 4th, no `s` flag) keep a `#scrambled` marker like upstream.
-     */
     private fun buildPageList(container: ComixPagesContainerDto?): List<Page> {
         val base = container?.baseUrl.orEmpty()
         return container?.items.orEmpty().mapIndexed { index, pageDto ->
@@ -859,10 +767,6 @@ abstract class Comix :
 
     override fun imageRequest(page: Page): Request {
         val imageUrl = page.imageUrl ?: return super.imageRequest(page)
-        // v46 (mirrors the official extension, Oct 3): comix image domains
-        // BLOCK any request carrying Referer or Origin — and the default
-        // source headers attach `Referer: $baseUrl/` to everything. Strip
-        // both (and any fragment marker) for image requests only.
         val requestHeaders = headersBuilder()
             .removeAll("Origin")
             .removeAll("Referer")
@@ -1058,22 +962,6 @@ abstract class Comix :
     // Sign + Decrypt (reverse-engineered API protection)
     // ========================================================================
 
-    /**
-     * v46: comix.to's origin answers flaky 502/503/522/523 (and intermittent
-     * 404s on image paths) behind Cloudflare — the site's own SPA retried
-     * them transparently, which is exactly why "the site works" while
-     * single-shot extension calls died with "HTTP 5xx". Port of the official
-     * extension's proceedWithRetry (Sep 25): up to 10 attempts, 1.5 s apart,
-     * each with an r= cache-buster so a poisoned CDN/edge entry can't serve
-     * the same failure twice. The origin excludes r from signature
-     * validation (the official extension adds r AFTER signing too).
-     *
-     * Managed challenges are skipped here — they flow up to the solver.
-     *
-     * After the retry budget: walk the image CDN's scramble-path variants
-     * (/hi/, /fcf/, /i5/, ...) the official extension maintains for image
-     * URLs that 404 on their current path segment.
-     */
     private fun retryInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         var response = proceedWithRetry(chain, request)
@@ -1098,7 +986,7 @@ abstract class Comix :
         var response = chain.proceed(request)
         if (response.isSuccessful) return response
 
-        // A managed challenge must reach the solver above untouched — retry
+        // A managed challenge must reach the solver above untouched. Retry
         // rounds against "Just a moment…" pages are pure dead air.
         if (response.isCloudflareChallenge()) return response
 
@@ -1129,12 +1017,6 @@ abstract class Comix :
             return chain.proceed(request)
         }
 
-        // Build the "normalized" path+query that the server expects for signing:
-        //  - strip the /api/v1 prefix
-        //  - strip the existing _ param (if any) and the retry cache-buster r
-        //    (v46: the origin validates signatures WITHOUT those two — the
-        //    official extension adds r after signing as well)
-        //  - serialize remaining params as raw "key=value" with sorted keys, arrays as key[0], key[1]...
         val normalizedPath = path.removePrefix("/api/v1")
         val paramsToSign = request.url.queryParameterNames
             .filter { it != "_" && it != "r" }
@@ -1176,7 +1058,7 @@ abstract class Comix :
     private fun decryptResponseInterceptor(chain: Interceptor.Chain): Response {
         val response = chain.proceed(chain.request())
 
-        // Only process API responses — never touch image downloads
+        // Only process API responses. Never touch image downloads
         val path = response.request.url.encodedPath
         if (!path.startsWith("/api/v1/")) return response
 
@@ -1210,14 +1092,6 @@ abstract class Comix :
             .build()
     }
 
-    /**
-     * Descrambles images with x-scramble-* headers (5x5 grid) and de-XORs
-     * byte-encrypted pages carrying x-enc-seed/x-enc-len/x-enc-algo (v46 —
-     * the official extension handles both layers; the byte layer was added
-     * in late Sept when the site started XOR-encoding page bodies).
-     * Grid: xorshift(13,17,5) / LCG + Fisher-Yates with inverse permutation.
-     * XOR: LCG keystream (or xorshift candidates when algo=2), top byte.
-     */
     private fun descrambleImageInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val response = chain.proceed(request)
@@ -1258,7 +1132,7 @@ abstract class Comix :
             // the reader is the "page only loads after refreshing twice" bug: the
             // broken response counts as delivered, so Mihon shows a blank/error
             // page until the user re-requests it manually. Retry the same request
-            // a couple of times right here instead — a fresh download decodes and
+            // a couple of times right here instead. A fresh download decodes and
             // the reader never sees the bad bytes.
             var decoded: android.graphics.Bitmap? = bitmap
             var currentResponse = response
@@ -1447,12 +1321,6 @@ abstract class Comix :
         }
     }
 
-    // --- Cipher material ---------------------------------------------------
-    // v47: the site's signing core now lives inside a VM-protected chunk
-    // (hash/MAC — no capturable material), so the recapture plumbing is
-    // gone. The frozen recon constants below keep the NATIVE path alive in
-    // case the site ever reverts its build; every native failure falls back
-    // to the WebView bridge (see WebViewFallback.kt).
 
     private val cipherMaterial: ComixCipherMaterial = ComixCipherMaterial.fromDefaults()
 
@@ -1700,7 +1568,7 @@ abstract class Comix :
             // The page-tee needs the site's own route to this chapter: the
             // chapter slug from the DTO plus the manga hid. lib 1.4's model
             // carries no per-chapter memo, so the route map lives in the
-            // source preferences (bounded, newest-wins) — one list refresh
+            // source preferences (bounded, newest-wins). One list refresh
             // teaches it every chapter of the series.
             if (mangaHid != null) {
                 rememberChapterRoute(id.toString(), mangaHid, url)
@@ -1850,8 +1718,6 @@ abstract class Comix :
 
     companion object {
 
-        // v46: origin flakiness + image CDN path variants + byte-XOR keystream
-        // constants (mirror of the official extension's handling).
         private val SERVER_ERROR_CODES = setOf(502, 503, 522, 523)
         private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
         private const val ENC_MULTIPLIER = 1000005
@@ -1872,12 +1738,8 @@ abstract class Comix :
         private const val PREF_SHOW_TAGS_IN_GENRE = "pref_show_tags_in_genre"
         private const val PREF_SCORE_POSITION = "pref_score_position"
 
-        /** v50: the learnt reader route template (e.g. /title/{hid}/{slug}) —
-         * discovered once from the title page's own chapter link, then used
-         * directly for every following page-list tee. */
         private const val PREF_READER_TEMPLATE = "pref_reader_template"
 
-        /** v50: the bounded chapter route map (chapterId → [hid, slug]). */
         private const val PREF_CHAPTER_ROUTES = "pref_chapter_routes"
 
         /** Route-map cap: the newest N chapter routes survive eviction. */

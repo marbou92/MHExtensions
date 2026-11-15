@@ -6,38 +6,6 @@ import okhttp3.Interceptor
 import okhttp3.OkHttpClient
 import okhttp3.Response
 
-/**
- * Request-hardening helpers for the Comix API client.
- *
- * v45: Cloudflare raised comix.to to managed challenges (`cf-mitigated:
- * challenge`) on the API — the chapter-list calls started answering 403
- * "Just a moment…" while the site itself kept loading fine in a browser.
- * Header hardening of plain OkHttp traffic can NEVER pass a managed
- * challenge (only a JS-executing browser can), so the hard block/retry
- * loop this class used to carry is GONE — managed challenges are now
- * solved by the repo's `CloudflareSolverInterceptor` (window-attached
- * WebView, Turnstile tap, self-heal verify), installed ahead of these
- * interceptors in [Comix.client].
- *
- * What remains here is the belt-and-braces layer that made the old Comix
- * CF handling good:
- *
- * 1. **Cookie sync** — explicitly attaches WebView cookies (`cf_clearance`,
- *    `__cf_bm`, session cookies) to requests for the protected hosts. The
- *    solver wipes and re-mints clearances through the same CookieManager,
- *    so a retried request that re-enters this interceptor picks up the
- *    FRESH clearance automatically.
- * 2. **Browser fingerprint headers** — `sec-fetch-*`, `sec-ch-ua*` client
- *    hints (derived from the request's own user agent, so the versions
- *    always match the WebView that solved the challenge), `accept-language`
- *    and a proper `accept`. Keeps the request shape browser-like between
- *    solves; the solver's own fingerprint pass only fills MISSING headers,
- *    so the two never fight.
- *
- * The user agent is intentionally NOT overridden: `cf_clearance` is bound to
- * the user agent of the WebView that solved the challenge, and the app's
- * default agent always matches it.
- */
 class CloudflareBypass(
     /** Hosts that receive synced WebView cookies (site + API hosts). */
     private val cookieHosts: Set<String>,
@@ -48,20 +16,13 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 1. Cookie sync — attach WebView cookies (cf_clearance, __cf_bm, ...)
+    // 1. Cookie sync. Attach WebView cookies (cf_clearance, __cf_bm, ...)
     // ------------------------------------------------------------------------
 
     private fun cookieSyncInterceptor(chain: Interceptor.Chain): Response {
         val request = chain.request()
         val host = request.url.host
 
-        // v74: subdomain-aware matching. cf_clearance is issued zone-wide
-        // (Domain=.comix.to), and the page images live on a CDN subdomain of
-        // comix.to — the old exact-match check dropped them, so every image
-        // request went out cookie-less and Cloudflare challenged it (the
-        // "extension doesn't utilize the cf token" report). Match the host
-        // itself and any subdomain of a protected host, mirroring the
-        // solver's own isProtectedHost().
         val applies = cookieHosts.any { root -> host == root || host.endsWith(".$root") }
         if (!applies || request.header("Cookie") != null) {
             return chain.proceed(request)
@@ -79,7 +40,7 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 2. Browser fingerprint — sec-fetch-* + client hints derived from the UA
+    // 2. Browser fingerprint. Sec-fetch-* + client hints derived from the UA
     // ------------------------------------------------------------------------
 
     private fun fingerprintInterceptor(chain: Interceptor.Chain): Response {
