@@ -106,10 +106,6 @@ class Bubble(
 
 @Serializable
 class ChapterProps(
-    // v105 (upstream vc 12, "load pending pages from the reader's pages API"): entries are a
-    // plain url, or an object marking a pending page or an off-screen decoy — the JSON decode
-    // failure the field report named ("a json something failure") was this: the site moved
-    // imageUrls from List<String> to mixed primitives/objects.
     val imageUrls: List<JsonElement> = emptyList(),
     val mangaSlug: String? = null,
     val chapterRef: String? = null,

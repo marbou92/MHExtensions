@@ -17,16 +17,6 @@ import java.util.concurrent.TimeUnit
 import kotlin.Pair
 import kotlin.concurrent.thread
 
-/**
- * TurnstileSolver — the bounded offscreen widget mint (reconstructed for
- * v1.6.56, behavior-faithful to the shipped v1.6.55 build).
- *
- * v1.6.56 (v143) PLACEMENT: the solver is ONLY reachable through the
- * opt-in browser road ("Browser page walk" switch, default OFF). The
- * default open path never constructs this class — the field device has
- * died inside every WebView-bearing profile this extension ever shipped,
- * so no browser may open unless the user explicitly asks for one.
- */
 internal object TurnstileSolver {
 
     private const val TAG = "ProComicTurnstile"
@@ -34,7 +24,7 @@ internal object TurnstileSolver {
     /** Per-rung widget solve timeouts (seconds). */
     private val RUNG_TIMEOUTS = listOf(24L, 14L)
 
-    /** The live-fetched sitekey arrives blank on some apexes — the baked
+    /** The live-fetched sitekey arrives blank on some apexes. The baked
      * login sitekey is the last-resort render key. */
     private const val FALLBACK_SITEKEY = "0x4AAAAAACk1d7qWJi_of2qU"
 
@@ -248,7 +238,7 @@ internal object TurnstileSolver {
         }
     }
 
-    /** The widget page — the site's own render call on an explicit #ts
+    /** The widget page. The site's own render call on an explicit #ts
      * target, with the solver's retry ladder and error callbacks. */
     private fun widgetHtml(siteKey: String, appearance: String, size: String): String {
         val script = """window.__pcRendered=false;

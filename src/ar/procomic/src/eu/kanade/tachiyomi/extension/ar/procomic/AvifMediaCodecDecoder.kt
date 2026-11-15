@@ -2,58 +2,11 @@ package eu.kanade.tachiyomi.extension.ar.procomic
 
 import java.nio.ByteBuffer
 
-/**
- * Framework-only AVIF decoder (v108, demoted to DEBUG-ONLY in v109,
- * RE-ARMED PIECE-SIZED in v139): parses the ISOBMFF container in pure
- * Kotlin and pushes the embedded AV1 OBU stream through MediaCodec's
- * platform "video/av1" software decoder (c2.android.av1 — shipped with
- * Android 10).
- *
- * v109 FIELD VERDICT: this tier KILLED the host app on the Android 10
- * field device — configuring Android 10's brand-new software AV1 codec at
- * a still image's full size (pages 800x5000, "originals" covers to
- * 4000x6000) is a native-crash/OOM-kill surface no Java guard can catch,
- * and the app crashed on every page and cover load. The tier was REMOVED
- * from the decode ladder and survived only behind the debugMediaCodecTier
- * hook.
- *
- * v139 — THE RE-ARMING, WITH THE MATH THAT CHANGED: the site's protected
- * pages now arrive as reconstruction-plan PIECES — the observed grid_2x3
- * shape is 800x298 (~0.24 MP), three orders of magnitude under every
- * full-size config the field device ever died of. At that size the
- * software AV1 decode is the profile of an ordinary video thumbnail
- * (1080p video is ~2 MP — every Android 10 device runs it). The piece
- * ladder calls [decodePieceToJpeg], which refuses any tile or output
- * past 1280 edge / 1.3 MP in PURE KOTLIN — before a single codec
- * allocation — so the v108 kill profile is structurally unreachable.
- * The WebView transcode tiers are gone for good (the field device died
- * inside every one of them, v109-v138), and the attempt-marker breaker
- * around the ladder bounds even a hostile codec: one handled-late death
- * disables the tier for the session, two for the install — the floor is
- * the legible 410 card, never a crash loop. The full-size [decodeToJpeg]
- * entry survives for the harness's decline pins only; the production
- * ladder never calls it. The pure-Kotlin parts remain LOAD-BEARING:
- * parseAvifImage is the piece gate's up-front container parse, and the
- * NV21/pack pins keep guarding the container logic.
- *
- * Container support (verified against live app.<host> files):
- *  - single-item AVIF ('av01' primary item): full support
- *  - grid-derived images ('grid' primary + dimg tiles): supported — tiles
- *    are decoded individually and composited row-major
- *  - 8-bit 4:2:0 output (the platform decoder's native output); exotic
- *    output formats bail gracefully into the next decode tier
- *
- * The parser and the YUV->NV21 converter are pure Kotlin (no Android
- * imports) so the JVM harness pins them with real bytes; only the MediaCodec
- * and YuvImage calls are framework surface, and every one of them is
- * guarded — any failure is reported through the log sink and returns null
- * so the caller falls through to the remaining decode tiers.
- */
 internal object AvifMediaCodecDecoder {
 
     // ============================ data model ============================
 
-    /** One decodable AV1 OBU sequence + the ispe dimensions of its item. */
+    /** One decodable av1 obu sequence + the ispe dimensions of its item. */
     internal class AvifTile(val obu: ByteArray, val width: Int, val height: Int)
 
     /** The parsed image: one tile (simple AVIF) or the grid's tile list in
@@ -73,20 +26,6 @@ internal object AvifMediaCodecDecoder {
 
     // ============================== entry ================================
 
-    /**
-     * v139 — THE PIECE-GATED ENTRY (the ONLY entry the map-piece ladder
-     * may use). The whole point of the site's reconstruction-plan pieces
-     * is that they are SMALL: the observed grid_2x3 shape is 800x298
-     * (~0.24 MP), three orders of magnitude under the full-size configs
-     * (pages 800x5000, "originals" covers 4000x6000) that killed the
-     * v108 field device. This entry enforces that BEFORE any MediaCodec
-     * allocation: the container is parsed in pure Kotlin (no codec, no
-     * native surface), and every tile — plus the composed output — must
-     * fit [MAX_PIECE_EDGE] / [MAX_PIECE_PIXELS]. A file that does not
-     * fit is not a decode, it is the old kill profile — refused on
-     * sight, the ladder falls through, the worst case stays the legible
-     * card. Never throws.
-     */
     fun decodePieceToJpeg(avif: ByteArray, log: (String) -> Unit, quality: Int): ByteArray? = try {
         val layout = parseAvifImage(avif) ?: run {
             log("container parse refused")
@@ -233,7 +172,7 @@ internal object AvifMediaCodecDecoder {
             parseGridImage(data, primaryId, dimgChildren, ::itemBytes, ::ispeOf, properties)
         } else {
             // Lenient fallback: quirky writers associate properties through
-            // non-standard channels — if the whole file carries exactly one
+            // non-standard channels. If the whole file carries exactly one
             // ispe, that is the image's size.
             val dims = primaryDims
                 ?: (
@@ -302,7 +241,7 @@ internal object AvifMediaCodecDecoder {
     }
 
     /** Plain-box walker: [block] receives the box type plus the body bounds
-     * (right after the size+type header — full-box version/flags are NOT
+     * (right after the size+type header. Full-box version/flags are NOT
      * stripped; parsers read them where they need them). */
     private inline fun walkBoxes(
         data: ByteArray,
@@ -525,7 +464,7 @@ internal object AvifMediaCodecDecoder {
         return readU32(data, pos + 4).toInt()
     }
 
-    /** Big-endian integer of [size] bytes (0/1/2/4/8 — the iloc field widths). */
+    /** Big-endian integer of [size] bytes (0/1/2/4/8. The iloc field widths). */
     private fun readIntSized(data: ByteArray, pos: Int, size: Int): Long = when (size) {
         0 -> 0L
 
@@ -547,7 +486,7 @@ internal object AvifMediaCodecDecoder {
 
     // ====================== MediaCodec decode tier ======================
 
-    /** Decodes ONE AV1 OBU sequence to JPEG via the platform codec. */
+    /** Decodes one av1 obu sequence to JPEG via the platform codec. */
     private fun decodeObuToJpeg(obu: ByteArray, width: Int, height: Int, quality: Int, log: (String) -> Unit): ByteArray? {
         val codec = try {
             android.media.MediaCodec.createDecoderByType(AV1_MIME)
@@ -701,7 +640,7 @@ internal object AvifMediaCodecDecoder {
      * Packs a YUV_420_888 frame into the tightly-packed NV21 layout
      * YuvImage requires. Handles both planar (pixelStride 1) and
      * semi-planar (pixelStride 2) decoder outputs; bulk-copies whole rows
-     * whenever the strides allow it (Image plane buffers are DIRECT — no
+     * whenever the strides allow it (Image plane buffers are DIRECT. No
      * array() access). Returns null on shape mismatch.
      */
     internal fun nv21FromPlanes(y: PlaneData, u: PlaneData, v: PlaneData, width: Int, height: Int): ByteArray? {
@@ -710,7 +649,7 @@ internal object AvifMediaCodecDecoder {
         val chromaHeight = height / 2
 
         // Exact minimum capacity each plane must cover (the last sample is
-        // at (rows-1)*rowStride + (cols-1)*pixelStride) — never reject a
+        // at (rows-1)*rowStride + (cols-1)*pixelStride). Never reject a
         // plane for being tighter than rows*rowStride.
         fun PlaneData.minCapacity(rows: Int, cols: Int): Long = (rows - 1).toLong() * rowStride + (cols - 1).toLong() * pixelStride + 1
         val yBuffer = y.buffer?.takeIf { it.capacity() >= y.minCapacity(height, width) }?.apply { position(0) } ?: return null
@@ -720,7 +659,7 @@ internal object AvifMediaCodecDecoder {
         val ySize = width * height
         val nv21 = ByteArray(ySize + 2 * chromaWidth * chromaHeight)
 
-        // Y plane — bulk per-row get when every row fits contiguously.
+        // Y plane. Bulk per-row get when every row fits contiguously.
         val yRowsContiguous = y.pixelStride == 1 &&
             yBuffer.capacity() >= (height - 1).toLong() * y.rowStride + width
         val rowCopy = ByteArray(width)
@@ -771,7 +710,7 @@ internal object AvifMediaCodecDecoder {
     /** ImageFormat.NV21. */
     private const val NV21_FORMAT = 17
 
-    /** ImageFormat.YUV_420_888 — the only output layout this tier converts. */
+    /** ImageFormat.YUV_420_888. The only output layout this tier converts. */
     private const val YUV_420_888 = 35
 
     /** MediaCodec.BUFFER_FLAG_KEY_FRAME. */
@@ -785,27 +724,21 @@ internal object AvifMediaCodecDecoder {
 
     /** Whole-image decode deadline: a tall page is a heavy software AV1
      * decode, but if the codec has not emitted anything in a minute the
-     * device is wedged — fall through to the next tier instead. */
+     * device is wedged. Fall through to the next tier instead. */
     private const val DECODE_DEADLINE_MS = 60_000L
 
-    /** Grid tiles are re-encoded into the composed bitmap — encode them
+    /** Grid tiles are re-encoded into the composed bitmap. Encode them
      * lossless-ish so the final JPEG quality governs the bytes. */
     private const val TILE_JPEG_QUALITY = 100
 
     /** Guard against absurd single items (a hostile/malformed mdat). */
     private const val MAX_ITEM_BYTES = 64L * 1024 * 1024
 
-    /** Composited grid ceiling (ARGB_8888): 50 MP ~ 200 MB — above this
+    /** Composited grid ceiling (ARGB_8888): 50 MP ~ 200 MB. Above this
      * the tier refuses rather than OOM-ing the host app. */
     private const val MAX_COMPOSE_PIXELS = 50_000_000L
 
-    /** v139: the PIECE budget — the map-piece ladder's hard pre-alloc
-     * gate. The observed grid_2x3 piece is 800x298 (~0.24 MP); anything
-     * past a 1280-long-edge / 1.3 MP tile is the v108 kill profile
-     * (full pages 800x5000, covers 4000x6000) and is refused before a
-     * single codec allocation happens. */
     internal const val MAX_PIECE_EDGE = 1280
 
-    /** v139: the piece pixel budget (see [MAX_PIECE_EDGE]). */
     internal const val MAX_PIECE_PIXELS = 1_300_000L
 }

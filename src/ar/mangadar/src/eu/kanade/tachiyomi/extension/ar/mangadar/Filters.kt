@@ -57,7 +57,7 @@ private val typeOptions = listOf(
  * Genres are fetched from `content.getGenres` (fetchFilterData), curated to
  * the entries that actually tag series (the raw table carries ~450 rows,
  * many scraped junk with zero series). The values carried here are the
- * Arabic slugs the `filters.genres` array expects — ids do NOT filter.
+ * Arabic slugs the `filters.genres` array expects. Ids do NOT filter.
  */
 class GenreFilter(genres: List<Pair<String, String>>) :
     Filter.Group<TriStateFilter>(

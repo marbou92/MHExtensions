@@ -73,7 +73,7 @@ abstract class MangaDot :
     override fun OkHttpClient.Builder.configureClient() = apply {
         // This fork routes every call through the repo's own Cloudflare
         // solver (challenge auto-solve in a window-attached WebView, handoff
-        // to the app's WebView flow for interactive rounds) — the upstream
+        // to the app's WebView flow for interactive rounds). The upstream
         // keiyoushi source relies on the app's WebView flow alone.
         connectTimeout(30, TimeUnit.SECONDS)
         readTimeout(60, TimeUnit.SECONDS)
@@ -821,7 +821,7 @@ abstract class MangaDot :
 
     // ============================= Settings ==============================
     // Organized like the Comix source: browse/content defaults first, then
-    // browse filtering, then chapter-list handling, then details display —
+    // browse filtering, then chapter-list handling, then details display. 
     // every item titled by what it does with a summary that spells out where
     // it applies and what the empty/default value means.
     override fun setupPreferenceScreen(screen: PreferenceScreen) {

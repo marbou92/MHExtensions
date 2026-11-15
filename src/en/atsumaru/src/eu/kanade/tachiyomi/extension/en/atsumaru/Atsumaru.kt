@@ -59,12 +59,11 @@ abstract class Atsumaru :
 
     /**
      * Cover/poster paths returned by the API (`posters/xxx.jpg`) live under
-     * `/static/` on the CDN — `cdn.atsu.moe/posters/...` answers 404, which is
-     * why browse covers used to be broken.
+     * `/static/` on the CDN. `cdn.atsu.moe/posters/...` answers 404, which is
      *
      * Search documents (used by the filter screen) already include the
      * `/static/` prefix (`/static/posters/xxx.jpg`) while browse/details send
-     * bare `posters/xxx.jpg` — strip an existing prefix so both resolve to
+     * bare `posters/xxx.jpg`. Strip an existing prefix so both resolve to
      * `cdn.atsu.moe/static/posters/...` (a doubled `static/static/` 404s,
      * which is why filtered results had no covers).
      */
@@ -388,7 +387,7 @@ abstract class Atsumaru :
     }
 
     // ----------------------------------------------------------------------
-    // Scanlator names — the allChapters payload only carries the group's id
+    // Scanlator names. The allChapters payload only carries the group's id
     // (`scanlationMangaId`); the display names live in the details response
     // (`scanlators[]`). Details parse fills the cache; the chapter list
     // fetches details once when the cache is cold.
@@ -409,7 +408,7 @@ abstract class Atsumaru :
                     map
                 }
         } catch (_: Exception) {
-            // Scanlator names are cosmetic — never fail the chapter list over them.
+            // Scanlator names are cosmetic. Never fail the chapter list over them.
             emptyMap()
         }
     }
@@ -467,7 +466,7 @@ abstract class Atsumaru :
         fun excluded(): List<String> = state.filter { it.state == Filter.TriState.STATE_EXCLUDE }.map { it.id }
 
         private companion object {
-            // Live values from /api/explore/availableFilters (2026-09).
+            // Live values from /api/explore/availableFilters.
             val GENRES = listOf(
                 "Action" to "39",
                 "Adult" to "46",
@@ -531,7 +530,7 @@ abstract class Atsumaru :
 
     private class YearFilter : Filter.Text("Year (e.g. 2024)")
 
-    /** Typesense numeric facet — verified live (chapterCount:>=100). */
+    /** Typesense numeric facet. Verified live (chapterCount:>=100). */
     private class MinChaptersFilter : Filter.Text("Minimum chapters (e.g. 50)")
 
     // ========================================================================

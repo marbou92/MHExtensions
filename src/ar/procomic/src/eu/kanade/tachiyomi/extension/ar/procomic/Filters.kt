@@ -3,12 +3,6 @@ package eu.kanade.tachiyomi.extension.ar.procomic
 import eu.kanade.tachiyomi.source.model.Filter
 import eu.kanade.tachiyomi.source.model.FilterList
 
-/**
- * ProComic's browse filters (reconstructed for v1.6.56 — behavior-faithful
- * to the shipped v1.6.55 build). The search endpoint takes
- * `sort` / `type` / `year` / `includeGenres`; the values below were
- * live-probed against /api/public/series/search (all answer 200).
- */
 class SortFilter :
     Filter.Select<String>(
         "الترتيب",

@@ -132,7 +132,7 @@ class DetailsDto(
     val trackerId: String? = null,
     @SerialName("series_covers")
     val covers: List<SeriesCover> = emptyList(),
-    // Optional rating fields — parsed when the API exposes them, silently
+    // Optional rating fields. Parsed when the API exposes them, silently
     // null otherwise (kotlinx skips unknown keys both ways).
     val rating: Double? = null,
     @SerialName("average_rating")
@@ -176,7 +176,7 @@ class DetailsDto(
      * Star rating line (like our other sources), e.g. "★★★★☆ 4.3/5".
      *
      * The API's `rating`/`average_rating` values are 0–100 PERCENTILES
-     * (observed live: 70.1, 85.6 — the old code treated anything >5 as a
+     * (observed live: 70.1, 85.6. The old code treated anything >5 as a
      * 0–10 scale and users saw "42.8/10" for 85.6). Small values are only
      * plausible as true 0–5 scores, so: ≤5 → as-is, otherwise divide by 20.
      */
@@ -197,7 +197,7 @@ class DetailsDto(
         thumbnail_url = covers.firstOrNull()?.imageId?.let { "$apiUrl/image/$it" }
         val desc = StringBuilder()
 
-        // Rating stars (rendered once, at the top — like MKissa/ManhuaRMTL)
+        // Rating stars (rendered once, at the top. Like MKissa/ManhuaRMTL)
         ratingStars()?.let {
             desc.append(it).append("\n\n")
         }
@@ -358,20 +358,6 @@ class ChapterDto(
     }
 }
 
-/**
- * The books INDEX endpoint (`GET /series/{id}/books/index?fields=List`) —
- * the v72 replacement for the chapter list. The details response stopped
- * embedding `series_books`, and the plain `/books` endpoint caps at 100
- * rows and ignores its cursor, while the index returns EVERY book in one
- * request (live-checked 2026-10: a 202-chapter series and a 120-book one
- * both come back complete, on every mirror).
- *
- * The payload is columnar: [fields] names the columns, every entry of
- * [books] is a positional row:
- *   fields = [book_id, sort_no, chapter_no, volume_no, group_ix,
- *             released_at, title, page_count, published_on, internal_release]
- * with [groups] resolving the group_ix indices to scanlator names.
- */
 @Serializable
 class BooksIndexDto(
     val count: Int = 0,

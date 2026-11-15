@@ -34,10 +34,10 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * Hijala (hijala.com) — MangaThemesia, Arabic (حجالة).
+ * Hijala (hijala.com). MangaThemesia, Arabic (حجالة).
  *
  * Beyond the stock MangaThemesia parse (plus the site's split-slice page
- * unscrambler), this source ships the family's Comix/MangaDot details block —
+ * unscrambler), this source ships the family's Comix/MangaDot details block. 
  * the same options ProComic, MangaTime and Kawaiimanga carry:
  *
  *   - an organized description: the theme's 0..10 rating rendered as the
@@ -325,9 +325,9 @@ abstract class Hijala :
     override fun chapterListParse(document: Document): List<SChapter> = combineDuplicateChapters(super.chapterListParse(document))
 
     /**
-     * Optional "combine duplicate chapters" — the same option ProComic and
+     * Optional "combine duplicate chapters". The same option ProComic and
      * MangaTime ship. When enabled, one entry per non-zero chapter number
-     * survives — the newest upload wins (the list is newest-first).
+     * survives. The newest upload wins (the list is newest-first).
      */
     private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
         mutableListOf<SChapter>().apply {

@@ -30,36 +30,6 @@ import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
 import java.util.concurrent.atomic.AtomicReference
 
-/**
- * ProComicImageServer — the loopback image pipeline (reconstructed for
- * v1.6.56, behavior-faithful to the shipped v1.6.55 build).
- *
- * Every image the reader requests is served by a loopback HTTP server in
- * this process:
- *
- *   /.image-proxy/<base64url>[?e=1280]  — the COVER ROAD: fetch upstream
- *       (inner client first, then the reader session), detect AVIF, and
- *       hand the reader nothing but JPEG (the platform BitmapFactory
- *       decodes whatever the platform can, then the weserv ladder
- *       transcodes server-side; the reader NEVER sees a raw AVIF byte
- *       mislabeled as jpeg).
- *   /.map-page/<hash>        — protected pages: the reconstruction plan
- *       (freshly-signed piece urls + rects) is fetched through the
- *       source's mapPlanner hook on first request and composed onto one
- *       canvas — pieces are AVIF-detected and transcoded exactly like
- *       every other image, so the canvas only ever receives JPEG.
- *   /.composed/<hash>        — reader-session piece rows composed from the
- *       site's own signed piece urls (same transcode discipline).
- *   /.captured/<hash>        — reader-session in-page captures: JPEG tiles
- *       straight from the session's canvas, stitched JPEG→JPEG.
- *   /.diag                   — the legible state trail the /.diag log
- *       contract reads.
- *
- * v1.6.56 discipline: NOTHING in this class feeds raw AVIF to any
- * decoder without the AVIF-detection gate, and every AVIF byte is
- * transcoded to JPEG (platform on Android 12+, weserv server-side
- * otherwise) before it reaches the reader.
- */
 internal class ProComicImageServer(
     private val baseUrl: String,
     private val sessionClient: OkHttpClient?,
@@ -67,7 +37,7 @@ internal class ProComicImageServer(
 ) {
 
     // ------------------------------------------------------------------
-    // Public API the source wires up (hooks may be null — the JVM harness
+    // Public API the source wires up (hooks may be null. The JVM harness
     // drives the server bare).
     // ------------------------------------------------------------------
 
@@ -144,7 +114,7 @@ internal class ProComicImageServer(
     // Clients
     // ------------------------------------------------------------------
 
-    /** The bare inner client (no interceptors, short timeouts) — the
+    /** The bare inner client (no interceptors, short timeouts). The
      * first fetch tier for upstream images and the weserv transcode. */
     private val innerClient: OkHttpClient by lazy {
         OkHttpClient.Builder()
@@ -425,7 +395,7 @@ internal class ProComicImageServer(
     }
 
     // ------------------------------------------------------------------
-    // /.image-proxy — the cover road
+    // /.image-proxy. The cover road
     // ------------------------------------------------------------------
 
     private fun handleImageProxy(path: String, query: String, out: OutputStream) {
@@ -440,7 +410,7 @@ internal class ProComicImageServer(
             return
         }
         // The proxy can also carry a planned loopback route (the walk
-        // merges simple rows over planned slots) — re-dispatch stateful.
+        // merges simple rows over planned slots). Re-dispatch stateful.
         if (upstream.startsWith("http://127.0.0.1:")) {
             val innerPath = runCatching { upstream.toHttpUrl().encodedPath }.getOrNull()
             when {
@@ -509,7 +479,7 @@ internal class ProComicImageServer(
             diag.add("signed rung 1: inner host is not a wide-open app host — skipped")
         }
         // Rung 2: weserv on the signed url itself (signed cdn-image urls
-        // answer bare — live-proven).
+        // answer bare. Live-proven).
         diag.add("signed rung 2: weserv on the signed url")
         weservLadder(maxEdge, diag, url, null)?.let { jpeg ->
             diag.add("signed rung 2: served ${jpeg.size}B via weserv")
@@ -519,7 +489,7 @@ internal class ProComicImageServer(
         diag.add("signed rung 3: upstream fetch (session-first + pass)")
         val (contentType, bytes) = fetchUpstream(url, diag)
         val decoded: ByteArray = if (isAvif(contentType, bytes)) {
-            // NEVER serve raw AVIF — transcode like every other image
+            // NEVER serve raw AVIF. Transcode like every other image
             // (the platform decoder on Android 12+, weserv otherwise).
             transcode(maxEdge, diag, url, bytes)
         } else {
@@ -904,7 +874,7 @@ internal class ProComicImageServer(
     }
 
     // ------------------------------------------------------------------
-    // The decode ladder — BitmapFactory first (the platform decoder that
+    // The decode ladder. BitmapFactory first (the platform decoder that
     // already renders the covers), weserv server-side as the fallback.
     // ------------------------------------------------------------------
 
@@ -926,7 +896,7 @@ internal class ProComicImageServer(
 
     /** Platform BitmapFactory decode → JPEG bytes, with bounds +
      * sample-size discipline (JPEG/WebP/PNG everywhere; AVIF on Android
-     * 12+ — the decoder that already renders the covers). Null when the
+     * 12+. The decoder that already renders the covers). Null when the
      * platform has no codec for the bytes. */
     private fun platformDecode(maxEdge: Int, diag: Diag, bytes: ByteArray): ByteArray? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
@@ -962,7 +932,7 @@ internal class ProComicImageServer(
     }
 
     // ------------------------------------------------------------------
-    // weserv ladder (server-side transcode — the same road as covers)
+    // weserv ladder (server-side transcode. The same road as covers)
     // ------------------------------------------------------------------
 
     private fun weservLadder(maxEdge: Int, diag: Diag, url: String, rawBytes: ByteArray?): ByteArray? {
@@ -1076,7 +1046,7 @@ internal class ProComicImageServer(
         return false
     }
 
-    /** The label the reader sees. AVIF bytes NEVER leave this class — the
+    /** The label the reader sees. AVIF bytes NEVER leave this class. The
      * caller transcodes them first; this only labels the rest. */
     private fun contentTypeLabel(contentType: String, bytes: ByteArray, url: String): String = when {
         isAvif(contentType, bytes) -> "image/jpeg" // unreachable: callers transcode first
@@ -1212,7 +1182,7 @@ internal class ProComicImageServer(
     }
 
     // ------------------------------------------------------------------
-    // The legible error card (drawn text — no decode involved)
+    // The legible error card (drawn text. No decode involved)
     // ------------------------------------------------------------------
 
     private fun errorCard(out: OutputStream, detail: String) {

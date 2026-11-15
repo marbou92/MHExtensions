@@ -35,10 +35,10 @@ import kotlin.math.roundToInt
 import kotlin.time.Duration.Companion.seconds
 
 /**
- * Team X (olympustaff.com) — custom Laravel reader, Arabic (تيم إكس).
+ * Team X (olympustaff.com). Custom Laravel reader, Arabic (تيم إكس).
  *
  * Beyond browse/search/filters, this source ships the family's Comix/MangaDot
- * details block — the same options ProComic, MangaTime and Kawaiimanga carry:
+ * details block. The same options ProComic, MangaTime and Kawaiimanga carry:
  *
  *   - an organized description: the site's own 0..5 rating (`#average_rating`)
  *     rendered as the familiar ★★★★☆ row, a Type/Status/extra-info line, the
@@ -406,9 +406,9 @@ abstract class TeamX :
     }
 
     /**
-     * Optional "combine duplicate chapters" — the same option ProComic and
+     * Optional "combine duplicate chapters". The same option ProComic and
      * MangaTime ship. When enabled, one entry per non-zero chapter number
-     * survives — the newest upload wins (the list is newest-first).
+     * survives. The newest upload wins (the list is newest-first).
      */
     private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
         mutableListOf<SChapter>().apply {
@@ -524,7 +524,7 @@ abstract class TeamX :
         const val PREF_SCORE_POSITION = "pref_score_position"
         const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
 
-        /** "#average_rating" text like "4/5" — grab the numeric part. */
+        /** "#average_rating" text like "4/5". Grab the numeric part. */
         val RATING_REGEX = Regex("""\d+(?:\.\d+)?""")
     }
 }

@@ -13,54 +13,6 @@ import java.io.IOException
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-/**
- * WebView bridge for comix.to's signed + encrypted JSON API (v48).
- *
- * WHY THIS EXISTS
- *
- * comix.to gates every `/api/v1/...` endpoint behind a per-request signature
- * (the `_` query param — a bare call answers 403 `missing_token`). In late
- * 2026 the site rebuilt that layer: the old env-*.js chunk (a base64-decoded
- * 3×S-box chain our native signer replicated) is GONE — replaced by a
- * VM-protected "secure-<build>.js" chunk whose signing core is a hash/MAC
- * computed entirely inside its bytecode VM (no s-box material ever
- * materialises as JS arrays, so nothing can be captured and re-implemented
- * in Kotlin).
- *
- * So the bridge stops chasing the algorithm and lets the SITE do all the
- * work — the same architecture the site itself runs:
- *
- *  1. Fetch a live comix.to HTML page through the full source client (the
- *     solver keeps the CF clearance working, the retry interceptor rides out
- *     flaky-origin 5xx). It carries the main bundle's URL.
- *  2. Fetch the main bundle's TEXT and collect EVERY relative chunk it
- *     imports (`from"./x.js"` + `import("./x.js")`) — the bundle layout is
- *     free to rename again; scanning imports instead of matching a chunk
- *     name survives that.
- *  3. PATCH-SERVE the api-client chunk: the chunk that creates the axios
- *     instance (`baseURL:"/api/..."`) normally only exports a thin facade
- *     with MINIFIED method names (`{Oo, EN, xG, ...}`) — the instance
- *     itself is unreachable. The bridge rewrites that chunk's export table
- *     (adds `__MH_CLIENT__ = <the signed instance>`) and serves the patched
- *     text from the request interceptor, so the WebView's module graph
- *     wires up EXACTLY like the site's own boot (importing the chunk runs
- *     `Fp($p)` at module scope — the secure module installs its signer onto
- *     the instance).
- *  4. Inside the WebView, import every collected chunk, take the patched
- *     `__MH_CLIENT__` export (with duck-typed fallbacks for older/future
- *     shapes), and call `client.get(path)` — signing AND (if the site
- *     re-enables it) response decryption happen in-JS, on the WebView's
- *     cookies and TLS stack. Paths are handed over in the site's own
- *     convention: relative to the client's `baseURL` (axios re-combines
- *     them), with an automatic retry on the alternate form.
- *
- * Every `/api/v1` call the source makes (browse, search, details, chapter
- * lists, page lists) flows through [apiGet]; the batch form keeps a whole
- * chapter-list sweep inside ONE WebView session.
- *
- * Request allow-list: only comix hosts and challenges.cloudflare.com may
- * load; everything else gets an empty response.
- */
 
 internal object ComixWebView {
 
@@ -78,7 +30,7 @@ internal object ComixWebView {
     /** The api-client chunk creates its axios instance with an `/api/...` baseURL. */
     private val API_CLIENT_MARKER = Regex("""baseURL\s*:\s*["']/api/""")
 
-    /** `VAR=SomeLib.create({baseURL:"/api/v1"...` — baseURL first (current minifier output). */
+    /** `VAR=SomeLib.create({baseURL:"/api/v1"...`. BaseURL first (current minifier output). */
     private val API_CLIENT_VAR = Regex(
         """([A-Za-z_$][A-Za-z0-9_$]*)\s*=\s*[A-Za-z_$][A-Za-z0-9_$]*\.create\(\s*\{\s*baseURL\s*:\s*["']/api/""",
     )
@@ -91,7 +43,7 @@ internal object ComixWebView {
     /**
      * Runs ONE WebView session and performs a GET for every path in [paths],
      * returning the site client's decrypted JSON payload per path (same
-     * order). Any path whose call fails bridges an empty string — callers
+     * order). Any path whose call fails bridges an empty string. Callers
      * decide how strict to be.
      */
     fun apiGet(
@@ -105,7 +57,7 @@ internal object ComixWebView {
         }
         require(paths.isNotEmpty()) { "ComixWebView.apiGet needs at least one path" }
 
-        // 1. A live page through the FULL source client — delivery vehicle
+        // 1. A live page through the FULL source client. Delivery vehicle
         // for the comix.to origin and the main-bundle URL.
         val document = client.newCall(GET(baseUrl)).execute().use { response ->
             if (!response.isSuccessful) {
@@ -135,11 +87,9 @@ internal object ComixWebView {
             throw IOException("Comix WebView bridge: main bundle imports no chunks")
         }
 
-        // 3. v48: find the api-client chunk and patch its export table so the
-        // signed axios instance becomes importable inside the WebView.
         val patchedChunks = findAndPatchClientChunk(client, chunkUrls)
 
-        // 4. Random bridge names — the site's JS must never poke them.
+        // 4. Random bridge names. The site's JS must never poke them.
         val (bridgeName, errorBridgeName) = List(2) {
             (1..(10..20).random()).map { (('a'..'z') + ('A'..'Z')).random() }.joinToString("")
         }
@@ -236,7 +186,7 @@ internal object ComixWebView {
      * api-client chunk. When found, rewrites its `export{...}` table to also
      * export the signed axios instance as [CLIENT_EXPORT], and returns the
      * URL → patched-text map (empty when the chunk can't be found or patched
-     * — the boot script then falls back to duck-typed detection).
+     * . The boot script then falls back to duck-typed detection).
      */
     private fun findAndPatchClientChunk(client: OkHttpClient, chunkUrls: List<String>): Map<String, String> {
         for (url in chunkUrls.take(48)) {
@@ -319,7 +269,7 @@ internal object ComixWebView {
 
                     const EXPORT_NAME = '$CLIENT_EXPORT';
 
-                    // 1. Patched export — the signed axios instance itself.
+                    // 1. Patched export. The signed axios instance itself.
                     let client = null;
                     for (const ns of namespaces) {
                         if (ns && ns[EXPORT_NAME] && typeof ns[EXPORT_NAME].get === 'function') {
@@ -328,7 +278,7 @@ internal object ComixWebView {
                         }
                     }
 
-                    // 2. Legacy shape — an exported object exposing get+post.
+                    // 2. Legacy shape. An exported object exposing get+post.
                     if (!client) {
                         const candidates = [];
                         for (const ns of namespaces) {
@@ -346,7 +296,7 @@ internal object ComixWebView {
                         client = candidates.find(c => typeof c.put === 'function' && typeof c.patch === 'function') || candidates[0] || null;
                     }
 
-                    // 3. Last resort — a facade whose every value is a function
+                    // 3. Last resort. A facade whose every value is a function
                     //    (minified method names churn every build; call the first).
                     if (!client) {
                         outer: for (const ns of namespaces) {
@@ -398,7 +348,7 @@ internal object ComixWebView {
                         try {
                             let data = await callGet(paths[i]);
                             if (data && typeof data === 'object' && typeof data.status === 'number' && data.config && data.data !== undefined) {
-                                // axios response object — unwrap to the body
+                                // axios response object. Unwrap to the body
                                 data = data.data;
                             }
                             if (data && typeof data === 'object' && data.status === 'ok' && data.result !== undefined) {

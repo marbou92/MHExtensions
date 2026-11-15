@@ -61,25 +61,6 @@ abstract class Kagane :
 
     private val prefs = getPreferences()
 
-    // ============================ Mirrors (v72) ============================
-    //
-    // kagane.to (the v50 domain) is gone — NXDOMAIN. The site now lives on
-    // kagane.si with kagane.cx / kagane.moe / kagane.net as mirrors; ALL of
-    // them serve the same backend and the same ID space (verified 2026-10:
-    // /api/integrity answers on every host, /api/v2/* paths identical), so a
-    // mirror switch never invalidates library entries — manga/chapter urls
-    // are bare ids.
-    //
-    // Three layers of fallback, closest to xcomic's mirror system:
-    //  1. a fixed mirror list the user can switch in the extension settings
-    //     (plus a free-text custom mirror override),
-    //  2. an auto-refresh that scrapes kagane.org — the site's OWN
-    //     mirror-status page (server-rendered <a> links) — whenever every
-    //     known mirror is down, so new domains appear WITHOUT an app update
-    //     (throttled to once every 6h; toggle in the extension settings),
-    //  3. automatic failover: an interceptor that rewrites a request whose
-    //     host is dead (connect failure / DNS NXDOMAIN / CF 521+523) onto
-    //     the next mirror and persists the winner.
 
     private val staticMirrors = listOf(
         "https://kagane.si",
@@ -116,34 +97,6 @@ abstract class Kagane :
     private val apiUrl get() = "https://$domain/api/v2"
 
     override fun OkHttpClient.Builder.configureClient() = apply {
-        // The Cloudflare method (v23): a challenge SOLVER in a window-attached
-        // WebView. Research conclusion (2026-09): header hardening can never
-        // pass a managed challenge — only a JS-executing browser environment
-        // solves them, and the WebView must be ATTACHED to a window: an
-        // unattached one reports document.visibilityState="hidden" and the
-        // Turnstile widget silently never renders (no token, no auto-solve).
-        // runWebView now parks its WebView behind the app's own UI, so the
-        // challenge auto-solves exactly like a real browser. Measured on this
-        // site: cf_clearance TTL is ONE YEAR — a single solve lasts, and the
-        // old "solve it manually every hour" loop was false-positive
-        // detection wiping valid clearance (see isCloudflareChallenge).
-        // Fingerprint headers stay for the traffic BETWEEN solves (they
-        // keep CF's bot score of the cleared session healthy).
-        //
-        // Kept from the 2026-09 audit:
-        // - originSanitizer: KeiSource stamps "Origin: <baseUrl>" onto every
-        //   request, but browsers NEVER send Origin on document GETs — an
-        //   inconsistent Origin is a bot signal that kept challenging clean
-        //   traffic.
-        // - refreshTokenInterceptor: Kagane's own auth (token-bearing URLs)
-        //   stays handled here; CF-challenge responses pass through it
-        //   untouched (they can't be fixed by a token refresh).
-        //
-        // v72: the mirror-failover interceptor runs FIRST (it rewrites the
-        // host before anything else looks at the request); the CF solver
-        // covers every known mirror so a challenge on any of them can be
-        // solved. The old kagane.to stays swappable so thumbnails stored by
-        // previous versions get rewritten instead of erroring forever.
         addInterceptor(::mirrorFailoverInterceptor)
 
         addInterceptor(CloudflareSolverInterceptor(knownMirrorHosts + "kagane.to"))
@@ -154,8 +107,6 @@ abstract class Kagane :
         rateLimit(3)
     }
 
-    /** The hosts the failover may rewrite onto a mirror: every known mirror
-     * plus the dead v50 domain (stored thumbnail urls point there). */
     private fun failoverHosts(): Set<String> = knownMirrorHosts + "kagane.to"
 
     private fun Request.withMirrorHost(mirrorUrl: String): Request {
@@ -195,9 +146,9 @@ abstract class Kagane :
     }
 
     /**
-     * Rewrites a failed request onto the next mirror and retries — mirrors
+     * Rewrites a failed request onto the next mirror and retries. Mirrors
      * share one backend and one ID space, so only scheme+host change.
-     * Triggers: connect-level IOExceptions (DNS-dead hosts — the exact
+     * Triggers: connect-level IOExceptions (DNS-dead hosts. The exact
      * kagane.to failure mode) and Cloudflare's 521/523 origin-down codes.
      * The first mirror that answers is persisted as the active one so later
      * requests start there. Requests whose host is not a mirror host (e.g.
@@ -249,7 +200,7 @@ abstract class Kagane :
     }
 
     /**
-     * Strips "Origin" from GET requests — browsers only send Origin on
+     * Strips "Origin" from GET requests. Browsers only send Origin on
      * CORS fetch/XHR and POSTs, never on document navigations or <img>
      * loads. Carrying it on every GET is a bot signal that keeps
      * Cloudflare challenging otherwise-clean traffic (the reported
@@ -266,7 +217,7 @@ abstract class Kagane :
     // Cloudflare challenge detection uses the strict core implementation
     // (keiyoushi.cloudflare.isCloudflareChallenge): cf-mitigated, or 403/503
     // from Cloudflare with challenge-page BODY markers. Kagane's own API
-    // returns plain-JSON 401/403 auth errors from behind Cloudflare — the old
+    // returns plain-JSON 401/403 auth errors from behind Cloudflare. The old
     // header-only check misread those as challenges, skipped the token
     // refresh and dumped the user into the app-level WebView prompt for a
     // mere expired token.
@@ -291,7 +242,7 @@ abstract class Kagane :
         )
 
         // Upstream-exact: a 401/403/507 from a token-bearing URL is treated
-        // as a Kagane auth failure and triggers a token refresh — EXCEPT
+        // as a Kagane auth failure and triggers a token refresh. EXCEPT
         // Cloudflare challenges (see isCloudflareChallenge), which fall
         // through to the app-level interceptor instead of burning a token
         // refresh per challenged request (the reported slowness).
@@ -471,7 +422,7 @@ abstract class Kagane :
     /**
      * Identity data the related-manga route needs later: the tracker id
      * (alternate editions) plus the series' genre/tag ids (client-side
-     * similar search — the API has no suggestions endpoint).
+     * similar search. The API has no suggestions endpoint).
      */
     private fun buildMemo(dto: DetailsDto): JsonObject = buildJsonObject {
         if (!dto.trackerId.isNullOrEmpty()) {
@@ -491,12 +442,6 @@ abstract class Kagane :
         ?.mapNotNull { (it as? JsonPrimitive)?.content }
         .orEmpty()
 
-    /**
-     * Chapters come from the books INDEX endpoint (v72): the details
-     * response stopped embedding `series_books`, and the plain /books
-     * endpoint caps at 100 rows while ignoring its cursor — the index
-     * returns every book in one request (live-checked on all mirrors).
-     */
     private suspend fun parseChapterList(seriesId: String, useSourceChapterNumber: Boolean): List<SChapter> = client.get("$apiUrl/series/$seriesId/books/index?fields=List")
         .parseAs<BooksIndexDto>()
         .toSChapterList(seriesId, useSourceChapterNumber, chapterTitleMode)
@@ -509,9 +454,8 @@ abstract class Kagane :
     /**
      * Related manga = tracker siblings + client-side "similar".
      *
-     * The API has NO suggestions/similar endpoint (route surface verified
-     * 2026-09), and the old implementation only ever returned same-tracker
-     * siblings (alternate editions of the SAME work — often just itself).
+     * The API has no suggestions/similar endpoint, so the similar list is
+     * built from this series' own genres and tags.
      * The similar list is built by searching with this series' own genres
      * and tags (match ANY), most-viewed first, excluding self and siblings.
      */
@@ -520,7 +464,7 @@ abstract class Kagane :
         val results = LinkedHashMap<String, SManga>()
         val siblings = mutableSetOf<String>()
 
-        // 1) Tracker siblings — alternate editions/translations of the work.
+        // 1) Tracker siblings. Alternate editions/translations of the work.
         manga.memo["trackerId"]?.string?.let { trackerId ->
             runCatching {
                 client.get("$apiUrl/trackers/$trackerId/series")
@@ -615,19 +559,6 @@ abstract class Kagane :
     private var integrityToken: String = ""
     private var integrityExp = System.currentTimeMillis()
 
-    /**
-     * Upstream-verbatim keiyoushi behaviour, including the site-root
-     * "priming" GET. That GET looks redundant but is load-bearing for
-     * Cloudflare: it is a plain GET to kagane.to, so when the clearance
-     * cookie is missing the app's CloudflareInterceptor can solve the
-     * challenge there (a WebView can only navigate with GET). Without it
-     * the FIRST thing to hit Cloudflare is the POST below / the POST to
-     * /books/{id} — and a challenged POST cannot be solved by the app's
-     * WebView flow, so users saw "Failed to bypass Cloudflare". The v15
-     * persistent token cache skipped this priming whenever a stale token
-     * was still cached, which is exactly why v15 failed where upstream
-     * works.
-     */
     private suspend fun getIntegrityToken(): String {
         if (integrityExp < System.currentTimeMillis()) {
             // Site-root "priming" GET (kept from upstream, host now dynamic):
@@ -811,15 +742,15 @@ abstract class Kagane :
     /**
      * Scrapes the site's own mirror-status page (kagane.org) for the mirrors
      * it currently advertises and persists any that aren't known yet. The
-     * page is fully server-rendered — one `<a href="https://kagane.X/">`
-     * per mirror — so plain HTML parsing suffices; kagane.org itself is
+     * page is fully server-rendered. One `<a href="https://kagane.X/">`
+     * per mirror. So plain HTML parsing suffices; kagane.org itself is
      * excluded (it's the directory, not a mirror).
      *
      * @return a human-readable result for the settings Toast.
      */
     private fun refreshMirrorsFromOrg(): String {
         val found = try {
-            // Plain blocking call — this runs on a worker Thread, not in a
+            // Plain blocking call. This runs on a worker Thread, not in a
             // coroutine, so the suspend network helpers can't be used here.
             val request = Request.Builder()
                 .url(MIRROR_LIST_URL)

@@ -24,21 +24,6 @@ data class OcrResponse(
     fun pages(): List<OcrPage> = data ?: emptyList()
 }
 
-/**
- * v39 lenient OCR payload parser.
- *
- * The gate response has been seen as a bare array of page objects and as a
- * `{data|pages: [...]}` envelope; text entries as `{box|clean_box, text}`,
- * as `[[x,y,w,h], text-or-map]` arrays, and as coordinate objects
- * `{x, y, width, height, angle, ...}`. Field names drift between the site
- * owner's obfuscation rounds, so the parser matches by SHAPE: image-ish
- * string keys, box-ish arrays/objects, text-ish strings — not one fixed
- * schema. This is what the WebView harvester (OcrHarvest) and the direct
- * gate path both feed into.
- *
- * Returns null when [body] is not an OCR payload at all (challenge page,
- * random JSON) and an empty list for a legitimate "nothing here" payload.
- */
 fun parseOcrPayload(body: String): List<OcrPage>? {
     val trimmed = body.trim()
     if (trimmed.length < 10) return null
@@ -149,13 +134,6 @@ data class OcrPage(
             val text = t.text ?: ""
             if (box != null && text.isNotBlank()) {
                 val vals = parseBox(box)
-                // v53: the wire parser can't know which space the gate speaks
-                // (it never sets normalized), so a wire box that LOOKS like a
-                // fraction (all four values within ±1% of [0,1]) is treated
-                // as one. A real PIXEL box can't satisfy that — text smaller
-                // than 1.01px is impossible — and the renderer scales
-                // fraction boxes by the downloaded bitmap, so a wrong guess
-                // used to burn the text as a squashed strip at the left edge.
                 val normalized = t.normalized || boxLooksFractional(vals)
                 result.add(OcrTextBox(vals, extractEnglish(text), normalized))
             }
@@ -182,13 +160,6 @@ data class OcrText(
     val text: String? = null,
     @SerialName("box") val boxList: List<JsonElement>? = null,
     @SerialName("clean_box") val cleanBox: List<JsonElement>? = null,
-    /**
-     * v45: true when the coordinates are FRACTIONS of the page image
-     * (0.0–1.0 relative to its width/height) instead of absolute pixels —
-     * the DOM harvest emits these because the WebView's loaded image
-     * variant can differ in resolution from the file the app downloads.
-     * The renderer scales normalized boxes by the real bitmap dimensions.
-     */
     val normalized: Boolean = false,
 )
 
@@ -198,52 +169,8 @@ data class OcrTextBox(
     val normalized: Boolean = false,
 )
 
-/**
- * v53: a box whose four values all sit in [0,1] is in FRACTION space.
- * Pixel boxes can't look like this (no real text is under ~1px wide), so
- * the false-positive risk is nil; the false-negative (fractions burned as
- * pixels) drew text as a squashed vertical strip at the left edge.
- */
 fun boxLooksFractional(vals: FloatArray): Boolean = vals.size == 4 && vals.all { it >= -0.01f && it <= 1.01f }
 
-/**
- * v54: the DOM sweep records every text element — a container div holding
- * several line spans qualifies BESIDE its children (its innerText equals its
- * textContent, so the sweep takes the whole wrapper as one box). A wrapper
- * spanning most of the page then burns its CONCATENATED text as a giant slab:
- * the font collapses, the layout clamps against the image edge ("squashed to
- * the left"), and the same lines burn a second time in their real bubbles
- * ("not in their bubble").
- *
- * This prune drops a box when its text is fully represented by tighter boxes
- * GEOMETRICALLY CONTAINED in it. The tight boxes stay; the wrapper goes. Real
- * bubbles never contain other bubbles, so the false-positive risk is nil.
- * Comparisons happen in each box's own space (a fraction box is never
- * contained in a pixel box or vice versa).
- *
- * v55: field logs showed side-by-side bubbles STILL combining. The v54 drop
- * condition demanded an EXACT text match after joining the children in
- * reading order — three real drifts defeat that: the site's text order can
- * run right-to-left (manga), adjacent inline spans fuse without spaces
- * ("Text AText B"), and sweep filters can skip one child entirely. The drop
- * condition is now CHARACTER-SET COVERAGE: a wrapper is dropped when the
- * alphanumeric characters of its contained boxes cover ~all of the
- * wrapper's (case/punctuation/spacing/order-insensitive). Content is never
- * lost — the covered characters burn in the tighter boxes at their true
- * positions. Candidates are evaluated LARGEST FIRST so a wrapper is judged
- * while all of its children are still present.
- *
- * v59: the combining symptom returned in the field ("OCR combines bubbles
- * right beside each other"). A wrapper captured in one sweep pass and its
- * children in another can drift a few OCR characters between them; at the
- * flat 95% floor that drift keeps the wrapper alive and it burns its
- * concatenated text dead-center BETWEEN the two bubbles again. A wrapper
- * with TWO OR MORE contained children is by definition a multi-bubble
- * slab (a real single bubble never contains two other bubbles) — for that
- * shape the coverage floor relaxes to 85%: the slab burning between the
- * bubbles costs far more than the few drifted characters it might carry.
- * Single-child wrappers keep the strict 95% floor.
- */
 fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
     if (boxes.size <= 1) return boxes
 
@@ -262,7 +189,7 @@ fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
         return cx >= outer[0] && cx <= outer[2] && cy >= outer[1] && cy <= outer[3]
     }
 
-    /** Alphanumeric character counts — case-, punctuation-, spacing-free. */
+    /** Alphanumeric character counts. Case-, punctuation-, spacing-free. */
     fun charCounts(text: String): HashMap<Char, Int> {
         val counts = HashMap<Char, Int>()
         for (c in text.lowercase()) {
@@ -271,7 +198,6 @@ fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
         return counts
     }
 
-    /** Fraction of [container]'s characters the [pool] covers (v59). */
     fun coverageFraction(container: HashMap<Char, Int>, pool: HashMap<Char, Int>): Float {
         var need = 0
         var missing = 0
@@ -315,10 +241,6 @@ fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
             changed = true
             continue
         }
-        // Coverage path: the union of the children's characters represents A.
-        // v59: a MULTI-child wrapper (≥2 bubbles' worth of text) drops at the
-        // relaxed slab floor — sweep-pass drift at the strict floor kept the
-        // slab alive and it burned between the bubbles again.
         val pool = HashMap<Char, Int>()
         for (cand in inner) {
             for ((c, n) in charCounts(boxes[cand.index].text)) {
@@ -335,32 +257,15 @@ fun pruneContainerBoxes(boxes: List<OcrTextBox>): List<OcrTextBox> {
     return if (changed) boxes.filterIndexed { i, _ -> !dropped[i] } else boxes
 }
 
-/** v55: fraction of a wrapper's characters its contained boxes must cover. */
 private const val MIN_COVER = 0.95f
 
-/** v59: relaxed floor for wrappers holding TWO OR MORE contained boxes —
- *  a shape only a multi-bubble slab can have. Drift between the sweep pass
- *  that captured the wrapper and the passes that captured its children used
- *  to keep the slab alive at 95% and burn it between the bubbles. */
 private const val MIN_COVER_SLAB = 0.85f
 
-// ============================== v56: site-chrome / ad-box filter ==============================
-//
-// The DOM sweep reads EVERY text element near the page images — including the
-// site's ad banners and app promos that float over the reader ("Ascent Browser
-// FREE", "Read manga the clean way Android", "Opens the Google Play Store").
-// Those boxes were stored like dialogue and burned onto the pages — English
-// ad text even on foreign-language chapters, plus wasted translation quota.
-//
-// The filter is deliberately conservative (dialogue false-positives cost real
-// bubbles): unambiguous phrases, literal UI labels, 3+ weak ad tokens, or the
-// one safe token pair. The repeated-banner sweep in storeOcrBoxes catches the
-// rest (the same text on 3+ different pages is chrome by definition).
 
 /** Word tokens of a normalized string (letters/digits/plus kept). */
 private val CHROME_TOKEN = Regex("""[a-z0-9+]+""")
 
-/** Unambiguous ad/promo phrases — dialogue never contains these. */
+/** Unambiguous ad/promo phrases. Dialogue never contains these. */
 private val CHROME_STRONG_PHRASES = listOf(
     "google play", "play store", "app store", "download now", "install now",
     "install the app", "open in app", "read manga", "read manhwa", "read free",
@@ -373,17 +278,16 @@ private val CHROME_STRONG_PHRASES = listOf(
     "chapter notifications", "recommended for you", "for you page",
 )
 
-/** Weak ad tokens — three or more together is an ad headline, not dialogue. */
+/** Weak ad tokens. Three or more together is an ad headline, not dialogue. */
 private val CHROME_WEAK_TOKENS = setOf(
     "free", "download", "install", "android", "browser", "app", "update",
     "premium", "official", "notify", "notifications", "bonus", "coins",
     "unlock", "unlimited", "offline", "apk", "ios", "chapters", "hd",
 )
 
-/** Whole-text matches — the box is literally site UI. */
+/** Whole-text matches. The box is literally site UI. */
 private val CHROME_EXACT = setOf("ad", "ads", "close", "skip ad", "18+", "21+")
 
-/** v56: true when [text] is site chrome (ad banner / app promo / UI label). */
 fun isChromeBoxText(text: String): Boolean {
     val norm = text.lowercase().replace(Regex("\\s+"), " ").trim()
     if (norm.isEmpty()) return false
@@ -396,12 +300,11 @@ fun isChromeBoxText(text: String): Boolean {
     var weak = 0
     for (token in tokens) if (token in CHROME_WEAK_TOKENS) weak++
     if (weak >= 3) return true
-    // "Ascent Browser FREE" — 'browser' is near-impossible in dialogue and
+    // "Ascent Browser FREE". 'browser' is near-impossible in dialogue and
     // pairs with 'free' only in app promos.
     return "browser" in tokens && "free" in tokens
 }
 
-/** v56: order/punctuation-free key for the repeated-banner sweep. */
 fun chromeRepetitionKey(text: String): String {
     val sb = StringBuilder(text.length)
     for (c in text.lowercase()) {
@@ -438,7 +341,7 @@ fun groupIntoParagraphs(boxes: List<OcrTextBox>): List<OcrTextBox> {
 /**
  * Mutable paragraph builder. Lines are absorbed while they are vertically
  * adjacent (gap smaller than ~70% of the shorter line height) and horizontally
- * overlapping (at least 30% of the narrower box) — the geometric footprint of
+ * overlapping (at least 30% of the narrower box). The geometric footprint of
  * lines belonging to the same text block. Different columns/balloons don't
  * overlap and therefore stay separate blocks.
  */
@@ -450,10 +353,6 @@ private class ParagraphAccumulator(first: OcrTextBox) {
     var lastHeight: Float = first.box.getOrElse(3) { 0f }
     var tallest: Float = first.box.getOrElse(3) { 0f }
 
-    // v53: the merged box lives in the SAME space as its lines. Dropping
-    // this flag burned every paragraph as PIXELS — fraction coordinates
-    // like x=0.35 became x=0.35px, and the text rendered as a squashed
-    // vertical strip pinned to the left edge of the page.
     val normalized: Boolean = first.normalized
     private val texts = mutableListOf(first.text)
 
@@ -461,28 +360,17 @@ private class ParagraphAccumulator(first: OcrTextBox) {
     val height: Float get() = bottom - top
 
     fun canAbsorb(box: OcrTextBox): Boolean {
-        // v53: never merge across coordinate spaces — a fraction line inside
-        // a pixel paragraph (or vice versa) would poison the union box.
         if (box.normalized != normalized) return false
         val bx = box.box.getOrElse(0) { 0f }
         val by = box.box.getOrElse(1) { 0f }
         val bw = box.box.getOrElse(2) { 0f }
         val bh = box.box.getOrElse(3) { 0f }
 
-        // Vertical proximity: the new line must start at/near the block's
-        // bottom (within 70% of the shorter of the two line heights).
-        // v54: the +2f slack was a PIXEL-space constant; in fraction space it
-        // meant +200% OF THE PAGE, so every stacked bubble chain-merged into
-        // page-sized slabs. The slack is now space-aware: 2px in pixel space,
-        // 0.4% of the page in fraction space.
         val gap = by - bottom
         val slack = if (normalized) 0.004f else 2f
         val tolerance = 0.7f * minOf(bh, lastHeight) + slack
         if (gap > tolerance || gap < -bh) return false // below block, or way above (out of order)
 
-        // v54 runaway cap: a real paragraph's height stays proportional to its
-        // line count. If the union would grow past (lines absorbed + 1.5) ×
-        // the tallest absorbed line (+slack), this is a different block.
         val tallestSoFar = maxOf(tallest, bh)
         val proposed = maxOf(bottom, by + bh) - minOf(top, by)
         val heightCap = (texts.size + 1.5f) * tallestSoFar + (if (normalized) 0.01f else 10f)

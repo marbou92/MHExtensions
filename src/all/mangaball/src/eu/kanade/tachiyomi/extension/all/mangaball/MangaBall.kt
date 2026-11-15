@@ -26,57 +26,6 @@ import java.text.SimpleDateFormat
 import java.util.Locale
 import java.util.TimeZone
 
-/**
- * MangaBall (mangaball.com — the old mangaball.net Laravel site is gone and
- * 301-redirects here; the front-end was rebuilt on Next.js with a dedicated
- * JSON API at api.mangaball.com/api/v1).
- *
- * THE CSRF ERA IS OVER: the new stack has no CSRF tokens, no XSRF cookies and
- * no meta tags. v25's "couldn't read the site CSRF token" failures came from
- * bootstrapping a token system that no longer exists, and from the API calls
- * hitting mangaball.net whose 301 redirect silently converted every POST into
- * a GET. Everything below talks to api.mangaball.com directly with the exact
- * calls the site's own client makes — all verified live (2026-09), anonymous,
- * cookie-free and challenge-free:
- *
- *  1. Browse/search  GET /title/search-advanced?sort_by=&sort_order=&page=
- *                    &limit=24&adult_mode=&keyword=&status=&demographic=
- *                    &original_language=&publication_year=&included_tags=
- *                    &tag_mode=&excluded_tags=
- *                    (valid sort_by values = the site's own dropdown:
- *                     views / lastupdate / rating / created_at / name)
- *  1b. Latest        GET /title/recently-added?page=&limit=24&adult_mode=
- *                    (the dedicated endpoint behind the site's
- *                     /recently-added page — titles ordered by creation)
- *  2. Details        GET  /title/detail/{title_id}
- *                    (v1.6.8's POST /title/detail was removed server-side in
- *                     late Sep 2026 — the chapter list broke with it)
- *  3. Chapters       GET  /title/chapter-listing?title_id=&page=&limit=
- *                    &sort_order=desc&language=&search=&user_id=
- *                    → FLAT rows (same shape as before), `total` on the
- *                    wrapper; limit=2000 returns a whole series in one call
- *                    (verified live: 1004-row series, page 2 empty). The old
- *                    POST /chapter/chapter-listing-by-title-id is gone.
- *  4. Pages          GET  /chapter-detail?chapter_id=…&user_id=
- *                    → data.chapter.pages[] = absolute image URLs
- *  5. Filter tags    GET  /tag/get-grouped → {format, genre, theme, content}
- *
- * "demo_user" is what the site's own client used to send for logged-out
- * visitors (the 2026-09-29 traffic capture sends an EMPTY user_id instead —
- * this source follows that). The NSFW toggle maps to the server's adult_mode
- * filter (all / no_18) instead of client-side hiding. Manga URLs are the
- * numeric title ids the site now links with (/title-detail/{id}); old v24
- * slug urls resolve via the same /title/search lookup the site's own code
- * uses as its fallback.
- *
- * v74: one source per content language (like MangaDot) — the source's `lang`
- * is the chapter language; Mihon's language picker switches. The old
- * "Chapter language" / "Fallback to any language" / "Show upload language
- * tags" settings are gone; chapters are strictly language-filtered. The
- * description follows MangaDot's format (meta line, `---` rule, bold
- * **Links:** and **Alternative Names:** blocks) with a "Show tags in genres"
- * option to match.
- */
 @Source
 abstract class MangaBall :
     KeiSource(),
@@ -96,7 +45,7 @@ abstract class MangaBall :
     /** Cover/page CDN (the site's BASE_DOMAIN_STORAGE_COVER constant). */
     private val coverCdn = "https://bulbasaur.poke-black-and-white.net/covers/"
 
-    /** Lenient JSON — shapes verified live but some fields are unions. */
+    /** Lenient JSON. Shapes verified live but some fields are unions. */
     private val json = Json {
         ignoreUnknownKeys = true
         isLenient = true
@@ -144,15 +93,6 @@ abstract class MangaBall :
 
     override suspend fun getPopularManga(page: Int): MangasPage = mangaList(page, sort = SORT_VIEWS_DESC)
 
-    /**
-     * Latest = the dedicated endpoint behind the site's /recently-added page
-     * (user-reported and verified against the site's JS client):
-     * GET /title/recently-added?page=&limit=24&adult_mode= — titles ordered by
-     * creation time. This is a DIFFERENT endpoint from everything Popular
-     * uses, so the two browse feeds can never collapse into the same list
-     * again (the previous /title/recently-updated attempt still mirrored
-     * popular's crawl order too closely).
-     */
     override suspend fun getLatestUpdates(page: Int): MangasPage {
         val url = "$apiBase/title/recently-added".toHttpUrl().newBuilder().apply {
             addQueryParameter("page", page.toString())
@@ -183,7 +123,7 @@ abstract class MangaBall :
                 is OriginalLanguageFilter -> originalLanguage = languageValues[filter.state].takeIf { it.isNotBlank() }
                 is YearFilter -> year = filter.state.trim().takeIf { it.isNotBlank() }
                 is GenreMatchModeFilter -> tagMatchAll = filter.state == 1
-                // Format tags live in the same tag taxonomy — they filter via
+                // Format tags live in the same tag taxonomy. They filter via
                 // the exact same included_tags parameter.
                 is FormatFilter -> includedTags += filter.selectedIds()
                 is GenreFilter -> {
@@ -222,16 +162,16 @@ abstract class MangaBall :
     ): MangasPage {
         val url = "$apiBase/title/search-advanced".toHttpUrl().newBuilder().apply {
             // The API expects TWO parameters: sort_by (views / lastupdate /
-            // rating / created_at / name) and sort_order (asc / desc) — the
+            // rating / created_at / name) and sort_order (asc / desc). The
             // site's advanced-search page forwards exactly these. The old
             // single `sort=views_desc` parameter was silently IGNORED (every
-            // browse list fell back to the server's default crawl order —
+            // browse list fell back to the server's default crawl order. 
             // which is why Popular and Latest looked identical for months).
             addQueryParameter("sort_by", sort.substringBefore(':'))
             addQueryParameter("sort_order", sort.substringAfter(':', "desc"))
             addQueryParameter("page", page.toString())
             addQueryParameter("limit", "24")
-            // Server-side NSFW filter — the exact vocabulary the site uses.
+            // Server-side NSFW filter. The exact vocabulary the site uses.
             addQueryParameter("adult_mode", if (preferences.showNsfw()) "all" else "no_18")
             if (keyword.isNotBlank()) addQueryParameter("keyword", keyword)
             status?.let { addQueryParameter("status", it) }
@@ -298,19 +238,10 @@ abstract class MangaBall :
         return detail.toSManga().apply { url = titleId }
     }
 
-    /**
-     * Accepts both url shapes:
-     *  - current site links: the numeric title id (/title-detail/{24-hex id})
-     *  - v24-era slugs (/title-detail/{slug}): resolved with the same
-     *    /title/search lookup the site's own code uses as its fallback,
-     *    exact-slug match preferred.
-     */
     private suspend fun resolveTitleId(key: String): String {
         val trimmed = key.trim().trim('/')
         if (trimmed.matches(TITLE_ID_REGEX)) return trimmed
 
-        // v1.6.9: the old POST /title/search/ went away with the other POST
-        // endpoints; the site's search page itself is a GET on search-advanced.
         val candidates = try {
             client.get(
                 "$apiBase/title/search-advanced".toHttpUrl().newBuilder()
@@ -344,7 +275,7 @@ abstract class MangaBall :
             .distinct()
             .joinToString("\n\n")
 
-        // Info line (bold labels) — status, original language, publication
+        // Info line (bold labels). Status, original language, publication
         // year, chapter/views/likes counters, content rating.
         val infoLine = if (showExtraInfo) {
             buildString {
@@ -384,9 +315,6 @@ abstract class MangaBall :
             null
         }
 
-        // v74: MangaDot-style description — meta info, a `---` rule, the
-        // synopsis, a bold **Links:** block and bold **Alternative Names:**
-        // bullets.
         val desc = buildString {
             if (infoLine != null) {
                 append(infoLine)
@@ -431,7 +359,7 @@ abstract class MangaBall :
         }
     }
 
-    /** MangaBall link fields mix ids, slugs and full urls — normalize. */
+    /** MangaBall link fields mix ids, slugs and full urls. Normalize. */
     private fun externalUrl(site: String, value: String): String = if (value.startsWith("http")) {
         value
     } else {
@@ -497,12 +425,6 @@ abstract class MangaBall :
     // ------------------------------------------------------------------
 
     private suspend fun chapterList(titleId: String): List<SChapter> {
-        // v1.6.9: the POST /chapter/chapter-listing-by-title-id endpoint was
-        // removed server-side (every POST on the API was, actually — the site's
-        // own title page now reads chapters from this GET endpoint, captured
-        // live from its traffic). Flat rows, same field shape as before;
-        // `limit=2000` returns a whole series in one call and the wrapper's
-        // `total` allows a safety loop for bigger ones.
         val fetchedRows = buildList {
             var page = 1
             while (page <= 10) {
@@ -525,17 +447,6 @@ abstract class MangaBall :
             }
         }
 
-        // v74: the source language IS the chapter language — one MangaBall
-        // source per language now (like MangaDot), so the old "Chapter
-        // language" and "Fallback to any language" settings are gone and
-        // Mihon's language picker decides instead. Same strict rule Swarm and
-        // MangaDot use: no chapters in this language → empty list, never a
-        // mixed-language dump.
-        // v75: the site's chapter rows don't all use Mihon's language codes —
-        // Chinese is indexed as "cn" (never "zh"/"zh-Hant"; verified live:
-        // every zh-tagged title carries cn rows) and Korean appears as both
-        // "ko" and "kr". Map the source language onto the codes the rows
-        // actually carry before the strict filter.
         val preferredLang = lang.lowercase()
         val preferredLangs = when (preferredLang) {
             "zh" -> setOf("zh", "cn")
@@ -640,7 +551,7 @@ abstract class MangaBall :
     }
 
     // Page images live on the site's own CDN and reject requests without a
-    // browser-like Referer — send one (the site's own <img> requests do).
+    // browser-like Referer. Send one (the site's own <img> requests do).
     override fun imageRequest(page: Page) = GET(
         page.imageUrl!!,
         headers.newBuilder()
@@ -722,7 +633,7 @@ abstract class MangaBall :
     // ------------------------------------------------------------------
 
     /**
-     * Live taxonomy from GET /tag/get-grouped — four groups (format / genre /
+     * Live taxonomy from GET /tag/get-grouped. Four groups (format / genre /
      * theme / content), each an array of {id, name} rows used verbatim as the
      * search-advanced tag ids. The response is wrapped in a {"data": …}
      * envelope, so the inner object is what gets cached for getFilterList.
@@ -928,7 +839,7 @@ abstract class MangaBall :
         )
 
         /**
-         * Sort options as "sort_by:sort_order" pairs — the exact vocabulary
+         * Sort options as "sort_by:sort_order" pairs. The exact vocabulary
          * the site's advanced-search page sends to the API (verified against
          * its JS: `sort_by` ∈ views / lastupdate / rating / created_at / name,
          * `sort_order` ∈ asc / desc; anything else is silently ignored).

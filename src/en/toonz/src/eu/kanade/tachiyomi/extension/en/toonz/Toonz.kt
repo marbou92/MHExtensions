@@ -41,27 +41,6 @@ import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import kotlin.time.Duration.Companion.seconds
 
-/**
- * Toonz (toonz.to).
- *
- * Next.js App Router site:
- * - browse: server-rendered /manga|/manhwa|/adult/browse cards (?sort=&page=),
- * - search: GET /api/search?q= (JSON),
- * - details: series page with a rich JSON-LD payload (author, status,
- *   aggregateRating, country) plus the RSC flight data (comicId, catalog),
- * - chapters: GET /api/comics/{comicId}/chapters (full JSON list),
- * - pages: the reader chapter page server-renders <img> tags pointing at
- *   /uploads/chapters/... (plain HTTP, no WebView needed).
- *
- * Cloudflare (v72): the site now serves a managed challenge (403,
- * cf-mitigated: challenge) on EVERY endpoint - browse, /api/search, the
- * chapters API and even cover/reader images. The window-attached WebView
- * solver clears it once; cf_clearance then lasts ~a year, so the challenge
- * cost is a single one-time WebView pass per installation. toonx.to (the
- * adult catalog host the old entries still point at) 301s into toonz.to
- * but is kept in the solver's domain set so a challenge on the redirect
- * source itself can be solved too.
- */
 @Source
 abstract class Toonz :
     HttpSource(),
@@ -320,7 +299,7 @@ abstract class Toonz :
         // The chapters API needs the numeric comic id. NEVER depend on
         // mangaDetailsParse having run first: on the very first open from
         // Browse the url is a bare path (Mihon does not copy the details url
-        // back onto the entry it fetches chapters with), which used to throw
+        // back onto the entry it fetches chapters with), which throws
         // "Open the manga details once to refresh this entry" - reported as
         // "chapter list not loading". Resolve the id from the series page
         // itself whenever the fragment is missing.
@@ -384,15 +363,6 @@ abstract class Toonz :
     override fun pageListRequest(chapter: SChapter): Request = if (chapter.url.startsWith("http")) GET(chapter.url, headers) else GET("$baseUrl${chapter.url}", headers)
 
     override fun pageListParse(response: Response): List<Page> {
-        // v74: the chapter page is read ONCE and parsed three ways, layered:
-        //  1. the classic server-rendered <img>/preload tags,
-        //  2. a raw scan of the WHOLE body for /uploads/chapters/ urls — the
-        //     site progressively moved markup into its React flight payload,
-        //     where the urls survive only as escaped JSON strings,
-        //  3. a WebView harvest of the reader URL (the site's own code
-        //     renders the <img> tags we can no longer see in plain HTML).
-        // The old single-shape parse is what turned into "No page images
-        // found" on every chapter once (1) stopped matching.
         val raw = response.body.string()
         val document = raw.asJsoup(response.request.url.toString())
 
@@ -404,7 +374,7 @@ abstract class Toonz :
             .distinct()
 
         val scanned = if (embedded.isEmpty()) {
-            // Flight/JSON payloads escape " as \" and / as \/ — normalize
+            // Flight/JSON payloads escape " as \" and / as \/. Normalize
             // before scanning, and strip srcset-style trailing descriptors.
             CHAPTER_IMAGE_REGEX.findAll(raw.replace("\\/", "/").replace("\\\"", "\""))
                 .map { it.groupValues[1].substringBefore(' ').trim() }

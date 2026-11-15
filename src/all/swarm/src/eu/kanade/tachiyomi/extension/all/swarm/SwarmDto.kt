@@ -104,7 +104,7 @@ data class SwarmChapterDto(
 // Envelopes
 // ---------------------------------------------------------------------------
 
-/** `{data:[...]}` — also tolerated as a root array by a fallback in the source. */
+/** `{data:[...]}`. Also tolerated as a root array by a fallback in the source. */
 @Serializable
 data class SwarmCardListDto(
     val data: List<SwarmCardDto> = emptyList(),
@@ -122,7 +122,7 @@ data class SwarmMangaEnvelopeDto(
     val data: SwarmMangaFullDto? = null,
 )
 
-/** Request body for `POST /api/sp` — see [SwarmCrypto]. */
+/** Request body for `POST /api/sp`. See [SwarmCrypto]. */
 @Serializable
 data class SwarmPagesRequestDto(
     val payload: String,

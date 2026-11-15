@@ -4,7 +4,7 @@ import kotlinx.serialization.Serializable
 
 // ============================ Auth / envelope ============================
 
-/** GET /api/manga/token — the visitor JWT every data call must carry. */
+/** GET /api/manga/token. The visitor JWT every data call must carry. */
 @Serializable
 class TokenDto(
     val token: String? = null,
@@ -42,7 +42,7 @@ class SeriesRowDto(
 ) {
     /** The catalog rows never omit the slug, but guard the fallbacks anyway:
      * the URL field must stay the request-side slug (see MangaTime's
-     * slugOrId lesson — an id here 404s every later refresh). */
+     * slugOrId lesson. An id here 404s every later refresh). */
     fun displaySlug(): String = slug?.takeIf(String::isNotBlank)
         ?: id?.takeIf(String::isNotBlank)
         ?: ""
@@ -67,7 +67,7 @@ class SearchResponseDto(
 
 // =============================== Chapters ===============================
 
-/** Lives inside the series payload — the whole TOC, newest first. */
+/** Lives inside the series payload. The whole TOC, newest first. */
 @Serializable
 class ChapterDto(
     val id: String,
@@ -76,7 +76,7 @@ class ChapterDto(
     val pageCount: Int? = null,
     val language: String? = null,
     val createdAt: String? = null,
-    /** Unsigned CDN path — always 403s; never used (kept for parsing). */
+    /** Unsigned CDN path. Always 403s; never used (kept for parsing). */
     val thumbnail: String? = null,
 )
 
@@ -136,7 +136,7 @@ class SeriesDetailsDto(
 
 // ================================ Pages =================================
 
-/** GET /own?action=pages&chapterId=... — signed CDN links (~24-48h TTL). */
+/** GET /own?action=pages&chapterId=.... Signed CDN links (~24-48h TTL). */
 @Serializable
 class PagesDto(
     val pages: List<String> = emptyList(),

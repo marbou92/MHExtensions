@@ -1,17 +1,5 @@
 package eu.kanade.tachiyomi.extension.ar.procomic
 
-/**
- * RscFlight — the Next.js SSR flight extractor (reconstructed for
- * v1.6.56, behavior-faithful to the shipped v1.6.55 build).
- *
- * Next.js App Router pages ship their server payload as a chain of
- * `self.__next_f.push([1,"…"])` script chunks — each chunk is a
- * JSON-escaped string fragment of ONE concatenated RSC payload.
- * [extract] walks every marker, unescapes each fragment, and returns
- * the joined flight string; [balancedObject] / [balancedArray] then
- * carve a balanced {…} / […] out of it at a caller-found index
- * (string-aware: braces inside string literals never count).
- */
 internal object RscFlight {
 
     private const val FLIGHT_MARKER = "self.__next_f.push([1,\""

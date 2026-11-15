@@ -94,7 +94,7 @@ class SeriesDetailsDto(
     val title: String? = null,
     val nameAr: String? = null,
     val nameEn: String? = null,
-    // Wire shape 2026-10: [{"title":"Blue Lock","language":"en"}] — objects,
+    // Wire shape: [{"title":"Blue Lock","language":"en"}]. Objects,
     // not strings; alternativeTitleNames() absorbs both.
     val alternativeTitles: List<JsonElement>? = null,
     val description: String? = null,
@@ -164,7 +164,7 @@ class ChapterListDto(
 class ChapterDto(
     val id: String,
     val seriesId: String? = null,
-    // Fractional numbers exist (364.5) — always a JSON number.
+    // Fractional numbers exist (364.5). Always a JSON number.
     val number: Float,
     val title: String? = null,
     val pageCount: Int? = null,

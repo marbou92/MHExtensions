@@ -6,24 +6,6 @@ import javax.crypto.Cipher
 import javax.crypto.spec.IvParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-/**
- * Client-side payload encryption for Swarm's reader endpoint (`POST /api/sp`).
- *
- * Reverse-engineered from the site bundle (chunk `32bx-yqtn5yus.js`) and live-verified
- * against the production API during the v26 recon:
- *
- * - The request body is `{"payload":"<hex iv>:<hex ciphertext>"}`.
- * - The ciphertext is AES-256-CBC / PKCS7 over a compact JSON object
- *   `{"chapterId":"<id>","nocache":false,"clean":false,"force":false}`.
- * - The key is SHA-256 of the ASCII string [SECRET] (a 64-hex-char constant embedded in the
- *   site JS — used directly as an ASCII seed, NOT decoded as hex bytes).
- * - The IV is 16 random bytes, prepended to the ciphertext as lowercase hex, separated by `:`.
- *
- * The server answers with a MangaDex@Home-style response
- * `{baseUrl:"/api/secure-proxy/<tok>", chapter:{data:[...page urls...], dataSaver:[...]}}`.
- *
- * Only `javax.crypto` / `java.security` are used — no external dependencies.
- */
 internal object SwarmCrypto {
 
     /**

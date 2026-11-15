@@ -34,41 +34,6 @@ import java.util.TimeZone
 import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
-/**
- * Kawaiimanga (kawaiimanga.org) — Arabic manga platform (كواي مانجا).
- *
- * The web app is a Next.js App Router shell (Arabic RTL) over a separate
- * JSON API on `manga-api.kawaii-anime.com`; page images live on
- * `manga-cdn.kawaii-anime.com`. Every data call is
- *
- *     GET {API}/own?action=<verb>&<params>
- *     headers: x-app-key: km_2026_live, x-app-token: <visitor JWT>
- *
- * where the visitor JWT comes from `GET {API}/token` (x-app-key only) and
- * lives 30 minutes — cached ~28 and refetched once on a 401. Verified live
- * 2026-10-26 (recon-v94/kawaiimanga): both zones occasionally throw a
- * score-based Cloudflare challenge at default UAs, so this source pins a
- * real browser UA onto every request it stamps.
- *
- * Recipes:
- *   - popular:   /own?action=browse&page&limit=20&sort=views
- *   - latest:    /own?action=browse&page&limit=20      (updatedAt desc)
- *   - search:    /own?action=search&q=                 (single-shot; Arabic
- *                normalization on the server — hamza-less queries match)
- *   - details:   /own?action=series&slug=              (carries the FULL
- *                chapter TOC, newest first, plus `rating` 0..5)
- *   - pages:     /own?action=pages&chapterId=          (signed CDN URLs,
- *                hotlink-verified with ZERO headers, ~1 day TTL)
- *
- * The API ignores genre/status/type query params (filters are client-side
- * on the site), so the filter list is empty here; the description options
- * follow the same Comix/MangaDot block ProComic and MangaTime ship, driven
- * by the same four applicable preferences (extra info, blocked genres,
- * score position, chapter dedupe).
- *
- * Novels (/novels, novelSlug in the details payload) are skipped: novel
- * chapters are text, not pages, so they are unusable in a reader.
- */
 @Source
 abstract class KawaiiManga :
     KeiSource(),
@@ -144,7 +109,7 @@ abstract class KawaiiManga :
             }
             // The edge scores every request; bursts can earn a challenge
             // (403) or an edge-generated 404 for a route that plainly exists.
-            // The site's own app rides this out by retrying — mirror that
+            // The site's own app rides this out by retrying. Mirror that
             // with a short spaced ladder before giving up.
             var lastError: IOException? = null
             repeat(3) { attempt ->
@@ -338,10 +303,10 @@ abstract class KawaiiManga :
     }
 
     /**
-     * Optional "combine duplicate chapters" — the same option ProComic and
+     * Optional "combine duplicate chapters". The same option ProComic and
      * MangaTime ship. The platform enforces unique numbers today (recon
      * found none), but it re-imports catalogs, so the TOC can carry repeats.
-     * When enabled, one entry per non-zero chapter number survives — the
+     * When enabled, one entry per non-zero chapter number survives. The
      * newest upload wins (the list is newest-first).
      */
     private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
@@ -390,7 +355,7 @@ abstract class KawaiiManga :
     // ======================== MangaDot description =======================
 
     /**
-     * MangaDot/ProComic-style description block — the same layout MangaTime
+     * MangaDot/ProComic-style description block. The same layout MangaTime
      * renders, with the site's own 0..5 rating (no halving: the star widget
      * feeds rating.toFixed(1) straight into five stars):
      *   ★★★★☆ 4.20
@@ -433,7 +398,7 @@ abstract class KawaiiManga :
     }
 
     /** Genre chips minus the blocked list (the platform has no separate
-     * tags field — genres ARE the chips). */
+     * tags field. Genres ARE the chips). */
     private fun genreField(genres: List<String>): String = genres
         .map(String::trim)
         .filter(String::isNotEmpty)

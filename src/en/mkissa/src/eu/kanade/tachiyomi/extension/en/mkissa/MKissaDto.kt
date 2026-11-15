@@ -299,7 +299,7 @@ fun MangaDetail.toSManga(
         genre = genreChips.ifBlank { null }
         // Without this, Mihon's info tab shows "Unknown" for the author row.
         // Authors arrive duplicated across spellings ("Neida (네이다)",
-        // "Neida", "네이다") — collapse the contained variants.
+        // "Neida", "네이다"). Collapse the contained variants.
         author = dedupeAuthors(authors).joinToString(", ").ifBlank { null }
         thumbnail_url = cover
         initialized = true
@@ -326,8 +326,8 @@ internal fun dedupeAuthors(authors: List<String>): List<String> {
 }
 
 /**
- * The site's descriptions arrive as HTML — "<br>" line breaks, "<b>" /
- * "<i>" emphasis, HTML entities — which Mihon's Markdown renderer shows as
+ * The site's descriptions arrive as HTML. "<br>" line breaks, "<b>" /
+ * "<i>" emphasis, HTML entities. Which Mihon's Markdown renderer shows as
  * literal tag text ("Guts...<br> <br>[Written by MAL Rewrite]<br>"). Convert
  * to clean text: real newlines, Markdown emphasis, decoded entities.
  */
@@ -378,7 +378,7 @@ fun MangaDetail.toChapterList(): List<SChapter> {
  * older chapters carry no dates anywhere (the site's own chapter list shows
  * none either). Leaving `date_upload` at 0 made every entry render as
  * "posted today" in the app, so the older chapters get evenly spaced
- * estimates walking backwards from the real newest date (one week apart —
+ * estimates walking backwards from the real newest date (one week apart. 
  * typical weekly serialisation cadence). The newest chapter always carries
  * the exact date from the API.
  */
@@ -403,7 +403,7 @@ private fun MangaDetail.datedChapters(
 
 private fun String.toSChapter(mangaId: String, translation: String, date: Long): SChapter = SChapter.create().apply {
     val suffix = if (translation == "raw") " (Raw)" else ""
-    // NOTE: must be "${this@toSChapter}" — without braces "$this" interpolates
+    // NOTE: must be "${this@toSChapter}". Without braces "$this" interpolates
     // the SChapter object being built (toString -> "SChapterImpl@..."), which
     // poisoned every chapter URL with the object identity string and broke
     // all page fetches.
@@ -419,7 +419,7 @@ private fun String.toSChapter(mangaId: String, translation: String, date: Long):
 
 /**
  * Response of the `chapterPages` GraphQL query used by the site's reader.
- * `pictureUrls` is an opaque Object scalar in the schema — live responses
+ * `pictureUrls` is an opaque Object scalar in the schema. Live responses
  * carry an array of image paths/URLs; `pictureUrlHead` is the prefix those
  * relative paths resolve against.
  */

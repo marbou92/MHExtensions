@@ -4,7 +4,7 @@ plugins {
     alias(kei.plugins.extension)
 }
 
-// One source per content language — language switching happens in Mihon's own
+// One source per content language. Language switching happens in Mihon's own
 // UI (Browse → Languages → pick a language → MangaDot), exactly like the
 // upstream keiyoushi "mangadotnet" extension does for this site. Chapter and
 // volume requests carry the source language via the site's `lang` parameter.

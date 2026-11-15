@@ -112,7 +112,7 @@ abstract class MangaGo :
 
     private fun searchParse(response: Response): MangasPage {
         val document = response.asJsoup()
-        // 2026-10 layout: #search_list > li > (div.left > a cover) + span.tit > a title.
+        // Layout: #search_list > li > (div.left > a cover) + span.tit > a title.
         // The old div.box wrapper is gone; select the manga link at li level
         // so both layouts parse.
         val mangas = document.select("#search_list li").mapNotNull { li ->
@@ -188,7 +188,7 @@ abstract class MangaGo :
             it.text().trim().takeIf(String::isNotBlank)
         }.distinct()
 
-        // The alternative row is served in mis-encoded UTF-8 — repair it.
+        // The alternative row is served in mis-encoded UTF-8. Repair it.
         val altRaw = document.select("td").firstOrNull { td ->
             td.selectFirst("label")?.text()?.contains("Alternative") == true
         }?.ownText()?.trim().orEmpty()
@@ -273,7 +273,7 @@ abstract class MangaGo :
         if (rows.isEmpty()) throw Exception("No chapters found — open the manga page once to refresh")
 
         return rows.mapNotNull { row ->
-            // 2026-10 layout: <td><a class="chico" href="https://www.mangago.zone/chapter/…">
+            // Layout: <td><a class="chico" href="https://www.mangago.zone/chapter/…">
             // where the host can be any mirror (mangago.zone, youhim.me, …).
             // Legacy layout: <a href*=read-manga> on mangago.me itself.
             val a = row.selectFirst("a.chico")
@@ -346,7 +346,7 @@ abstract class MangaGo :
     // `imgsrcs` payload is decoded by the site's own obfuscated script and
     // Cloudflare gates the whole host), so the extraction runs the reader
     // URL inside the repo's window-attached WebView and lets the site's own
-    // code decrypt + render — we only collect what it produces.
+    // code decrypt + render. We only collect what it produces.
 
     @Serializable
     internal class WebViewPages(
@@ -355,25 +355,6 @@ abstract class MangaGo :
         val page: Int = 0,
     )
 
-    // =============================== Pages ===============================
-    //
-    // 2026-10: the reader became ONE PAGE PER URL — /…/pg-1/ renders a single
-    // <img> (the encrypted `imgsrcs` payload still carries the whole chapter,
-    // but the old all-pages slider markup is gone). The v70 flow waited for
-    // total_pages <img> tags to appear at once, which can never happen now,
-    // so it burned its whole 60s budget and timed out on every chapter.
-    //
-    // The replacement harvests pages two ways:
-    //  1. FAST LANE: the site's own image requests are intercepted — if it
-    //     preloads upcoming pages (its imgReady/imgonload machinery suggests
-    //     it does), their urls land in the set while only page 1 renders.
-    //     Resolve fires as soon as the set reaches total_pages.
-    //  2. SEQUENTIAL WALKER: otherwise the WebView is driven through
-    //     /pg-{N}/ (the site's own next-page path) one page at a time,
-    //     harvesting each page's rendered <img> — total_pages read from the
-    //     reader globals, navigation capped at that many pages.
-    // Insertion order = the order the site produced the images in, which is
-    // the reading order (page 1 renders first, preloads follow).
 
     override fun pageListRequest(chapter: SChapter): Request = GET(getChapterUrl(chapter), headers)
 
@@ -389,8 +370,8 @@ abstract class MangaGo :
         return pages.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
     }
 
-    /** The reader is one page per URL: {chapterBase}/pg-{N}/ (live-verified
-     * 2026-10). Older chapter urls may already carry a /pg-N/ segment. */
+    /** The reader is one page per URL: {chapterBase}/pg-{N}/.
+     * Older chapter urls may already carry a /pg-N/ segment. */
     private fun buildPageUrl(chapterUrl: String, page: Int): String? {
         val base = if (chapterUrl.contains("/pg-")) {
             chapterUrl.substringBefore("/pg-")
@@ -410,9 +391,9 @@ abstract class MangaGo :
                     if (!u) return;
                     if (u.indexOf('data:') === 0) return;
                     if (u.indexOf('mangapicgallery.com') < 0 && u.indexOf('/r/') < 0) return;
-                    // v74: the reader page also pulls favicons and tracking
+                    // The reader page also pulls favicons and tracking
                     // pixels from the image host (favicon.ico, ywz.ico) and
-                    // ad/JS assets under /r/ — those used to win slots in the
+                    // ad/JS assets under /r/. Those win slots in the
                     // harvested list (they arrive first), so Page 0 decoded a
                     // favicon and the app threw "failed to create image
                     // decoder: unimplemented input contained an error".
@@ -440,7 +421,7 @@ abstract class MangaGo :
         """.trimIndent()
 
         // --- shared harvest state (poll runs on the main thread, request
-        // interception on a WebView background thread — hence synchronize).
+        // interception on a WebView background thread. Hence synchronize).
         val collected = LinkedHashSet<String>()
         var expectedPages = 0
         val donePages = HashSet<Int>()
@@ -458,11 +439,6 @@ abstract class MangaGo :
                         val raw = request.url?.toString()
                         val requestUrl = raw?.toHttpUrlOrNull()
                             ?: return@interceptRequest emptyResponse
-                        // FAST LANE: collect the reader's own image requests.
-                        // v74: same rule as the DOM collector — the image host
-                        // also serves favicons (favicon.ico, ywz.ico), scripts
-                        // and /r/ ad beacons; those arrived first and used to
-                        // fill the page list with undecodable garbage.
                         if (raw.contains("mangapicgallery.com") || raw.contains("/r/")) {
                             val isRealImage = IMAGE_URL_REGEX.containsMatchIn(raw)
                             if (isRealImage) {
@@ -514,10 +490,10 @@ abstract class MangaGo :
                                         return@runCatching
                                     }
 
-                                    // SEQUENTIAL WALKER: a page counts as done
+                                    // sequential walker: a page counts as done
                                     // when its image landed while we were on it,
                                     // or after a few idle polls (don't wedge on
-                                    // a page whose render failed — its url may
+                                    // a page whose render failed. Its url may
                                     // still arrive via the request stream).
                                     if (data.page in 1..expectedPages) {
                                         if (grew) {
@@ -595,7 +571,7 @@ abstract class MangaGo :
     companion object {
         private val SIMPLE_DATE = SimpleDateFormat("MMM d, yyyy", Locale.US)
 
-        /** Real page images only — excludes favicons (.ico), scripts and
+        /** Real page images only. Excludes favicons (.ico), scripts and
          *  other reader assets that share the image host. */
         private val IMAGE_URL_REGEX = Regex(
             "\\.(?:jpg|jpeg|png|webp|gif|avif|bmp)(?:[?#]|$)",

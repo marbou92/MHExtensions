@@ -19,10 +19,10 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * Mangalek (mangalik.net) — Madara, Arabic (مانجاليك).
+ * Mangalek (mangalik.net). Madara, Arabic (مانجاليك).
  *
  * Beyond the stock Madara parse, this source ships the family's
- * Comix/MangaDot details block — the same options ProComic, MangaTime and
+ * Comix/MangaDot details block. The same options ProComic, MangaTime and
  * Kawaiimanga carry:
  *
  *   - an organized description: the site's own 0..5 rating rendered as the
@@ -53,7 +53,7 @@ abstract class Mangalek :
      * `li.wp-manga-chapter` rows (the page's own TOC widget renders empty),
      * so the stock MangaPage mode parses nothing and every series shows
      * "0 chapters". The theme's own reader still loads them the classic
-     * way — POST /wp-admin/admin-ajax.php with action=manga_get_chapters
+     * way. POST /wp-admin/admin-ajax.php with action=manga_get_chapters
      * and the series' numeric post ID (the `data-id` the page carries)
      * returns the full `li.wp-manga-chapter` list. AdminAjax mode does
      * exactly that; the memoized post ID rides in the manga url (and the
@@ -262,10 +262,10 @@ abstract class Mangalek :
     override suspend fun fetchChapters(mangaPath: String, id: String, mangaPage: Document?): List<SChapter> = combineDuplicateChapters(super.fetchChapters(mangaPath, id, mangaPage))
 
     /**
-     * Optional "combine duplicate chapters" — the same option ProComic and
+     * Optional "combine duplicate chapters". The same option ProComic and
      * MangaTime ship. Madara TOCs can carry repeats when a series is
      * re-imported; when enabled, one entry per non-zero chapter number
-     * survives — the newest upload wins (the list is newest-first).
+     * survives. The newest upload wins (the list is newest-first).
      */
     private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
         mutableListOf<SChapter>().apply {
@@ -341,7 +341,7 @@ abstract class Mangalek :
         const val PREF_SCORE_POSITION = "pref_score_position"
         const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
 
-        /** "Average 4 / 5 out of 3" — the Madara rating item text. */
+        /** "Average 4 / 5 out of 3". The Madara rating item text. */
         val VOTES_REGEX = Regex("""out of (\d+)""")
 
         val CHAPTER_NUMBER_REGEX = Regex("""\d+(?:[.,]\d+)?""")

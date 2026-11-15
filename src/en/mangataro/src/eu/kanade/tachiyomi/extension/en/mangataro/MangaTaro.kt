@@ -53,7 +53,7 @@ import java.util.concurrent.atomic.AtomicLong
  *
  * WordPress site running the "mangapeak" theme (MangaTaro theme family):
  * - browse/filter list: POST /wp-json/manga/v1/load with JSON string-encoded arrays
- *   ({"genres":"[...]"} — the theme runs json_decode on each field again),
+ *   ({"genres":"[...]"}. The theme runs json_decode on each field again),
  * - quick search: POST /auth/search {"query":..., "limit":25},
  * - details: the manga page (rich JSON-LD: status, type, author, rating,
  *   episode count) + /wp-json/wp/v2/manga/{id}?_embed (full synopsis,
@@ -74,28 +74,11 @@ abstract class MangaTaro :
     override val client: OkHttpClient = network.client.newBuilder()
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
-        // v74: mangataro.org sits behind Cloudflare (server: cloudflare) and
-        // started managed-challenging non-browser clients per IP — the whole
-        // details screen (page + chapters, both same host) dies with 403 on
-        // affected networks while every flow passes from others. Route the
-        // client through the repo's window-attached WebView solver like the
-        // other CF sources here; the clearance is earned once and reused.
         .addInterceptor(CloudflareSolverInterceptor(setOf("mangataro.org")))
         .addInterceptor(::serverClockInterceptor)
         .rateLimit(3)
         .build()
 
-    // ========================= Server clock (v72) =========================
-    //
-    // The /auth/manga-chapters token validates a brutal window around the
-    // SERVER's clock: live checks (2026-10) accept _ts only ~60-120s old and
-    // REJECT future timestamps outright - a device clock off by a minute in
-    // either direction (hour-boundary races are enough) makes every chapter
-    // fetch 403 forever, which on the details screen reads as "manga details
-    // failing to load". Fix: keep the server/device offset observed from the
-    // standard Date response header of every request, compute _ts/_t from
-    // that, and self-heal any residual 403 by re-reading the header the
-    // rejection itself carries and retrying once with a fresh token.
 
     private val serverClockOffsetMs = AtomicLong(UNSET_OFFSET)
 
@@ -249,10 +232,6 @@ abstract class MangaTaro :
     }
 
     override fun mangaDetailsParse(response: Response): SManga {
-        // Parse the page body exactly ONCE and hand the document down — a
-        // second asJsoup() on the same response reads an already-consumed
-        // body and dies with "IllegalStateException: closed" (v74 shipped
-        // exactly that bug: every details load failed).
         val document = response.asJsoup()
         val id = document.body().attr("data-manga-id")
             .takeIf(String::isNotBlank)
@@ -263,7 +242,7 @@ abstract class MangaTaro :
 
     /** The page embeds the numeric manga id on <body data-manga-id>. If the
      * theme ever stops rendering it, resolve the id from the WordPress REST
-     * API by slug (verified live 2026-10: /wp-json/wp/v2/manga?slug=…) so
+     * API by slug (/wp-json/wp/v2/manga?slug=…) so
      * details keep loading instead of hard-failing. */
     private fun resolveMangaIdBySlug(response: Response): String? {
         val slug = response.request.url.encodedPath
@@ -290,7 +269,7 @@ abstract class MangaTaro :
         // one: the JSON-LD block and the WP REST response below carry dozens of
         // fields outside these DTOs, and a host that registers a strict Json
         // (ignoreUnknownKeys=false) made both parses throw inside the
-        // runCatching — silently degrading details to "no genres, unknown
+        // runCatching. Silently degrading details to "no genres, unknown
         // status, meta-description synopsis" with nothing in any log.
         val detailJson = Json {
             ignoreUnknownKeys = true
@@ -648,7 +627,7 @@ abstract class MangaTaro :
     private fun String.htmlUnescape(): String = org.jsoup.parser.Parser.unescapeEntities(this, false)
 
     companion object {
-        /** Sentinel for "no server-clock offset observed yet" — see [serverClockInterceptor]. */
+        /** Sentinel for "no server-clock offset observed yet". See [serverClockInterceptor]. */
         private const val UNSET_OFFSET = Long.MIN_VALUE
 
         private val JSON_MEDIA_TYPE = "application/json".toMediaType()
@@ -729,7 +708,7 @@ internal class SearchResponse(
 @Serializable
 internal class SearchResult(
     // The quick-search endpoint switched its ids from JSON strings to JSON
-    // numbers (verified live 2026-10-23: "id":47) — strict kotlinx parsing
+    // numbers ("id":47). Strict kotlinx parsing
     // of a String field then dies with "Expected quotation mark, but had
     // '5' instead at path $.results[0].id" and EVERY search fails. A
     // JsonPrimitive absorbs both shapes and .content hands the id down as
@@ -764,10 +743,6 @@ internal class WpManga(
     val slug: String,
     val title: WpTitle,
     val content: WpContent,
-    // The WP REST API keys this field "_embedded" — without the SerialName
-    // the property parsed the nonexistent "embedded" key and was ALWAYS
-    // null (v60-v89): no term genres, no WP synopsis, no featured cover and
-    // no WP author terms, every details screen silently degraded.
     @kotlinx.serialization.SerialName("_embedded")
     val embedded: WpEmbedded? = null,
 )

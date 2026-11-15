@@ -7,7 +7,7 @@ import kotlinx.serialization.json.JsonElement
 /**
  * DTOs for the new MangaBall stack (mangaball.com + api.mangaball.com/api/v1).
  * Every endpoint used here was captured live from the real site's own client
- * (the Next.js app on mangaball.com, 2026-09) and the exact field shapes below
+ * (the Next.js app on mangaball.com) and the exact field shapes below
  * come from real response bodies. Types that looked unstable across endpoints
  * (ids, covers, stats) stay JsonElement and are read with tolerant helpers.
  */
