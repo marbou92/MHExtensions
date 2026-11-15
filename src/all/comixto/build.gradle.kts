@@ -15,7 +15,6 @@ keiyoushi {
         baseUrl = "https://comix.to"
     }
 
-
     deeplink {
         host("comix.to")
         path("/title/..*")

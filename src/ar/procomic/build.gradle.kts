@@ -15,9 +15,6 @@ keiyoushi {
         baseUrl = "https://procomic.net"
     }
 
-
-
-
     deeplink {
         host("procomic.net")
         host("www.procomic.net")
