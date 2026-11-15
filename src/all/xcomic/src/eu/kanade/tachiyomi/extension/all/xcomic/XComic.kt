@@ -26,54 +26,6 @@ import org.jsoup.nodes.Document
 import java.io.IOException
 import java.util.Locale
 
-/**
- * XComic (xcomic.me) — Qwik City SSR site. FOUR mirrors share one backend and
- * one ID space (the same /title/{id6} and /chapter/{id} resolve identically
- * on all of them): xcomic.me (primary), xcomic.net, comik.to, yona.to. The
- * user can switch mirrors — or enter a custom one — in the extension
- * settings; every request is built against the chosen mirror.
- *
- * The site hosts English, Arabic AND French content (plus more): language is
- * a per-source(-group) attribute rendered as flag emojis on the series page,
- * so chapters are grouped per source group × language and the "Chapter
- * language" setting filters those groups.
- *
- * Endpoints (live-verified 2026-09, desktop Chrome UA, no CF challenges):
- *  - Browse/search  GET /search?word={query}&page={N} — the ONLY server-side
- *    paginated listing (48 cards/page). Popular = empty word (site order),
- *    search = the query. The `sortby` query param IS honored server-side
- *    (verified: field_update / field_name_* reorder the SSR cards); the
- *    type / demographic / content-rating / status panel controls are
- *    client-side only on the site — this source reads those exact panels from
- *    the card chips and applies them in searchMangaParse (v1.4.5).
- *  - Latest         GET /latest — NOW server-rendered series cards (24 per
- *    page; the v1 recon's "client-side only" no longer holds, and the old
- *    /rss/latest.xml feed was chapter-level and capped at 100 entries).
- *    Pagination follows the page's own "Older →" link: /latest?before={the
- *    oldest release timestamp on the page}. Cards carry the REAL title slug,
- *    so the RSS-era two-hop details resolution is no longer needed on the
- *    browse path (kept for old library entries).
- *  - Details        GET /title/{id6}; selectors below. The header stats row
- *    carries the star rating (+ user count), follows, reviews, comments.
- *  - Chapters       TWO-STEP: the title page renders one box per VISIBLE
- *    source group, each showing only that group's LATEST chapter (plus flag
- *    + /source/{id} link) — the v1 build mistook those for the full list.
- *    The grid is also INCOMPLETE: the page state's `comic_ids` array is the
- *    site's COMPLETE source list, and sources missing from the DOM (adult/
- *    sfw-filtered ones like Reset Scans or Xscans) keep live /source/{id}
- *    pages with real chapters. The FULL chapter list of a group lives on
- *    its /source/{id} page (`a[href^=/chapter/]` rows + `time[data-time]`
- *    epoch millis), so we fetch one /source/{id} per group — rendered and
- *    hidden — that matches the language setting. The group's REAL name is
- *    the badge chip next to the "source #id" caption on that page (the
- *    title-page boxes display series-title-style names instead). The same
- *    chapter number is frequently uploaded by several groups — the
- *    "Deduplicate chapters" setting keeps one per number × language.
- *  - Pages          GET /chapter/{id} — the reader has no <img> tags; the
- *    page URLs are absolute (`https://iXX.imgXX.org/_f/...`) inside the
- *    `"imageUrls"` qwik/json state. Parsed positionally with a URL regex;
- *    relative `/_f/...` paths (if any) are prefixed with the mirror.
- */
 @Source
 abstract class XComic :
     HttpSource(),
@@ -85,7 +37,7 @@ abstract class XComic :
 
     private val preferences = getPreferences()
 
-    /** The active mirror — one of the fixed list or a user-entered custom URL. */
+    /** The active mirror. One of the fixed list or a user-entered custom URL. */
     private val mirror: String
         get() {
             preferences.customMirror()?.let { custom ->
@@ -99,9 +51,9 @@ abstract class XComic :
         .set("User-Agent", CHROME_UA)
         .set("Referer", "$mirror/")
 
-    // A chapter refresh fetches one /source/{id} page PER source group — a
+    // A chapter refresh fetches one /source/{id} page PER source group. A
     // big series can have 40+ groups (the page state's complete list). Keep
-    // that burst polite. (lib-1.4 HttpSource has no configureClient hook —
+    // that burst polite. (lib-1.4 HttpSource has no configureClient hook. 
     // the client itself is overridden, same as Comix.)
     override val client: OkHttpClient = network.client.newBuilder()
         .rateLimit(5)
@@ -152,8 +104,8 @@ abstract class XComic :
 
     override fun searchMangaRequest(page: Int, query: String, filters: FilterList): Request {
         val encoded = java.net.URLEncoder.encode(query, "UTF-8")
-        // The site's ONLY server-side search lever (verified live: field_update
-        // and field_name_* reorder the SSR cards; everything else in the
+        // The site's only server-side search lever. field_update
+        // and field_name_* reorder the SSR cards. Everything else in the
         // filter panel is client-side-only).
         val sortFilter = filters.firstOrNull { it is SortByFilter } as? SortByFilter
         val sortValue = SORT_VALUES.getOrElse(sortFilter?.state ?: 0) { SORT_VALUES.first() }
@@ -200,7 +152,7 @@ abstract class XComic :
     }
 
     /** Server-rendered cards (shared by search and latest): cover link
-     * `a[href^="/title/"]:has(img)` — each series card renders the link
+     * `a[href^="/title/"]:has(img)`. Each series card renders the link
      * twice (cover + heading), so dedupe by href.
      */
     private fun parseTitleCards(document: Document): List<SManga> = parseCards(document).map { it.manga }
@@ -237,7 +189,7 @@ abstract class XComic :
                     }
             }
 
-            // Chip row: 🇨🇳 Manhua · Safe · 2017 · completed · tags… — the
+            // Chip row: 🇨🇳 Manhua · Safe · 2017 · completed · tags…. The
             // type span directly follows the flag emoji span; the content
             // rating and status are small-caps spans (the rating one lives in
             // a text-success wrapper, the status one after the circle icon).
@@ -260,7 +212,7 @@ abstract class XComic :
     override fun mangaDetailsRequest(manga: SManga): Request {
         val url = manga.url
         return if (url.startsWith("c/")) {
-            // Latest-updates entry: chapter page first — its payload carries
+            // Latest-updates entry: chapter page first. Its payload carries
             // the series slug (title_id) for the real title page.
             GET("$mirror/chapter/${url.removePrefix("c/")}", headers)
         } else {
@@ -519,8 +471,8 @@ abstract class XComic :
         // …then reconcile with the page state: its `comic_ids` array is the
         // site's COMPLETE source list for the title, and the Sources grid
         // only renders a subset of it (adult/sfw-filtered sources stay
-        // hidden from the DOM while their /source/{id} pages — and chapters
-        // — stay live). The hidden ids are fetched like any other group.
+        // hidden from the DOM while their /source/{id} pages. And chapters
+        // . Stay live). The hidden ids are fetched like any other group.
         val renderedIds = groups.mapTo(mutableSetOf()) { it.sourceId }
         val hiddenIds = hiddenSourceIds(html, renderedIds)
 
@@ -531,7 +483,7 @@ abstract class XComic :
         val selected = groups
             .filter { preferredLang == "all" || it.lang == preferredLang }
             .ifEmpty {
-                // The requested language has no group on this series — fall
+                // The requested language has no group on this series. Fall
                 // back to everything rather than returning an empty list.
                 groups
             }
@@ -539,7 +491,7 @@ abstract class XComic :
         // One /source/{id} page per group carries the group's FULL chapter
         // list, its flag (the only language signal for hidden groups) and
         // the REAL group name (the badge chip next to the "source #id"
-        // caption — the title-page boxes display series-title-style names
+        // caption. The title-page boxes display series-title-style names
         // instead). Hidden groups must be fetched to learn their language;
         // they are filtered afterwards.
         val renderedFetches = selected.map { Triple(it.sourceId, it.lang, it.domName) }
@@ -549,7 +501,7 @@ abstract class XComic :
             mapOf(candidates.first() to fetchSourcePage(candidates.first()))
         } else {
             // Overlap the ~0.5-1 s per-group page latency instead of stacking
-            // it (language "all" on a multi-group series used to serialize up
+            // it (language "all" on a multi-group series serializes up
             // to ten sequential fetches; a big series can have 40+ groups).
             runBlocking {
                 candidates.distinct()
@@ -626,8 +578,8 @@ abstract class XComic :
 
     /**
      * The chapter number inside a label. The number that follows a chapter
-     * word ("Chapter 12", "Ch.12", "Episode 7", "Cap. 5") always wins —
-     * labels like "Chapter 48 - S2 START" used to parse as chapter 2 (the
+     * word ("Chapter 12", "Ch.12", "Episode 7", "Cap. 5") always wins. 
+     * labels like "Chapter 48 - S2 START" parse as chapter 2 (the
      * last number token) and land between chapters 2 and 3. Without a
      * chapter word, the last number NOT glued to a letter is taken
      * ("One Punch 98" → 98; "S2" alone → no number).
@@ -682,7 +634,7 @@ abstract class XComic :
 
                 // The group's language flag sits inside the header heading.
                 // (The page also renders the SERIES' original-language flag
-                // outside the heading — never fall back to a page-wide flag
+                // outside the heading. Never fall back to a page-wide flag
                 // lookup, it grabs the wrong country.)
                 val lang = pageDocument.selectFirst("h3 span.font-family-NotoColorEmoji")
                     ?.text()?.trim()?.let { flagToLanguage(it) }.orEmpty()
@@ -697,7 +649,7 @@ abstract class XComic :
 
     /** The group's REAL name: the badge chip rendered right after the
      * "source #id" caption ("WebToon", "Thunderscans", "Reset Scans"…).
-     * The chip carries the rounded-box class — the heading's flag emoji
+     * The chip carries the rounded-box class. The heading's flag emoji
      * span does not, which keeps a missing badge from resolving to the
      * flag. Absent on badge-less groups; callers fall back to the
      * title-page box display name.
@@ -708,14 +660,14 @@ abstract class XComic :
         ?.selectFirst("span.rounded-box")
         ?.text()?.trim()?.takeIf { it.isNotBlank() }
 
-    /** Bounded per-session cache of source-group pages (refresh speed — a
+    /** Bounded per-session cache of source-group pages (refresh speed. A
      * big title's full sweep is 40+ pages). */
     private val sourcePageCache = object : LinkedHashMap<String, SourcePageData>(16, 0.75f, true) {
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, SourcePageData>): Boolean = size > 64
     }
 
     /**
-     * The title page's qwik state carries `"comic_ids",4,[0,"vgreew",…]` —
+     * The title page's qwik state carries `"comic_ids",4,[0,"vgreew",…]`. 
      * the site's COMPLETE source list for the title. The Sources grid only
      * renders a subset of it; the ids missing from the DOM are the hidden
      * groups whose /source/{id} pages stay live with full chapter lists.
@@ -993,7 +945,7 @@ abstract class XComic :
 
         /**
          * MangaUpdates-style format/tag words the site mixes into the genre
-         * chip row — hiding them (settings) leaves the actual genres.
+         * chip row. Hiding them (settings) leaves the actual genres.
          */
         private val TAG_WORDS = setOf(
             "Long Strip", "Full Color", "Web Comic", "Webtoon", "1-Koma", "4-Koma",
@@ -1022,7 +974,7 @@ abstract class XComic :
         /** Numbers NOT glued to a letter ("S2" is excluded, "#98" isn't). */
         private val NUMBER_TOKEN_REGEX = Regex("""(?<![A-Za-z])\d+(?:[.,]\d+)?""")
 
-        /** `"comic_ids",4,[0,"vgreew",0,"82xv6a",…]` — the title page's
+        /** `"comic_ids",4,[0,"vgreew",0,"82xv6a",…]`. The title page's
          * qwik state carries the site's COMPLETE source list there, while
          * the rendered Sources grid hides a subset of it. */
         private val COMIC_IDS_REGEX = Regex(""""comic_ids",4,\[(.*?)\]""")
