@@ -60,13 +60,6 @@ abstract class MKissa :
         readTimeout(60, java.util.concurrent.TimeUnit.SECONDS)
         writeTimeout(30, java.util.concurrent.TimeUnit.SECONDS)
 
-        // v15: plain client, exactly like keiyoushi sources. Browsing goes to
-        // api.mkissa.net (open), reading happens inside the site's own reader
-        // WebView (which solves Cloudflare + Turnstile + AA crypto itself),
-        // and page images load from the CDN with browser-like image headers
-        // (see imageRequest). The v14 CloudflareBypass forced fetch-like
-        // sec-fetch-* headers onto every request — a bot signal that made
-        // Cloudflare challenges MORE likely, not less.
         rateLimit(2)
     }
 
@@ -105,7 +98,7 @@ abstract class MKissa :
      *
      * (Browsing/details/chapters are not captcha-gated; the captcha+AA-crypto
      * gates only apply to `chapterPages`, which is now harvested from the
-     * reader WebView — see getPageList.)
+     * reader WebView. See getPageList.)
      */
     private suspend fun graphql(
         query: String,
@@ -371,47 +364,6 @@ abstract class MKissa :
         SMangaUpdate(detailsDeferred.await(), chaptersDeferred.await())
     }
 
-    // =============================== Pages ===============================
-    //
-    // The reader is opened in an off-screen WebView and the page list is
-    // captured from the site's OWN pipeline. Live-verified against the site
-    // and its bundle, 2026-09 (this is why every previous build dead-ended
-    // on "open the chapter in WebView" — and why opening WebView never
-    // actually fixed it):
-    //
-    // 1. The reader document route is Cloudflare-challenged for non-browser
-    //    TLS, but the SPA path is NOT: loading the SERIES page and clicking
-    //    the chapter row (div.media-ep-item[data-href=…]) navigates to the
-    //    reader client-side without ever fetching the challenged document.
-    //    So the capture WebView loads the series page, never the reader URL.
-    // 2. `chapterPages` answers NEED_CAPTCHA until a fresh captcha token is
-    //    presented — Turnstile on production (rendered directly into
-    //    #captcha-root; the token lands in input[name="cf-turnstile-response"]).
-    //    A Cloudflare/WebView solve alone does NOT produce that token, which
-    //    is exactly why "go to webview, solve, come back" never helped.
-    // 3. Once a token exists the site re-executes the query itself
-    //    (forced POST + extensions.captcha) and the response carries the
-    //    FULL page list per source offering (edges[].pictureUrls). Capture
-    //    is layered (v20):
-    //      a. NETWORK MITM — the WebView's shouldInterceptRequest re-fetches
-    //         the chapterPages APQ GET byte-identically, tees the response
-    //         and passes it through. This sits BELOW all JavaScript, so the
-    //         site's realm-isolated primitives cannot dodge it.
-    //      b. our own GET replay with the captured token, fired the instant
-    //         the token lands (the token is single-use; waiting loses the
-    //         race to the site's own retry, whose POST response no capture
-    //         layer can see).
-    //      c. reader-route-gated DOM harvest of the reader's own image strip
-    //         (img.reader-page__img) — the last resort.
-    //
-    // So the capture flow is an active pipeline, not a passive wait:
-    //   series page → SPA-click the chapter row → captcha modal →
-    //   token arrives (Turnstile auto-solve, or reCAPTCHA switch, or a
-    //   synthetic checkbox tap that reaches through the cross-origin iframe)
-    //   → capture layers race for the payload → resolve.
-    //
-    // Successful results are cached in the source prefs — chapter pages are
-    // immutable, so re-opening a chapter is instant.
 
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         // url format: "/manga/<mangaId>/chapter-<chapterString>-<translation>"
@@ -421,7 +373,7 @@ abstract class MKissa :
         val chapterPath = "/" + parts.joinToString("/")
         val readerUrl = "$baseUrl$chapterPath"
 
-        // Chapter pages are immutable — serve the cached list instantly when
+        // Chapter pages are immutable. Serve the cached list instantly when
         // we already captured it once (covers re-opens and retries).
         val cached = readPageCache(chapter.url)
         if (cached != null) return cached.mapIndexed { index, imageUrl -> Page(index, imageUrl = imageUrl) }
@@ -463,14 +415,11 @@ abstract class MKissa :
     private fun writePageCache(chapterUrl: String, urls: List<String>) {
         val editor = preferences.edit()
 
-        // Purge lists captured by older builds — v14 harvested partially-
-        // rendered DOM trees (wrong counts); v15/v16 could capture nothing
-        // but the browser's favicon request (one "page" per chapter).
         preferences.all.keys
             .filter { it.startsWith(LEGACY_PAGE_CACHE_PREFIX) && !it.startsWith(PAGE_CACHE_PREFIX) }
             .forEach { editor.remove(it) }
 
-        // Keep the cache bounded — drop the oldest entries beyond the cap.
+        // Keep the cache bounded. Drop the oldest entries beyond the cap.
         val keys = preferences.all.keys
             .filter { it.startsWith(PAGE_CACHE_PREFIX) }
             .toMutableSet()
@@ -485,33 +434,8 @@ abstract class MKissa :
 
     // --------------------------- WebView capture ---------------------------
 
-    /**
-     * Runs the whole reader pipeline in one off-screen WebView:
-     *
-     * 1. Loads the SERIES page (the reader document itself is CF-challenged;
-     *    the SPA route to it is not).
-     * 2. SPA-clicks the target chapter row (div.media-ep-item[data-href]).
-     * 3. Waits for the site's Security Check modal, helps the captcha finish
-     *    (auto-switch to reCAPTCHA, synthetic taps through the cross-origin
-     *    widget iframe) and watches for the token in the parent DOM.
-     * 4. The site re-runs its chapterPages query with the token. Three
-     *    capture layers race for its payload: the network MITM (sees every
-     *    APQ GET regardless of the site's JS-realm isolation), the fetch/XHR
-     *    hook (POST responses, when the hook survives), and our own token
-     *    replay GET fired the instant the token lands.
-     * 5. Last resort: the reader's own image strip is harvested from the
-     *    DOM — ONLY while the reader route is on screen, scoped to the
-     *    reader's img.reader-page__img elements. (The v19 build harvested
-     *    the whole document instead: the series page loaded first is
-     *    wall-to-wall recommendation covers, which it collected as the
-     *    first ~40 "pages" of every chapter.)
-     */
     private suspend fun collectReaderPages(chapterPath: String, readerUrl: String): List<String> = runWebView(timeout = 3.minutes) {
         val collected = Collections.synchronizedSet(LinkedHashSet<String>())
-        // Whether we saw at least one REAL page candidate (extension-based
-        // image URL or an extensionless non-site-host CDN URL). Fallback
-        // resolution may only fire on real evidence — never on UI assets
-        // like favicons (the v15 bug).
         val sawRealCandidate = java.util.concurrent.atomic.AtomicBoolean(false)
         val captchaToken = java.util.concurrent.atomic.AtomicReference<String?>(null)
         val captchaProvider = java.util.concurrent.atomic.AtomicReference<String?>("turnstile1")
@@ -526,9 +450,6 @@ abstract class MKissa :
         val harvestedHash = java.util.concurrent.atomic.AtomicReference<String?>(null)
         val harvestedLane = java.util.concurrent.atomic.AtomicReference<String?>(null)
 
-        // True only while the READER route (…/chapter-…-…) is on screen.
-        // The series page loaded first is full of recommendation covers;
-        // harvesting before the SPA click is exactly the v19 bug.
         val readerActive = java.util.concurrent.atomic.AtomicBoolean(false)
         val replayAttempts = java.util.concurrent.atomic.AtomicInteger(0)
 
@@ -548,9 +469,6 @@ abstract class MKissa :
 
         fun consider(url: String) {
             val cleaned = url.trim().takeIf { it.startsWith("http") } ?: return
-            // Harvest only while the reader route is on screen (the v19
-            // bug: the series page's recommendation covers were collected
-            // as the first pages of every chapter).
             if (!readerActive.get()) return
             if (isHarvestablePageUrl(cleaned) && isPageImageUrl(cleaned)) {
                 collected.add(cleaned)
@@ -558,19 +476,6 @@ abstract class MKissa :
             }
         }
 
-        // Active token replay: re-issues the chapterPages query with the
-        // freshly captured token the MOMENT it lands. Prefers the site's own
-        // captured APQ GET (byte-identical variables + extensions, fresh
-        // aaReq); falls back to a constructed APQ GET from the harvested
-        // identity pieces (the pinned hash verified live against the API,
-        // 2026-09: it answers NEED_CAPTCHA, i.e. registered).
-        //
-        // v26: the replayed GET also carries the FRESHEST harvested aaReq.
-        // The site's own captcha-retry mints a new one per attempt (per-request,
-        // epoch-bound) — replaying with the ORIGINAL captured aaReq is what
-        // made the server answer "Error Re-captcha!"/AA-mismatch even with a
-        // valid token. Every teed "aareq" envelope re-arms the replay so a
-        // failed attempt retries itself with the newer aaReq (bounded below).
         fun fireActiveReplay() {
             if (replayAttempts.incrementAndGet() > MAX_ACTIVE_REPLAYS) return
             val token = captchaToken.get() ?: return
@@ -648,16 +553,11 @@ abstract class MKissa :
                         harvestBuildId(url, buildId)
                         harvestAaReq(url, req, aaReq)
                         // A teed chapterPages GET (fetch-hook path) is just as
-                        // good as one seen at the network layer — capture it.
+                        // good as one seen at the network layer. Capture it.
                         if (isChapterPagesApqUrl(url)) {
                             chapterPagesGetUrl.compareAndSet(null, url)
                             harvestApqIdentity(url, harvestedHash, harvestedLane, aaReq, buildId)
                         }
-                        // v26: a NEWLY minted aaReq means the site just ran its
-                        // own (captcha-gated) query again — the perfect moment
-                        // to replay with the token + fresh aaReq (bounded by
-                        // MAX_ACTIVE_REPLAYS; also covers the case where an
-                        // earlier replay failed with a stale aaReq).
                         val updatedAaReq = aaReq.get()
                         if (updatedAaReq != null && updatedAaReq != previousAaReq && captchaToken.get() != null) {
                             fireActiveReplay()
@@ -673,12 +573,6 @@ abstract class MKissa :
         }
 
         interceptRequest { request ->
-            // ---- Promo-redirect hijack guard (v24) ----
-            // The site's ad layer top-level-navigates the first chapter
-            // click to a sister site (kagane.to, "Just a moment..."), which
-            // killed the whole off-screen pipeline and produced the
-            // misleading "open the site in WebView" advice. Block any
-            // main-frame navigation away from mkissa.to.
             if (request.isForMainFrame) {
                 val uri = request.url
                 val scheme = uri.scheme
@@ -690,15 +584,6 @@ abstract class MKissa :
                 val url = request.url
                 val urlString = url.toString()
 
-                // ---- Network-layer capture (primary path, v20) ----
-                // The site pins realm-isolated JS primitives so window.fetch/
-                // XHR wrappers can lose its API traffic entirely (v17 recon).
-                // This hook sits BELOW all JavaScript, on the WebView's own
-                // network stack: the chapterPages APQ GET is re-fetched here
-                // byte-identically, its response teed to the extractor and
-                // then handed to the WebView unmodified. The site's captcha
-                // retry is a POST (body invisible here) — hence the separate
-                // active GET replay below.
                 if (url.host == apiHost && isChapterPagesApqUrl(urlString)) {
                     chapterPagesGetUrl.compareAndSet(null, urlString)
                     harvestApqIdentity(urlString, harvestedHash, harvestedLane, aaReq, buildId)
@@ -709,16 +594,6 @@ abstract class MKissa :
                     }
                 }
 
-                // ---- DOM-harvest path (RETIRED in v24) ----
-                // The old image-sniff ("Accept: image/... on a non-site host
-                // is a page image") was the root cause of the "chapter shows
-                // recommended manhuas" bug: the reader route itself renders
-                // recommendation rails whose covers come from CDN hosts and
-                // were swept into the harvest, then baked into the page cache
-                // by the DOM fallback resolution. Resolution now comes ONLY
-                // from structured chapterPages payloads (MITM tee / fetch
-                // hook / active replay) or the strictly-scoped
-                // img.reader-page__img strip poll — never from request sniffing.
             }
             null
         }
@@ -747,8 +622,6 @@ abstract class MKissa :
                 // (on NEED_CAPTCHA) opens the Security Check modal.
             }
 
-            // Track the reader route: DOM harvesting is only allowed while
-            // the chapter route is on screen (the v19 covers bug).
             evaluateJs(readerRouteJs(chapterPath)) { value ->
                 readerActive.set(value?.contains("true") == true)
             }
@@ -768,7 +641,7 @@ abstract class MKissa :
                         modalPolls++
 
                         // 12s without a token: switch the modal to the Google
-                        // reCAPTCHA provider (the site's own footer button —
+                        // reCAPTCHA provider (the site's own footer button. 
                         // plain DOM, fully scriptable).
                         if (modalPolls == PROVIDER_SWITCH_POLL && !providerSwitched) {
                             providerSwitched = true
@@ -777,7 +650,7 @@ abstract class MKissa :
 
                         // 15s and still no token: tap the widget checkbox.
                         // The checkbox lives inside a cross-origin iframe no
-                        // page script can click — the synthetic tap enters at
+                        // page script can click. The synthetic tap enters at
                         // the platform input layer and reaches it anyway.
                         if (modalPolls >= FIRST_TAP_POLL && tapAttempts < MAX_TAP_ATTEMPTS &&
                             modalPolls % TAP_RETRY_POLL == 0
@@ -802,10 +675,10 @@ abstract class MKissa :
             }
 
             // ---- Phase 3: active token replay ----
-            // The token is single-use: the first replay fires THE MOMENT the
+            // The token is single-use: the first replay fires the moment the
             // token lands, racing the site's own retry (whose POST response
             // no capture layer can see). Follow-ups every few seconds while
-            // nothing has resolved — a lost race just means the token was
+            // nothing has resolved. A lost race just means the token was
             // spent; follow-ups then ride any fresher harvested state.
             if (tokenSeenAtMs > 0 && replayAttempts.get() < MAX_ACTIVE_REPLAYS &&
                 System.currentTimeMillis() - tokenSeenAtMs >=
@@ -814,7 +687,7 @@ abstract class MKissa :
                 fireActiveReplay()
             }
 
-            // Nudge lazy loaders — walk the reader strip so its
+            // Nudge lazy loaders. Walk the reader strip so its
             // IntersectionObserver loads every page.
             evaluateJs(
                 "try{window.scrollTo(0,(document.scrollingElement||document.body).scrollHeight)}catch(e){}",
@@ -869,7 +742,7 @@ abstract class MKissa :
             // Last-resort resolution: reader-route-gated strip harvest, only
             // after a LONG stability window (lazy loading + virtualised
             // strips need time to settle). Never resolves on UI-asset-only
-            // collections (favicon etc.) — if the reader produced no real
+            // collections (favicon etc.). If the reader produced no real
             // candidates we keep waiting (the timeout then fails with the
             // actionable message).
             if (finished && sawRealCandidate.get() && readerActive.get() && count > 0 && count == lastCount) {
@@ -919,7 +792,7 @@ abstract class MKissa :
 
     /**
      * Harvests the site's own `aaReq` crypto proof (and the chapterPages
-     * hash) out of the requests our hooks teed — the proof is minted by
+     * hash) out of the requests our hooks teed. The proof is minted by
      * obfuscated WebCrypto we deliberately do NOT reimplement. It travels
      * either in the GET query (`extensions={"aaReq":…}`) or in a POST body.
      */
@@ -996,7 +869,7 @@ abstract class MKissa :
     /**
      * The network MITM: re-fetches [url] (the site's own chapterPages APQ
      * GET) through our client, tees the body to the caller and returns
-     * `(response, body)` for the WebView — a pass-through the page cannot
+     * `(response, body)` for the WebView. A pass-through the page cannot
      * distinguish from its own request. Returns null on any failure so the
      * WebView simply performs the request itself (graceful degradation).
      */
@@ -1016,29 +889,12 @@ abstract class MKissa :
         }.getOrNull()
     }
 
-    /**
-     * A 204-style empty response used to block a navigation outright (the
-     * v24 promo-redirect hijack guard). Cheaper and safer than letting a
-     * sister-site challenge page consume the WebView's time budget.
-     */
     private fun emptyResponse(): android.webkit.WebResourceResponse = android.webkit.WebResourceResponse(
         "text/plain",
         "utf-8",
         java.io.ByteArrayInputStream(ByteArray(0)),
     )
 
-    /**
-     * Re-issues the site's captured chapterPages GET with the captcha token
-     * injected as `extensions.captcha = {token, provider}` — the exact
-     * envelope the site's own retry uses (verified in the site bundle).
-     * Everything else (variables, persistedQuery, lane) rides along
-     * byte-identical. v26: when a fresher aaReq has been harvested (the
-     * site's own retry mints one per attempt), the stale captured one is
-     * REPLACED — the server validates aaReq per request, so replaying with
-     * the original aaReq + new token fails with an AA/captcha error. Returns
-     * null when the URL carries no parsable extensions (then the caller uses
-     * its constructed fallback).
-     */
     private fun withCaptchaInjected(url: String, token: String, provider: String?, freshAaReq: String?): String? {
         return runCatching {
             val httpUrl = url.toHttpUrlOrNull() ?: return null
@@ -1066,11 +922,6 @@ abstract class MKissa :
         }.getOrNull()
     }
 
-    /**
-     * The bridge message is our own JSON envelope {url, req, res} (v15+).
-     * Anything that isn't the envelope is treated as a raw response body
-     * (defensive compatibility).
-     */
     private fun parseBridgeEnvelope(message: String): Pair<String?, String> {
         val root = runCatching { Json.parseToJsonElement(message) }.getOrNull() as? JsonObject
             ?: return null to message
@@ -1119,31 +970,6 @@ abstract class MKissa :
         return ChapterRef(segments[1], chapterString, translation)
     }
 
-    /**
-     * Pulls the page list out of a captured chapterPages GraphQL response,
-     * mirroring the site reader's own pipeline (verified against the site
-     * bundle, 2026-09):
-     *
-     * - `chapterPages` returns `edges[]` where EACH edge is one page-source
-     *   offering (streamerId + sourceName + priority) carrying the chapter's
-     *   FULL page list in `pictureUrls`. `pageInfo.total` counts SOURCES,
-     *   and the site requests them in batches (`limit: 10, offset`) to fill
-     *   its source picker — the first response already carries every page.
-     * - `pictureUrls` is a list of OBJECTS `{num, url}` (a.k.a. `{n, u}`),
-     *   sometimes wrapped as a JSON string, ordered by page number — NOT a
-     *   list of plain URL strings. (This is exactly what v14 got wrong: it
-     *   read the entries as strings, dropped them all, and fell back to
-     *   partial DOM harvesting — hence wrong page counts.)
-     * - Source choice (the reader's `foe`/`goe`): skip edges whose
-     *   sourceName is missing/"unkonw"/"Wp-*", dedupe by
-     *   `streamerId|sourceName` keeping the highest priority, sort by
-     *   priority descending, and take the first edge whose normalized list
-     *   is non-empty.
-     * - URL joining (the reader's `KP`/`yP`): absolute and `//`-prefixed
-     *   URLs pass through; otherwise they join `pictureUrlHead` — after
-     *   `https://` is added when the head carries no scheme. Relative URLs
-     *   without a head resolve against the reader page origin.
-     */
     private fun extractPageUrls(rawBody: String, rawRequestBody: String?, readerUrl: String): List<String> {
         if (!rawBody.contains("chapterPages") || !rawBody.contains("pictureUrls")) return emptyList()
 
@@ -1204,7 +1030,7 @@ abstract class MKissa :
 
         // goe(): first source (highest priority) with a usable page list,
         // AFTER sanitising every candidate (drops reader-page links and any
-        // site-host entry — the payload can hand out a link back to the
+        // site-host entry. The payload can hand out a link back to the
         // reader as "page 1"). Some streamers also expose the ENTIRE
         // chapter as a single strip; the site reader effectively prefers
         // proper per-page sources, and so do we: a multi-entry list beats
@@ -1220,10 +1046,10 @@ abstract class MKissa :
     }
 
     /**
-     * Shape-drift safety net: recursively walks ANY JSON payload and
+     * Shape-drift safety net: recursively walks any JSON payload and
      * collects every object that carries a "pictureUrls" array, wherever
      * it now lives (the site actively reshapes its payloads to break
-     * extension scrapers — the structured path above can come up empty
+     * extension scrapers. The structured path above can come up empty
      * while the data is right there under a new envelope). Falls back to
      * regex extraction when the body isn't pure JSON (inline script text).
      */
@@ -1251,7 +1077,7 @@ abstract class MKissa :
             }
         }
 
-        // Not parseable as JSON with pictureUrls anywhere — try regexing
+        // Not parseable as JSON with pictureUrls anywhere. Try regexing
         // "pictureUrls"/"pictureUrlsProcessed" fragments out of the raw
         // text (inline scripts, JSON-string-encoded payloads). Entries are
         // flat {num,url} objects, so a bracket-balanced-enough scan is
@@ -1282,7 +1108,7 @@ abstract class MKissa :
      * The reader's KP()/yP(): normalise every entry of one edge's
      * pictureUrls into an absolute URL, ordered by page number.
      * Some streamers only fill `pictureUrlsProcessed` (the site's own
-     * chapterPages query selects both fields) — it carries the same
+     * chapterPages query selects both fields). It carries the same
      * entries, so it is used as a fallback when pictureUrls is empty.
      */
     private fun normalizeEdgePages(edge: JsonObject, readerUrl: String): List<String> {
@@ -1348,14 +1174,14 @@ abstract class MKissa :
 
     private fun JsonElement?.jsonArrayOrNull(key: String): JsonArray? = (this as? JsonObject)?.get(key) as? JsonArray
 
-    /** True for URLs that look like page images — never site UI, API or captcha traffic. */
+    /** True for URLs that look like page images. Never site UI, API or captcha traffic. */
     private fun isPageImageUrl(url: String): Boolean {
         val host = runCatching { url.toHttpUrl().host }.getOrNull() ?: return false
         if (host == "challenges.cloudflare.com" || host == apiHost) return false
         val path = url.substringBefore('?').substringBefore('#').lowercase()
         if (isSiteUiAssetPath(path)) return false
         // Recommendation-rail covers (the "chapter shows recommended manhuas"
-        // bug): the site's cover CDN paths are unmistakable — reject them
+        // bug): the site's cover CDN paths are unmistakable. Reject them
         // before any other check can admit them.
         if (isCoverAssetPath(path)) return false
         return path.substringAfterLast('.').substringBefore('%') in PAGE_IMAGE_EXTENSIONS
@@ -1364,7 +1190,7 @@ abstract class MKissa :
     /**
      * The site's recommendation rails / cards serve covers from paths like
      * `/mcovers/...` and `.../m_tbs...`, `ms_tbs`, `usr_tbs`, `a_tbs`
-     * (aln.youtube-anime.com, live-verified 2026-09). None of those can be
+     * (aln.youtube-anime.com). None of those can be
      * a reader page.
      */
     private fun isCoverAssetPath(path: String): Boolean {
@@ -1374,14 +1200,6 @@ abstract class MKissa :
         }
     }
 
-    /**
-     * Site chrome assets that browsers auto-request but are NOT chapter
-     * pages: favicons of every flavour, PWA icons, manifest. This is what
-     * the v15 build harvested as "page 1" for EVERY chapter (the browser
-     * requests /favicon.ico with an Accept: image/... header, and the old
-     * interceptRequest added any accept-image URL without an extension
-     * check) — the page list then collapsed to a single favicon image.
-     */
     private fun isSiteUiAssetPath(path: String): Boolean {
         if (path.endsWith(".ico") || path.endsWith(".icon")) return true
         return path.substringAfterLast('/').let { name ->
@@ -1400,7 +1218,7 @@ abstract class MKissa :
     /**
      * True when a URL may enter the harvested/extracted page list at all.
      * The site reader hands out payload entries that link BACK to the
-     * reader page ("/manga/..." — that single URL serves the WHOLE
+     * reader page ("/manga/...". That single URL serves the WHOLE
      * chapter; loading it as an image is the "first page is the entire
      * chapter" bug and, once cached, the "Failed to initialize decoder"
      * HTML-into-decoder error). Filter by path, not by host: page images
@@ -1477,7 +1295,7 @@ abstract class MKissa :
         fun excluded(): List<String> = state.filter { it.state == Filter.TriState.STATE_EXCLUDE }.map { it.value }
 
         private companion object {
-            // Site genre/tag names (verified live against the API, 2026-09).
+            // Site genre/tag names.
             val GENRES = listOf(
                 "Action", "Adult", "Adventure", "Comedy", "Cooking", "Crossdressing",
                 "Demons", "Doujinshi", "Drama", "Ecchi", "Fantasy", "Gender Bender",
@@ -1496,7 +1314,7 @@ abstract class MKissa :
 
     /**
      * Tags carry the site's own values ("theme:monsters", "format:full_color"
-     * plus plain AniList-style names) — verified live. Sending display names
+     * plus plain AniList-style names). Verified live. Sending display names
      * that don't exist server-side simply matches nothing, never errors.
      */
     private class TagFilter :
@@ -1737,7 +1555,7 @@ abstract class MKissa :
         """
 
         // IMPORTANT: `airedStart` and `availableChaptersDetail` are opaque
-        // "Object" scalar fields — they must NOT carry a sub-selection.
+        // "Object" scalar fields. They must NOT carry a sub-selection.
         // Selecting subfields on them is a GraphQL validation error and the
         // whole details query answers HTTP 400 (details/chapters never loaded).
         private const val QUERY_MANGA_DETAILS = """
@@ -1769,11 +1587,8 @@ abstract class MKissa :
         // (The chapter-pages GraphQL document was removed: the server now
         // answers AA_CRYPTO_MISSING to any request lacking the site's own
         // obfuscated anti-abuse crypto proof, so pages are collected from the
-        // real reader in an off-screen WebView instead — see getPageList.)
+        // real reader in an off-screen WebView instead. See getPageList.)
 
-        // v20: prefix bumped again so page lists captured by older builds
-        // are never served — v19/v18 lists were DOM-harvest fallbacks whose
-        // first ~40 entries were recommendation covers from the series page.
         private const val PAGE_CACHE_PREFIX = "mkissa_pages_v6_"
         private const val LEGACY_PAGE_CACHE_PREFIX = "mkissa_pages_"
         private const val PAGE_CACHE_MAX_ENTRIES = 60
@@ -1816,7 +1631,7 @@ abstract class MKissa :
          * Injected at page start (and re-installed by the poll loop): wraps
          * window.fetch and XMLHttpRequest so every API call is reported:
          *  - responses carrying the chapterPages payload → {url,req,res}
-         *    (the primary capture path — one response carries the FULL list),
+         *    (the primary capture path. One response carries the FULL list),
          *  - every request containing `aaReq` (or the client-crypto bootstrap)
          *    → {kind:"aareq",url,req} so we can harvest the site's own crypto
          *    proof + build id for the active fallback POST.
@@ -1890,7 +1705,7 @@ abstract class MKissa :
          *  2. Listens for the sitea-captcha-ready postMessage the
          *     iframe-provider variant emits, forwarding {token, provider}.
          * (On production mkissa.to the token is read directly from the
-         * parent-DOM inputs — see CAPTCHA_STATE_JS; these hooks are the
+         * parent-DOM inputs. See CAPTCHA_STATE_JS; these hooks are the
          * belt-and-braces for the other variants.)
          */
         private val CAPTCHA_HOOK_JS = """
@@ -1923,10 +1738,10 @@ abstract class MKissa :
 
         /**
          * Reads the captcha state from the PARENT document (updated for the
-         * 2026-09 site build: the modal classes are gone; the widget renders
+         * The modal classes are gone; the widget renders
          * into #captcha-root as a direct Turnstile (hidden response input in
          * the parent DOM) or an iframe provider whose token arrives via
-         * postMessage — see CAPTCHA_HOOK_JS). Reports the widget iframe rect
+         * postMessage. See CAPTCHA_HOOK_JS). Reports the widget iframe rect
          * for the synthetic-tap fallback and whether the widget is live.
          */
         private val CAPTCHA_STATE_JS = """
@@ -1963,8 +1778,8 @@ abstract class MKissa :
 
         /**
          * Clicks the provider-switch control (the site's own “use Google
-         * reCAPTCHA” path — re-renders the widget as a reCAPTCHA checkbox
-         * when Turnstile won't complete). The 2026-09 rebuild dropped the
+         * reCAPTCHA” path. Re-renders the widget as a reCAPTCHA checkbox
+         * when Turnstile won't complete). The rebuild dropped the
          * old .captcha-footer classes, so the button is located by text,
          * scoped to modal-ish containers first, then document-wide.
          */
@@ -1990,11 +1805,11 @@ abstract class MKissa :
         /**
          * SPA-clicks the target chapter row on the series page. Reader rows
          * are div.media-ep-item[data-href=…] (NOT links) handled by the
-         * site's client-side router — clicking one navigates to the reader
+         * site's client-side router. Clicking one navigates to the reader
          * WITHOUT fetching the Cloudflare-challenged reader document.
          *
-         * 2026 redesign (live-verified): the series page is tabbed and a
-         * FRESH load defaults to the Reviews tab — zero chapter rows exist
+         * The series page is tabbed and a
+         * FRESH load defaults to the Reviews tab. Zero chapter rows exist
          * until the "Chapters" tab (button.tab-item[aria-label=Chapters])
          * is clicked. Older chapters additionally sit behind a
          * button.showmore pagination (the list window starts at ~50 rows).
@@ -2021,7 +1836,7 @@ abstract class MKissa :
                 if(row){ row.click(); window.__mhSpaDone=true; return 'clicked'; }
                 // Phase 2: open the tab the chapter list lives behind.
                 // NOTE: the aria-label/text carries the chapter count
-                // ("Chapters (56)" / "Chapters 56") on some loads — match by
+                // ("Chapters (56)" / "Chapters 56") on some loads. Match by
                 // PREFIX, never exactly.
                 var tab=document.querySelector('button.tab-item[aria-label^="Chapters"], [role="tab"][aria-label^="Chapters"]');
                 if(!tab){
@@ -2053,13 +1868,6 @@ abstract class MKissa :
             })();
         """.trimIndent()
 
-        /**
-         * Collects the reader's own page-image strip: the reader renders
-         * each page as img.reader-page__img (site bundle, 2026-09). STRICTLY
-         * scoped to that selector since v24 — the old whole-document fallback
-         * swept the recommendation-rail covers that the reader route itself
-         * renders, which is how "recommended manhuas" became "chapter pages".
-         */
         private val READER_STRIP_JS = """
             (function () {
               try {
@@ -2079,7 +1887,7 @@ abstract class MKissa :
          * Scans inline <script> payloads (SSR state / embedded JSON) for the
          * chapterPages payload and pushes hits through the same bridge path
          * as the fetch hook. The site pins realm-isolated primitives so
-         * extension fetch hooks can't see its API calls — embedded state is
+         * extension fetch hooks can't see its API calls. Embedded state is
          * the remaining in-page copy of the same data.
          */
         private val INLINE_PAYLOAD_JS = """
@@ -2100,7 +1908,7 @@ abstract class MKissa :
             })();
         """.trimIndent()
 
-        /** Current page title — used to detect a stuck Cloudflare challenge. */
+        /** Current page title. Used to detect a stuck Cloudflare challenge. */
         private const val DOM_TITLE_JS = "document.title"
 
         /** File extensions the chapter-page image harvester accepts. */
