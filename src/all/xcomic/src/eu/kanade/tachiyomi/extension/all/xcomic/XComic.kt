@@ -30,7 +30,6 @@ import java.util.Locale
 abstract class XComic :
     HttpSource(),
     ConfigurableSource {
-
     override val name = "XComic"
 
     override val supportsLatest = true
@@ -53,7 +52,7 @@ abstract class XComic :
 
     // A chapter refresh fetches one /source/{id} page PER source group. A
     // big series can have 40+ groups (the page state's complete list). Keep
-    // that burst polite. (lib-1.4 HttpSource has no configureClient hook. 
+    // that burst polite. (lib-1.4 HttpSource has no configureClient hook.
     // the client itself is overridden, same as Comix.)
     override val client: OkHttpClient = network.client.newBuilder()
         .rateLimit(5)
@@ -578,7 +577,7 @@ abstract class XComic :
 
     /**
      * The chapter number inside a label. The number that follows a chapter
-     * word ("Chapter 12", "Ch.12", "Episode 7", "Cap. 5") always wins. 
+     * word ("Chapter 12", "Ch.12", "Episode 7", "Cap. 5") always wins.
      * labels like "Chapter 48 - S2 START" parse as chapter 2 (the
      * last number token) and land between chapters 2 and 3. Without a
      * chapter word, the last number NOT glued to a letter is taken
@@ -667,7 +666,7 @@ abstract class XComic :
     }
 
     /**
-     * The title page's qwik state carries `"comic_ids",4,[0,"vgreew",…]`. 
+     * The title page's qwik state carries `"comic_ids",4,[0,"vgreew",…]`.
      * the site's COMPLETE source list for the title. The Sources grid only
      * renders a subset of it; the ids missing from the DOM are the hidden
      * groups whose /source/{id} pages stay live with full chapter lists.

@@ -20,7 +20,6 @@ import java.util.concurrent.atomic.AtomicReference
 
 @SuppressLint("SetJavaScriptEnabled")
 internal object VrfGenerator {
-
     private const val READY_TIMEOUT_MS = 15_000L
     private const val READY_POLL_INTERVAL_MS = 250L
     private const val READY_POLL_ATTEMPTS = 40
@@ -57,7 +56,7 @@ internal object VrfGenerator {
     internal fun obj(values: Map<String, String>) = Param.MapValue(values)
 
     /**
-     * Computes the `vrf` token for [path] with [params]. Blocks the caller. 
+     * Computes the `vrf` token for [path] with [params]. Blocks the caller.
      * call from a worker thread only. Set [forceWebView] (the 403 self-heal
      * re-sign path) to bypass the token cache and mint a fresh token.
      */
@@ -93,7 +92,7 @@ internal object VrfGenerator {
         }
 
         // Three null results in a row means the WebView itself is suspect
-        // (dead renderer, crashed page). Rebuild it once and try again. 
+        // (dead renderer, crashed page). Rebuild it once and try again.
         // this is what recovers a signing machine that died mid-session.
         resetWebView()
         awaitReady()
@@ -195,12 +194,12 @@ internal object VrfGenerator {
                             } else if (attempt < READY_POLL_ATTEMPTS) {
                                 mainHandler.postDelayed({ poll(attempt + 1) }, READY_POLL_INTERVAL_MS)
                             } else {
-                                // Poll exhausted: never leave waiters hanging. 
+                                // Poll exhausted: never leave waiters hanging.
                                 // fail them now with what the page reported,
                                 // and drop the machine so the NEXT request
                                 // rebuilds a fresh WebView instead of
                                 // inheriting this failure forever. (The
-                                // destroy is deferred out of this callback. 
+                                // destroy is deferred out of this callback.
                                 // destroying a view from inside its own
                                 // client callback is not safe.)
                                 val stale = view

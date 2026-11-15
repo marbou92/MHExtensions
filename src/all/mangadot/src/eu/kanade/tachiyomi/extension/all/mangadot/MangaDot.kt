@@ -68,7 +68,6 @@ import kotlin.time.Duration.Companion.hours
 abstract class MangaDot :
     KeiSource(),
     ConfigurableSource {
-
     // =============================== Setup ===============================
     override fun OkHttpClient.Builder.configureClient() = apply {
         // This fork routes every call through the repo's own Cloudflare
@@ -821,7 +820,7 @@ abstract class MangaDot :
 
     // ============================= Settings ==============================
     // Organized like the Comix source: browse/content defaults first, then
-    // browse filtering, then chapter-list handling, then details display. 
+    // browse filtering, then chapter-list handling, then details display.
     // every item titled by what it does with a summary that spells out where
     // it applies and what the empty/default value means.
     override fun setupPreferenceScreen(screen: PreferenceScreen) {

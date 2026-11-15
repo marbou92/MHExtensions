@@ -55,12 +55,10 @@ import okio.IOException
 abstract class Kagane :
     KeiSource(),
     ConfigurableSource {
-
     private val kaganeLangs: List<String>
         get() = if (lang == "zh") listOf("zh-Hans", "zh-Hant") else listOf(lang)
 
     private val prefs = getPreferences()
-
 
     private val staticMirrors = listOf(
         "https://kagane.si",

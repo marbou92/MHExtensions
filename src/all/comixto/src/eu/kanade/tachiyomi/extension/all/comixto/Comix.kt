@@ -45,7 +45,6 @@ private class WebViewPagesResult(
 abstract class Comix :
     HttpSource(),
     ConfigurableSource {
-
     override val supportsLatest = true
 
     private val preferences = getPreferences()
@@ -77,7 +76,6 @@ abstract class Comix :
             .build()
     }
 
-
     private val webViewUserAgent: String
         get() = headers["User-Agent"] ?: FALLBACK_UA
 
@@ -101,7 +99,6 @@ abstract class Comix :
         CloudflareSolverDiagnostics.record("COMIX WebView bridge OK ($path)")
         return teeResponse(request, payload)
     }
-
 
     private val teeJson = Json { ignoreUnknownKeys = true }
 
@@ -1321,7 +1318,6 @@ abstract class Comix :
         }
     }
 
-
     private val cipherMaterial: ComixCipherMaterial = ComixCipherMaterial.fromDefaults()
 
     /** One substitution round's material + its precomputed inverse. */
@@ -1717,7 +1713,6 @@ abstract class Comix :
     private fun android.content.SharedPreferences.getScorePosition(): String = getString(PREF_SCORE_POSITION, "end") ?: "end"
 
     companion object {
-
         private val SERVER_ERROR_CODES = setOf(502, 503, 522, 523)
         private val SCRAMBLE_PATH_FALLBACK_REGEX = Regex("/(?:i5|s?i+)/")
         private const val ENC_MULTIPLIER = 1000005

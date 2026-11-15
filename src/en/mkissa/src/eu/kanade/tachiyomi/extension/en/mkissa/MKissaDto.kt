@@ -378,7 +378,7 @@ fun MangaDetail.toChapterList(): List<SChapter> {
  * older chapters carry no dates anywhere (the site's own chapter list shows
  * none either). Leaving `date_upload` at 0 made every entry render as
  * "posted today" in the app, so the older chapters get evenly spaced
- * estimates walking backwards from the real newest date (one week apart. 
+ * estimates walking backwards from the real newest date (one week apart.
  * typical weekly serialisation cadence). The newest chapter always carries
  * the exact date from the API.
  */

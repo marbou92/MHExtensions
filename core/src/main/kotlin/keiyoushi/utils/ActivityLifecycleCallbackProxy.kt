@@ -15,24 +15,33 @@ import android.app.Application
  * the whole extension down with it.
  */
 internal object ActivityLifecycleCallbackProxy {
-
     fun install(app: Application) {
-        app.registerActivityLifecycleCallbacks(object : Application.ActivityLifecycleCallbacks {
-            override fun onActivityResumed(activity: Activity) = ForegroundActivityTracker.onResumed(activity)
+        app.registerActivityLifecycleCallbacks(
+            object : Application.ActivityLifecycleCallbacks {
+                override fun onActivityResumed(activity: Activity) = ForegroundActivityTracker.onResumed(activity)
 
-            // Pause alone does NOT clear the tracker: a translucent activity
-            // or a dialog over us still leaves the window visible - the
-            // WebView renders and solves fine behind it. Only a STOP
-            // (fully covered / backgrounded) ends usability.
-            override fun onActivityPaused(activity: Activity) = Unit
+                // Pause alone does NOT clear the tracker: a translucent activity
+                // or a dialog over us still leaves the window visible - the
+                // WebView renders and solves fine behind it. Only a STOP
+                // (fully covered / backgrounded) ends usability.
+                override fun onActivityPaused(activity: Activity) = Unit
 
-            override fun onActivityStopped(activity: Activity) = ForegroundActivityTracker.onStopped(activity)
+                override fun onActivityStopped(activity: Activity) = ForegroundActivityTracker.onStopped(activity)
 
-            override fun onActivityDestroyed(activity: Activity) = ForegroundActivityTracker.onStopped(activity)
+                override fun onActivityDestroyed(activity: Activity) = ForegroundActivityTracker.onStopped(activity)
 
-            override fun onActivityCreated(activity: Activity, savedInstanceState: android.os.Bundle?) = Unit
-            override fun onActivityStarted(activity: Activity) = Unit
-            override fun onActivitySaveInstanceState(activity: Activity, outState: android.os.Bundle) = Unit
-        })
+                override fun onActivityCreated(
+                    activity: Activity,
+                    savedInstanceState: android.os.Bundle?,
+                ) = Unit
+
+                override fun onActivityStarted(activity: Activity) = Unit
+
+                override fun onActivitySaveInstanceState(
+                    activity: Activity,
+                    outState: android.os.Bundle,
+                ) = Unit
+            },
+        )
     }
 }

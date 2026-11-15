@@ -156,7 +156,7 @@ class TocChapterDto(
 
 // =============================== Reader ================================
 
-/** The reader's own `<img>` sources: `"appImages":[{mobile,desktop}]`. 
+/** The reader's own `<img>` sources: `"appImages":[{mobile,desktop}]`.
  * signed-filename AVIF URLs on `app.<host>` that fetch directly from any
  * client (the signature rides in the file name). */
 @Serializable
@@ -213,7 +213,7 @@ class ChapterMapPlanDto(
 
     /**
      * The per-slot rects: absolute when the map ships them (count must
-     * match the draw slots), derived from [mode] otherwise. Never empty. 
+     * match the draw slots), derived from [mode] otherwise. Never empty.
      * callers check the size against [pieces].
      */
     fun effectiveRects(width: Int, height: Int): List<ChapterMapRectDto> {
@@ -263,7 +263,7 @@ class ChapterMapPlanDto(
             }
         }
 
-        // Fallback: equal horizontal slices (the site's default branch. 
+        // Fallback: equal horizontal slices (the site's default branch.
         // count = the draw slots, remainder to the first slices).
         val sliceHeights = splitWithRemainder(h, slotCount)
         val tops = runningOffsets(sliceHeights)
@@ -312,7 +312,7 @@ class ChapterMapRectDto(
 // ============================== Chapters API ============================
 
 /**
- * GET /api/public/chapters?contentId={id}&page={n}&limit=50. 
+ * GET /api/public/chapters?contentId={id}&page={n}&limit=50.
  * `{chapters:[...], total, hasMore}`. Newest first, dates included. The
  * server caps `limit` at 50. Works for client-rendered series too.
  */

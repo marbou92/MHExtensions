@@ -66,7 +66,6 @@ import java.util.concurrent.atomic.AtomicLong
 abstract class MangaTaro :
     HttpSource(),
     ConfigurableSource {
-
     override val supportsLatest = true
 
     private val preferences: SharedPreferences by getPreferencesLazy()
@@ -78,7 +77,6 @@ abstract class MangaTaro :
         .addInterceptor(::serverClockInterceptor)
         .rateLimit(3)
         .build()
-
 
     private val serverClockOffsetMs = AtomicLong(UNSET_OFFSET)
 

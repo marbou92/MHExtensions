@@ -261,7 +261,6 @@ private const val MIN_COVER = 0.95f
 
 private const val MIN_COVER_SLAB = 0.85f
 
-
 /** Word tokens of a normalized string (letters/digits/plus kept). */
 private val CHROME_TOKEN = Regex("""[a-z0-9+]+""")
 

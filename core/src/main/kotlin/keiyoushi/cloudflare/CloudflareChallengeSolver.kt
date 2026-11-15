@@ -27,7 +27,6 @@ import kotlin.concurrent.withLock
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.minutes
 
-
 /** True when [response] is a Cloudflare managed challenge (official detection). */
 fun Response.isCloudflareChallenge(): Boolean {
     // The authoritative marker. Cloudflare sets it on every managed challenge.
@@ -142,7 +141,6 @@ class CloudflareSolverInterceptor(
     /** Hosts (registrable domain + subdomains) this solver handles. */
     private val cookieHosts: Set<String>,
 ) : Interceptor {
-
     /** One solve at a time per source; parallel challenged requests queue here. */
     private val solveLock = ReentrantLock()
 
@@ -217,7 +215,7 @@ class CloudflareSolverInterceptor(
         var solvedRecently = false
         solveLock.withLock {
             // Parallel challenged requests queue on this lock; whoever enters
-            // right after a successful solve must NOT wipe the fresh cookie. 
+            // right after a successful solve must NOT wipe the fresh cookie.
             // just retry on it.
             if (System.currentTimeMillis() - lastSolveAt > SOLVE_DEDUPE_MS) {
                 // Up to two rounds: some challenges simply clear on the
@@ -569,7 +567,6 @@ class CloudflareSolverInterceptor(
             .readTimeout(15, TimeUnit.SECONDS)
             .build()
     }
-
 
     /**
      * Runs a silent verify solve when the stored clearance predates

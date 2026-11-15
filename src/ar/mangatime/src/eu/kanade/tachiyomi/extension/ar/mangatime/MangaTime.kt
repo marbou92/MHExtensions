@@ -70,7 +70,6 @@ import kotlin.math.roundToInt
 abstract class MangaTime :
     KeiSource(),
     ConfigurableSource {
-
     // =============================== Setup ===============================
 
     private val preferences: SharedPreferences = getPreferences()
@@ -191,7 +190,7 @@ abstract class MangaTime :
      * The verified searchSeries superjson input. Unused optional fields are
      * listed in meta.values as undefined AND stay null in the JSON skeleton
      * (the exact shape the site's own client sends); a field this request
-     * actually uses gets its real value and is REMOVED from meta.values. 
+     * actually uses gets its real value and is REMOVED from meta.values.
      * a path left behind would force the value back to undefined.
      */
     private fun buildSearchInput(

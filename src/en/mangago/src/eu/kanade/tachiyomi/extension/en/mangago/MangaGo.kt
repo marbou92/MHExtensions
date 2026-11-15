@@ -56,7 +56,6 @@ import kotlin.time.Duration.Companion.seconds
 abstract class MangaGo :
     HttpSource(),
     ConfigurableSource {
-
     override val supportsLatest = true
 
     private val preferences: SharedPreferences by getPreferencesLazy()
@@ -354,7 +353,6 @@ abstract class MangaGo :
         val expected: Int = 0,
         val page: Int = 0,
     )
-
 
     override fun pageListRequest(chapter: SChapter): Request = GET(getChapterUrl(chapter), headers)
 

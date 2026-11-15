@@ -37,7 +37,7 @@ import kotlin.math.roundToInt
  * Hijala (hijala.com). MangaThemesia, Arabic (حجالة).
  *
  * Beyond the stock MangaThemesia parse (plus the site's split-slice page
- * unscrambler), this source ships the family's Comix/MangaDot details block. 
+ * unscrambler), this source ships the family's Comix/MangaDot details block.
  * the same options ProComic, MangaTime and Kawaiimanga carry:
  *
  *   - an organized description: the theme's 0..10 rating rendered as the
@@ -52,7 +52,6 @@ import kotlin.math.roundToInt
 abstract class Hijala :
     MangaThemesia(),
     ConfigurableSource {
-
     private val preferences: SharedPreferences = getPreferences()
 
     override fun OkHttpClient.Builder.configureClient() = addInterceptor(::scrambledImageInterceptor)

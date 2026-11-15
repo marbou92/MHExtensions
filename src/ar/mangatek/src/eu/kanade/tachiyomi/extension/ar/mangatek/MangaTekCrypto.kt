@@ -6,7 +6,6 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-
 /**
  * Computes the SHA-256 digest of this [ByteArray].
  *

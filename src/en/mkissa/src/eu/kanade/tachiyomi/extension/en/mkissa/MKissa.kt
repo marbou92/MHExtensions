@@ -49,7 +49,6 @@ import kotlin.time.Duration.Companion.seconds
 abstract class MKissa :
     KeiSource(),
     ConfigurableSource {
-
     private val preferences = getPreferences()
 
     private val apiHost = "api.mkissa.net"
@@ -364,7 +363,6 @@ abstract class MKissa :
         SMangaUpdate(detailsDeferred.await(), chaptersDeferred.await())
     }
 
-
     override suspend fun getPageList(chapter: SChapter): List<Page> {
         // url format: "/manga/<mangaId>/chapter-<chapterString>-<translation>"
         // (blank segments filtered so leading/trailing slashes don't matter)
@@ -593,7 +591,6 @@ abstract class MKissa :
                         return@interceptRequest response
                     }
                 }
-
             }
             null
         }
@@ -641,7 +638,7 @@ abstract class MKissa :
                         modalPolls++
 
                         // 12s without a token: switch the modal to the Google
-                        // reCAPTCHA provider (the site's own footer button. 
+                        // reCAPTCHA provider (the site's own footer button.
                         // plain DOM, fully scriptable).
                         if (modalPolls == PROVIDER_SWITCH_POLL && !providerSwitched) {
                             providerSwitched = true

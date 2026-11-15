@@ -23,7 +23,6 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 internal object OcrHarvest {
-
     /** DOM-scraped box in FRACTION space (relative to the page's visible image frame). */
     @Serializable
     private class DomBox(val x: Float, val y: Float, val w: Float, val h: Float, val t: String)
@@ -397,7 +396,6 @@ internal object OcrHarvest {
             loadUrl(chapterUrl)
         }
     }
-
 
     /**
      * One at a time, at most two attempts per visit: take the observed gate

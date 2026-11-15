@@ -13,9 +13,7 @@ import java.io.IOException
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-
 internal object ComixWebView {
-
     private const val WEBVIEW_TIMEOUT_SECONDS = 120L
 
     /** Chapter-list pages fetched per session (matches the old native cap). */

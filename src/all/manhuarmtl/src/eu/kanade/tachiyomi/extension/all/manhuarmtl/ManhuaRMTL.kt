@@ -66,7 +66,6 @@ import kotlin.math.roundToInt
 abstract class ManhuaRMTL :
     Madara(),
     ConfigurableSource {
-
     override val mangaSubString = "manga"
 
     /**
@@ -130,7 +129,7 @@ abstract class ManhuaRMTL :
 
     /**
      * Document-shaped fingerprint for every HTML page request. The CF solver
-     * only fills in sec-fetch-* headers that are MISSING (and its defaults. 
+     * only fills in sec-fetch-* headers that are MISSING (and its defaults.
      * dest=empty / mode=cors. Describe an XHR, not a navigation), so a page
      * fetch without these read as a script making CORS calls to document
      * URLs: a strong bot signal that kept the site challenge-prone.
@@ -367,7 +366,7 @@ abstract class ManhuaRMTL :
         }
 
         // Every fetch failed (challenge the app couldn't clear, hard 429s…).
-        // Ship the built-in genre list so the Genres filter still works. 
+        // Ship the built-in genre list so the Genres filter still works.
         // "press Reset" replaces it with the live list once the site answers.
         return FilterTaxonomyDto(
             genres = fallbackGenres.map { GenreRoute(it.first, it.second, "/genre/${it.second}/") },
@@ -841,7 +840,7 @@ abstract class ManhuaRMTL :
     }
 
     private fun parseOcrCredentials(html: String): OcrCredentials? {
-        // Any JS array literal of strings/numbers on one logical line. 
+        // Any JS array literal of strings/numbers on one logical line.
         // candidates are filtered by role matching below, so over-matching
         // is harmless (worst case: an array without an OCR URL is skipped).
         val arrayRegex = Regex("""\[\s*"(?:[^"\\]|\\.)*"(?:\s*,\s*(?:"(?:[^"\\]|\\.)*"|\d+))+\s*\]""")
@@ -1070,7 +1069,6 @@ abstract class ManhuaRMTL :
         }
     }
 
-
     private fun resolveHarvestResult(result: OcrHarvest.HarvestResult, readingPageUrl: String): List<OcrPage>? {
         for (candidate in result.payloadCandidates) {
             val pages = parseOcrPayload(candidate)
@@ -1184,7 +1182,7 @@ abstract class ManhuaRMTL :
                         }
                         break
                     } catch (_: Exception) {
-                        // Transient (gate still blocking, page fetch choked). 
+                        // Transient (gate still blocking, page fetch choked).
                         // the next spaced attempt takes over.
                     }
                 }
@@ -1194,7 +1192,6 @@ abstract class ManhuaRMTL :
             }
         }
     }
-
 
     /** Chapters whose top-up rounds proved the site has nothing more. */
     private val exhaustedChapters = ConcurrentHashMap<String, Boolean>()
@@ -1559,7 +1556,6 @@ abstract class ManhuaRMTL :
             .forEach { (key, _) -> editor.remove(key) }
     }
 
-
     // In-flight translation requests, deduplicated so the image interceptor
     // can piggyback on the background prefetch instead of doing its own
     // serial network calls (which used to hold every page response hostage
@@ -1793,7 +1789,7 @@ abstract class ManhuaRMTL :
 
     /**
      * One throttled, retried batch round-trip to the dict-chrome-ex endpoint.
-     * Returns one result per input (null where a string failed). 
+     * Returns one result per input (null where a string failed).
      * deliberately NOT caching a fallback, which used to permanently render
      * English over a chapter the user asked for in Arabic.
      */

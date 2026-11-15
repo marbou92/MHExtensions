@@ -30,7 +30,6 @@ import java.util.TimeZone
 abstract class MangaBall :
     KeiSource(),
     ConfigurableSource {
-
     override val name = "MangaBall"
 
     override val supportsLatest = true
@@ -165,7 +164,7 @@ abstract class MangaBall :
             // rating / created_at / name) and sort_order (asc / desc). The
             // site's advanced-search page forwards exactly these. The old
             // single `sort=views_desc` parameter was silently IGNORED (every
-            // browse list fell back to the server's default crawl order. 
+            // browse list fell back to the server's default crawl order.
             // which is why Popular and Latest looked identical for months).
             addQueryParameter("sort_by", sort.substringBefore(':'))
             addQueryParameter("sort_order", sort.substringAfter(':', "desc"))

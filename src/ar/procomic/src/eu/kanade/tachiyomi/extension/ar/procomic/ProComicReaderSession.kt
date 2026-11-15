@@ -12,7 +12,6 @@ import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
 internal object ProComicReaderSession {
-
     private const val POLL_MS = 600L
 
     /** Quiet ticks (no growth in mounted rows) before the session resolves. */
@@ -208,7 +207,6 @@ internal object ProComicReaderSession {
                         }
                     }
 
-
                     val growthKey = "${state["rows"]}:${state["loaded"]}"
                     if (growthKey != lastGrowthKey) {
                         lastGrowthKey = growthKey
@@ -256,8 +254,6 @@ internal object ProComicReaderSession {
         return ReaderSessionHarvest(ordered, notes, capturedRows.toMap())
     }
 
-
-
     /** One captured layer: a JPEG data url plus its rect relative to the row. */
     @Serializable
     internal data class CapturedTile(val d: String, val x: Int, val y: Int, val w: Int, val h: Int)
@@ -271,7 +267,6 @@ internal object ProComicReaderSession {
 
     /** Rows whose in-page capture answered the 'failed' tombstone. */
     private val failedPix = HashSet<String>()
-
 
     /** Pull attempts per pending key (a capture that never lands stops trying). */
     private val pixAttempts = HashMap<String, Int>()
@@ -590,7 +585,7 @@ internal object ProComicReaderSession {
                 // window.__mihonSeg. With a target set (the band draw
                 // pass. Latched until the walk reached the end), the
                 // requested band of that row is PLACED at the viewport
-                // top. Window first, then inner scrollable ancestors. 
+                // top. Window first, then inner scrollable ancestors.
                 // and the placed top is reported (tvy). Without a target
                 // the walk continues: the last row into view, one beat
                 // deeper every tick, so the site's reader mounts its rows

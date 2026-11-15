@@ -50,7 +50,6 @@ import kotlin.math.roundToInt
 abstract class ProComic :
     KeiSource(),
     ConfigurableSource {
-
     // =============================== Setup ===============================
 
     private val preferences: SharedPreferences = getPreferences()
@@ -155,7 +154,6 @@ abstract class ProComic :
     }
 
     private fun parseDate(raw: String?): Long = dateFormat.tryParse(raw?.substringBefore('.')?.take(19))
-
 
     private fun chapterPageUrl(ref: ChapterRef): String = "$baseUrl/ar/chapter/${ref.seriesSlug}-${ref.chapterNumber}-${ref.chapterId}"
 
@@ -323,7 +321,7 @@ abstract class ProComic :
         year: String = "",
     ): MangasPage {
         val data = searchSeries(query, sort, page, type, genres, year)
-        // Novel rows are dropped: text chapters, client-rendered pages. 
+        // Novel rows are dropped: text chapters, client-rendered pages.
         // nothing a reader can show.
         val rows = data.data.filterNot { it.type.equals("novel", true) }
         val hasNext = when (val pages = data.meta?.pages) {
@@ -737,7 +735,7 @@ abstract class ProComic :
 
         // Full TOC lives on the newest chapter's reader page (one request,
         // SSR series only). Client-rendered series have no recent rows to
-        // anchor that request, and their reader route is client-side too. 
+        // anchor that request, and their reader route is client-side too.
         // for those the public chapters API is the full-TOC source.
         var toc: List<TocChapterDto> = newestChapter?.let { chapter ->
             val number = chapter.chapter_number ?: ""
@@ -871,7 +869,7 @@ abstract class ProComic :
     }
 
     /**
-     * GET /api/public/chapters?contentId={seriesId}&page={n}&limit=50. 
+     * GET /api/public/chapters?contentId={seriesId}&page={n}&limit=50.
      * `{chapters:[...], hasMore}`. Newest first, dates included. The server
      * caps `limit` at 50; page through until `hasMore` flips false.
      */
@@ -1030,7 +1028,7 @@ abstract class ProComic :
         // The site-gated CDN era: pages that ride only the raw cdn{1-4}
         // hosts cannot be fetched WebView-free at all (the origin 403s
         // every non-browser client, and their lawful signed route needs a
-        // browser session). Listing them renders permanent error cards. 
+        // browser session). Listing them renders permanent error cards.
         // the reader gets the loadable pages only, with the drop named
         // in logcat and /.diag. A raw-ONLY flight still ships everything
         // (the legacy guard inside [partitionLoadablePages]).
@@ -1322,7 +1320,7 @@ abstract class ProComic :
             )
     }.getOrDefault(false)
 
-    /** The reader's own `<img>` sources: `"appImages":[{mobile,desktop}]`. 
+    /** The reader's own `<img>` sources: `"appImages":[{mobile,desktop}]`.
      * signed-filename AVIF URLs on `app.<host>` that fetch directly from
      * any client (200 for plain okhttp/curl TLS on every
      * probed chapter, the signature carried in the file name; mobile and
@@ -1344,7 +1342,6 @@ abstract class ProComic :
         }.getOrDefault(emptyList())
     }
 
-
     /** Everything getPageList extracts from one reader flight. */
     private class PagesPayload(
         val upstreams: List<String>,
@@ -1356,7 +1353,7 @@ abstract class ProComic :
 
     internal class PlannedMap(
         val chapterId: Int,
-        /** The page's ABSOLUTE index in the chapter (public base + ordinal). 
+        /** The page's ABSOLUTE index in the chapter (public base + ordinal).
          * exactly the `pageIndex` the site's own plan POST sends. */
         val pageIndex: Int,
         val token: String,
@@ -2218,7 +2215,7 @@ abstract class ProComic :
         const val PREF_READER_SESSION = "pref_reader_session_optin_v142"
 
         /** The reader-session failure breaker: N consecutive sessions that
-         * yielded nothing pause the session for the cooldown window. 
+         * yielded nothing pause the session for the cooldown window.
          * chapter opens stay fast and browser-free until it lapses. */
         const val SESSION_FAILURE_LIMIT = 3
         const val SESSION_COOLDOWN_MS = 30L * 60_000L
@@ -2240,7 +2237,6 @@ private class ProComicChallengeInterceptor(
     private val cookieHosts: Set<String>,
     private val safeMode: () -> Boolean,
 ) : Interceptor {
-
     /** The library solver only loads when the user opts out of safe
      * mode. Lazy keeps the safe path free of any WebView dependency. */
     private val webviewSolver: Interceptor by lazy { CloudflareSolverInterceptor(cookieHosts) }
