@@ -97,7 +97,7 @@ class SearchDto(
         val releaseYear: Int? = null,
         val chapterCount: Int? = null,
         // Search documents send views as a bare number ("views": 10265475)
-        // while other endpoints send strings ("16M") — accept both.
+        // while other endpoints send strings ("16M"). Accept both.
         @Serializable(with = StringOrNumberSerializer::class)
         val views: String? = null,
         val poster: String? = null,
@@ -134,7 +134,7 @@ class MangaPage(
     val poster: PosterDto? = null,
     val released: Long? = null,
     val scanlators: List<ScanlatorDto> = emptyList(),
-    // NOTE: `totalChapterCount` is deliberately NOT declared — the API sends
+    // NOTE: `totalChapterCount` is deliberately NOT declared. The API sends
     // it as an inconsistent numeric type (sometimes "112.7"), which crashed
     // strict Int parsing with JsonDecodingException. Unknown keys are skipped.
     val chapters: List<ChapterDto> = emptyList(),
@@ -233,7 +233,7 @@ class PageDto(
 
 /**
  * Page image paths live under `/static/` on the CDN. Paths that already
- * contain `static/` are kept as-is so previously working URLs stay stable.
+ * contain `static/` are kept as-is so working URLs stay stable.
  */
 fun List<PageDto>.toPageList(cdnBase: String): List<eu.kanade.tachiyomi.source.model.Page> = mapIndexed { index, dto ->
     val path = dto.image.trim()

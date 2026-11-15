@@ -13,14 +13,14 @@ import java.io.IOException
  * Hardens every request to look like a real browser XHR, which is what Cloudflare's
  * bot scoring actually checks beyond the `cf_clearance` cookie:
  *
- * 1. **Browser fingerprint headers** — `sec-fetch-*`, `sec-ch-ua*` client hints
+ * 1. **Browser fingerprint headers**. `sec-fetch-*`, `sec-ch-ua*` client hints
  *    (derived from the request's own user agent, so the versions always match the
  *    WebView that solved the challenge), `accept-language` and a proper `accept`.
- * 2. **Cookie sync** — explicitly attaches WebView cookies (`cf_clearance`,
+ * 2. **Cookie sync**. Explicitly attaches WebView cookies (`cf_clearance`,
  *    `__cf_bm`, session cookies) to requests for the protected hosts. Belt and
  *    braces on top of the app's cookie jar; guarantees clearance cookies flow even
  *    after a WebView solve mid-session.
- * 3. **Smart retry** — detects Cloudflare block responses (403/429/503 with
+ * 3. **Smart retry**. Detects Cloudflare block responses (403/429/503 with
  *    `cf-mitigated` / `server: cloudflare` headers) and retries with backoff,
  *    honouring `Retry-After`. Survives short rate-limit windows without failing
  *    the whole refresh.
@@ -45,7 +45,7 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 1. Cookie sync — attach WebView cookies (cf_clearance, __cf_bm, ...)
+    // 1. Cookie sync. Attach WebView cookies (cf_clearance, __cf_bm, ...)
     // ------------------------------------------------------------------------
 
     private fun cookieSyncInterceptor(chain: Interceptor.Chain): Response {
@@ -68,7 +68,7 @@ class CloudflareBypass(
     }
 
     // ------------------------------------------------------------------------
-    // 2. Browser fingerprint — sec-fetch-* + client hints derived from the UA
+    // 2. Browser fingerprint. Sec-fetch-* + client hints derived from the UA
     // ------------------------------------------------------------------------
 
     private fun fingerprintInterceptor(chain: Interceptor.Chain): Response {
