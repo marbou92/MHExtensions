@@ -40,7 +40,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 /**
- * MangaDar (mangadar.com) — Arabic manga platform (مانجا تايم).
+ * MangaDar (mangadar.com). Arabic manga platform (مانجا تايم).
  *
  * The web app is a Vite-built SPA wrapped with Capacitor; every piece of
  * data goes through a same-origin tRPC gateway (superjson, batch=1):
@@ -51,22 +51,22 @@ import kotlin.math.roundToInt
  *   /api/trpc/content.getChapterPagesWeb   (reader pages, absolute URLs)
  *   /api/trpc/content.getGenres            (filter genres)
  *
- * mangadar.com — this source's own domain — is the SAME platform behind a
- * Cloudflare challenge: its HTML AND its API paths answer 403 "Just a
- * moment..." to non-browser clients (verified 2026-10). The sister domain
+ * mangadar.com. This source's own domain. Is the SAME platform behind a
+ * Cloudflare challenge: its HTML and its API paths answer 403 "Just a
+ * moment..." to non-browser clients. The sister domain
  * mangatime.org serves the identical backend with no challenge, and the
  * site's own web reader already talks to it, so this source (MangaTime's
  * exact code under the mangadar.com brand) points every network call there.
  *
  * superjson gotchas baked into buildSearchInput(): literal `null` for a
  * field the schema types as string|undefined is a 400, so absent fields are
- * marked undefined through meta.values paths — and a path listed there is
+ * marked undefined through meta.values paths. And a path listed there is
  * FORCED undefined server-side, so a field carrying a real value must be
  * removed from meta.values again. The verified recipe keeps nulls in the
  * JSON skeleton AND lists the unused paths in meta.values.
  *
  * Details follow the MangaDot description layout: star rating, a meta info
- * line, the synopsis, a Links section and the alternative names — the same
+ * line, the synopsis, a Links section and the alternative names. The same
  * block ProComic ships, driven by the same five options.
  */
 @Source
@@ -83,7 +83,7 @@ abstract class MangaDar :
         readTimeout(60, TimeUnit.SECONDS)
         writeTimeout(30, TimeUnit.SECONDS)
         // The platform sits behind Cloudflare and the edge 403s some client
-        // populations (region/POP dependent — the device-side "chapter
+        // populations (region/POP dependent. The device-side "chapter
         // listing fails while the browser works" class). Solve challenges
         // in-app the same way ProComic does instead of failing the call.
         addInterceptor(CloudflareSolverInterceptor(setOf(apiBase.toHttpUrl().host)))
@@ -96,8 +96,8 @@ abstract class MangaDar :
 
     /**
      * API + image origin. mangadar.com challenges Cloudflare on its API
-     * paths (403 verified 2026-10), so every network call goes to the
-     * platform's canonical origin — the same backend the site's own reader
+     * paths, so every network call goes to the
+     * platform's canonical origin. The same backend the site's own reader
      * uses.
      */
     private val apiBase = "https://mangatime.org"
@@ -199,7 +199,7 @@ abstract class MangaDar :
      * The verified searchSeries superjson input. Unused optional fields are
      * listed in meta.values as undefined AND stay null in the JSON skeleton
      * (the exact shape the site's own client sends); a field this request
-     * actually uses gets its real value and is REMOVED from meta.values —
+     * actually uses gets its real value and is REMOVED from meta.values. 
      * a path left behind would force the value back to undefined.
      */
     private fun buildSearchInput(
@@ -393,7 +393,7 @@ abstract class MangaDar :
         // Entries whose url holds the platform's mongo id instead of the slug
         // (older library writes / host-app migrations) 404 on getSeriesBySlug:
         // recover the slug from the browse API by matching the id, then load
-        // details by slug — the healed slug flows back so every later refresh
+        // details by slug. The healed slug flows back so every later refresh
         // is a plain slug lookup again.
         val slug = if (isSeriesId(manga.url)) {
             healSlugById(manga.url, manga.title)
@@ -421,7 +421,7 @@ abstract class MangaDar :
         }
     }
 
-    /** A 24-char lowercase-hex string — the platform's mongo series id shape. */
+    /** A 24-char lowercase-hex string. The platform's mongo series id shape. */
     private fun isSeriesId(raw: String): Boolean = raw.length == 24 && raw.all { it.isDigit() || it in 'a'..'f' }
 
     /** Recovers the slug for a series known only by its mongo id, via the
@@ -468,8 +468,8 @@ abstract class MangaDar :
                 },
             )
         }.toString()
-        // One retry for the transient class (timeouts, 429/5xx) — a library
-        // refresh that loses a single chapter call to an edge hiccup used to
+        // One retry for the transient class (timeouts, 429/5xx). A library
+        // refresh that loses a single chapter call to an edge hiccup
         // surface as a broken listing.
         val chapters = retryTransient {
             val response = client.newCall(trpc("content.getChapters", input)).execute()
@@ -512,7 +512,7 @@ abstract class MangaDar :
     }
 
     private suspend fun resolveSeriesId(slugOrId: String): String {
-        // Entries whose url already IS the platform id skip the lookup —
+        // Entries whose url already IS the platform id skip the lookup. 
         // getChapters takes the id directly (only getSeriesBySlug insists
         // on the slug).
         if (isSeriesId(slugOrId)) return slugOrId
@@ -535,11 +535,11 @@ abstract class MangaDar :
     }
 
     /**
-     * Optional "combine duplicate chapters" — the same option ProComic ships.
+     * Optional "combine duplicate chapters". The same option ProComic ships.
      * The platform enforces unique chapter numbers today (recon probed two
      * long series and found none), but it re-imports catalogs, so the TOC
      * can carry repeats. When enabled, one entry per non-zero chapter
-     * number survives — the newest upload wins (the list is newest-first).
+     * number survives. The newest upload wins (the list is newest-first).
      */
     private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
         mutableListOf<SChapter>().apply {
