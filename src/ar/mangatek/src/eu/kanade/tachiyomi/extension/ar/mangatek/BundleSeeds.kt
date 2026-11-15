@@ -71,7 +71,7 @@ object BundleSeeds {
             val script = sites.joinToString(",", prefix = "$prelude JSON.stringify([", postfix = "])") {
                 "(() => { try { return String(${it.expression}) } catch (e) { return null } })()"
             }
-            val result = QuickJs.create().use { it.evaluate(script) } as? String
+            val result = evaluateScript(script)
                 ?: error("Reader script strings did not evaluate")
             val values = result.parseAs<List<String?>>().zip(sites)
                 .mapNotNull { (value, site) -> value?.let { site.position to it } }
@@ -183,6 +183,41 @@ object BundleSeeds {
             .minByOrNull { it.last - it.first } ?: js.indices
 
         private fun depth(position: Int): Int = blocks.count { position > it.first && position < it.last }
+    }
+
+    /**
+     * Runs the reader script and returns its JSON result.
+     *
+     * QuickJS is the fast path: Android ships it in the host app. Desktop
+     * hosts do not ship it, so GraalJS is used instead when the host has it.
+     * GraalJS is reached reflectively because the extension cannot compile
+     * against a dependency the Android host does not have.
+     */
+    private fun evaluateScript(script: String): String? {
+        var failure: Throwable? = null
+        for (engine in listOf<() -> String?>(::evaluateWithQuickJs, ::evaluateWithGraalJs)) {
+            try {
+                engine(script)?.let { return it }
+            } catch (t: Throwable) {
+                if (failure == null) failure = t
+            }
+        }
+        failure?.let { throw it }
+        return null
+    }
+
+    private fun evaluateWithQuickJs(script: String): String? = QuickJs.create().use { it.evaluate(script) as? String }
+
+    private fun evaluateWithGraalJs(script: String): String? {
+        val context = Class.forName("org.graalvm.polyglot.Context")
+            .getDeclaredConstructor()
+            .newInstance() as AutoCloseable
+        try {
+            val value = context.javaClass.getMethod("eval", String::class.java).invoke(context, script)
+            return value.javaClass.getMethod("asString").invoke(value) as? String
+        } finally {
+            runCatching { context.close() }
+        }
     }
 
     // Brace pairs of the source, skipping strings, templates, regex literals and comments
