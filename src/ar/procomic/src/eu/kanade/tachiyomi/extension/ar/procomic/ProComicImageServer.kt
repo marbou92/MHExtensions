@@ -900,6 +900,18 @@ internal class ProComicImageServer(
     }
 
     /**
+     * True when the host can decode images itself.
+     *
+     * The decoder is an Android class; a desktop host has no android.graphics
+     * at all, so the lookup itself fails there. Every caller treats that like
+     * a missing codec and lets the server-side transcode do the work.
+     */
+    private fun platformDecoderAvailable(): Boolean = runCatching {
+        BitmapFactory.Options()
+        true
+    }.getOrDefault(false)
+
+    /**
      * Platform BitmapFactory decode to JPEG bytes, with bounds and
      * sample-size discipline (JPEG/WebP/PNG everywhere; AVIF on Android
      * 12+. The decoder that already renders the covers). Null when the
@@ -989,6 +1001,13 @@ internal class ProComicImageServer(
                             diag.add("proxy/$host returned avif")
                             return@use
                         }
+                        // The platform decoder is an Android class. Without it
+                        // the JPEG weserv already produced (sized by the w/h
+                        // it was asked for) is served as it came.
+                        if (!platformDecoderAvailable()) {
+                            diag.add("proxy/$host served as-is ${jpegCandidate.size}B (no platform decoder)")
+                            return jpegCandidate
+                        }
                         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                         BitmapFactory.decodeByteArray(jpegCandidate, 0, jpegCandidate.size, bounds)
                         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
@@ -1034,9 +1053,11 @@ internal class ProComicImageServer(
     private fun budgetBoxOf(rawBytes: ByteArray?, maxEdge: Int, diag: Diag): Int {
         if (maxEdge > 0) return maxEdge
         val dims = rawBytes?.let { raw ->
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
-            if (bounds.outWidth > 0 && bounds.outHeight > 0) bounds.outWidth to bounds.outHeight else null
+            runCatching {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
+                if (bounds.outWidth > 0 && bounds.outHeight > 0) bounds.outWidth to bounds.outHeight else null
+            }.getOrNull()
         } ?: return 0
         val (w, h) = dims
         val pixels = w.toLong() * h.toLong()

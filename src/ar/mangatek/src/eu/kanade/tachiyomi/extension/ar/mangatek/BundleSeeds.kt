@@ -212,11 +212,13 @@ object BundleSeeds {
     private fun evaluateWithQuickJs(script: String): String? = QuickJs.create().use { it.evaluate(script) as? String }
 
     private fun evaluateWithGraalJs(script: String): String? {
-        val context = Class.forName("org.graalvm.polyglot.Context")
-            .getDeclaredConstructor()
-            .newInstance() as AutoCloseable
+        val contextClass = Class.forName("org.graalvm.polyglot.Context")
+        val builder = contextClass.getMethod("newBuilder", Array<String>::class.java)
+            .invoke(null, arrayOf("js"))
+        val context = builder.javaClass.getMethod("build").invoke(builder) as AutoCloseable
         try {
-            val value = context.javaClass.getMethod("eval", String::class.java).invoke(context, script)
+            val value = contextClass.getMethod("eval", String::class.java, CharSequence::class.java)
+                .invoke(context, "js", script)
             return value.javaClass.getMethod("asString").invoke(value) as? String
         } finally {
             runCatching { context.close() }
