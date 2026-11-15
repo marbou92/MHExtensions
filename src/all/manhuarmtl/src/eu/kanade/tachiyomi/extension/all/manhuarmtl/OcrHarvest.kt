@@ -22,77 +22,6 @@ import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-/**
- * v50 — passive OCR observatory + payload-channel revival.
- *
- * HISTORY (why the file looks like this):
- *  - v39 hooked fetch/XHR before the site's scripts ran; the site checks its
- *    own network functions for tampering and serves DECOYS to hooked pages.
- *    Hooking is a dead strategy on this site.
- *  - v40 "change nothing, read the result": the chapter loads in an
- *    UNMODIFIED WebView and read-only channels collect the outcome.
- *  - v45 added the runtime window scan + fraction-space DOM sweep.
- *  - v46 added the two-pass inner-container-aware traversal, iframe/shadow
- *    piercing and the image-load census.
- *  - v47 added the 600 ms poll, the pass-1 fast path and the census on the
- *    result line.
- *  - v48 added the mappable-frame census ("N frames").
- *  - v49 added foreground preemption, the quiet-settle early exit and the
- *    canvas/svg census (the decisive readout for WHERE text lives).
- *  - v50 (this file) revives the PAYLOAD channel, dead since the static
- *    vault left the HTML: field data proves the DOM sweep has a hard
- *    ceiling (27/38 and 93/150 pages — the site renders its complete set
- *    ~1s in, then stops), so the missing pages' text can only come from
- *    the site's own fetch-ocr.php response. Three read-only additions:
- *      (a) POST capture — shouldInterceptRequest sees the gate POST's
- *          HEADERS (X-Gate-Token/Nonce/Timestamp, Referer, Origin) even
- *          though the body stays hidden; captured for a replay.
- *      (b) context scan — read-only sweep for the runtime-minted
- *          {cid, ref} body pair (window state + inline HTML literals),
- *          widening v45's credential shape (which required an URL element
- *          the runtime array no longer carries).
- *      (c) replay — ONE direct POST with the captured headers + WebView
- *          cookies + the scanned body pair, parsed through the same
- *          parseOcrPayload as the GET tee. The site's own call is NEVER
- *          touched (always null from the interceptor — the WebView
- *          performs it itself); the replay is a separate request a few
- *          seconds later. A consumed credential just 403s and is logged.
- *  - v51 fixes three field-proven breaks (v50 log: "1/25 page images
- *    loaded", "harvest result: 1 pages, 1 boxes", ZERO wire2 lines):
- *      (1) SETTLE: the 2-quiet-tick close fired while page images were
- *          still loading — the page is SHORT until images lay out, so the
- *          walk "finished" in seconds and the visit closed ~4s in, before
- *          the site's OCR payload even rendered, with unmappable boxes.
- *          The fast close now requires the image census to complete
- *          (ld >= lt); a proven 20s stall escapes; a wire payload
- *          resolves early instead (it is scroll- and census-independent).
- *      (2) REPLAY PAIRS: only {cid, ref}-keyed OBJECTS fed the replay,
- *          but the runtime credentials are ARRAYS — and the site's own
- *          wire capture (token=false) proves the protocol dropped the
- *          token/URL slots the strict source-side parser still required.
- *          Pairs are now DERIVED from the arrays (cid = first non-URL
- *          string, ref = preferred 32-hex) and every hold/skip is logged
- *          — silence is a bug.
- *      (3) CENSUS LOGGING: the v50 build collected the frame/canvas/svg
- *          census but never printed it. It rides the result line again
- *          and progress is logged during the visit.
- *  - v52 fixes the replay's execution thread: the poll callback runs on
- *    the WebView's MAIN thread, so the v50/v51 replay threw
- *    NetworkOnMainThreadException on EVERY attempt (the v51 field log:
- *    "wire2: replay threw NetworkOnMainThreadException") and the payload
- *    channel never got its second chance. The replay now runs on its own
- *    daemon executor; the visit's wire fast path picks the result up on
- *    a later tick.
- *
- * THE PRINCIPLE — change nothing, read the result. Nothing on the page is
- * replaced or wrapped, so every Function.prototype.toString() integrity
- * check still passes. evaluateJs only READS DOM/storage/performance/window.
- *
- * Result precedence (resolveHarvestResult in the source): site-memory
- * payload → direct POST with runtime credentials → DOM fractions. Wire
- * boxes (tee/replay/storage) beat DOM boxes per filename inside
- * buildResult — they carry the gate's own coordinates.
- */
 internal object OcrHarvest {
 
     /** DOM-scraped box in FRACTION space (relative to the page's visible image frame). */
@@ -142,15 +71,9 @@ internal object OcrHarvest {
         .readTimeout(12.seconds)
         .build()
 
-    /** One harvest at a time — reader preloads can open several chapters at once. */
+    /** One harvest at a time. Reader preloads can open several chapters at once. */
     private val inFlight = AtomicBoolean(false)
 
-    /**
-     * Foreground preemption (v49): set by a foreground harvest while a
-     * background visit holds the slot; the running visit settles within one
-     * poll tick and returns its partials (nothing wasted — the background
-     * caller still merges them).
-     */
     private val preemptRequested = AtomicBoolean(false)
 
     /** OCR payload captured off the wire (tee/replay/storage). Gate space. */
@@ -165,14 +88,13 @@ internal object OcrHarvest {
     /** Runtime context-scan hits: {cid, ref} body pairs for the gate POST replay. */
     private val replayPairs = ConcurrentLinkedQueue<Pair<String, String>>()
 
-    /** Gate POST requests observed on the wire (headers only — bodies are hidden). */
+    /** Gate POST requests observed on the wire (headers only. Bodies are hidden). */
     private class WirePost(val url: String, val headers: Map<String, String>, val summary: String)
 
     private val wirePosts = ConcurrentLinkedQueue<WirePost>()
 
     private var replayAttempts = 0
 
-    /** v52: the replay runs OFF the main thread — one at a time. */
     private val replayInFlight = AtomicBoolean(false)
 
     private val replayExecutor = java.util.concurrent.Executors.newSingleThreadExecutor { runnable ->
@@ -183,30 +105,20 @@ internal object OcrHarvest {
     @Volatile
     private var censusSnapshot: String = ""
 
-    /** Logs the "replay held — no pair" note once per visit, not per tick. */
+    /** Logs the "replay held. No pair" note once per visit, not per tick. */
     @Volatile
     private var replayHoldLogged = false
 
-    /**
-     * v53: which harvest pass the DOM sweeps are running in. Pass 2 (after
-     * the scroll returned to the top and every image had a frame) is the
-     * page's settled layout state — boxes measured there are the truth, and
-     * a same-text pass-2 box replaces a pass-1 box even when they DON'T
-     * overlap ≥40% (a mid-entrance-animation box slides far from its final
-     * spot; the old overlap-only rule kept BOTH — the ghost burned as text
-     * squashed against the left edge while the real box sat in the bubble).
-     */
     @Volatile
     private var sweepPass = 1
 
-    /** v53: chapter URL of the running visit — the replay needs a Referer. */
     @Volatile
     private var currentChapterUrl: String = ""
 
     /**
      * DOM-scraped boxes, deduplicated across sweeps: filename → (key → box).
      * Same-text boxes that overlap replace the older entry (LATEST layout
-     * state wins) — sweeps during image lazy-loading used to leave stale
+     * state wins). Sweeps during image lazy-loading used to leave stale
      * ghost boxes behind, which burned as doubled, misaligned text.
      */
     private val domAccum = java.util.concurrent.ConcurrentHashMap<String, LinkedHashMap<String, DomBox>>()
@@ -221,25 +133,14 @@ internal object OcrHarvest {
     private const val MAX_TEE_BODY = 2_000_000
     private const val MAX_WINDOW_SCAN_TICKS = 25
 
-    /** Diagnostics build tag — one line per visit, so logs are attributable. */
+    /** Diagnostics build tag. One line per visit, so logs are attributable. */
     private const val DIAG_TAG = "v59"
 
-    /** v51 stalled-page escape hatch: ≥20 s old, ~5 s of total stillness. */
     private const val STALL_SETTLE_TICKS = 8
     private const val STALL_SETTLE_MIN_MS = 20_000L
 
     fun isBusy(): Boolean = inFlight.get()
 
-    /**
-     * Loads [chapterUrl] in an unmodified WebView and returns everything the
-     * site's own pipeline rendered/minted during the visit. Never throws.
-     * Blocking; safe from any non-main thread.
-     *
-     * v49: a foreground caller passes [preemptCurrent] to ask a running
-     * background visit to wrap up within one poll tick; it resolves with its
-     * partials (still merged by its own caller) and the foreground harvest
-     * proceeds. Wait cap: 12 × 1 s.
-     */
     fun harvest(chapterUrl: String, userAgent: String, preemptCurrent: Boolean = false): HarvestResult? {
         if (preemptCurrent && inFlight.get()) {
             preemptRequested.set(true)
@@ -318,7 +219,6 @@ internal object OcrHarvest {
             poll(POLL_MS.milliseconds) {
                 val elapsed = System.currentTimeMillis() - startAt
 
-                // ---- foreground preemption (v49): settle within one tick ----
                 if (preemptRequested.get()) {
                     OcrDiagnostics.record("harvest: preempted — returning partials to the background caller")
                     resolve(buildResult())
@@ -336,9 +236,6 @@ internal object OcrHarvest {
                             OcrDiagnostics.record("recon gate-ish URLs: ${hits.take(3).joinToString(" | ")}")
                         }
                         if (names.any { it.contains("challenge", true) }) sawChallenge = true
-                        // v50: response SIZES of the gate calls — decisive about
-                        // whether the endpoint returned more data than the DOM
-                        // rendered (site-side caps) or genuinely less.
                         val sizes = decodeSizes(decoded)
                         if (sizes.isNotEmpty()) {
                             val totalKb = sizes.sumOf { it.second } / 1024
@@ -383,7 +280,6 @@ internal object OcrHarvest {
                     }
                 }
 
-                // ---- channel 3b: gate POST replay (v50) ----
                 tryReplayPost()
 
                 // ---- channel 4: storage scan (once, after scripts had time) ----
@@ -411,9 +307,6 @@ internal object OcrHarvest {
                         if (sameScrollTicks >= 2) {
                             scrolledOut = true
                             if (pass == 1) {
-                                // v46: return to the top and re-sweep the now-
-                                // loaded page once — boxes over images that
-                                // loaded late are invisible during pass 1.
                                 pass = 2
                                 scrolledOut = false
                                 sameScrollTicks = 0
@@ -432,9 +325,6 @@ internal object OcrHarvest {
                     val scan = decodeDomScan(decodeEval(raw))
                     val changed = addDomBoxes(scan.p)
                     if (changed == 0) domQuietTicks++ else domQuietTicks = 0
-                    // v51: honest counters — noNewBoxesTicks resets when boxes
-                    // actually changed (its name promises that), and both
-                    // stall counters reset when the census moves.
                     if (changed > 0) noNewBoxesTicks = 0
                     if (scan.ld != lastLoaded) {
                         noNewImagesTicks = 0
@@ -455,8 +345,6 @@ internal object OcrHarvest {
                             "dom: ${scan.ld}/${scan.lt} page images loaded — boxes over unloaded images are invisible",
                         )
                     }
-                    // v51: census progress is visible in the paste — a visit
-                    // that never finished loading is diagnosable at a glance.
                     if (scan.lt > 0 && (scan.lt > lastCensusLt + 9 || scan.ld > lastCensusLd + 9)) {
                         lastCensusLt = scan.lt
                         lastCensusLd = scan.ld
@@ -475,20 +363,11 @@ internal object OcrHarvest {
                 val haveWire = wirePages.isNotEmpty()
                 val haveRuntime = runtimePayloads.isNotEmpty() || runtimeCreds.isNotEmpty()
                 val haveDom = synchronized(domLock) { domAccum.isNotEmpty() }
-                // v51: the census gates the fast close. A page whose images
-                // are still loading is NOT done — boxes are unmappable until
-                // each image has a frame, which is exactly how a ~4s visit
-                // ended with "1 page, 1 box" on a 56-page chapter.
                 val censusComplete = lastLt == 0 || lastLd >= lastLt
                 val settled = scrolledOut && domQuietTicks >= 2 && censusComplete
-                // v51 stalled-page escape: genuinely still for ~5s after 20s
-                // (a stuck CDN must not burn the whole budget every visit).
                 val stalled = elapsed >= STALL_SETTLE_MIN_MS &&
                     noNewBoxesTicks >= STALL_SETTLE_TICKS &&
                     noNewImagesTicks >= STALL_SETTLE_TICKS
-                // v51 wire fast path: the payload channel answered and the
-                // DOM stopped changing — wire data is gate-space and beats
-                // DOM fractions, no reason to keep walking.
                 val wireFast = haveWire && elapsed >= 5_000 && domQuietTicks >= 2
                 when {
                     wireFast -> resolve(buildResult())
@@ -519,19 +398,16 @@ internal object OcrHarvest {
         }
     }
 
-    // ==================== channel 3b: gate POST replay (v50) ====================
 
     /**
      * One at a time, at most two attempts per visit: take the observed gate
-     * POST (headers captured app-side — the platform never exposes the body)
+     * POST (headers captured app-side. The platform never exposes the body)
      * and the scanned {cid, ref} pair, and fire the SAME request the site's
      * own runtime just fired. A 200 with a parseable payload is the site's
-     * FULL OCR data for the chapter — often more than its DOM renders.
+     * full OCR data for the chapter. Often more than its DOM renders.
      */
     private fun tryReplayPost() {
         if (replayAttempts >= 2) return
-        // v52: one replay at a time; the executor's result lands
-        // asynchronously and later poll ticks pick it up via haveWire.
         if (!replayInFlight.compareAndSet(false, true)) return
         val post = wirePosts.poll()
         if (post == null) {
@@ -540,18 +416,13 @@ internal object OcrHarvest {
         }
         var pair = replayPairs.poll()
         if (pair == null) {
-            // v51: the runtime credentials are ARRAYS — derive the body pair
-            // from them when no keyed object was found. The site's current
-            // runtime mints arrays without the URL/token slots the v45 vault
-            // carried, so pairFromObj rarely fires anymore; without this the
-            // replay silently never ran (zero wire2 lines in the v50 log).
             pair = pairFromCredentialArrays()
             if (pair != null) {
                 OcrDiagnostics.record("wire2: {cid, ref} derived from a runtime credential array")
             }
         }
         if (pair == null) {
-            // Keep the observation queued for a later tick — the context scan
+            // Keep the observation queued for a later tick. The context scan
             // may not have found the pair yet.
             wirePosts.add(post)
             replayInFlight.set(false)
@@ -564,10 +435,6 @@ internal object OcrHarvest {
             return
         }
         replayAttempts++
-        // v52: the poll callback runs on the WebView's main thread — an
-        // execute() here throws NetworkOnMainThreadException on EVERY
-        // attempt, so the payload channel's second chance never fired.
-        // The POST now runs on its own daemon executor.
         replayExecutor.execute {
             try {
                 runReplayPost(post, pair)
@@ -577,7 +444,7 @@ internal object OcrHarvest {
         }
     }
 
-    /** The replay POST itself — runs on [replayExecutor], never the main thread. */
+    /** The replay POST itself. Runs on [replayExecutor], never the main thread. */
     private fun runReplayPost(post: WirePost, pair: Pair<String, String>) {
         try {
             val body = """{"cid":"${pair.first}","ref":"${pair.second}"}"""
@@ -597,9 +464,6 @@ internal object OcrHarvest {
             CookieManager.getInstance().getCookie(post.url)?.let {
                 builder.header("Cookie", it)
             }
-            // v53: the replay is a same-origin XHR from the chapter page — a
-            // captured header set without Origin/Referer reads as a cross-site
-            // bot call and earns a 403 before the body is even parsed.
             val postHttpUrl = post.url.toHttpUrlOrNull()
             if (postHttpUrl != null && post.headers.keys.none { it.equals("Origin", true) }) {
                 builder.header("Origin", "${postHttpUrl.scheme}://${postHttpUrl.host}")
@@ -635,15 +499,6 @@ internal object OcrHarvest {
         }
     }
 
-    /**
-     * v51: derives a {cid, ref} body pair from the runtime credential
-     * ARRAYS. Role mapping follows the v45 vault shapes but every slot
-     * except the two that form the POST body is optional:
-     *  - cid: the first non-URL, non-digit string (sent as-is, not decoded)
-     *  - ref: a 32-char hex when present, else the second-longest hex
-     *    (the longest hex slot was historically the token, which the
-     *    current protocol no longer sends — token=false on the wire).
-     */
     private fun pairFromCredentialArrays(): Pair<String, String>? {
         val hex = Regex("^[0-9a-fA-F]{16,64}$")
         for (raw in runtimeCreds) {
@@ -666,20 +521,6 @@ internal object OcrHarvest {
 
     // ==================== channel 1: runtime context scan ====================
 
-    /**
-     * READ-ONLY sweep over `window` and the document's own HTML looking for
-     * the shapes the site's runtime leaves behind:
-     *
-     *  - credential arrays (v45 shape, loosened in v50: the URL element the
-     *    old shape REQUIRED is no longer part of the runtime array) — handed
-     *    back for the source's direct gate POST;
-     *  - OCR payload objects — parsed directly, no network needed;
-     *  - {cid, ref} pairs (v50) — the gate POST body the site's JS mints at
-     *    runtime, found in window state or inline literals; feeds the replay.
-     *
-     * Nothing is replaced, wrapped or called — anti-tamper cannot observe
-     * property READS.
-     */
     private fun contextScanJs(): String = """
         (function(){
           try {
@@ -796,14 +637,6 @@ internal object OcrHarvest {
 
     // ==================== channel 3: GET tee + POST capture ====================
 
-    /**
-     * Pass-through tee for gate-shaped GET requests; v50 also CAPTURES the
-     * gate POST's headers (the body stays hidden, but the X-Gate-* credential
-     * headers ride the request). Runs on a WebView background thread; page JS
-     * sees an untouched stack either way — we either answer with the site's
-     * own bytes (fetched with the WebView's own headers + cookies) or return
-     * null and let the WebView proceed.
-     */
     private fun teeGateRequest(request: WebResourceRequest, chapterHost: String): WebResourceResponse? {
         val url = request.url ?: return null
         val urlString = url.toString()
@@ -820,8 +653,6 @@ internal object OcrHarvest {
         if (!ocrish || !sameSite) return null
         if (isMediaUrl(urlString)) return null
 
-        // v50: POST headers are VISIBLE app-side (only the body is hidden).
-        // Capture them for the replay and pass the site's own call through.
         if (!method.equals("GET", ignoreCase = true)) {
             OcrDiagnostics.record("recon: site $method → ${urlString.takeAfterSlash(120)}")
             if (wirePosts.size < 3) {
@@ -879,7 +710,7 @@ internal object OcrHarvest {
     /**
      * Adds swept boxes. Same-text boxes overlapping ≥ 40% of the smaller
      * one are the SAME overlay re-measured at a different moment (image
-     * lazy-load swaps, scrollbar-induced reflow, entrance animations) — the
+     * lazy-load swaps, scrollbar-induced reflow, entrance animations). The
      * newest measurement replaces the old one instead of piling up beside
      * it. Boxes identical to what's stored (within 0.4%) count as no-change
      * so the settle logic still converges.
@@ -900,9 +731,6 @@ internal object OcrHarvest {
                     var identical = false
                     for ((k, existing) in slot) {
                         if (existing.t != text) continue
-                        // v53: pass-2 measurements are the settled layout —
-                        // same text, ANY overlap → the old box is the same
-                        // overlay measured mid-load/mid-animation; replace it.
                         val settles = sweepPass >= 2
                         if (settles || fractionOverlap(existing, b) >= 0.4f) {
                             replacedKey = k
@@ -1001,14 +829,9 @@ internal object OcrHarvest {
     )
 
     // ==================== page-side read scripts ====================
-    // All of these ONLY READ. Nothing on the page is replaced or wrapped, so
+    // All of these only read. Nothing on the page is replaced or wrapped, so
     // native-function integrity checks still pass. Results are JSON strings.
 
-    /**
-     * v46/v49 scroll: window first; when the window refuses to move (the
-     * site's reader scrolls an INNER container) walk the scrollable divs.
-     * Returns "windowY" or "windowY|containerY" so stuck-detection works.
-     */
     private fun scrollJs(): String = """
         (function(){
           try {
@@ -1030,7 +853,6 @@ internal object OcrHarvest {
         })();
     """.trimIndent()
 
-    /** v46: reset BOTH scroll spaces for the second pass. */
     private fun scrollTopJs(): String = """
         (function(){
           try {
@@ -1047,7 +869,6 @@ internal object OcrHarvest {
 
     private fun challengeTitleJs(): String = "(function(){try{return document.title||''}catch(e){return ''}})()"
 
-    /** v46: iframe/title forensics for challenge pages. */
     private fun cfIframeDumpJs(): String = """
         (function(){
           try{
@@ -1067,11 +888,6 @@ internal object OcrHarvest {
         })();
     """.trimIndent()
 
-    /**
-     * v50 recon: resource names AND response sizes — "how many bytes did the
-     * site actually fetch for OCR" is the counterweight to "how many boxes
-     * did it render".
-     */
     private fun reconJs(): String = """
         (function(){
           try {
@@ -1116,16 +932,6 @@ internal object OcrHarvest {
         })();
     """.trimIndent()
 
-    /**
-     * The overlay sweep, v49. Shape-based by design (the site's markup
-     * namespace keeps changing): for every real page image, any visible
-     * element whose text sits on that image is a text box, recorded as a
-     * FRACTION of the image's visible frame (aspect-corrected). Sweeps the
-     * main document, same-origin IFRAMES and SHADOW ROOTS, and returns a
-     * census: { p: pages, lt: images total, ld: images loaded, lf: mappable
-     * frames, cv: frames with a canvas overlay, sv: frames with an svg
-     * overlay } — cv/sv answer WHERE the un-rendered pages' text lives.
-     */
     private fun domScrapeJs(): String = """
         (function(){
           try {
@@ -1183,7 +989,7 @@ internal object OcrHarvest {
               }
               if (!pages.length) return;
               framesTotal += pages.length;
-              // v49 census: frames carrying a canvas/svg overlay element.
+              // Counts frames carrying a canvas/svg overlay element.
               function overlayCount(tag) {
                 var n = 0;
                 try {
@@ -1285,7 +1091,6 @@ internal object OcrHarvest {
         arr.mapNotNull { (it as? JsonPrimitive)?.takeIf { p -> p.isString }?.content }
     }.getOrDefault(emptyList())
 
-    /** Decode the v50 recon {names, sized} envelope; falls back to a bare list. */
     private fun decodeSizes(decoded: String?): List<Pair<String, Long>> = runCatching {
         val obj = json.parseToJsonElement(decoded.orEmpty())
         if (obj !is kotlinx.serialization.json.JsonObject) return emptyList()
