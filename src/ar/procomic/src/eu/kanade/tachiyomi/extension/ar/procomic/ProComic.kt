@@ -46,301 +46,6 @@ import java.util.concurrent.TimeUnit
 import java.util.regex.Pattern
 import kotlin.math.roundToInt
 
-/**
- * ProComic (procomic.pro/ar) — Arabic Next.js site hosting manga, manhwa,
- * manhua and novels.
- *
- * Data paths:
- *   - browse/search/filter: GET /api/public/series/search (status=approved,
- *     limit, page, search, sort, type, year, includeGenres). The endpoint is
- *     "trusted" for requests that carry a non-empty `search` term and
- *     Turnstile-gated otherwise, so the source always sends one (`e` covers
- *     the overwhelmingly English-titled catalog for the popular tab).
- *     Novel-type rows are dropped everywhere: novel chapters are text and
- *     their pages render client-side, so they are unusable in a reader.
- *   - latest updates: the SSR flight payload of /ar/updates (18 groups with
- *     real chapter dates), with the paginated search API as fallback.
- *   - details: the SSR flight payload of the series page (`{"series":{...}}`
- *     with author/artist/year/descriptions.ar inside `metadata`). Series
- *     whose page renders client-side (no flight payload at all — the old
- *     chapter-list killer) fall back to the search API, matched by id.
- *   - chapters: the reader page of the series' newest chapter embeds the
- *     FULL chapter table of contents (ids, numbers, teams) — the series
- *     page only carries the latest 30 (with dates), which are merged in.
- *     Series that render client-side get their full TOC from the public
- *     chapters API (/api/public/chapters?contentId=...) instead.
- *   - pages (v101): the site moved to procomic.net and reworked the reader
- *     payload — every page now ships as a plain signed-filename AVIF in
- *     `appImages` (app.<host>), fetchable directly, and the old map-token
- *     protection (deferredMedia maps, /chapter-map-proxy-plan, session
- *     keys, the stitch server) is gone from the payload (`maps:[]`,
- *     `protectionV2:null`) and dead server-side (the .pro signing stack
- *     answers 403 forbidden — the device-side HTTP 502 wave). Pages are
- *     served through the loopback image server's /.image-proxy route
- *     (browser UA + AVIF→JPEG transcode) because host apps cannot be
- *     relied on to send browser headers or decode AVIF below Android 12.
- *   - pages (v105): the site is DUAL-HOMED — most series migrated to
- *     procomic.net, but a share of the catalog still lives on procomic.pro
- *     (their .net reader route 308s to the series page with no payload;
- *     the .pro route carries it, with appImages on app.procomic.pro). The
- *     reader fetch falls back across both apexes.
- *   - covers (v105): the search API switched a wave of series to RELATIVE
- *     thumbnail paths (`/224/image_series/...avif`) that only resolve on
- *     the row's cdn{N} host, and every cover is AVIF on a widening host
- *     pool (cdn{1-4}.procomic.net, app.procomic.net, app.procomic.pro,
- *     app.prochan.net). Covers now resolve through resolveCoverUrl() and
- *     ride the same loopback proxy as pages: browser UA (the raw cdn hosts
- *     403 app clients) + AVIF→JPEG transcode (Android 10/11 cannot decode
- *     AVIF) + the result cache. The proxy binds a FIXED preferred port so
- *     persisted thumbnail_url values survive process restarts.
- *   - covers/pages v106: the bundled software decoder (libavif/dav1d) is
- *     CRASH-LOOP-GATED — a native crash inside the JNI takes the whole host
- *     app down (1.6.19 crashed at chapter load, 1.6.20 at cover load, both
- *     on Android 10 arm64), so every native decode writes an attempt marker
- *     first and a stale marker at process start disables the tier (this
- *     session, permanently after two). Native output is ARGB_8888 only
- *     (the RGBA_F16 10-bit path was the crash surface) and images over ~25
- *     MP are refused before allocation. Covers additionally request a
- *     downscaled variant (?e=1280) so an "originals" cover never becomes a
- *     ~90 MB bitmap, and the result cache is byte-budgeted (32 MB).
- *   - pages/covers v107: the loader root cause is fixed — v104–v106 handed
- *     the server the HOST app's apk (there is no per-extension Context),
- *     so the bundled libavif_android.so was never actually found on any
- *     device and Android 10/11 stayed on the error page. The path is now
- *     the extension's own installed apk from the package manager, the
- *     loader scans every candidate (pm path + classloader dex paths) for
- *     the .so entry before loading, and the diag trail names each scanned
- *     zip with its per-file outcome.
- *   - pages/covers v108: the MediaCodec "video/av1" framework tier — and
- *     the field verdict: the host app CRASHED on every cover and page
- *     load. Android 10's brand-new c2.av1 software codec, configured at a
- *     still image's full size (pages 800x5000, "originals" covers to
- *     4000x6000), is a native-crash/OOM-kill surface no Java guard can
- *     catch; the marker breaker only gates after two process deaths.
- *   - pages/covers v109: the MediaCodec tier is REMOVED from the ladder
- *     and replaced with a WebView decode tier — the host's Chromium
- *     engine (AVIF since Chrome 85; Play auto-updates the WebView package
- *     even on Android 10) decodes the AVIF offscreen (data: URL on the
- *     main looper, JS size probe, draw into a software bitmap) and every
- *     failure mode is survivable: caught Java exceptions, bounded
- *     timeouts, or a sandboxed-renderer death that leaves the app alive.
- *     Ladder: BitmapFactory (12+) -> libavif (loader) -> WebView (24+)
- *     -> ImageDecoder (28+).
- *   - pages/covers v111 (supersedes that ladder): the WebView tier died
- *     in the field too, so the device runs NO AVIF decoder anymore — the
- *     loopback server re-fetches every image through the weserv proxy as
- *     plain JPEG (see ProtectedPageServer for the full story).
- *   - pages v112: the site capped the SSR page embed at the first
- *     `publicImageCount` pages (observed live: 3) and moved the rest
- *     behind Cloudflare Turnstile — its own browser reader solves the
- *     challenge in-page. The source now replays the site's own
- *     deferred-media credential chain (deferredMedia JWT + the
- *     x-chapter-pass header, with the refresh / image-pass renewals);
- *     while the gate holds, the public pages ship unchanged, and if the
- *     site ever relaxes it the full chapter appears with no update.
- *   - pages v113: the gate does not relax, so the source mints the
- *     missing credential itself — a throwaway offscreen WebView runs
- *     the site's exact Turnstile widget (same sitekey, same
- *     interaction-only appearance) on the site's own origin and hands
- *     the token to the deferred exchange (x-turnstile-token +
- *     x-turnstile-widget + the split param, all matching the reader's
- *     chunk). Crash safety is the v111 contract extended, not
- *     weakened: that WebView loads ONE page with blockNetworkImage set
- *     before anything loads, the page's only remote fetch is
- *     Cloudflare's challenge JS (no image, stylesheet or font
- *     resource exists on it), a sandboxed-renderer death is consumed
- *     via onRenderProcessGone, and the whole solve is bounded and
- *     always torn down. No AVIF byte can ever reach it — the decode
- *     path that killed v104–v110 does not exist in this build.
- *   - pages v114 (field verdict on v113): the mint never produced a
- *     token because the sitekey ROTATED. The reader never bakes the
- *     key — it fetches it per session from GET /api/auth/public-settings
- *     (`loginTurnstile.siteKey`; live 2026-10-28:
- *     0x4AAAAAACwjiJ5Kt0K0kWx9, while v113's baked key was already
- *     dead — a dead sitekey fails turnstile.render on the spot and
- *     retry:auto cannot recover). The gate config is now fetched LIVE
- *     per gate run: the sitekey plus the server's own turnstileMode
- *     from the 403 answer drive the widget (visible ->
- *     appearance:always + size:normal, hidden -> interaction-only +
- *     size:flexible — the reader chunk's exact per-mode config), the
- *     widget header becomes the reader's own "login" value, and the
- *     solver lays the WebView out with real pixels so the challenge
- *     iframe has a container box. Everything else is the v113 shape:
- *     the same image-free page, the same renderer-death contract, the
- *     same bounded teardown, and the same graceful fallback to the
- *     public pages.
- *   - pages v120 (field verdict on v118/v119: "it still crashes when it
- *     tries to fetch the number of pages a chapter has"): the one WebView
- *     surface OUTSIDE the v119 firewall is the LIBRARY
- *     CloudflareSolverInterceptor wired into the client. Its challenge
- *     solve builds the WebView on the MAIN looper with NO
- *     onRenderProcessGone handler — and Android's documented default for
- *     an unhandled renderer death is KILL THE APP PROCESS. It arms on
- *     any 403/503/429 HTML answer from the site's hosts, and the reader
- *     flight IS an HTML page — i.e. exactly the page-count fetch. v120
- *     makes the fetch WebView-free BY DEFAULT: a safe-fetch preference
- *     (default ON) turns the page-count fetch into pure HTTP — the
- *     challenge interceptor fast-fails legibly instead of spawning a
- *     WebView, the walk ships the public pages when the gate holds, and
- *     getPageList itself is Throwable-tight (worst case a legible empty
- *     list — never an exception into the host, never a WebView). Opting
- *     out ("Solve challenges" toggle) restores the full-chapter attempt
- *     (mint + library solve) plus a fruitless-mint cooldown breaker:
- *     two consecutive dead ladders pause mints for 30 minutes so opens
- *     stay fast and WebView-free until then.
- *   - pages (live recon on the site-gated CDN era): the site now serves
- *     every page beyond the public embed ONLY through a real browser
- *     session. The deferred exchange hard-requires a fresh Cloudflare
- *     Turnstile widget token per call (a single-use credential — one
- *     mint buys one ~2-page batch), the pages it hands out ride raw
- *     cdn{1-4} hosts that answer 403 to every non-browser fetch
- *     (browser UA + referer included — origin nginx rule), and the raw
- *     files' only lawful route (/api/cdn-image) needs a session-signed
- *     token minted by POST /api/cdn-image/sign — which refuses any
- *     cookie-less client (verified live on both apexes, pass header
- *     included). A minted batch therefore lists pages that can never
- *     render. The source ships exactly what it can serve: the flight's
- *     app-host pages (signed filenames, wide-open) plus any deferred
- *     pages that ride app hosts; raw-host-only batches are dropped
- *     instead of listed as permanent error cards (the legacy guard
- *     keeps a raw-only flight intact — a maybe-dead page beats an
- *     empty chapter), and a mint whose whole batch is raw-host-only
- *     counts against the fruitless-mint breaker and ends the walk —
- *     every further batch would cost another WebView and die the same
- *     way. Reader flights that arrive as a data-less app shell are
- *     retried through the router's own flight form (RSC header + the
- *     router's _rsc param), which still returns the payload stream.
- *   - pages v128 (the "only the first three pages / pages not loading"
- *     field verdict): live recon showed the WebView-free chain is ALIVE —
- *     the flight still ships images[]/appImages[] (the public embed) plus
- *     deferredMedia/imagePass, the exchange still validates real widget
- *     tokens, the refresh endpoint is still ungated, the sitekey still
- *     arrives live from public-settings. What was dead: (a) the MINT —
- *     safe fetch's early return sat in front of it and safe fetch is the
- *     default, so every chapter stopped at the public embed ("only the
- *     first three"); (b) the reader SESSION — the anonymous reader mounts
- *     exactly the public rows and never fires its own deferred walk, so
- *     it added nothing while burning 20–110 s per open and tripping the
- *     30-min fruitless breaker, whose cooldown shipped empty/short
- *     chapters ("pages are not loading"). v128: the mint is its own
- *     preference and DEFAULT ON (the hardened v113 solver — one solve
- *     per open, wall, breaker); the session is demoted to the fallback
- *     for chapters whose completeness the walk cannot prove (no-payload
- *     flights — the dual-homed .pro catalog —, gate-held walks,
- *     raw-host-only batches); signed-in devices keep their entitlement
- *     through it.
- *
- *   - pages v140 / v1.6.53 ("the signed class" — the field verdict on
- *     v1.6.52: "the extension crashs when it try to load it" on pages 4+,
- *     plus the user's decisive observation: "we were encoding the cover
- *     and the first three pages perfectly fine and they are avif so why
- *     have problems for page 4+"). The user is right, and the live recon
- *     (sandbox, 2026-11-08, chapter 1 of series 261 — their own test
- *     chapter) finally makes the whole pipeline add up:
- *     (1) the flight embeds exactly `publicImageCount` (3) pages on the
- *     wide-open app hosts — those ride weserv and render on every device,
- *     which is why pages 1-3 and covers NEVER had a decode problem;
- *     (2) the tokenless deferred exchange answers 200 with the REST of
- *     the chapter as reconstruction MAPS (13 for that chapter, images[]
- *     EMPTY) — the server silently degrades cookie-less/tokenless
- *     sessions to the maps tier and never ASKS for Turnstile, so the old
- *     mint (which only fired on a TURNSTILE verdict) never ran;
- *     (3) the site's own reader always carries a real widget token (its
- *     invisible Turnstile solves in-page) and WITH the
- *     `x-turnstile-token` header the exchange answers the IMAGES tier —
- *     raw cdn{1-4} urls the reader signs in-page (POST /api/cdn-image/sign
- *     + x-chapter-pass, credentials same-origin) into
- *     `/api/cdn-image?url=&token=&expires=&es=` urls — the EXACT class the
- *     field user copied from their reader for pages 4+ ("this an example
- *     of a page after 4"), and their two specimens are 900x2398 FULL
- *     pages that answer 200 BARE for ~15 min (the token IS the auth);
- *     (4) the sign endpoint 403s a genuinely cookie-less client (curl,
- *     re-verified) but the device client shares the host cookie store —
- *     the clearance the reader session earns is the client's clearance —
- *     so the device-side mint rides the same cookies the site's own
- *     reader signs with.
- *     v140 therefore: SIGNS every raw deferred image at collection time
- *     (a refusal keeps the raw url and the partition drops it exactly as
- *     before); ADMITS the signed class (`/api/cdn-image?url=&token=` on a
- *     site-owned host) into the loadable partition — bare-fetchable, so
- *     pages 4+ ride the SAME weserv transcode as pages 1-3 with zero
- *     on-device decode; UPGRADES a maps-only walk with ONE minted widget
- *     token + one re-exchange (the reader's own shape) so the images tier
- *     is actually attempted, with the fruitless-mint breaker counting
- *     upgrades that bought nothing; and RETIRES the v139 piece codec tier
- *     for good — the field device died inside c2.android.av1 at piece
- *     size exactly like it died at full size in v108 (the user's crash),
- *     so `codecPieceTierReady()` is now always false: map pages below
- *     Android 12 answer the fast legible 410 card, the reader session
- *     re-arms as their render fallback, and NO native codec ever runs in
- *     this process again. The leftover WebAvifTranscoder.kt some builds
- *     still carry is dead code (no references since v1.6.52) — delete it
- *     from the repo on the next upload.
- *
- *   - pages v142 / v1.6.55 ("the cover road" — the field verdict on
- *     v1.6.54 was the same sentence a third time, "when we try to load
- *     the pages of a chapter it just crashs", plus the user's own
- *     prescription: "if it's avif problem why don't we use the cover
- *     methods on the images of the chapiter"). The prescription is
- *     adopted verbatim. The audit that came with it found one plain
- *     fact: after the draw deletion and the codec retirement, the ONLY
- *     browser left on the chapter-open path is the reader session
- *     itself — a maps-only-complete walk on a decode-less device arms
- *     `needsUrlHarvest` and boots the offscreen browser against the
- *     reader page, and the field device has died inside every
- *     browser-bearing profile this module ever shipped (v109, v110,
- *     v134, v137, v1.6.51, v1.6.53's re-armed draw). Meanwhile the
- *     pipeline the user names — the cover method — has never crashed a
- *     single time in the field: covers and pages 1-3 have ridden the
- *     loopback's weserv transcode (server-side JPEG) since v1.6.42,
- *     and on Android 12+ the same pipeline decodes through the
- *     platform BitmapFactory — the exact decoder that already renders
- *     the covers on those devices.
- *     v142 therefore: THE BROWSER WALK IS OPT-IN, DEFAULT OFF (a fresh
- *     pref key so no stale persisted value re-arms it). The default
- *     open path runs ZERO WebViews and every page rides the cover
- *     road: app-host pages through the loopback's weserv transcode
- *     (server-side JPEG), map pages composed by the loopback with the
- *     platform BitmapFactory on Android 12+ — the exact decoder that
- *     already renders the covers on those devices — and the fast
- *     legible 410 card below it, named in /.diag. Flipping the new
- *     "Browser page walk" switch re-arms the session (the URL harvest
- *     plus its bounded in-page capture) with the session breaker and
- *     its 30-min cooldown as the economics — an explicit, informed
- *     choice, not a default. A load error can answer; a crash cannot.
- *
- *   - pages v143 / v1.6.56 ("no browser, ever, by default" — the field
- *     verdict on v1.6.55 was the same sentence a FOURTH time: "procomic
- *     openning a chapiter and the load of a page crasgs"). The audit
- *     that came with it closed the case: v142 retired the browser WALK
- *     but MISSED the v140 token-upgrade MINT — a TurnstileSolver WebView
- *     wired inside the deferred walk behind the DEFAULT-ON "reader gate"
- *     switch. The tokenless exchange answers maps-only on EVERY open
- *     (live-proven: 13 maps, zero images), so `freshImages.isEmpty() &&
- *     freshMaps.isNotEmpty()` fired on every chapter open and booted the
- *     solver WebView on the default path — the one browser-bearing
- *     profile left, exactly the shape the field device dies in, and the
- *     reason covers (which never open the walk) always rendered while
- *     chapter pages always died. v143 (the user's own prescription,
- *     taken to its end: "use the cover methods on the images of the
- *     chapter"): BOTH mints ride the OPT-IN browser switch now — the
- *     default open path runs ZERO WebViews on every preference state.
- *     The maps tier IS the cover road: the loopback composes protected
- *     pages server-side from the site's own pieces (AVIF-detected,
- *     transcoded JPEG like every other image) and the reader receives
- *     plain JPEG — the identical pipeline that renders covers and pages
- *     1-3 on every device. The default-ON gate switch is retired; one
- *     opt-in switch now governs every WebView in the extension (both
- *     mints + the URL harvest). The image server reconstruction also
- *     closes the one raw-AVIF leak the audit found (the signed ladder's
- *     rung 3 served AVIF bytes labeled jpeg — now transcoded like
- *     everywhere else). A load error can answer; a crash cannot.
- *
- * Details follow the Comix description layout: the star score and a bold
- * info line rendered once in the configured position, the synopsis, and —
- * behind the same options the Comix source ships — tag and blocked-genre
- * filtering.
- */
 @Source
 abstract class ProComic :
     KeiSource(),
@@ -353,7 +58,7 @@ abstract class ProComic :
     private val json = Json { ignoreUnknownKeys = true }
 
     // lazy: the server reads baseUrl, which the @Source-generated subclass
-    // supplies via computed getters (safe at any phase) — lazy keeps the
+    // supplies via computed getters (safe at any phase). Lazy keeps the
     // construction order a non-issue either way. internal: the JVM harness
     // drives the verification probes on it; harmless in the shipped build.
     internal val imageServer by lazy {
@@ -362,70 +67,17 @@ abstract class ProComic :
             // The source's own client as the retry tier: when the server's
             // bare inner client cannot get an image through (region-
             // dependent edge behavior), the fetch is retried with the
-            // session the reader page established — cookies, CF clearance,
+            // session the reader page established. Cookies, CF clearance,
             // the forced browser UA.
             sessionClient = client,
-            // v111: a writable cache dir for the crash-loop breaker's
-            // best-effort marker files. The decode ladder no longer needs
-            // an APK path (the bundled .so is gone) or a context — the
-            // AVIF transcode happens SERVER-SIDE through the weserv image
-            // proxy, so on Android 10/11 NO AVIF decoder ever runs in this
-            // process. Every tier that could kill the host app (libavif
-            // JNI, MediaCodec, the offscreen WebView) is removed — v134
-            // re-admitted the WebView tier and the field device died again
-            // (the v1.6.47 crash report) — the worst case is the legible
-            // error card, never a crash.
-            // v137: the WebView RETURNS as the raster tier — but with the
-            // crash profile turned inside-out: one renderer, one job at a
-            // time, the plan laid out as percent-positioned <img>s whose
-            // bytes stream in through the intercept (no JS canvas, no
-            // toDataURL bridge, no full-page canvas allocations — the
-            // allocations that killed the field device), one bounded view
-            // draw per page, onRenderProcessGone absorbed behind a
-            // 3-strike breaker. A hostile stack degrades to the legible
-            // 410 card; it cannot take the host app down.
             nativeCacheDir = applicationContext.cacheDir,
         ).apply {
-            // v116: the loopback server fetches signed-proxy urls with the
-            // exchange's chapter credential (x-chapter-pass, exactly the
-            // header the site's reader attaches), and re-signs a rejected
-            // or expired signed url through the gated session — an expired
-            // mid-read page heals itself instead of dying into an error
-            // card. Both hooks are optional so the JVM harness can drive
-            // the server bare.
             chapterPassProvider = { latestImagePass }
             deferredResigner = { rejected -> resignDeferredImageUrl(rejected) }
-            // v129: the loopback server plans a protected map page's
-            // reconstruction map (freshly-signed piece urls + rects) on the
-            // page's first image request — the plan POST is a source-level
-            // operation (client, apex ladder, the chapter pass), so it rides
-            // this hook exactly like the two above.
             mapPlanner = { request -> planChapterMap(request) }
-            // v139: THE PIECE CODEC TIER — no hook to wire. The field
-            // verdict on v1.6.51 (v138's sandboxed-renderer WebView tier)
-            // was the FIFTH WebView decode death ("the extension crashs
-            // when it try to load it"), so every WebView decode is gone
-            // for good. The piece decode is now the FRAMEWORK's own
-            // software AV1 codec (c2.android.av1, shipped with the field
-            // device's Android 10) behind AvifMediaCodecDecoder's
-            // PIECE-SIZED gate: the live plan (re-walked this round on
-            // chapter 51 of series 261) answers grid_2x3 pieces of
-            // 800x298 — ~0.24 MP, the profile of an ordinary video
-            // thumbnail, three orders of magnitude under the full-size
-            // configs (pages 800x5000, covers 4000x6000) that killed the
-            // v108 field device. The 1280-edge / 1.3 MP gate runs in pure
-            // Kotlin BEFORE any codec allocation, and the attempt-marker
-            // breaker bounds even a hostile codec: one handled-late death
-            // disables the tier for the session, two for the install —
-            // the worst case degrades to the legible 410 card, never a
-            // crash loop. No context is needed (MediaCodec is not a view).
         }
     }
 
-    /** v116: the newest x-chapter-pass credential (flight's imagePass or
-     * a renewed one) — the loopback server reads it through
-     * [ProComicImageServer.chapterPassProvider] when it fetches
-     * signed-proxy urls. */
     @Volatile
     private var latestImagePass: String? = null
 
@@ -435,28 +87,15 @@ abstract class ProComic :
         writeTimeout(30, TimeUnit.SECONDS)
         addInterceptor(::userAgentOverrideInterceptor)
         addInterceptor(::originSanitizerInterceptor)
-        // v120: the challenge gate that CANNOT kill the host app. The
-        // library solver this delegates to (ONLY when the user opts out
-        // of safe fetch) builds its WebView on the main looper with no
-        // onRenderProcessGone handler — an unhandled renderer death there
-        // kills the process. Safe fetch (default) answers a challenged
-        // response with a legible IOException instead of spawning it.
         addInterceptor(
             ProComicChallengeInterceptor(setOf(baseUrl.toHttpUrl().host)) { safeFetchEnabled },
         )
         rateLimit(3)
     }
 
-    /** v120: safe fetch (default ON) — the page-count fetch spawns NO
-     * WebView at all: no library challenge solve, no Turnstile mint.
-     * Live read per request so a settings toggle applies immediately. */
     private val safeFetchEnabled: Boolean
         get() = preferences.getBoolean(PREF_SAFE_FETCH, true)
 
-    /** v120: the fruitless-mint circuit breaker (safe fetch OFF): two
-     * consecutive mint ladders that yielded no token pause further mints
-     * for the cooldown window — chapter opens stay fast and WebView-free
-     * until it lapses. */
     @Volatile
     private var mintFruitless = 0
 
@@ -473,16 +112,12 @@ abstract class ProComic :
     private var sessionPausedUntil = 0L
 
     private val readerSessionEnabled: Boolean
-        // v142: the browser walk is OPT-IN, default OFF — the open path
-        // runs zero WebViews and every page rides the cover road. The
-        // fresh key ignores any stale value persisted under the old
-        // always-on switch.
         get() = preferences.getBoolean(PREF_READER_SESSION, false)
 
     /**
-     * The site's WAF answers 403 to non-browser User-Agents — including the
+     * The site's WAF answers 403 to non-browser User-Agents. Including the
      * app UA some hosts stamp onto every request (Kotatsu's Mihon-compat
-     * layer among them, verified live: "Kotatsu/1.0" gets 403 on the reader
+     * layer among them. "Kotatsu/1.0" gets 403 on the reader
      * page AND on the image CDN while browser UAs pass). One forced browser
      * UA across the whole chain also keeps the deferred-media JWT's uah
      * (user-agent hash) claim consistent, since the loopback server's inner
@@ -498,7 +133,7 @@ abstract class ProComic :
 
     /**
      * KeiSource stamps "Origin: <baseUrl>" onto every request, but browsers
-     * never send Origin on document GETs or same-origin fetches — carrying it
+     * never send Origin on document GETs or same-origin fetches. Carrying it
      * everywhere is a bot signal (same finding as the Kagane source).
      */
     private fun originSanitizerInterceptor(chain: Interceptor.Chain): Response {
@@ -521,21 +156,9 @@ abstract class ProComic :
 
     private fun parseDate(raw: String?): Long = dateFormat.tryParse(raw?.substringBefore('.')?.take(19))
 
-    // v117: seriesPageUrl removed — the series page walks both apexes
-    // through fetchFlightAcrossApexes (net first); see fetchSeriesPage.
 
     private fun chapterPageUrl(ref: ChapterRef): String = "$baseUrl/ar/chapter/${ref.seriesSlug}-${ref.chapterNumber}-${ref.chapterId}"
 
-    /**
-     * The reader/series routes exist on BOTH deployments (v104/v105): the
-     * build's baseUrl is the .net deployment (where the real flight
-     * payloads serve since the migration), and the .pro apex stays as the
-     * fallthrough for the share of the catalog that still lives there
-     * (their .net reader route 308s to the series page instead of
-     * carrying the payload). Pure helper so the harness can pin the
-     * order; every apex ladder (details, reader flight, deferred
-     * exchange, refresh, re-sign) walks this list.
-     */
     internal fun apexOrderFor(rawBaseUrl: String): List<String> {
         val base = rawBaseUrl.trimEnd('/')
         val host = base.substringAfter("//")
@@ -578,9 +201,9 @@ abstract class ProComic :
             }
             // The edge sometimes answers the document route with a data-less
             // app shell (its flight middleware routes some clients to it,
-            // live-verified: 200 + x-prochan-shell, no payload at all). The
-            // router's OWN flight form of the same route — the RSC header
-            // plus the _rsc param — still returns the raw payload stream.
+            // 200 + x-prochan-shell, no payload at all). The
+            // router's OWN flight form of the same route. The RSC header
+            // plus the _rsc param. Still returns the raw payload stream.
             // NOTE: the raw stream carries no self.__next_f.push markers,
             // so the body is parsed as-is (no RscFlight.extract pass).
             try {
@@ -664,35 +287,13 @@ abstract class ProComic :
             thumbnail = null,
             cdnPath = cdn_path,
         )?.let(::coverProxyUrl)
-        // v117: the type rides with the canonical long-strip keywords so
-        // reader apps auto-suggest the webtoon/long-strip mode (see
-        // typeGenreKeywords).
         genre = typeGenreKeywords(type).joinToString(", ").ifBlank { null }
         status = this@toSManga.status.toProComicStatus()
         initialized = true
     }
 
-    /**
-     * Covers ride the same loopback transcoder as pages (v105): every cover
-     * the site ships is AVIF — undecodable below Android 12 — and the raw
-     * cdn{N} hosts 403 non-browser clients. The proxy fetches with the
-     * browser UA and serves plain JPEG, so covers render (fast) on every
-     * device and in every host app. Falls back to the raw URL if the local
-     * server cannot start; the server's fixed preferred port keeps the
-     * persisted thumbnail_url values valid across app restarts.
-     */
     private fun coverProxyUrl(resolved: String): String = runCatching { imageServer.imageProxyUrl(resolved, ProComicImageServer.COVER_PROXY_MAX_EDGE) }.getOrDefault(resolved)
 
-    /**
-     * v136: true when the url is one of the loopback routes that still
-     * needs a build/compose at read time — a PLANNED page (the walk's
-     * reconstruction-map compose) — as opposed to a finished render
-     * (/.captured) or a real proxied direct url (/.image-proxy). The
-     * captured-overlay merge upgrades exactly these slots: a captured
-     * render or a plainly-rendered simple row beats a compose that still
-     * has to be built (and on a decode-less device, a planned compose is
-     * the fast legible 410 card — the thing the field called out).
-     */
     private fun isPlannedLoopbackUrl(url: String): Boolean = url.contains("/${ProComicImageServer.MAP_PAGE_PATH_PREFIX}/") ||
         url.contains("/${ProComicImageServer.COMPOSED_PATH_PREFIX}/")
 
@@ -722,7 +323,7 @@ abstract class ProComic :
         year: String = "",
     ): MangasPage {
         val data = searchSeries(query, sort, page, type, genres, year)
-        // Novel rows are dropped: text chapters, client-rendered pages —
+        // Novel rows are dropped: text chapters, client-rendered pages. 
         // nothing a reader can show.
         val rows = data.data.filterNot { it.type.equals("novel", true) }
         val hasNext = when (val pages = data.meta?.pages) {
@@ -780,8 +381,6 @@ abstract class ProComic :
             cdnPath = cdn_path,
         )?.let(::coverProxyUrl)
         genre = buildList {
-            // v117: the canonical long-strip keywords ride the browse rows
-            // too (the suggestion fires on them before details ever load).
             addAll(typeGenreKeywords(this@toSManga.type))
             addAll(this@toSManga.metadata?.genres.orEmpty())
         }.distinct().joinToString(", ")
@@ -827,13 +426,10 @@ abstract class ProComic :
 
     // ============================== Details ==============================
 
-    /** v117: the series INFO page lives on the .net deployment now (the
-     * .pro series route renders a "page moved" shell) — "Open in WebView"
-     * follows the site. */
     override fun getMangaUrl(manga: SManga): String = "${readerApexes.first()}/ar/series/${manga.url}"
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        // Both apexes (and their www forms) — the site migrated .pro → .net
+        // Both apexes (and their www forms). The site migrated .pro → .net
         // and older library entries still carry .pro links.
         if (url.host !in setOf(
                 "procomic.net",
@@ -854,7 +450,7 @@ abstract class ProComic :
             }
 
             segments.size >= 3 && segments[1] == "series" -> {
-                // /ar/series/{seriesSlug}-{id} — the canonical series path
+                // /ar/series/{seriesSlug}-{id}. The canonical series path
                 // since the .net migration (the bare /ar/{slug}-{id} only
                 // 308s there now).
                 segments[2]
@@ -891,7 +487,7 @@ abstract class ProComic :
     ): SMangaUpdate {
         if (fetchDetails && fetchChapters) {
             // One series-page fetch feeds both details and the chapter
-            // list — fetching them independently would issue the same
+            // list. Fetching them independently would issue the same
             // GET twice, concurrently.
             val pageData = fetchSeriesPageWithFallback(manga)
             return SMangaUpdate(buildManga(manga, pageData), buildChapters(manga, pageData))
@@ -968,9 +564,6 @@ abstract class ProComic :
             artist = meta?.artistText()
             genre = buildList {
                 addAll(typeGenreKeywords(series.type))
-                // v117: BOTH shapes — the legacy flat strings (search rows
-                // + any .pro-served legacy flight) and the migrated
-                // flight's localized categories object.
                 addAll(meta?.genres.orEmpty())
                 addAll(pageData.categories?.genreNames().orEmpty())
                 if (showTags) {
@@ -989,16 +582,6 @@ abstract class ProComic :
         }
     }
 
-    /**
-     * v117: the site's own type string plus the CANONICAL long-strip
-     * genre keywords. Field report: reader apps ("Mihon and the like")
-     * auto-suggest the long-strip / webtoon mode from exact genre strings
-     * — different forks key on different subsets ("Long Strip",
-     * "Webtoon", "Manhwa", "Manhua"), so every long-strip type carries
-     * them ALL (they are semantically true: every ProComic page is an
-     * 800xN tall strip). Non-long-strip types keep the capitalized site
-     * value only. Pure so the harness pins it.
-     */
     internal fun typeGenreKeywords(type: String?): List<String> {
         val trimmed = type?.trim().orEmpty()
         if (trimmed.isEmpty()) return emptyList()
@@ -1104,10 +687,6 @@ abstract class ProComic :
 
     // ============================= Chapters ==============================
 
-    /** Parsed from the series page flight payload (or the search fallback).
-     * v117: [categories] carries the migrated flight's sibling
-     * genres/tags object (null on legacy flights and search fallbacks).
-     * Internal so the JVM harness can pin the parse with real payloads. */
     internal class SeriesPageData(
         val series: SeriesDetailsDto,
         val recentChapters: List<ChapterRowDto>,
@@ -1115,29 +694,12 @@ abstract class ProComic :
         val categories: SeriesCategoriesDto? = null,
     )
 
-    /**
-     * v117: the series page walks BOTH apexes (the .net base leads — see
-     * [apexOrderFor]; the .pro fallthrough covers the legacy catalog
-     * share whose .net route 308s to the series page). The .pro series
-     * route renders a "page moved" shell whose flight carries no
-     * `{"series":{...}}` payload, and the real payload (title, type,
-     * genres, tags, description, progress) serves from procomic.net. The
-     * search-API fallback downstream stays as the last resort for
-     * client-rendered series.
-     */
     private suspend fun fetchSeriesPage(mangaUrl: String): SeriesPageData = fetchFlightAcrossApexes(
         path = "/ar/series/$mangaUrl",
         emptyPayloadError = "ProComic: the series page carried no payload on either apex",
         parse = ::parseSeriesFlight,
     )
 
-    /** The `{"series":{…},"categories":{…},…}` props object of the
-     * migrated series flight + the recent chapter rows. The wrapper decode
-     * is what v117 restores: the pre-migration parse captured the inner
-     * series object only, and the migration moved genres/tags into the
-     * sibling `categories` — metadata.genres now parses null and the
-     * genre field collapsed to the bare type. Internal + payload-only for
-     * the harness pins. */
     internal fun parseSeriesFlight(flight: String): SeriesPageData? {
         val wrapperKey = "{\"series\":{"
         val wrapperStart = flight.indexOf(wrapperKey)
@@ -1175,7 +737,7 @@ abstract class ProComic :
 
         // Full TOC lives on the newest chapter's reader page (one request,
         // SSR series only). Client-rendered series have no recent rows to
-        // anchor that request, and their reader route is client-side too —
+        // anchor that request, and their reader route is client-side too. 
         // for those the public chapters API is the full-TOC source.
         var toc: List<TocChapterDto> = newestChapter?.let { chapter ->
             val number = chapter.chapter_number ?: ""
@@ -1242,7 +804,7 @@ abstract class ProComic :
      * Optional "combine duplicate chapters" (same option the MangaDot source
      * ships): the site re-uploads the same chapter under several teams, so
      * the TOC can carry multiple entries per chapter number. When enabled,
-     * one entry per non-zero chapter number survives — the first team in
+     * one entry per non-zero chapter number survives. The first team in
      * the user's priority list wins, otherwise the first (newest) upload.
      * The zero-width scanlator filler matches MangaDot's behavior of keeping
      * the scanlator row uniform across entries.
@@ -1289,11 +851,6 @@ abstract class ProComic :
         return result
     }
 
-    /**
-     * The reader page flight embeds `chapters:[{id, chapterNumber, group,
-     * translator, metadata:{team}}]` right after the "chapterLabel" key.
-     * Either apex may carry the chapter (dual-homed site, v105).
-     */
     private suspend fun fetchReaderToc(readerPath: String): List<TocChapterDto> = fetchFlightAcrossApexes(
         path = readerPath,
         emptyPayloadError =
@@ -1314,8 +871,8 @@ abstract class ProComic :
     }
 
     /**
-     * GET /api/public/chapters?contentId={seriesId}&page={n}&limit=50 —
-     * `{chapters:[...], hasMore}` — newest first, dates included. The server
+     * GET /api/public/chapters?contentId={seriesId}&page={n}&limit=50. 
+     * `{chapters:[...], hasMore}`. Newest first, dates included. The server
      * caps `limit` at 50; page through until `hasMore` flips false.
      */
     private suspend fun fetchChaptersApi(seriesId: Int): List<TocChapterDto> {
@@ -1357,19 +914,10 @@ abstract class ProComic :
     // =============================== Pages ===============================
 
     override fun getChapterUrl(chapter: SChapter): String {
-        // v120: guarded — hosts call this for the "open in web" action and
-        // several fork shapes crash on a throw from it.
         val ref = runCatching { json.decodeFromString(ChapterRef.serializer(), chapter.url) }.getOrNull()
         return if (ref != null) chapterPageUrl(ref) else "$baseUrl/ar"
     }
 
-    /**
-     * v120: the page-count fetch is the call a host app waits on with the
-     * reader spinner up — NOTHING inside it may escape as an exception
-     * (fork-shaped hosts vary in what they do with one; several die). The
-     * worst case is a legible empty list, never a crash. Cancellation
-     * still propagates (structured concurrency is not ours to swallow).
-     */
     override suspend fun getPageList(chapter: SChapter): List<Page> = runCatching { pageListInternal(chapter) }
         .onFailure { t ->
             if (t is kotlinx.coroutines.CancellationException) throw t
@@ -1378,28 +926,12 @@ abstract class ProComic :
         .getOrDefault(emptyList())
 
     private suspend fun pageListInternal(chapter: SChapter): List<Page> {
-        // v120: chapters cached by an older build can carry a url this
-        // decoder refuses — a legible empty list beats any crash shape.
         val ref = runCatching { json.decodeFromString(ChapterRef.serializer(), chapter.url) }.getOrNull()
         if (ref == null) {
             Log.e(TAG, "chapter url decode failed: ${chapter.url.take(80)}")
             return emptyList()
         }
         val readerPath = "/ar/chapter/${ref.seriesSlug}-${ref.chapterNumber}-${ref.chapterId}"
-        // images[] is the site's own page list (cdn.<host> raw files);
-        // appImages[] mirrors it with the signed-filename app.<host>
-        // variants the reader actually loads — the only URLs the edge
-        // serves to non-browser clients since the .net migration. Either
-        // apex may carry the chapter: the payload comes from whichever
-        // deployment hosts this series (the other 308s to the series page).
-        // v112: the flight now also carries `deferredMedia` (a JWT for the
-        // pages beyond the public embed) and a pages-scope `imagePass` —
-        // the exact credentials the site's own reader exchanges for the
-        // remaining pages. Both are parsed here and consumed below.
-        // v124: the chapter flights are GONE (no images/appImages/deferred
-        // on either apex — the reader moved to the .pro deployment and
-        // streams pages into a real browser only). A missing payload no
-        // longer aborts the open: the session below becomes the source.
         val payload = runCatching {
             fetchFlightAcrossApexes(
                 path = readerPath,
@@ -1412,7 +944,7 @@ abstract class ProComic :
                 if (images.isEmpty() && appImages.isEmpty()) {
                     null
                 } else {
-                    // Prefer the app variant per page (verified live: 200 for
+                    // Prefer the app variant per page (200 for
                     // plain clients, the signature rides in the file name); the
                     // raw CDN URL is the fallback (the proxy's session retry is
                     // its last chance, the edge 403s bare TLS on those hosts).
@@ -1440,26 +972,9 @@ abstract class ProComic :
         val deferred = payload.deferred
         latestImagePass = payload.imagePass
         var walkTrail: List<String> = emptyList()
-        // v128: did the deferred walk reach the server's own terminal answer?
-        // True means the chapter's deferred list was walked to its end — the
-        // strongest completeness proof the WebView-free chain can produce.
         var deferredWalkComplete = false
-        // v129: the walk's PLANNED protected pages — one reconstruction-map
-        // token per page beyond the public embed, registered with the loopback
-        // server below and composed from the site's own freshly-signed piece
-        // urls on first request.
         var plannedMaps: List<PlannedMap> = emptyList()
         if (deferred?.token != null && upstreams.isNotEmpty()) {
-            // v116: the full-list exchange WALKS THE BATCHES (the server
-            // hands out the deferred list in redis-tracked batches; the
-            // loop re-calls with the reader's constant split until the
-            // answer is terminal). v129: the exchange speaks the site's own
-            // reader-signal dialect (no Turnstile mint on the normal path)
-            // and the walk collects BOTH page classes: plain images[] urls
-            // AND maps[] reconstruction tokens. While the gate holds this
-            // yields whatever the session cleared plus a legible diag trail
-            // (mirrored to /.diag) and the source ships at least the public
-            // pages exactly as before.
             val walk = fetchDeferredPages(
                 chapterId = ref.chapterId,
                 deferred = deferred,
@@ -1476,12 +991,6 @@ abstract class ProComic :
                 upstreams = upstreams + extra.filter { it !in seen }
                 Log.i(TAG, "deferred: +${extra.size} pages (total ${upstreams.size})")
             }
-            // v140: the maps are the DEGRADED tier of the same pages the
-            // images tier covers. When the walk collected actual images
-            // (the token upgrade's tier — renderable everywhere), the maps
-            // would double-register the same page indexes, so they are
-            // dropped with a named trail row; a maps-only walk keeps them
-            // exactly as before.
             val walkMaps = walk.maps.takeIf { walk.images.isEmpty() }.orEmpty()
             if (walk.images.isNotEmpty() && walk.maps.isNotEmpty()) {
                 Log.i(TAG, "deferred: the images tier answered — dropping ${walk.maps.size} redundant map tokens")
@@ -1489,7 +998,7 @@ abstract class ProComic :
             if (walkMaps.isNotEmpty()) {
                 // The maps are the chapter's protected pages IN ORDER after
                 // the public embed (the site's own reader renders them at
-                // absoluteIndex = publicBase + ordinal — the exact pageIndex
+                // absoluteIndex = publicBase + ordinal. The exact pageIndex
                 // its plan POST sends). The public count from the flight is
                 // the base; the walk's own image batches (when any) extend it.
                 val mapBase = (payload.publicCount ?: upstreams.size).coerceAtLeast(upstreams.size)
@@ -1512,8 +1021,6 @@ abstract class ProComic :
                 walk.trail.forEach { Log.i(TAG, "deferred: $it") }
             }
         } else if (deferred == null && upstreams.isNotEmpty()) {
-            // v128: the flight embedded the whole chapter (no deferred
-            // credentials at all) — the WebView-free list is provably whole.
             deferredWalkComplete = true
         }
         payload.publicCount?.takeIf { it > upstreams.size }?.let { cap ->
@@ -1523,7 +1030,7 @@ abstract class ProComic :
         // The site-gated CDN era: pages that ride only the raw cdn{1-4}
         // hosts cannot be fetched WebView-free at all (the origin 403s
         // every non-browser client, and their lawful signed route needs a
-        // browser session). Listing them renders permanent error cards —
+        // browser session). Listing them renders permanent error cards. 
         // the reader gets the loadable pages only, with the drop named
         // in logcat and /.diag. A raw-ONLY flight still ships everything
         // (the legacy guard inside [partitionLoadablePages]).
@@ -1544,48 +1051,6 @@ abstract class ProComic :
         }
         var finalUrls: List<String> = loadable
 
-        // v129: register the planned protected pages with the loopback server
-        // (in-memory, listing time — the list stays fast) and append their
-        // loopback urls AFTER the app-host partition (loopback urls are not
-        // site hosts; the partition is about which SITE hosts can render).
-        // The reconstruction map is planned on the page's first image request:
-        // POST /chapter-map-proxy-plan/{id} names the freshly-signed piece
-        // urls + their rects, the loopback fetches every piece with the
-        // chapter referer and stitches them onto one canvas. A registration
-        // failure (registry bound) costs that one page, never the open.
-        //
-        // v132: THE DECODE WALL — the maps-era pages are grids of AVIF
-        // pieces on img{1-4} (referer-gated; live recon 2026-11-06: the
-        // edge checks the Referer VALUE, any UA passes with the chapter
-        // referer, and weserv — which cannot send a referer at all — 404s
-        // the pieces). Below Android 12 NOTHING turns those pieces into
-        // pixels: the platform has no AVIF decoder, the removed tiers
-        // (WebView, libavif JNI, MediaCodec) each crashed the host app,
-        // the site's android API is signature-gated (minVersionCode 93),
-        // and /api/cdn-image/sign refuses piece urls. Listing them rendered
-        // permanent 502 error cards after ~30 s of doomed fetch+transcode
-        // retries per page — the exact field verdict on v131. The loadable
-        // pages ship; the unrenderable ones are NAMED in logcat and /.diag
-        // (the same contract the raw-host partition above follows).
-        //
-        // v135 — THE CRASH VERDICT. v134's wall-lift premise (2) died in
-        // the field: the offscreen WebView transcode tier killed the host
-        // app on the user's device the moment pages 4+ were requested
-        // (v1.6.47) — the exact v108–v110 field verdict it was re-admitted
-        // against. The tier is OFF the ladder again (this process runs no
-        // AVIF decoder below Android 12, ever). What remains, per device:
-        //  - Android 12+: the platform BitmapFactory decodes the AVIF
-        //    pieces; every planned page registers and ships.
-        //  - Android 10/11: the READER SESSION's in-page capture is the
-        //    decode path (the session's own Chromium decodes the pieces
-        //    in-page — the same renderer that renders the site in the
-        //    user's browser). v135 also makes the capture KEEP PACE: four
-        //    rows pulled per tick and the settle waits for the last
-        //    pending capture, so a long chapter no longer out-runs the
-        //    puller. A piece row that is neither captured nor platform-
-        //    decodable still LISTS — the loopback answers a fast, legible
-        //    410 card (no 30 s hang, no crash) so the page count stays
-        //    whole and the gap is named.
         val plannedDistinct = plannedMaps
             .groupBy { it.pageIndex }
             .map { (_, sameIndex) -> sameIndex.first() }
@@ -1627,66 +1092,8 @@ abstract class ProComic :
             }
         }
 
-        // The reader session (v124, the manhuarmtl architecture): ONE bounded
-        // offscreen browser session opens the REAL reader, waits through a
-        // Cloudflare challenge, and walks the chapter like a reading user
-        // while the site's own reader mounts its rows. Simple rows ship as
-        // proxied direct URLs; piece rows are re-assembled by the loopback
-        // server from the site's own freshly-signed piece URLs. The harvest
-        // is authoritative when it sees more pages than the plain chain.
-        // v126 ran the session on EVERY chapter open. v128 demotes it to the
-        // FALLBACK it has become (live recon: the anonymous reader mounts
-        // exactly the public rows and never fires its own deferred walk, so
-        // the session cannot add pages the walk collected — it only burned
-        // 20–110 s per open and tripped the 30-min breaker, which is the
-        // "pages are not loading" stretch the field reported). The session
-        // now runs ONLY when the walk did not prove the chapter complete:
-        // flights with no payload (the dual-homed .pro catalog), walks that
-        // ended at the gate, and raw-host-only batches. Signed-in devices
-        // (the session shares the app's cookie store) still get their
-        // entitlement through it.
-        // v135: ONE more reason to run it — the walk can prove the LIST
-        // complete while the device still cannot RENDER its planned pages
-        // (Android 10/11 has no AVIF decoder; the removed on-device tiers
-        // are the v108–v110 native killers). The session's viewport-draw
-        // capture renders those pages through the session's own Chromium —
-        // the exact renderer the user's browser uses — so a decode-less
-        // device with planned map pages runs it too.
-        // v137: THAT RENDER PURPOSE IS RETIRED. Two facts (round-8 recon
-        // + the sandbox re-walk of 2026-11-07) closed it: the site's
-        // ANONYMOUS reader never mounts the protected rows (zero reader
-        // rows — the paywall text instead), so the capture had nothing to
-        // capture on signed-out devices — exactly why v1.6.48/v1.6.49
-        // delivered nothing; and the offscreen raster tier now renders the
-        // plans directly (the plan POST needs no login — live-verified).
-        // The session runs ONLY for its completeness/entitlement roles
-        // again; the moment the raster tier dies its 3-strike death, the
-        // render purpose re-arms automatically (belt and braces).
         val avifRenderable = ProComicImageServer.avifDecodable(android.os.Build.VERSION.SDK_INT)
-        // v141 — THE RENDER PURPOSE IS GONE FOR GOOD. v135 armed the session
-        // to RENDER pages a decode-less device cannot, and v139/v140 re-armed
-        // it whenever the codec tier was out — on the field device that is
-        // now ALWAYS (v140 retired the codec tier for good). The re-armed
-        // session ran the band draw (lib captureView: view.draw(Canvas)
-        // with a software-layer retry — the EXACT v109/v110/v137 in-process
-        // rasterization profile) against a page full of the site's AVIF,
-        // and the field verdict was the old one verbatim: "when it tries to
-        // load the pages it just crashs". The draw pass is structurally
-        // retired (ProComicReaderSession) and the render purpose with it:
-        // map pages below Android 12 answer the legible 410 card and
-        // NOTHING ever rasterizes in this process again.
         val needsSessionRendering = false
-        // v141 — THE URL-HARVEST ROLE. A maps-only-complete walk ships
-        // planned loopback pages this device can never decode — but on a
-        // FREE chapter the site's own reader mounts the REAL signed image
-        // rows (the field user's browser reads them — that is exactly the
-        // copied cdn-image class). One bounded session pass collects those
-        // rows as URLS — never pixels, no draw, no capture: the plain-row
-        // merge upgrades the planned slots with the signed cdn-image class
-        // (bare-fetchable, weserv-transcodeable — the same road as pages
-        // 1-3) and rows beyond the walk's plan append. Bounded at 120 s,
-        // with the session breaker and its 30-min cooldown as the
-        // economics — a fruitless pass never pins the open.
         val needsUrlHarvest = deferredWalkComplete && plannedDistinct.isNotEmpty() && !avifRenderable
         if (readerSessionEnabled && (!deferredWalkComplete || needsUrlHarvest)) {
             if (System.currentTimeMillis() < sessionPausedUntil) {
@@ -1703,9 +1110,6 @@ abstract class ProComic :
                         readerApexes,
                         readerPath,
                         ProComicImageServer.BROWSER_UA,
-                        // v141: the URL-harvest role bounds the session
-                        // tighter — it upgrades an already-usable list,
-                        // it is never the only road to the open.
                         timeoutSeconds = if (deferredWalkComplete) 120L else 240L,
                     )
                 }
@@ -1716,10 +1120,6 @@ abstract class ProComic :
                 val harvestedRows = harvest?.rows.orEmpty()
                 harvest?.notes?.forEach { Log.i(TAG, it) }
                 runCatching { imageServer.recordDeferredTrail(ref.chapterId, harvest?.notes.orEmpty()) }
-                // v136: per-row session results kept beside their rows —
-                // the captured-overlay merge needs to know WHICH row
-                // produced which url (its own index, captured render vs
-                // plain render) instead of a take-it-all list.
                 var capturedRowsCount = 0
                 val sessionEntries: List<Pair<ProComicReaderSession.HarvestRow, String?>> = if (harvestedRows.isEmpty()) {
                     emptyList()
@@ -1728,24 +1128,6 @@ abstract class ProComic :
                     val entries = harvestedRows.mapIndexed { index, row ->
                         val url = runCatching {
                             if (row.isPieces) {
-                                // v133 — THE RENDERED HARVEST: a piece row the
-                                // session captured as pixels rides the
-                                // /.captured route (the session's WebView
-                                // decoded the site's AVIF pieces; the loopback
-                                // only stitches plain JPEG tiles) — it renders
-                                // on EVERY Android version, which is exactly
-                                // what the field asked for after v132 dropped
-                                // these rows and the page count fell back to 3.
-                                // v135: the capture has two engines — the
-                                // in-page canvas (fast, when the site's own
-                                // signed proxy allows) and the band draw (the
-                                // session's composited output — no page
-                                // canvas, no taint, no sign endpoint).
-                                // Fallback: an uncaptured row keeps the v129
-                                // compose — and on a decode-less device the
-                                // loopback answers the fast, legible 410 card
-                                // (no doomed 30 s build, no crash — the page
-                                // count stays whole and the gap is named).
                                 val captured = harvest?.captured?.get(row.index)
                                 when {
                                     captured != null -> {
@@ -1755,11 +1137,6 @@ abstract class ProComic :
                                     else -> imageServer.composedProxyUrl(row)
                                 }
                             } else {
-                                // v136: the half-loaded guard — a simple url
-                                // is only a page when the row truly HAS one
-                                // <img>; a piece row that reported early can
-                                // never masquerade as a whole page (the
-                                // script enforces this too — belt and braces).
                                 if (row.total > 1) null else row.u?.let { imageServer.imageProxyUrl(it) }
                             }
                         }.onFailure { t ->
@@ -1783,29 +1160,6 @@ abstract class ProComic :
                     }
                     entries
                 }
-                // v136 — THE CAPTURED-OVERLAY MERGE. v135's gate was
-                // all-or-nothing: the session list could only replace the
-                // walk list whole (sessionWins), so with zero captures it
-                // never won, the walk's planned pages — the only thing a
-                // decode-less device cannot render — rode the decode-wall
-                // 410s, and rows the site mounted beyond the walk's plan
-                // were discarded with it (the "I don't think all of them"
-                // page-count gap). The merge upgrades the walk list PER
-                // PAGE instead:
-                //
-                //  · the walk list stays the BASE — the list can only
-                //    upgrade, never shrink;
-                //  · each captured row replaces the page AT ITS OWN INDEX
-                //    with its /.captured url — a render beats a plan;
-                //  · a simple row (the site renders that page plainly)
-                //    replaces a slot that still holds a PLANNED loopback
-                //    url (/.map-page, /.composed) — a real url beats a
-                //    compose that still has to be built;
-                //  · rows beyond the walk's count APPEND — the site can
-                //    mount pages the walk never planned, and the list must
-                //    carry them;
-                //  · uncaptured piece rows keep their planned compose (the
-                //    legible 410 below Android 12, the real compose on 12+).
                 if (sessionEntries.isNotEmpty()) {
                     val merged = finalUrls.toMutableList()
                     var replacedCaptured = 0
@@ -1866,35 +1220,9 @@ abstract class ProComic :
         upstreams = finalUrls
 
         val pages = upstreams.mapIndexed { index, upstream ->
-            // v130 — FIELD VERDICT on v129: "the right number of pages, but
-            // only the first three images load — every page beyond shows
-            // HTTP 400". The planned protected pages ARE loopback routes
-            // already (/.map-page/<key>): wrapping them through the
-            // .image-proxy route again made the proxy decode its own inner
-            // url, refuse the non-https loopback host inside
-            // isAllowedImageUrl, and answer its legible 400 "unusable image
-            // url" — the exact field verdict (the public app-host pages
-            // passed the allow-list and loaded; every .map-page page 400'd).
-            // A loopback upstream ships AS-IS (the same rule the preloader's
-            // filter below already applies); every site url keeps the v106
-            // wrap + fallback.
-            // v131 — FIELD VERDICT on v130: "410 instead of 400 — that's the
-            // only difference". The 410 is the loopback server's own
-            // registry-miss answer, which the REGISTERING process cannot
-            // produce — the answer came from another process of the family
-            // that owns the preferred port (v105's reuse predates the
-            // stateful routes). The stateful mints now bind this process's
-            // own socket (ensureOwnedPort), and the ship-as-is test here is
-            // port-aware: the old "127.0.0.1/" prefix never matched a
-            // ported loopback url ("127.0.0.1:44097/…") — only
-            // imageProxyUrl's idempotency save kept the v130 pages
-            // unwrapped. Same correction in the preloader filter below.
             val imageUrl = if (upstream.startsWith("http://127.0.0.1:")) {
                 upstream
             } else {
-                // v106: if the loopback server cannot start at all, fall
-                // back to the raw upstream URL rather than failing the
-                // chapter — the app hosts serve plain clients fine.
                 runCatching { imageServer.imageProxyUrl(upstream) }.getOrDefault(upstream)
             }
             Page(
@@ -1904,12 +1232,6 @@ abstract class ProComic :
             )
         }
 
-        // v101: warm the transcode cache in the background so the
-        // reader's own fetches land on finished JPEGs (the old
-        // protected-page preloader, re-targeted at direct app images).
-        // v124: composed loopback rows are skipped — they build+cache on
-        // first request, and a self-call into the loopback server from the
-        // preloader would be a pointless self-visit.
         imageServer.preloadImages(ref.chapterId.toString(), upstreams.filterNot { it.startsWith("http://127.0.0.1:") })
         return pages
     }
@@ -1918,7 +1240,7 @@ abstract class ProComic :
      * (the exact props the site's reader component consumes) with any
      * https URL on a site-owned host kept. Since the .net migration these
      * are `cdn{1..4}.procomic.net/{series}/{chapter}/{file}.avif` raw
-     * files — 403 to non-browser clients, so they only feed the appImages
+     * files. 403 to non-browser clients, so they only feed the appImages
      * fallback below. */
     private fun parseReaderImages(flight: String): List<String> {
         val urls = mutableListOf<String>()
@@ -1927,10 +1249,6 @@ abstract class ProComic :
         while (true) {
             index = flight.indexOf(key, index)
             if (index < 0) break
-            // arrayStart must point AT the '[' — balancedArray refuses to
-            // scan otherwise. (The pre-v101 code pointed one past it, which
-            // only ever matched the old nested per-page shape and silently
-            // dropped the flat page list the .net flight ships.)
             val arrayStart = index + key.length - 1
             val arrayJson = RscFlight.balancedArray(flight, arrayStart) ?: run {
                 index += key.length
@@ -1944,7 +1262,7 @@ abstract class ProComic :
                             if (isReaderImageUrl(element.content)) urls.add(element.content)
 
                         // Legacy nested per-page shape: an array of piece
-                        // URLs per page — flatten, order preserved.
+                        // URLs per page. Flatten, order preserved.
                         is JsonArray -> element.forEach { inner ->
                             val imageUrl = (inner as? JsonPrimitive)?.content ?: return@forEach
                             if (isReaderImageUrl(imageUrl)) urls.add(imageUrl)
@@ -1960,9 +1278,9 @@ abstract class ProComic :
     }
 
     /** The app-host image class: signed-filename files on `app.<apex>`
-     * (app.procomic.net, app.procomic.pro, app.prochan.net — the parent
+     * (app.procomic.net, app.procomic.pro, app.prochan.net. The parent
      * brand serves a share of the catalog) that fetch directly from any
-     * client, the signature riding in the file name (live-verified: 200
+     * client, the signature riding in the file name (200
      * for plain TLS on every probed chapter). These are the only page
      * hosts the WebView-free chain can always serve. */
     internal fun isAppHostImageUrl(url: String): Boolean = runCatching {
@@ -1970,12 +1288,6 @@ abstract class ProComic :
         httpUrl.isHttps && httpUrl.host.startsWith("app.") && isReaderImageUrl(url)
     }.getOrDefault(false)
 
-    /** v140: the site's signed-proxy image class — `/api/cdn-image?url=&token=…`
-     * on a site-owned host. The signature IS the fetch credential: these
-     * answer 200 BARE (no cookies, no referer, any client — live-verified
-     * with the field user's own page-4+ urls; ~15-min TTL, and the loopback's
-     * deferredResigner re-signs a lapsed one mid-read), so they are exactly
-     * as loadable as the app-host class. Pure so the harness can pin it. */
     internal fun isSignedProxyImageUrl(url: String): Boolean = runCatching {
         val httpUrl = url.toHttpUrl()
         httpUrl.isHttps &&
@@ -1985,16 +1297,6 @@ abstract class ProComic :
             isReaderImageUrl(url)
     }.getOrDefault(false)
 
-    /** The loadable/gated partition of a page list. v140: app-host pages
-     * AND signed-proxy pages ship; raw cdn{1-4} pages remain the site's
-     * browser-gated CDN class — the origin 403s every non-browser fetch
-     * (browser UA + referer included, live-verified) and their lawful
-     * route needs a signature this list did not get, so listing them
-     * only renders error cards. Legacy guard: when NOTHING is loadable
-     * the whole list ships unchanged — a maybe-dead page beats a
-     * guaranteed-empty chapter (a flight that predates the app hosts,
-     * or a future site change that re-opens the raw hosts). Pure so the
-     * harness can pin it. */
     internal fun partitionLoadablePages(upstreams: List<String>): Pair<List<String>, List<String>> {
         val loadable = upstreams.filter { isAppHostImageUrl(it) || isSignedProxyImageUrl(it) }
         if (loadable.isEmpty() || loadable.size == upstreams.size) return upstreams to emptyList()
@@ -2002,13 +1304,6 @@ abstract class ProComic :
         return loadable to upstreams.filterNot { it in kept }
     }
 
-    /** Any https URL on a site-owned image host. The app-CDN pool grew in
-     * v105: pages/covers ride app.procomic.net, app.procomic.pro AND
-     * app.prochan.net (the parent brand serves a share of the catalog's
-     * images), with raw files on cdn{1..4}.procomic.net. v127: the .im
-     * apex joins — the live reader mounts its own rows on app.procomic.im
-     * (observed in the real reader DOM), so a session-harvested URL on
-     * that host is exactly as site-owned as its .net/.pro siblings. */
     private fun isReaderImageUrl(url: String): Boolean = runCatching {
         val httpUrl = url.toHttpUrl()
         httpUrl.isHttps && (
@@ -2027,9 +1322,9 @@ abstract class ProComic :
             )
     }.getOrDefault(false)
 
-    /** The reader's own `<img>` sources: `"appImages":[{mobile,desktop}]` —
+    /** The reader's own `<img>` sources: `"appImages":[{mobile,desktop}]`. 
      * signed-filename AVIF URLs on `app.<host>` that fetch directly from
-     * any client (verified live: 200 for plain okhttp/curl TLS on every
+     * any client (200 for plain okhttp/curl TLS on every
      * probed chapter, the signature carried in the file name; mobile and
      * desktop are identical). desktop wins, mobile is the fallback. */
     private fun parseAppImages(flight: String): List<String> {
@@ -2049,7 +1344,6 @@ abstract class ProComic :
         }.getOrDefault(emptyList())
     }
 
-    // ====================== Deferred pages (v112) =========================
 
     /** Everything getPageList extracts from one reader flight. */
     private class PagesPayload(
@@ -2057,35 +1351,22 @@ abstract class ProComic :
         val deferred: DeferredMediaDto?,
         val imagePass: String?,
         val publicCount: Int?,
-        /** v129: the flight's `"cdnPath":"cdn{N}"` — the CDN path class the
-         * plan POST needs for the map tokens (the chapters API metadata
-         * carries the same value; the flight is authoritative). */
         val cdnPath: String? = null,
     )
 
-    /** v129: one PLANNED protected page — a map token registered with the
-     * loopback server at listing time; its reconstruction map (piece urls +
-     * rects) is planned on the first image request. */
     internal class PlannedMap(
         val chapterId: Int,
-        /** The page's ABSOLUTE index in the chapter (public base + ordinal) —
+        /** The page's ABSOLUTE index in the chapter (public base + ordinal). 
          * exactly the `pageIndex` the site's own plan POST sends. */
         val pageIndex: Int,
         val token: String,
         val method: String?,
         val cdnPath: String?,
-        /** The chapter route — the Referer the piece edge requires
-         * (live-verified: pieces 403 without it, 200 with it). */
+        /** The chapter route. The Referer the piece edge requires
+         * (pieces 403 without it, 200 with it). */
         val referer: String,
     )
 
-    /** The reader-signal dialect (v129): the exchange accepts the site's own
-     * reader probe constants as the `readerSignal` query param and WAIVES
-     * the Turnstile gate — the anonymous reader never mints a widget token.
-     * Live-verified 2026-11-06: tokenless + the primary signal → HTTP 200
-     * with the full maps[] payload; without a signal → 403 Turnstile token
-     * required; the fallback signal answers the same payload. The constants
-     * live in the companion (ktlint: SCREAMING_SNAKE only for const). */
     internal val readerSignalPrimary: String get() = READER_SIGNAL_PRIMARY
     internal val readerSignalFallback: String get() = READER_SIGNAL_FALLBACK
 
@@ -2102,7 +1383,7 @@ abstract class ProComic :
         return runCatching { json.decodeFromString(DeferredMediaDto.serializer(), objJson) }.getOrNull()
     }
 
-    /** The flight's `"imagePass":"p1.…"` JWT — the pages-scope credential
+    /** The flight's `"imagePass":"p1.…"` JWT. The pages-scope credential
      * the reader attaches as `x-chapter-pass` on protected media fetches. */
     internal fun parseImagePass(flight: String): String? {
         val key = "\"imagePass\":\""
@@ -2113,7 +1394,7 @@ abstract class ProComic :
         return flight.substring(index + key.length, end).takeIf { it.startsWith("p1.") }
     }
 
-    /** The flight's `"publicImageCount":N` — how many pages the site
+    /** The flight's `"publicImageCount":N`. How many pages the site
      * considers public (the SSR embed cap; observed live: 3). */
     internal fun parsePublicImageCount(flight: String): Int? {
         val key = "\"publicImageCount\":"
@@ -2126,11 +1407,6 @@ abstract class ProComic :
         return flight.substring(start, end).toIntOrNull()
     }
 
-    /** v129: the flight's `"cdnPath":"cdn{N}"` — the CDN path class the
-     * plan POST needs for the reconstruction-map tokens (the chapters API
-     * metadata carries the same value; observed live: "cdn2"). Null when
-     * the flight ships none — the plan body then omits the field exactly
-     * like the site's own `JSON.stringify` does for undefined. */
     internal fun parseCdnPath(flight: String): String? {
         val key = "\"cdnPath\":\""
         val index = flight.indexOf(key)
@@ -2141,14 +1417,6 @@ abstract class ProComic :
         return value.takeIf { Regex("cdn[1-9]").matches(it) }
     }
 
-    /**
-     * v115: thin wrapper — runs the deferred exchange and mirrors the
-     * attempt trail into the image server's /.diag state, so the trail
-     * is user-visible (the reader only sees logcat otherwise; a
-     * screenshot of /.diag in a phone browser is now an actionable
-     * report: mint-fail vs mint-ok/exchange-reject is distinguishable
-     * at a glance).
-     */
     private suspend fun fetchDeferredPages(
         chapterId: Int,
         deferred: DeferredMediaDto,
@@ -2161,18 +1429,6 @@ abstract class ProComic :
         return DeferredWalk(images, trail, complete, maps, pass)
     }
 
-    /** v128: the walk's outcome, plus whether it ENDED AT THE SERVER'S OWN
-     * TERMINAL ANSWER (empty images[] / replay-after-renewal) — the only
-     * proof the deferred list was walked to its end. The reader session is
-     * skipped when this is true: the anonymous reader cannot add anything
-     * the walk did not already collect (live-verified: it mounts exactly the
-     * public rows and never fires its own deferred walk), so running it only
-     * burns 20–110 s per open and feeds the failure breaker.
-     *
-     * v129: the walk also carries the answer's RECONSTRUCTION MAPS (one
-     * token per protected page — each becomes a planned loopback page) and
-     * the answer's own `pass` (the freshest pages-scope credential; the
-     * plan POSTs ride it). */
     private class DeferredWalk(
         val images: List<String>,
         val trail: List<String>,
@@ -2181,40 +1437,6 @@ abstract class ProComic :
         val imagePass: String? = null,
     )
 
-    /**
-     * The site's own reader flow for the pages beyond the public embed:
-     * GET /chapter-deferred-media/{id}?token={deferredMedia JWT}&split=N
-     * with the x-chapter-pass header, renewing either credential through
-     * its open POST endpoint when the answer names it expired.
-     *
-     * v129 — THE READER-SIGNAL DIALECT: the site's own anonymous reader
-     * never mints a Turnstile token. Its page JS runs a DOM probe on the
-     * reader's own row mount (a querySelector trap + the zoom-placeholder
-     * shape check) and sends the probe's BAKED success constant as the
-     * `readerSignal` query param — the exchange waives the gate for those
-     * constants (live-verified from the sandbox, 2026-11-06: tokenless +
-     * `reader-slot-script-v1` → HTTP 200 with the full payload; the same
-     * request without a signal → 403 "Turnstile token required"; the
-     * fallback `zoom-placeholder-v2` → 200 with the same payload). The
-     * walk sends the primary signal first, the fallback second, and only
-     * then — the day the site starts validating real probes again —
-     * falls back to the v114–v118 mint ladder, unchanged (one mint,
-     * breaker, wall).
-     *
-     * v129 — THE MAPS ERA: the answer now ships
-     * `{images:[…], maps:[N × {token, method}]}` — the pages beyond the
-     * public embed moved from plain urls into ENCRYPTED reconstruction-map
-     * tokens (`mapDelivery:"proxy-plan"`), one per page. v128 read only
-     * `images[]`: the empty-but-present array meant "batch done", the walk
-     * declared the chapter complete on the FIRST answer and the 3 public
-     * pages shipped (the field verdict). The walk now collects BOTH
-     * classes — plain image urls (the legacy shape) and map tokens (each
-     * becomes a PLANNED loopback page, composed from the site's own
-     * freshly-signed piece urls on first request). The terminal answer is
-     * BOTH arrays empty. The answer's own `pass` (a fresh pages-scope
-     * credential) updates [latestImagePass] so the plan POSTs ride the
-     * freshest x-chapter-pass. Never throws: every failure is a row.
-     */
     private suspend fun fetchDeferredPagesInner(
         chapterId: Int,
         deferred: DeferredMediaDto,
@@ -2242,24 +1464,11 @@ abstract class ProComic :
         val seen = HashSet<String>()
         val collectedMaps = mutableListOf<ChapterMapTokenDto>()
         val mapSeen = HashSet<String>()
-        // v129: the reader-signal ladder — the primary constant, then the
-        // fallback, then (and only then) the mint.
         var readerSignal: String? = READER_SIGNAL_PRIMARY
         var fallbackSignalTried = false
-        // v117: whether the CURRENT token is a fresh renewal that has
-        // already been exchanged once and replayed the same slice.
         var replayedAfterRenewal = false
-        // v134: the previous exchange's fresh-maps count — the re-mint
-        // terminal compares against this (the exchange re-mints the same
-        // slice with fresh tokens when the deferred list is complete).
         var lastMapsCount = 0
 
-        // v117: one slice-advance renewal — the walk's between-batches
-        // refresh (the reader's own economics: a fresh token per loader
-        // call). Counts against MAX_TOKEN_RENEWALS (now walk-scale: every
-        // slice costs one refresh) and appends a trail row on both
-        // outcomes. Null = the walk keeps the current token (a
-        // session-keyed cursor may still advance without a renewal).
         fun renewForNextSlice(): String? {
             if (tokenRenewals >= MAX_TOKEN_RENEWALS) {
                 trail += "deferred renewals exhausted — walking with the current token"
@@ -2275,23 +1484,8 @@ abstract class ProComic :
             return renewed
         }
 
-        // v116 introduced the batch walk; v117 fixed its economics; v129
-        // speaks the signal dialect and collects the maps era. LIVE RECON
-        // (the decisive test, run from the sandbox, 2026-11-06): the
-        // tokenless exchange with the primary reader signal answers HTTP
-        // 200 with the WHOLE remaining chapter as reconstruction maps (one
-        // exchange — the server echoes the token's split and hands out
-        // every remaining page at once), the answer carries a fresh
-        // `pass`, and the immediate next exchange answers empty/empty —
-        // the terminal answer. The walk renews between slices exactly as
-        // before and only terminates on: the terminal answer (both arrays
-        // empty), a replay AFTER a renewal, bounds, or the wall-clock
-        // budget.
         val walkDeadline = System.currentTimeMillis() + MAX_WALK_WALL_MS
 
-        // v140: an upgrade mint whose tokened exchange still answered the
-        // maps tier bought nothing — count it against the fruitless breaker
-        // so two such opens pause the solver and opens stay fast.
         fun noteUpgradeVerdict(where: String) {
             if (turnstileToken != null && collected.isEmpty()) {
                 mintFruitless++
@@ -2324,29 +1518,11 @@ abstract class ProComic :
             when (outcome.kind) {
                 DeferredOutcome.Kind.OK -> {
                     trail += outcome.note
-                    // v129: the answer's own pass is the freshest pages
-                    // credential — the plan POSTs (and any signed re-fetch)
-                    // ride it.
                     outcome.pass?.takeIf { it.isNotBlank() && it != pass }?.let {
                         pass = it
                         latestImagePass = it
                         trail += "the answer carried a fresh pages pass (x-chapter-pass renewed)"
                     }
-                    // v140 — THE SIGNED CLASS. The exchange's image pages
-                    // ride the raw cdn{1-4} hosts (403 to every bare
-                    // fetch) whose lawful route is the site's own signed
-                    // proxy: POST /api/cdn-image/sign {url} with the
-                    // chapter pass mints {token, expires, es?, host?} and
-                    // the signed /api/cdn-image?url=… answers 200 BARE —
-                    // the EXACT class the field user copies from their
-                    // reader for pages 4+ (their two specimens are
-                    // 900x2398 FULL pages through it). The device client
-                    // shares the host cookie store — the clearance the
-                    // reader session earned is the client's clearance —
-                    // so the mint rides the same cookies the site's own
-                    // reader signs with. Sign at collection time; a
-                    // refusal keeps the raw url (the partition drops it
-                    // exactly as before — the walk loses nothing).
                     val freshImages = images
                         .filter { seen.add(it) }
                         .map { url ->
@@ -2376,7 +1552,7 @@ abstract class ProComic :
                             return WalkResult(collected, trail, true, collectedMaps, pass)
                         }
                         // Same slice again: advance the cursor the reader's
-                        // way — renew the token, then exchange once more.
+                        // way. Renew the token, then exchange once more.
                         val renewed = renewForNextSlice()
                         if (renewed == null) {
                             trail += "the deferred list is complete (${collected.size + collectedMaps.size} pages beyond the public embed)"
@@ -2386,61 +1562,7 @@ abstract class ProComic :
                         replayedAfterRenewal = true
                         continue
                     }
-                    // v134 — THE RE-MINT TERMINAL. Live recon (sandbox,
-                    // 2026-11-06 evening, chapter 394 of series 311): the
-                    // exchange answers the SAME slice with FRESHLY MINTED
-                    // map tokens every call — 11 maps, then 11 maps again,
-                    // ZERO token overlap, images empty both times. The map
-                    // token payload is fully encrypted (v3/m/cid/iv/tag/
-                    // data — no page identity survives the mint), so token
-                    // dedup can never see the repeat and the v116 loop
-                    // would walk its full 14-exchange bound re-collecting
-                    // the same 11 pages 14 times (pageIndexes 3..156 — a
-                    // corrupted page list). The stable COUNT is the
-                    // terminal answer: when an images-empty exchange
-                    // re-mints exactly as many maps as the previous
-                    // exchange, the deferred list is complete. (The old
-                    // genuinely-batched server answered empty/empty on the
-                    // second call — that terminal still runs above.)
-                    // v134: the stable COUNT is the terminal answer — pin it
-                    // BEFORE the upgrade so the post-upgrade exchange (same
-                    // slice, fresh map tokens) still hits the re-mint
-                    // terminal instead of double-collecting the maps.
                     if (freshMaps.isNotEmpty()) lastMapsCount = freshMaps.size
-                    // v140 — THE TOKEN UPGRADE. The site's own reader
-                    // always carries a real widget token (its invisible
-                    // Turnstile solves in-page), and WITH the
-                    // x-turnstile-token header the exchange answers the
-                    // IMAGES tier — the raw page urls the reader signs
-                    // into the field user's copied cdn-image class. WITHOUT
-                    // it the server silently degrades to the maps tier and
-                    // never ASKS for Turnstile (live recon 2026-11-08,
-                    // chapter 1 of series 261: tokenless 200 with 13 maps /
-                    // zero images — so the old mint, which only fired on a
-                    // TURNSTILE verdict, never ran). When the answer is
-                    // maps-only, spend the v128 mint NOW and re-exchange
-                    // with the token: the images tier if the server honors
-                    // it, the maps as the floor if not.
-                    //
-                    // v143 — THE MINT LEAVES THE DEFAULT PATH. The field
-                    // verdict on v1.6.55 was the same sentence a FOURTH
-                    // time ("openning a chapiter and the load of a page
-                    // crashs") — and the audit that came with it found the
-                    // one WebView v142's "zero WebViews" claim missed: THIS
-                    // mint. v142 retired the browser walk but left the
-                    // default-ON reader-gate mint wired here — and the
-                    // tokenless exchange answers maps-only on EVERY open
-                    // (live-proven), so the mint booted a solver WebView on
-                    // the default path of EVERY chapter open. The field
-                    // device has died inside every browser-bearing profile
-                    // this extension ever shipped; a default-on WebView is
-                    // a crash, not a feature. The maps tier IS the cover
-                    // road (pieces compose server-side into JPEG — the
-                    // identical pipeline that renders covers and pages 1-3
-                    // on every device), so the mint buys nothing on the
-                    // default path. Both mints now ride the OPT-IN browser
-                    // switch: OFF by default — a load error can answer; a
-                    // crash cannot.
                     if (freshImages.isEmpty() && freshMaps.isNotEmpty() &&
                         turnstileToken == null && mints == 0 &&
                         System.currentTimeMillis() <= walkDeadline &&
@@ -2473,7 +1595,7 @@ abstract class ProComic :
                             turnstileToken = solved.first
                             // Reader parity: the visible-mode widget is
                             // rendered from the login sitekey, so the
-                            // header is "login" — the gate branch's exact
+                            // header is "login". The gate branch's exact
                             // pairing.
                             turnstileWidget = "login"
                             trail += "upgrade token minted offscreen — re-exchanging with the images tier requested"
@@ -2496,7 +1618,7 @@ abstract class ProComic :
                     // The site-gated CDN era: a batch whose IMAGE pages all
                     // ride the raw cdn hosts can never be displayed (their
                     // signed route needs a browser session the WebView-free
-                    // chain cannot mint) — the WebView mint that bought it
+                    // chain cannot mint). The WebView mint that bought it
                     // was fruitless. Map pages are NOT subject to this: a
                     // reconstruction map composes from the site's own
                     // freshly-signed piece urls, no raw-host fetch at all.
@@ -2514,7 +1636,7 @@ abstract class ProComic :
                     }
                     // Refresh between slices so the server's cursor
                     // advances (the reader renews its token before every
-                    // load). A failed renewal is not fatal — one more
+                    // load). A failed renewal is not fatal. One more
                     // exchange with the current token may still advance a
                     // session-keyed cursor.
                     renewForNextSlice()?.let { token = it }
@@ -2528,21 +1650,12 @@ abstract class ProComic :
 
                 DeferredOutcome.Kind.TURNSTILE -> {
                     trail += outcome.note
-                    // v129: the signal ladder comes FIRST — the primary
-                    // reader signal already waived this gate once; the
-                    // fallback constant gets one retry before any mint.
                     if (readerSignal != null && !fallbackSignalTried) {
                         fallbackSignalTried = true
                         readerSignal = READER_SIGNAL_FALLBACK
                         trail += "the primary reader signal was rejected — retrying the exchange with the fallback signal"
                         continue
                     }
-                    // The day the site validates real probes again: the
-                    // v128 mint ladder (the hardened v113 solver — one
-                    // solve per open, wall, breaker).
-                    // v143: the mint rides the OPT-IN browser switch — the
-                    // default answer to a TURNSTILE verdict is the maps
-                    // tier (the cover road), never a WebView.
                     readerSignal = null
                     if (!readerSessionEnabled) {
                         trail += if (collected.isEmpty() && collectedMaps.isEmpty()) {
@@ -2553,11 +1666,6 @@ abstract class ProComic :
                         return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     if (mints >= MAX_TURNSTILE_MINTS) {
-                        // v118: ONE mint per chapter open — the widget token
-                        // is single-use per exchange, so a re-armed gate
-                        // cannot be walked for free; every extra mint costs
-                        // a full WebView ladder (the v117 crash). Ship what
-                        // the session cleared.
                         trail += if (collected.isEmpty() && collectedMaps.isEmpty()) {
                             "a minted turnstile token did not clear the gate — keeping the public pages"
                         } else {
@@ -2565,45 +1673,19 @@ abstract class ProComic :
                         }
                         return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
-                    // v119: the wall must hold ACROSS the mint — a WebView
-                    // ladder burns ~40 s and the deadline is only checked
-                    // between rounds, so a mint launched past the wall
-                    // stretched the fetch back into the minutes the v118
-                    // verdict called a dead app. Past the wall: ship what
-                    // the session cleared.
                     if (System.currentTimeMillis() > walkDeadline) {
                         trail += "deferred walk wall reached before the mint — shipping ${collected.size + collectedMaps.size} deferred pages"
                         return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
                     mints++
-                    // v120/v128: the fruitless-mint cooldown (mint OFF, or a
-                    // dead ladder). A mint ladder that yields no token
-                    // (rotated sitekey, hostile WebView stack) costs ~40 s of
-                    // Chromium every chapter open — after two consecutive dead
-                    // ladders the breaker pauses mints for the window.
                     if (System.currentTimeMillis() < mintPausedUntil) {
                         trail += "turnstile solver cooling down after fruitless mints — shipping ${collected.size + collectedMaps.size} deferred pages"
                         return WalkResult(collected, trail, false, collectedMaps, pass)
                     }
-                    // v119: a /.diag screenshot now names the mint moment —
-                    // if a device death happens mid-mint, the trail shows
-                    // exactly how far the walk got before it.
                     trail += "minting the widget token offscreen (mint $mints/${MAX_TURNSTILE_MINTS}, mode=${outcome.mode ?: "hidden"})…"
-                    // v114: the sitekey ROTATES — the live reader pulls it
-                    // per session from /api/auth/public-settings
-                    // (loginTurnstile.siteKey). A stale baked-in key fails
-                    // turnstile.render outright, which is exactly what
-                    // v113's mint died of. Fetched fresh for every gate run.
                     val (siteKey, siteKeyNote) = fetchTurnstileGateConfig(referer)
                     trail += siteKeyNote
                     val solved = runCatching {
-                        // v118: the mint origin is BACK on the solver default
-                        // (procomic.pro) — the field-proven pairing. 1.6.30/31
-                        // minted there and the token cleared the .net exchange
-                        // (5 pages every time); v117's .net-origin mint was
-                        // never field-proven and burned its full ladder when
-                        // the widget would not clear. The exchange validates
-                        // the token server-side; the mint just has to WORK.
                         TurnstileSolver.solve(
                             applicationContext,
                             siteKey,
@@ -2680,8 +1762,6 @@ abstract class ProComic :
         return WalkResult(collected, trail, false, collectedMaps, pass)
     }
 
-    /** v129: the walk's five-part outcome (a data class so the caller can
-     * destructure it). */
     private data class WalkResult(
         val images: List<String>,
         val trail: List<String>,
@@ -2693,14 +1773,8 @@ abstract class ProComic :
     private class DeferredOutcome(
         val kind: Kind,
         val note: String,
-        /** v114: the server's own turnstileMode from the gate's 403
-         * answer ("hidden"/"visible") — drives the solver's widget. */
         val mode: String? = null,
-        /** v129: the answer's reconstruction-map tokens (one per protected
-         * page) when the exchange answered OK. */
         val maps: List<ChapterMapTokenDto> = emptyList(),
-        /** v129: the answer's own pages-scope credential — the freshest
-         * x-chapter-pass. */
         val pass: String? = null,
         val mapDelivery: String? = null,
         val pieceRenderMode: String? = null,
@@ -2708,15 +1782,6 @@ abstract class ProComic :
         enum class Kind { OK, DONE, TURNSTILE, TOKEN_EXPIRED, PASS_EXPIRED, UNREACHABLE }
     }
 
-    /** One GET across the reader apexes; verdicts, never exceptions.
-     * v113 carries the reader's exact shape: the split query param plus
-     * the x-turnstile-token / x-turnstile-widget headers once a real
-     * widget token exists. v129: the reader-signal dialect — the
-     * `readerSignal` query param rides the URL exactly like the site's
-     * own reader JS sends it (`token`, then `readerSignal`, then
-     * `split`), and the Turnstile headers ride ONLY when a minted token
-     * exists (the signal path is tokenless — matching the site's own
-     * anonymous reader, verified live). */
     private fun deferredAttempt(
         chapterId: Int,
         token: String,
@@ -2773,12 +1838,6 @@ abstract class ProComic :
                         }
                         return@use
                     }
-                    // v129: parse the FULL answer — images[], maps[], the
-                    // delivery meta and the fresh pass. The terminal answer
-                    // is BOTH arrays empty (the maps era's "done" — v128
-                    // saw only images[] and read the empty-but-present
-                    // array as done on the FIRST answer, which is exactly
-                    // the 3-pages field verdict).
                     val answer = parseDeferredAnswer(bodyText)
                     if (answer != null) {
                         val images = answer.images
@@ -2815,9 +1874,6 @@ abstract class ProComic :
                             pieceRenderMode = answer.pieceRenderMode?.takeIf { it == "img" },
                         )
                     }
-                    // Legacy shape without a parseable data object but with
-                    // an images[] array present: the pre-v129 terminal
-                    // answer.
                     if (hasDeferredImagesArray(bodyText)) {
                         return emptyList<String>() to DeferredOutcome(
                             DeferredOutcome.Kind.DONE,
@@ -2836,9 +1892,6 @@ abstract class ProComic :
         return emptyList<String>() to DeferredOutcome(DeferredOutcome.Kind.UNREACHABLE, lastNote)
     }
 
-    /** v129: the deferred exchange's answer object — `{data:{…}}` (or the
-     * same shape top-level) with BOTH page classes plus the delivery meta
-     * and the fresh pass. Null when the body carries no such object. */
     internal fun parseDeferredAnswer(bodyText: String): DeferredAnswerDto? {
         if (bodyText.isBlank()) return null
         return runCatching {
@@ -2848,7 +1901,7 @@ abstract class ProComic :
         }.getOrNull()
     }
 
-    /** `{data:{images:[…]}}` (or the same shape top-level) — the reader
+    /** `{data:{images:[…]}}` (or the same shape top-level). The reader
      * appends these after the public pages. Strict about what may ride
      * further: absolute https URLs on the site's own image hosts. */
     internal fun parseDeferredImages(bodyText: String): List<String> {
@@ -2863,21 +1916,12 @@ abstract class ProComic :
         }.getOrDefault(emptyList())
     }
 
-    /** v116: does the body carry a `data.images` (or top-level `images`)
-     * JSON ARRAY — present even when EMPTY, which is the server's
-     * batch-exhausted terminal answer. Distinguishing "empty because done"
-     * from "no images field at all" is what lets the batch walk stop on
-     * completion instead of retrying. */
     internal fun hasDeferredImagesArray(bodyText: String): Boolean = runCatching {
         val root = json.parseToJsonElement(bodyText).jsonObject
         val data = (root["data"] as? kotlinx.serialization.json.JsonObject) ?: root
         data["images"] is JsonArray
     }.getOrDefault(false)
 
-    /** The gate's 403 answer carries the server's own widget mode
-     * (`{"error":"turnstile_token_required","turnstileMode":"visible"}`)
-     * — "hidden" or "visible" are the two values the reader accepts.
-     * v114 feeds it to the solver (it picks the widget appearance). */
     internal fun parseDeferredTurnstileMode(bodyText: String): String? = runCatching {
         val mode = json.parseToJsonElement(bodyText)
             .jsonObject["turnstileMode"]?.jsonPrimitive?.content?.trim()?.lowercase()
@@ -2886,10 +1930,10 @@ abstract class ProComic :
 
     /** The live Turnstile gate config from GET /api/auth/public-settings:
      * `{"loginTurnstile":{"enabled":true,"siteKey":"0x…"}}`. The reader
-     * renders its widget from THIS key (verified live 2026-10-28 — the
+     * renders its widget from this key. The
      * challenge URL sitekey equals this field, and it differs from the
      * key baked into older page chunks). Returns (siteKey|null, note).
-     * siteKey null means every apex failed — the solver falls back to
+     * siteKey null means every apex failed. The solver falls back to
      * its baked-in reader key. */
     internal fun parseTurnstileSiteKey(bodyText: String): String? = runCatching {
         val root = json.parseToJsonElement(bodyText).jsonObject
@@ -2930,9 +1974,9 @@ abstract class ProComic :
         return if (compact.length > 80) compact.take(77) + "…" else compact.ifEmpty { "(empty body)" }
     }
 
-    /** POST /chapter-deferred-media/{id}/refresh — the renewal endpoint
+    /** POST /chapter-deferred-media/{id}/refresh. The renewal endpoint
      * the site's reader uses when the deferred JWT expires mid-read
-     * (verified live: 200 {token} with just the session cookies). */
+     * (200 {token} with just the session cookies). */
     private fun renewDeferredToken(chapterId: Int, token: String, referer: String): String? {
         for (apex in readerApexes) {
             val answer = postJson(
@@ -2949,7 +1993,7 @@ abstract class ProComic :
         return null
     }
 
-    /** POST /chapter-deferred-media/{id}/image-pass — renews the
+    /** POST /chapter-deferred-media/{id}/image-pass. Renews the
      * x-chapter-pass credential the same way. */
     private fun renewImagePass(chapterId: Int, pass: String, referer: String): String? {
         for (apex in readerApexes) {
@@ -2967,9 +2011,6 @@ abstract class ProComic :
         return null
     }
 
-    /** One JSON POST across the apexes; (code, body) or null. v116:
-     * [passHeader] rides as x-chapter-pass (the re-sign endpoint validates
-     * the chapter credential exactly like the media fetches do). */
     private fun postJson(url: String, jsonBody: String, referer: String, passHeader: String? = null): Pair<Int, String>? = runCatching {
         val request = Request.Builder()
             .url(url)
@@ -2983,21 +2024,6 @@ abstract class ProComic :
         }
     }.getOrNull()
 
-    /**
-     * v129: the protected page's plan POST — POST /chapter-map-proxy-plan/{id}
-     * with `{token, method, cdnPath, pageIndex}` and the freshest
-     * x-chapter-pass header. LIVE-VERIFIED (sandbox, 2026-11-06, anonymous
-     * session): 200 `{success,data:{map:{dim,mode,pieces,order,rects}}}` —
-     * the map's pieces are FRESHLY-SIGNED absolute urls on img{1-4}.procomic.im
-     * (multi-use within their window, ~200 for a browser UA + the chapter
-     * referer, 403 bare) and the rects are absolute pixel rects aligned with
-     * the draw order. This is the site's own reader flow for the maps era
-     * (its chunk calls the same endpoint with the same body). Runs on the
-     * loopback server's worker thread on the page's first image request;
-     * every failure is null (the server names the stage in its diag trail).
-     * The walk's ONE re-plan self-heal lives server-side: when pieces lapse
-     * mid-build, the server plans ONCE more with this same hook.
-     */
     internal fun planChapterMap(request: ProComicImageServer.MapPageRequest): ProComicImageServer.MapPagePlanResult? {
         val pass = latestImagePass
         val body = buildString {
@@ -3028,7 +2054,7 @@ abstract class ProComic :
             val rects = map.effectiveRects(width, height)
             if (rects.size < map.pieces.size) continue
             // The server draws slot i at rects[i]; the site's own renderer
-            // draws pieces[order[i]] there — hand it the DRAW-ORDERED
+            // draws pieces[order[i]] there. Hand it the DRAW-ORDERED
             // pieces (identity in the observed live shape).
             val drawPieces = map.drawOrder().map { map.pieces[it] }
             return ProComicImageServer.MapPagePlanResult(
@@ -3041,16 +2067,6 @@ abstract class ProComic :
         return null
     }
 
-    /**
-     * v116: mint a fresh signed-proxy URL for one the edge rejected (410
-     * expired mid-read / 403), or sign a raw CDN url the deferred answer
-     * shipped unsigned. The site's own flow: POST /api/cdn-image/sign
-     * {url} with the chapter pass + the gated session (the successful
-     * exchange just established it) → {token, expires, es?, host?} → the
-     * signed fetch URL. Verified live in the v99 recon: sign 200 → signed
-     * fetch 200 (273 KB AVIF). Null on any refusal — the server's diag
-     * names the rung.
-     */
     private fun resignDeferredImageUrl(rejectedUrl: String): String? {
         val pass = latestImagePass ?: return null
         val raw = runCatching { rejectedUrl.toHttpUrl().queryParameter("url") }.getOrNull()
@@ -3091,14 +2107,6 @@ abstract class ProComic :
     // ========================= Preference screen =========================
 
     override fun setupPreferenceScreen(screen: PreferenceScreen) {
-        // ---- v142/v143: the browser road (default OFF, opt-in) ----
-        // v143: this switch now governs EVERY WebView in the extension —
-        // the URL-harvest session AND both Turnstile mints (the old
-        // default-ON "Solve the reader gate" switch is retired: with the
-        // tokenless exchange answering maps-only on every open, that mint
-        // booted a solver WebView on the default path of every chapter
-        // open — the exact profile the field device dies in). OFF means
-        // zero WebViews, ever: pages ride the cover road and the maps tier.
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_READER_SESSION
             title = "Browser page walk (opt-in)"
@@ -3113,7 +2121,6 @@ abstract class ProComic :
             setDefaultValue(false)
         }.let(screen::addPreference)
 
-        // ---- v120: the safe-fetch master switch (default ON) ----
         SwitchPreferenceCompat(screen.context).apply {
             key = PREF_SAFE_FETCH
             title = "Safe flight fetch (no challenge solver on listings)"
@@ -3184,40 +2191,15 @@ abstract class ProComic :
         const val TAG = "ProComic"
         const val PAGE_LIMIT = 24
 
-        /** v129: the reader-signal dialect constants — the site's own
-         * reader probe success values (see the fetchDeferredPagesInner
-         * doc). */
         private const val READER_SIGNAL_PRIMARY = "reader-slot-script-v1"
         private const val READER_SIGNAL_FALLBACK = "zoom-placeholder-v2"
 
-        /** v116: the deferred exchange is BATCHED server-side (redis
-         * progression — the reader re-calls with the same split value and
-         * renews its token as batches advance). These bounds keep the
-         * batch walk finite no matter what the server answers. v117:
-         * MAX_TOKEN_RENEWALS is walk-scale — every slice advance costs one
-         * refresh POST (the reader's own renewal cadence).
-         *
-         * v118 FIELD VERDICT on v117 (1.6.32): "procomic just crashes the
-         * app when it tries to fetch the chapter pages". Root cause: a
-         * Turnstile token is SINGLE-USE (siteverify consumes it), so the
-         * second exchange re-arms the gate and the walk minted AGAIN —
-         * v117 allowed up to 3 sequential WebView mints per chapter open
-         * (each a ~40 s ladder + a full chromium renderer spawn), plus
-         * 40 exchange/renewal rounds: minutes of blocked fetch = the
-         * crash. The bounds come back down to one-mint scale (the exact
-         * 1.6.30/31 economics that worked in the field) and a hard
-         * wall-clock budget caps the whole walk. */
         const val MAX_DEFERRED_EXCHANGES = 14
         const val MAX_DEFERRED_PAGES = 200
         const val MAX_TOKEN_RENEWALS = 14
         const val MAX_PASS_RENEWALS = 2
         const val MAX_TURNSTILE_MINTS = 1
 
-        /** v118: the whole deferred walk (exchanges + renewals + the one
-         * mint) must finish inside this wall — getPageList is a blocking
-         * fetch a host app waits on, and v117 proved a minutes-long walk
-         * reads as a dead app. 90 s covers one full mint ladder (~40 s)
-         * plus the public+first-batch economics with room to spare. */
         const val MAX_WALK_WALL_MS = 90_000L
 
         /** A single letter keeps the search endpoint in its "trusted" mode
@@ -3231,32 +2213,16 @@ abstract class ProComic :
         const val PREF_DEDUPLICATE_CHAPTERS = "pref_deduplicate_chapters"
         const val PREF_PREFERRED_SCANLATORS = "pref_preferred_scanlators"
 
-        /** v120: safe chapter fetch — the page-count (flight) fetch spawns
-         * NO library-solver WebView. v128: the reader-gate mint is NOT part
-         * of this promise anymore — it has its own switch below (the mint
-         * WebView is the hardened v113 surface, not the library one). */
         const val PREF_SAFE_FETCH = "pref_safe_fetch"
 
-        /** v142: the reader session, OPT-IN. When the plain fetch cannot
-         * serve the whole chapter, one bounded offscreen browser session
-         * collects the pages the site's own reader renders. Default OFF —
-         * after the draw deletion and the codec retirement this session is
-         * the last browser on the chapter-open path, and the field device
-         * has died inside every browser-bearing profile; the default open
-         * now runs zero WebViews and every page rides the cover road
-         * (weserv server-side JPEG, the platform decoder on Android 12+).
-         * The fresh key value discards any stale always-on value an older
-         * build persisted. */
         const val PREF_READER_SESSION = "pref_reader_session_optin_v142"
 
         /** The reader-session failure breaker: N consecutive sessions that
-         * yielded nothing pause the session for the cooldown window —
+         * yielded nothing pause the session for the cooldown window. 
          * chapter opens stay fast and browser-free until it lapses. */
         const val SESSION_FAILURE_LIMIT = 3
         const val SESSION_COOLDOWN_MS = 30L * 60_000L
 
-        /** v120: the fruitless-mint cooldown (reader-gate mint OFF or a
-         * dead ladder). */
         const val MINT_FRUITLESS_LIMIT = 2
         const val MINT_COOLDOWN_MS = 30L * 60_000L
 
@@ -3270,28 +2236,13 @@ abstract class ProComic :
     }
 }
 
-/**
- * v120: the challenge gate that CANNOT kill the host app. The library
- * [CloudflareSolverInterceptor] it delegates to (ONLY when the user opts
- * out of safe fetch) solves Cloudflare interstitials with a WebView built
- * on the MAIN looper and NO onRenderProcessGone handler — Android's
- * documented default for an unhandled renderer death is KILL THE PROCESS.
- * On the page-count fetch (the reader flight is an HTML GET) that was the
- * last unprotected WebView in the chain — the exact "crashes when it
- * tries to fetch the number of pages" report.
- *
- * Safe fetch (default) never spawns one: a challenged response is closed
- * and answered with a legible IOException every caller already treats as
- * a transport miss. Detection mirrors the library's own verdict logic
- * (cf-mitigated header, HTML content type, challenge markers).
- */
 private class ProComicChallengeInterceptor(
     private val cookieHosts: Set<String>,
     private val safeMode: () -> Boolean,
 ) : Interceptor {
 
     /** The library solver only loads when the user opts out of safe
-     * mode — lazy keeps the safe path free of any WebView dependency. */
+     * mode. Lazy keeps the safe path free of any WebView dependency. */
     private val webviewSolver: Interceptor by lazy { CloudflareSolverInterceptor(cookieHosts) }
 
     override fun intercept(chain: Interceptor.Chain): Response {
@@ -3299,7 +2250,7 @@ private class ProComicChallengeInterceptor(
         if (request.url.host !in cookieHosts) return chain.proceed(request)
 
         // Opt-out: the library behavior wholesale (proceed + detect +
-        // solve + retry), unchanged — the user accepted the WebView risk.
+        // solve + retry), unchanged. The user accepted the WebView risk.
         if (!safeMode()) return webviewSolver.intercept(chain)
 
         val response = chain.proceed(request)

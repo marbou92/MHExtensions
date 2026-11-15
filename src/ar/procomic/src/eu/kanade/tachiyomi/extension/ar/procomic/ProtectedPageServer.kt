@@ -44,58 +44,6 @@ internal class ProxyDiag {
     fun isEmpty(): Boolean = synchronized(lock) { rows.isEmpty() }
 }
 
-/**
- * Serves ProComic reader images from a loopback HTTP server.
- *
- * v101 shape — one route, no stitching. The site moved to procomic.net and
- * reworked the reader payload: every page now ships as a plain
- * signed-filename AVIF on `app.procomic.net` (the signature rides in the
- * file name, verified live: 200 for plain okhttp/curl clients on every
- * probed chapter), and the old protection stack is gone from the payload
- * (`maps:[]`, `protectionV2:null`) and dead server-side (the deferred-media
- * endpoints are Turnstile-gated, the cdn-image signing answers 403
- * forbidden to non-browser sessions — that is where the device-wide HTTP
- * 502 wave came from: v1.6.16 still talked to the dying .pro origin, whose
- * reader pages are "moved" stubs in migrated regions and whose plan/sign
- * endpoints refuse everything).
- *
- * Route:
- *
- * `/.image-proxy/{base64url}` — the upstream image fetched with the browser
- * UA and the site Referer, then TRANSCODED to JPEG when it is AVIF. Two
- * reasons the bytes cannot just pass through:
- *
- * 1. Host apps fetch image URLs with THEIR OWN client, and the site's WAF
- *    answers 403 to non-browser User-Agents (Kotatsu's app UA among them —
- *    verified live on the new app.<host> CDN too), so direct URLs break in
- *    those readers while the browser works fine. Proxying through the
- *    extension's process makes every page image host-app-proof.
- * 2. The page files are AVIF (tall long-strip pages, up to 8000px). The
- *    platform AVIF codec only exists on Android 12+ and some OEM builds
- *    lack it even after that, so a raw pass-through would fail to decode
- *    on exactly the devices this source serves. v111 (the new way): the
- *    AVIF is re-fetched through the weserv image proxy (`output=jpg`) so
- *    the TRANSCODE HAPPENS SERVER-SIDE and this process only ever decodes
- *    plain JPEG/PNG/WebP with BitmapFactory — on Android 10/11 NO AVIF
- *    decoder runs on the device at all. Every decoder that ever killed
- *    the host app (bundled libavif JNI, framework MediaCodec, the
- *    offscreen WebView) is GONE from the ladder; the worst case is now a
- *    legible error card, never a crash.
- *
- * Why a loopback server instead of a client interceptor: host apps differ in
- * how they execute image requests. Several Mihon-compatible readers (Kotatsu's
- * Mihon-compat layer among them) run image requests through their own client
- * without the source's application interceptors, which would send the site
- * URL raw and get HTTP 403 back. A plain HTTP URL that any HTTP client can
- * fetch works everywhere, with identical behavior in every reader and in
- * downloaders.
- *
- * Speed model (v101): one upstream GET per page (no plan POSTs, no piece
- * ladders, no session keys), a bounded JPEG result cache keyed by the
- * upstream URL, in-flight coalescing so the host's preload stampede shares
- * one build, and [preloadImages] warming the cache chapter-ahead in the
- * background so the reader's own fetches land on finished bytes.
- */
 class ProComicImageServer(
     private val baseUrl: String,
     /**
@@ -105,18 +53,7 @@ class ProComicImageServer(
      * sees the browsing session the reader page established.
      */
     private val sessionClient: OkHttpClient? = null,
-    /**
-     * A writable cache dir — the crash-loop breaker's marker files for the
-     * DEBUG-ONLY MediaCodec hook live here. The production ladder never
-     * runs native code (v111), so tracking is best-effort and optional so
-     * the JVM harness can drive the server without one.
-     */
     private val nativeCacheDir: java.io.File? = null,
-    /**
-     * v111: the server-side transcode hosts, tried in order. Overridable
-     * so the JVM harness can pin the both-hosts-fail path deterministically
-     * without touching the network defaults.
-     */
     private val proxyHosts: List<String> = DEFAULT_PROXY_HOSTS,
 ) {
 
@@ -127,72 +64,19 @@ class ProComicImageServer(
 
     private val startedAtMs = System.currentTimeMillis()
 
-    /**
-     * v132 — THE DECODE WALL. Android 12 (API 31) is the first platform
-     * whose BitmapFactory decodes AVIF. Below it, the stateful pipelines
-     * (/.map-page, /.composed) cannot turn the site's reconstruction-map
-     * pieces into pixels at all: the pieces are AVIF on img{1-4}, the piece
-     * edge checks the Referer VALUE (live recon 2026-11-06: ANY UA passes
-     * with the chapter referer, a wrong referer 403s, a bare fetch 403s),
-     * and the one remote transcoder this architecture can reach — weserv,
-     * the v111 production tier — cannot send a Referer at all (its fetcher
-     * 404s the pieces). The site's own android API is signature-gated
-     * (minVersionCode 93), Cloudflare transformations are off, and the
-     * removed on-device tiers (WebView, libavif JNI, MediaCodec) each
-     * crashed the host app on the affected device. So on Android 10/11
-     * every piece of every protected page decodes null → "every piece
-     * failed" → the legible 502 after ~30 s of doomed fetch+transcode
-     * retries — the exact field verdict.
-     *
-     * The wall answers FAST instead: stateful routes 410 with a legible
-     * body when the device cannot decode, and the source does not even
-     * list those pages (the decode-wall gate in getPageList).
-     */
     private val avifRenderable: Boolean by lazy {
         runCatching { avifDecodable(android.os.Build.VERSION.SDK_INT) }.getOrDefault(true)
     }
 
-    /** v116: the current x-chapter-pass credential (the pages-scope p1 JWT
-     * the deferred exchange holds and renews). Attached to signed-proxy
-     * fetches — the same header the site's own reader sends on protected
-     * media. Optional so the JVM harness can drive the server bare. */
     @Volatile
     var chapterPassProvider: (() -> String?)? = null
 
-    /** v116: mints a fresh signed-proxy URL for a rejected or expired one
-     * (the source re-signs the wrapped CDN url through the site's own
-     * POST /api/cdn-image/sign with its gated session). Returning null
-     * keeps the legible failure + diag trail. */
     @Volatile
     var deferredResigner: ((String) -> String?)? = null
 
-    /** v129: plans one protected map page's reconstruction map — the
-     * freshly-signed piece urls plus their rects. The source owns the
-     * POST /chapter-map-proxy-plan/{id} call (client, apex ladder, the
-     * chapter pass); the server calls this on the page's first image
-     * request and once more for the re-plan self-heal. Optional so the
-     * JVM harness can drive the server bare. */
     @Volatile
     internal var mapPlanner: ((MapPageRequest) -> MapPagePlanResult?)? = null
 
-    /**
-     * v140 — RETIRED FOR GOOD. The v139 piece codec gate (the FRAMEWORK's
-     * own software AV1 codec, c2.android.av1 = API 29+, behind
-     * AvifMediaCodecDecoder's PIECE-SIZED pure-Kotlin pre-alloc gate —
-     * plan pieces 800x298 ~0.24 MP, the video-thumbnail profile) was the
-     * field verdict on v1.6.52: "the extension crashs when it try to load
-     * it" — the device died inside c2.android.av1 at 800x298 exactly like
-     * it died at full size in v108, and no Java guard catches a native
-     * codec death. The production ladder runs NO AVIF decoder below
-     * Android 12 ever again: BitmapFactory (12+) → weserv server-side
-     * transcode → the legible error card. Map pages below Android 12 take
-     * the fast legible 410 at the decode wall, and the reader session
-     * re-arms as their render fallback. (The debugMediaCodecTier harness
-     * hook keeps its dedicated entry — production never reaches it; the
-     * WebView transcode tier was already deleted — the field device died
-     * inside every WebView decode profile across v109–v138, the fifth
-     * being v1.6.51's sandboxed-renderer tier.)
-     */
     internal fun codecPieceTierReady(): Boolean = false
 
     /** Fair 2-wide semaphore over the TRANSCODE stage only (decode + JPEG
@@ -205,15 +89,6 @@ class ProComicImageServer(
         Executors.newCachedThreadPool { runnable ->
             Thread(runnable, "ProComicImageServer").apply {
                 isDaemon = true
-                // v119: THE PROCESS-DEATH FIREWALL. An uncaught Throwable on
-                // ANY extension-spawned thread reaches the default
-                // uncaught-exception handler and kills the HOST APP — the
-                // exact 1.6.19/1.6.20 field crash shape, back in the field
-                // on 1.6.32/33 ("entering a chapter crashes the entire
-                // extension"). Every thread this server spawns now swallows
-                // its own death: a worker that dies mid-build costs that one
-                // answer (the host sees the error card / a 502), the pool
-                // heals per request, and the app survives.
                 uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { t, e ->
                     Log.w(TAG, "server thread ${t.name} died safely: ${e.javaClass.simpleName}")
                 }
@@ -224,15 +99,10 @@ class ProComicImageServer(
     /**
      * Loopback URL that serves [imageUrl] through the extension's own
      * client (browser User-Agent + site Referer + AVIF→JPEG transcode), so
-     * host apps that would get 403 from the CDN with their own headers —
-     * or could not decode AVIF at all — still load every page.
+     * host apps that would get 403 from the CDN with their own headers. 
+     * or could not decode AVIF at all. Still load every page.
      */
     fun imageProxyUrl(imageUrl: String): String {
-        // v130: idempotent — a loopback route of this server (.map-page,
-        // .composed, .image-proxy) is already fetchable as-is; wrapping it
-        // again would make the .image-proxy route decode its own inner url
-        // and refuse it in isAllowedImageUrl (the 400 "unusable image url"
-        // wave the field saw on every protected page in v129).
         if (imageUrl.startsWith("http://127.0.0.1:")) return imageUrl
         val encoded = android.util.Base64.encodeToString(
             imageUrl.toByteArray(Charsets.UTF_8),
@@ -241,15 +111,7 @@ class ProComicImageServer(
         return "http://127.0.0.1:${ensureStarted()}/$IMAGE_PROXY_PATH_PREFIX/$encoded"
     }
 
-    /** Loopback URL that serves [imageUrl] through the extension's own
-     * client. [maxEdge] > 0 asks the transcoder to downscale the decoded
-     * image so its long edge fits — covers (v106) request 1280 so a
-     * 4000x6000 "originals" AVIF never turns into a ~90 MB ARGB bitmap on
-     * a phone; pages keep the full resolution (0). The parameter rides the
-     * URL query (?e=) so one route serves both shapes and the cache keys
-     * stay distinct. */
     fun imageProxyUrl(imageUrl: String, maxEdge: Int = 0): String {
-        // v130: idempotent (see the 1-arg overload).
         if (imageUrl.startsWith("http://127.0.0.1:")) return imageUrl
         val encoded = android.util.Base64.encodeToString(
             imageUrl.toByteArray(Charsets.UTF_8),
@@ -259,16 +121,6 @@ class ProComicImageServer(
         return "http://127.0.0.1:${ensureStarted()}/$IMAGE_PROXY_PATH_PREFIX/$encoded$query"
     }
 
-    /**
-     * Loopback URL that serves a COMPOSED reader row (v124): [row] is one
-     * of the reader session's piece rows — the site's own freshly-signed
-     * piece URLs plus the rectangles they were laid out at. The server
-     * fetches every piece through the normal proxy ladder (which already
-     * knows the /api/cdn-image signed wraps) and stitches them onto one
-     * canvas — the same assembly the site performs in the browser. The
-     * spec rides an in-memory registry keyed by its own hash; a process
-     * restart simply re-harvests on the next chapter open.
-     */
     internal fun composedProxyUrl(row: ProComicReaderSession.HarvestRow): String? {
         if (row.pieces.isEmpty()) return null
         val spec = ComposedSpec(row.w, row.h, row.pieces.map { ComposedPiece(it.u, it.x, it.y, it.w, it.h) })
@@ -295,12 +147,7 @@ class ProComicImageServer(
     @kotlinx.serialization.Serializable
     internal data class ComposedSpec(val w: Int, val h: Int, val pieces: List<ComposedPiece>)
 
-    // ==================== protected map pages (v129) ======================
 
-    /** v129: the plan request the server hands the source's [mapPlanner]
-     * when a protected page's reconstruction map is needed. Fields are
-     * exactly the plan POST body's own: token, method, cdnPath, pageIndex —
-     * plus the chapter route (the Referer the piece edge requires). */
     internal class MapPageRequest(
         val chapterId: Int,
         val pageIndex: Int,
@@ -310,10 +157,6 @@ class ProComicImageServer(
         val referer: String,
     )
 
-    /** v129: the planned reconstruction map — the canvas size, the
-     * DRAW-ORDERED freshly-signed piece urls and their slot-aligned pixel
-     * rects (draw slot i composes [pieces][MapPagePlanResult.pieces][i] at
-     * [rects][MapPagePlanResult.rects][i]). */
     internal class MapPagePlanResult(
         val width: Int,
         val height: Int,
@@ -334,15 +177,6 @@ class ProComicImageServer(
 
     private val mapPages = LinkedHashMap<String, MapPageEntry>()
 
-    /**
-     * v129: registers one planned protected page (an exchange maps[] token)
-     * at listing time and returns its loopback url. Listing stays fast —
-     * the plan POST (freshly-signed piece urls) fires on the page's FIRST
-     * image request, inside [serveMapPage]. The registry is keyed by a hash
-     * of the page's identity (chapter + index + token), bounded like the
-     * composed-row registry; a process restart simply re-walks on the next
-     * chapter open.
-     */
     internal fun registerMapPage(
         chapterId: Int,
         pageIndex: Int,
@@ -368,14 +202,14 @@ class ProComicImageServer(
 
     /**
      * Serves one protected map page: plan (the source's [mapPlanner] hook
-     * — the freshly-signed piece urls + rects) → fetch every piece with the
-     * CHAPTER referer (live-verified: the img{1-4} piece edge 403s without
+     * . The freshly-signed piece urls + rects) → fetch every piece with the
+     * CHAPTER referer (the img{1-4} piece edge 403s without
      * it) → local AVIF→JPEG transcode → stitch onto the map's canvas → JPEG.
      * Coalesced per page; ONE re-plan self-heal when the short-lived piece
      * signatures lapse between listing and the first request (fresh plan,
-     * only the failed slots redrawn — the site's own reader heals the same
+     * only the failed slots redrawn. The site's own reader heals the same
      * way, re-planning a lapsed map mid-read). Every failure surfaces as a
-     * legible 502 or a partially-blank canvas — never a crash.
+     * legible 502 or a partially-blank canvas. Never a crash.
      */
     private fun serveMapPage(path: String, output: java.io.OutputStream) {
         val key = path.removePrefix("/$MAP_PAGE_PATH_PREFIX/").trim()
@@ -389,26 +223,6 @@ class ProComicImageServer(
             writeImageBytes(output, it.first, it.second)
             return
         }
-        // v132: the decode wall — a device below Android 12 cannot decode
-        // the AVIF pieces the plan returns with its own BitmapFactory; a
-        // doomed on-device build answers nothing (the field verdict: ~30 s
-        // of fetch+transcode retries, then "every piece failed").
-        // v138: THE PIECE-BY-PIECE TRANSCODE — "cannot decode" no longer
-        // means "cannot render". The v137 view-draw raster tier was deleted
-        // (its ONE view draw ran Chromium's rasterizer in the app process —
-        // the v108-v111 kill pattern; the field verdict on v137 was "their
-        // images just crash the reader"), and v1.6.51's sandboxed-renderer
-        // WebView tier died in the field TOO — the FIFTH WebView decode
-        // death. v139 tried the framework's own software AV1 codec
-        // (c2.android.av1) behind a PIECE-SIZED gate — and the field
-        // verdict on v1.6.52 arrived with the user's own words: "we were
-        // encoding the cover and the first three pages perfectly fine and
-        // they are avif so why have problems for page 4+" — the device
-        // died inside c2.android.av1 at 800x298 exactly like it died at
-        // full size in v108. v140: the tier is RETIRED FOR GOOD (see
-        // codecPieceTierReady) — this wall always stands below Android 12,
-        // the legible 410 is the floor, and the reader session re-arms as
-        // the render fallback. Never a crash.
         if (!avifRenderable && !codecPieceTierReady()) {
             writeResponse(
                 output,
@@ -425,10 +239,6 @@ class ProComicImageServer(
             )
             return
         }
-        // v130: the build's failures surface as a legible 502 (stage + diag
-        // headers, the docstring's own contract) instead of a bare socket
-        // close — a dropped connection renders as a cryptic network error
-        // in the reader and hides the whole diag trail.
         val (contentType, bytes) = try {
             composedCoalesced(cacheId) {
                 buildMapPage(entry)
@@ -505,10 +315,6 @@ class ProComicImageServer(
             canvas.drawColor(Color.WHITE)
             var failed = drawMapPieces(canvas, plan.pieces, plan.rects, null, entry.referer, diag)
             if (failed.isNotEmpty()) {
-                // v129: the ONE re-plan self-heal. The piece signatures are
-                // short-lived; a lapse between the listing and this first
-                // request re-plans once (a fresh plan POST mints fresh
-                // signatures) and redraws ONLY the failed slots.
                 diag.add("compose: ${failed.size}/${plan.pieces.size} pieces failed — one re-plan self-heal")
                 val healed = runCatching { planner(request) }.getOrNull()
                 if (healed != null && healed.pieces.size == plan.pieces.size && healed.pieces != plan.pieces) {
@@ -539,7 +345,7 @@ class ProComicImageServer(
 
     /** Draws [pieces] at their rects; [only] restricts the work to the
      * given slot indices (the self-heal's failed set). Returns the slots
-     * that still failed (a failed piece leaves its rect blank — the page
+     * that still failed (a failed piece leaves its rect blank. The page
      * stays readable). */
     private fun drawMapPieces(
         canvas: Canvas,
@@ -592,14 +398,6 @@ class ProComicImageServer(
         return failed
     }
 
-    /** v129: the piece ladder — the img{1-4} signed piece urls answer 200
-     * to a BROWSER UA carrying the CHAPTER referer and 403 to anything
-     * else (live-verified; weserv cannot fetch them either — no referer —
-     * so the server-side transcode tier is out for pieces and the local
-     * transcode runs: Android 12+ decodes the AVIF natively, older
-     * devices leave the rect blank, the rest of the page intact). The
-     * inner client goes first, the session client retries (the reading
-     * session the walk established). */
     private fun fetchPieceBytes(pieceUrl: String, referer: String, diag: ProxyDiag): Pair<String, ByteArray> {
         val tiers = listOf(innerClient to "inner") +
             (sessionClient?.let { listOf(it to "session") } ?: emptyList())
@@ -622,10 +420,6 @@ class ProComicImageServer(
                     val contentType = response.header("Content-Type").orEmpty()
                     val raw = response.body.bytes()
                     if (isAvif(contentType, raw)) {
-                        // v138: the map-piece ladder is the ONE caller the
-                        // WebView decode tier answers (pieces are ~800x298 —
-                        // the observed grid_2x3 shape; the tier caps and
-                        // locks its canvas whatever the piece claims).
                         return "image/jpeg" to transcodeUnderPermit(raw, pieceUrl, diag, 0, allowWebViewDecode = true)
                     }
                     return contentType.ifBlank { "application/octet-stream" } to raw
@@ -650,21 +444,6 @@ class ProComicImageServer(
 
     private val composedSpecs = LinkedHashMap<String, ComposedSpec>()
 
-    /** Starts (or restarts) the loopback server and returns its port.
-     *
-     * v105: a FIXED preferred port is tried first so proxy URLs embedded in
-     * host-app data (cover thumbnail_url persists in the library DB; page
-     * URLs live in the reader session) stay valid across process restarts.
-     * When the port is taken, a /.diag probe decides: another process of
-     * THIS extension (a second host app) serves the identical stateless
-     * route and is reused as-is; anything else falls back to an ephemeral
-     * port exactly like the pre-v105 behavior.
-     *
-     * v131: this is now the STATELESS mint port only (/.image-proxy — the
-     * url carries its whole job, so any family process can answer it). The
-     * stateful routes (.map-page, .composed) mint through [ensureOwnedPort]
-     * — see there for the field verdict that forced the split.
-     */
     private fun ensureStarted(): Int {
         machine.get()?.takeIf { !it.socket.isClosed }?.let { return it.socket.localPort }
         synchronized(startLock) {
@@ -674,9 +453,6 @@ class ProComicImageServer(
                 startAcceptor(socket)
             }.onSuccess { return PREFERRED_PORT }
             if (familyServerListening(PREFERRED_PORT)) return PREFERRED_PORT
-            // v106: the fallback bind is guarded too — an unguarded bind
-            // throw here escapes into whatever thread asked for a cover
-            // URL first.
             runCatching {
                 val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
                 startAcceptor(socket)
@@ -685,28 +461,6 @@ class ProComicImageServer(
         }
     }
 
-    /** v131: the port the STATEFUL routes (/.map-page, /.composed) mint
-     * against — a socket THIS process owns.
-     *
-     * FIELD VERDICT on v130: "410 instead of 400 — that's the only
-     * difference". The 410 is this server's own registry-miss answer
-     * ("protected page expired") — and inside the process that REGISTERED
-     * the pages, that lookup cannot miss, so the answering socket belonged
-     * to a DIFFERENT process: v105's family-reuse hands out the preferred
-     * port whenever another process of this extension answers /.diag with
-     * the family marker (a second host app, an older test build still
-     * installed). That was sound while every route was stateless, but the
-     * v129 map pages and the v124 composed rows keep their payload in an
-     * IN-MEMORY registry — minting them against a foreign listener 410s
-     * every one of them while the stateless .image-proxy pages keep
-     * loading: the exact "first three load, the rest 410" split the field
-     * reported.
-     *
-     * So the stateful mints bind here: preferred port when free, otherwise
-     * an EPHEMERAL port this process owns — the foreign family listener is
-     * deliberately not probed. A sibling process keeps serving the
-     * stateless /.image-proxy flow without interference.
-     */
     private fun ensureOwnedPort(): Int {
         machine.get()?.takeIf { !it.socket.isClosed }?.let { return it.socket.localPort }
         synchronized(startLock) {
@@ -715,8 +469,6 @@ class ProComicImageServer(
                 val socket = ServerSocket(PREFERRED_PORT, BACKLOG, InetAddress.getByName("127.0.0.1"))
                 startAcceptor(socket)
             }.onSuccess { return PREFERRED_PORT }
-            // v131: the family probe is deliberately ABSENT here — a family
-            // listener on the preferred port is another process's registry.
             runCatching {
                 val socket = ServerSocket(0, BACKLOG, InetAddress.getByName("127.0.0.1"))
                 startAcceptor(socket)
@@ -730,8 +482,6 @@ class ProComicImageServer(
         machine.set(Machine(socket))
         val acceptor = Thread({ acceptLoop(socket) }, "ProComicImageServer-accept").apply {
             isDaemon = true
-            // v119: the acceptor carries the same firewall — its death may
-            // never be the app's death (a fresh acceptor starts on demand).
             uncaughtExceptionHandler = Thread.UncaughtExceptionHandler { t, e ->
                 Log.w(TAG, "acceptor ${t.name} died safely: ${e.javaClass.simpleName}")
             }
@@ -764,8 +514,6 @@ class ProComicImageServer(
             try {
                 executor.execute { handleConnection(connection) }
             } catch (_: Throwable) {
-                // v119: a rejected dispatch (pool saturated/shutting down)
-                // must not kill the acceptor — close the socket and move on.
                 runCatching { connection.close() }
             }
         }
@@ -788,10 +536,6 @@ class ProComicImageServer(
                 }
             }
         } catch (_: Throwable) {
-            // v106: Throwable, not Exception — an Error escaping this worker
-            // thread reaches the default uncaught-exception handler and the
-            // HOST APP PROCESS DIES (exactly the 1.6.19/1.6.20 field crash
-            // shape). Nothing on this thread is allowed to kill the app.
         }
     }
 
@@ -840,11 +584,6 @@ class ProComicImageServer(
             writeImageBytes(output, it.first, it.second)
             return
         }
-        // v132: the decode wall — same guard serveMapPage carries (the
-        // composed rows are the same AVIF pieces through the harvest path).
-        // v133: this guard only ever sees rows the session could NOT capture
-        // in-page (an old WebView without AVIF) — captured rows ride
-        // /.captured below and need no decoder at all.
         if (!avifRenderable) {
             writeResponse(
                 output,
@@ -856,8 +595,6 @@ class ProComicImageServer(
             )
             return
         }
-        // v130: the same legible-502 wrap serveMapPage got (a compose failure
-        // used to close the socket with no response at all).
         val (contentType, bytes) = try {
             composedCoalesced(cacheId) {
                 composeRow(spec)
@@ -918,7 +655,7 @@ class ProComicImageServer(
         }
     }
 
-    /** Fetches every piece (through the full proxy ladder — signed wraps
+    /** Fetches every piece (through the full proxy ladder. Signed wraps
      * included), draws them at their harvested rects, JPEGs the canvas.
      * A single failed piece leaves its rect blank (the page stays
      * readable); a fully failed row throws. */
@@ -934,12 +671,6 @@ class ProComicImageServer(
             for (piece in spec.pieces) {
                 runCatching {
                     val (_, bytes) = buildImageBytes(piece.u, diag)
-                    // v135: the platform decode only — the offscreen
-                    // WebView tier is on the ban list (it died inside the
-                    // field device across v108–v110 AND again on v1.6.47).
-                    // A piece the platform cannot decode leaves its rect
-                    // blank; the capture path owns these pixels on
-                    // Android 10/11.
                     val decoded = BitmapFactory.decodeByteArray(bytes, 0, bytes.size)
                         ?: return@runCatching
                     canvas.drawBitmap(
@@ -968,7 +699,6 @@ class ProComicImageServer(
         }
     }
 
-    // ==================== captured rows (v133) =========================
 
     /** One already-decoded tile of a captured row: image bytes + dest rect. */
     internal class CapturedTileSpec(
@@ -990,15 +720,6 @@ class ProComicImageServer(
 
     private val capturedRows = LinkedHashMap<String, CapturedRowSpec>()
 
-    /**
-     * v133: registers one session-captured protected page (the rendered
-     * harvest — the WebView decoded the site's AVIF pieces and handed back
-     * JPEG data urls) and returns its loopback url. The tiles are decoded
-     * HERE (Base64 data urls → bytes) so the serving route never touches
-     * AVIF: the build is BitmapFactory(JPEG/PNG) draws onto one canvas —
-     * universal on every Android version. Registry bounded like the other
-     * stateful routes; a process restart re-harvests on the next open.
-     */
     internal fun registerCapturedRow(
         chapterId: Int,
         pageIndex: Int,
@@ -1036,11 +757,11 @@ class ProComicImageServer(
 
     /**
      * Serves one captured protected page: decode every tile with
-     * BitmapFactory (JPEG/PNG — the capture already did the AVIF work in
+     * BitmapFactory (JPEG/PNG. The capture already did the AVIF work in
      * the WebView), draw at the harvested rects, JPEG the canvas. No
-     * fetch, no referer, no AVIF decoder — the one page class that renders
+     * fetch, no referer, no AVIF decoder. The one page class that renders
      * identically on every Android version. Coalesced per key; every
-     * failure surfaces as a legible 502 — never a crash.
+     * failure surfaces as a legible 502. Never a crash.
      */
     private fun serveCaptured(path: String, output: java.io.OutputStream) {
         val key = path.removePrefix("/$CAPTURED_PATH_PREFIX/").trim()
@@ -1085,7 +806,7 @@ class ProComicImageServer(
         writeImageBytes(output, contentType, bytes)
     }
 
-    /** Stitches the captured tiles at their rects — plain raster work. */
+    /** Stitches the captured tiles at their rects. Plain raster work. */
     private fun buildCapturedRow(spec: CapturedRowSpec): Pair<String, ByteArray> {
         val width = spec.w.coerceIn(8, MAX_COMPOSED_EDGE)
         val height = spec.h.coerceIn(8, MAX_COMPOSED_EDGE * 2)
@@ -1146,8 +867,6 @@ class ProComicImageServer(
      */
     private fun serveImageProxy(path: String, query: String, output: java.io.OutputStream) {
         val encoded = path.removePrefix("/$IMAGE_PROXY_PATH_PREFIX/")
-        // ?e=<edge> — the cover-downscale variant (v106). Out-of-range or
-        // malformed values fall back to 0 (full resolution) silently.
         val maxEdge = query.substringAfter("e=", "").substringBefore('&').toIntOrNull()
             ?.takeIf { it in MIN_DOWNSCALE_EDGE..MAX_DOWNSCALE_EDGE }
             ?: 0
@@ -1163,11 +882,6 @@ class ProComicImageServer(
             }.getOrNull()
         }
         if (decoded == null || !isAllowedImageUrl(decoded)) {
-            // v130: heal the stale double-wrap a v129 build minted — an inner
-            // url that is a loopback route of THIS server (.map-page,
-            // .composed) is dispatched to that route directly instead of the
-            // dead-end 400 (the route itself answers 410 when its registry
-            // entry is gone, which stays legible).
             if (decoded != null && decoded.startsWith("http://127.0.0.1:")) {
                 val route = runCatching { decoded.toHttpUrl().encodedPath }.getOrNull()
                 when {
@@ -1203,7 +917,7 @@ class ProComicImageServer(
             Log.w(TAG, "image $decoded failed at stage=${failure.stage}: ${failure.readerBody}")
             recordFailure(decoded, failure.stage, failure.diag)
             // Deterministic device-side failures (decode) render a legible
-            // JPEG — most hosts surface only the HTTP code, which made every
+            // JPEG. Most hosts surface only the HTTP code, which made every
             // earlier diagnosis trail invisible to the user.
             val image = if (failure.stage == "decode") errorPageJpeg(failure) else null
             if (image != null) {
@@ -1232,12 +946,6 @@ class ProComicImageServer(
         cause: Throwable? = null,
     ) : Exception(readerBody, cause)
 
-    /** Fetch + transcode for one upstream URL, throwing [ImageBuildFailure]
-     * with the reader-visible body. Shared by the request path and the
-     * background preloader; runs ONCE per URL even under concurrent host
-     * fetches (coalesced by [buildImageCoalesced]). v117: signed-proxy
-     * urls (the deferred pages' /api/cdn-image wraps) walk a dedicated
-     * ladder — see [buildSignedImageBytes]. */
     private fun buildImageBytes(imageUrl: String, diag: ProxyDiag, maxEdge: Int = 0): Pair<String, ByteArray> {
         if (isSignedProxyUrl(imageUrl)) {
             var stage = "signed"
@@ -1264,7 +972,7 @@ class ProComicImageServer(
             val bytes = if (isAvif(contentType, raw)) {
                 transcodeUnderPermit(raw, imageUrl, diag, maxEdge)
             } else {
-                // JPEG/PNG/WebP pass through untouched — no decode cost.
+                // JPEG/PNG/WebP pass through untouched. No decode cost.
                 raw
             }
             stage = "cache"
@@ -1286,7 +994,7 @@ class ProComicImageServer(
     }
 
     /** The signed url's inner target (the `url` query param) when it is a
-     * WIDE-OPEN app host — those files are served to any client (the
+     * WIDE-OPEN app host. Those files are served to any client (the
      * signature rides in the file name), so the wrap can be skipped
      * entirely and the plain p1-p3-style ladder used. Null for any other
      * host (cdn2 and friends stay behind the signed route). Internal +
@@ -1299,27 +1007,8 @@ class ProComicImageServer(
         if (host.startsWith("app.")) inner else null
     }.getOrNull()
 
-    /**
-     * v117: the signed-proxy ladder. LIVE RECON (all from the sandbox,
-     * with a real flight-issued pass): signed urls are MULTI-USE within
-     * their ~4-min window, BOTH apexes' /api/cdn-image fetches answer 200,
-     * and weserv converts a signed url to JPEG cleanly — so the v116
-     * failure was never weserv's refetch. The ladder walks the cheapest
-     * proven rungs first and names every one in the diag trail:
-     *
-     *  1. UNWRAP — when the wrap is a wide-open app host, use the inner
-     *     url through the exact p1-p3-proven plain ladder (no token, no
-     *     cdn-image route, no expiry).
-     *  2. WESERV-ON-SIGNED — weserv fetches the signed url itself (its
-     *     datacenter reaches the route; proven 200 → JPEG) with one 5xx
-     *     retry per host (the route 502s cold-started on first hit).
-     *  3. UPSTREAM — the v116 ladder: the session client first with the
-     *     x-chapter-pass header, then inner; on a rejected/expired signed
-     *     url the source's re-sign hook mints a fresh one and the weserv
-     *     tier tries the fresh url.
-     */
     private fun buildSignedImageBytes(imageUrl: String, diag: ProxyDiag, maxEdge: Int): Pair<String, ByteArray> {
-        // Rung 1 — unwrap to the wide-open app host.
+        // Rung 1. Unwrap to the wide-open app host.
         signedInnerAppUrl(imageUrl)?.let { inner ->
             diag.add("signed rung 1: unwrap → ${runCatching { inner.toHttpUrl().host }.getOrDefault("?")} (wide-open app host)")
             try {
@@ -1332,7 +1021,7 @@ class ProComicImageServer(
             }
         } ?: diag.add("signed rung 1: inner host is not a wide-open app host — skipped")
 
-        // Rung 2 — weserv fetches the signed url itself.
+        // Rung 2. Weserv fetches the signed url itself.
         diag.add("signed rung 2: weserv on the signed url")
         try {
             val jpeg = fetchProxyJpegBytes(imageUrl, raw = null, diag = diag, maxEdge = maxEdge)
@@ -1344,9 +1033,6 @@ class ProComicImageServer(
             diag.add("signed rung 2 threw: ${t.javaClass.simpleName}")
         }
 
-        // Rung 3 — the proxy fetches the signed url (session-first + pass,
-        // the v116 ladder), then re-signs a rejection and lets weserv try
-        // the fresh url.
         diag.add("signed rung 3: upstream fetch (session-first + pass)")
         val (ct, raw) = fetchUpstreamWithRetry(imageUrl, diag)
         if (!isAvif(ct, raw)) {
@@ -1363,8 +1049,6 @@ class ProComicImageServer(
         } else {
             diag.add("signed rung 3: no fresh url (the source could not re-sign)")
         }
-        // Last resort inside rung 3: the v111 weserv tier on the original
-        // bytes (harmless repeat — named for the trail).
         transcodeUnderPermit(raw, imageUrl, diag, maxEdge).let { bytes ->
             diag.add("signed rung 3: served ${bytes.size}B via the local transcode tier")
             return "image/jpeg" to bytes
@@ -1374,7 +1058,7 @@ class ProComicImageServer(
     private fun contentTypeServed(upstreamType: String, bytes: ByteArray): String = if (isAvif(upstreamType, bytes)) "image/jpeg" else upstreamType.ifBlank { "application/octet-stream" }
 
     /** The transcode stage under the fair semaphore: proxy fetch + decode
-     * + JPEG encode. Raw bytes are already in memory — the proxy fetch is
+     * + JPEG encode. Raw bytes are already in memory. The proxy fetch is
      * a small network hop that shares the permit so a cover grid cannot
      * stampede the transcoder. */
     private fun transcodeUnderPermit(
@@ -1387,9 +1071,6 @@ class ProComicImageServer(
         try {
             transcodePermits.acquire()
         } catch (_: InterruptedException) {
-            // v119: an interrupt must surface as the legible decode failure
-            // (the error card), never as a raw InterruptedException
-            // escaping a pool thread.
             Thread.currentThread().interrupt()
             throw ImageBuildFailure("decode", "ProComic: page transcode interrupted", diag)
         }
@@ -1400,16 +1081,8 @@ class ProComicImageServer(
         }
     }
 
-    /** v116: the signed-proxy URL class — /api/cdn-image answers mint
-     * short-lived (~15 min observed) signed urls whose token rides the
-     * query. These get the pass header, the session-first fetch order and
-     * the re-sign rung; plain CDN/app-host urls keep the v101 ladder. */
     internal fun isSignedProxyUrl(imageUrl: String): Boolean = imageUrl.contains("/api/cdn-image")
 
-    /** One upstream fetch attempt with the exact headers a browser <img>
-     * sends. Caller retries/cascades. v116: [pass] rides as x-chapter-pass
-     * on signed-proxy urls — the credential the site's reader attaches to
-     * the same requests. */
     private fun fetchUpstreamOnce(imageUrl: String, client: OkHttpClient, pass: String? = null): Pair<String, ByteArray> {
         val request = Request.Builder()
             .url(imageUrl)
@@ -1431,15 +1104,6 @@ class ProComicImageServer(
         }
     }
 
-    /** v116 fetch ladder. Signed-proxy urls (/api/cdn-image) try the
-     * SESSION client first (the fetch may be cookie-gated exactly like
-     * the exchange that minted them), then the bare inner client; every
-     * other host keeps the v101 order (inner first, session as the
-     * retry). When a signed url is rejected outright by the edge (410
-     * expired / 403), the source's re-sign hook mints a fresh signed url
-     * out of the gated session and both clients retry it once — an
-     * expired mid-read page heals itself instead of dying into an error
-     * card. */
     private fun fetchUpstreamWithRetry(imageUrl: String, diag: ProxyDiag): Pair<String, ByteArray> {
         val host = runCatching { imageUrl.toHttpUrl().host }.getOrDefault("?")
         val signed = isSignedProxyUrl(imageUrl)
@@ -1495,7 +1159,7 @@ class ProComicImageServer(
         return message.substringAfter("ProComic: ").take(48)
     }
 
-    /** AVIF sniffing: the container is ISOBMFF — "ftyp" at offset 4 with an
+    /** AVIF sniffing: the container is ISOBMFF. "ftyp" at offset 4 with an
      * "av" family brand (avif/avis) at 8, or one of the heic-style brands
      * the CDN sometimes puts in Content-Type. Content-Type first, magic as
      * the tiebreaker (some edges serve application/octet-stream). */
@@ -1511,32 +1175,6 @@ class ProComicImageServer(
         return brand.startsWith("av") || brand == "mif1" || brand == "miaf"
     }
 
-    /**
-     * AVIF → JPEG, the v111 ladder — THE NEW WAY. After four field rounds
-     * (v107 native loader, v108 MediaCodec, v109+v110 offscreen WebView)
-     * every on-device AVIF decoder still found a way to kill the host app
-     * on the affected Android 10 device, so the device no longer runs one:
-     *
-     * 1. BitmapFactory — the platform codec. On Android 12+ this decodes
-     *    AVIF natively (and it also decodes the proxy tier's JPEG output
-     *    on every version). Subsampled when a max edge is requested.
-     * 2. SERVER-SIDE transcode — the same URL re-fetched through the
-     *    weserv image proxy (`output=jpg`, both hosts tried in order), so
-     *    the AVIF decode happens in their datacenter and this process only
-     *    ever touches plain JPEG bytes. On Android 10/11 this is the
-     *    production tier — there is NO AVIF decoder on the device at all.
-     *
-     * Everything else (bundled libavif JNI, framework MediaCodec, the
-     * offscreen WebView, ImageDecoder) is REMOVED from the ladder: each was
-     * a native-crash/OOM surface no Java guard could catch, and the field
-     * device died inside all of them across v108-v110. A total decode
-     * failure now throws the legible IOException -> the error card — never
-     * a dead process.
-     *
-     * Every tier call site is Throwable-tight: an unexpected throw in one
-     * tier (JVM stubs, an exotic device API misbehavior) must fall through
-     * to the NEXT tier, never abort the ladder.
-     */
     private fun avifToJpeg(
         bytes: ByteArray,
         imageUrl: String,
@@ -1562,18 +1200,6 @@ class ProComicImageServer(
                 bitmap.recycle()
             }
         }
-        // v139 — RETIRED IN v140. The piece-gated framework codec tier
-        // (c2.android.av1 at piece size) was the field verdict on v1.6.52:
-        // the device died inside it exactly like the v108 full-size death.
-        // The production ladder runs NO on-device AVIF decode below
-        // Android 12: BitmapFactory (12+) → weserv server-side transcode
-        // (the v111 tier — the decode happens in their datacenter and
-        // this process only ever touches plain JPEG bytes) → the legible
-        // IOException → the error card. The WebView decode tiers are
-        // DELETED: the field device died inside every one of them
-        // (v109-v110 view draws, v134 full-page canvases, v137
-        // software-layer draw, v138/v1.6.51 sandboxed renderer — five
-        // field deaths), and no Java guard can catch a native kill.
         val proxyBytes = try {
             fetchProxyJpegBytes(imageUrl, raw = bytes, diag = diag, maxEdge = maxEdge)
         } catch (t: Throwable) {
@@ -1584,21 +1210,6 @@ class ProComicImageServer(
         throw IOException("ProComic: page failed to decode (server-side transcode unavailable)")
     }
 
-    /**
-     * The server-side transcode tier (v111): re-fetch [imageUrl] through
-     * the weserv image proxy with `output=jpg` so the AVIF decode happens
-     * on their infrastructure, then keep the returned JPEG — the one
-     * format BitmapFactory decodes safely on EVERY Android version.
-     * Both proxy hosts are tried in order (one 5xx retry each — v117: the
-     * cdn-image route behind the signed urls 502s cold-started on its
-     * first hit, so a single attempt could poison the rung); every
-     * failure lands in the diag trail and the tier returns null (the
-     * ladder then throws the legible decode failure — the error card,
-     * never a crash). [raw] is the already-downloaded source bytes when
-     * they exist (they feed the container pixel-budget gate) and null for
-     * the v117 signed rungs, which never fetch the source first — the
-     * budget then applies client-side from the JPEG bounds.
-     */
     private fun fetchProxyJpegBytes(imageUrl: String, raw: ByteArray?, diag: ProxyDiag, maxEdge: Int): ByteArray? {
         if (proxyHosts.isEmpty()) {
             diag.add("proxy: no hosts configured")
@@ -1612,8 +1223,6 @@ class ProComicImageServer(
         val box = proxyBoxFor(raw?.let(::proxyPixelBudgetGate), maxEdge, diag)
         for (host in proxyHosts) {
             val url = proxyTranscodeUrl(imageUrl, encoded, quality, box, host)
-            // v117: one 5xx retry per host (the signed route's cold-start
-            // 502s are transient — a retry succeeds).
             for (attempt in 0..1) {
                 try {
                     val request = Request.Builder()
@@ -1635,7 +1244,7 @@ class ProComicImageServer(
                             return@use
                         }
                         // Loop guard: the proxy must hand back a decodable
-                        // raster — an AVIF answer would send us in circles.
+                        // raster. An AVIF answer would send us in circles.
                         if (isAvif("", body)) {
                             diag.add("proxy/$host returned avif")
                             return@use
@@ -1647,8 +1256,6 @@ class ProComicImageServer(
                             return@use
                         }
                         diag.add("proxy/$host ok ${bounds.outWidth}x${bounds.outHeight} ${body.size}B")
-                        // v117: the signed rungs never see the source bytes,
-                        // so the decode budget applies from the JPEG bounds.
                         val options = BitmapFactory.Options()
                         options.inSampleSize = when {
                             maxEdge > 0 -> sampleSizeFor(bounds.outWidth, bounds.outHeight, maxEdge)
@@ -1680,7 +1287,7 @@ class ProComicImageServer(
     }
 
     /** Pixels the raw container declares (pure-Kotlin ISOBMFF parse of the
-     * already-downloaded bytes), or null when the parser refuses a shape —
+     * already-downloaded bytes), or null when the parser refuses a shape. 
      * a refusal simply means no server-side downscale, the same policy the
      * WebView tier had (a full decoder handles what the lenient parser
      * rejects). Never throws. */
@@ -1733,12 +1340,6 @@ class ProComicImageServer(
         return null
     }
 
-    /**
-     * The v108 framework tier: AVIF → JPEG with zero external state.
-     * Gated by the same crash-loop breaker as the bundled-decoder tier (the
-     * codec is native too — a c2 crash kills the process exactly like a
-     * dav1d one) and the same pixel budget.
-     */
     private fun decodeWithMediaCodecFramework(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int, pieceGated: Boolean = false): ByteArray? {
         val crashState = nativeCrashState
         if (!crashState.startsWith("ok")) {
@@ -1748,12 +1349,6 @@ class ProComicImageServer(
         val marker = attemptMarker()
         return try {
             marker?.writeText(System.currentTimeMillis().toString())
-            // v139: the production ladder (pieceGated = true) decodes
-            // through the PIECE-GATED entry — the 1280-edge / 1.3 MP
-            // pre-alloc gate refuses the v108 kill profile in pure
-            // Kotlin, before any codec allocation. The debug hook
-            // (pieceGated = false) keeps the full-size entry for the
-            // harness's decline pins.
             val jpeg =
                 if (pieceGated) {
                     AvifMediaCodecDecoder.decodePieceToJpeg(bytes, { row -> diag.add("mediacodec: ${row.take(48)}") }, if (maxEdge > 0) COVER_JPEG_QUALITY else JPEG_QUALITY)
@@ -1828,30 +1423,8 @@ class ProComicImageServer(
         return scaled
     }
 
-    /** Harness hook for the v108 framework tier: drives the MediaCodec path
-     * against a diag trail without an HTTP round-trip. Debug-only — the
-     * v109 ladder no longer calls the codec tier (the field device died
-     * inside it) and v111 removed every remaining on-device decoder, but
-     * the decline behavior stays pinned. */
     internal fun debugMediaCodecTier(bytes: ByteArray, diag: ProxyDiag, maxEdge: Int = 0): ByteArray? = decodeWithMediaCodecFramework(bytes, diag, maxEdge)
 
-    /**
-     * Crash-loop breaker state for the DEBUG-ONLY MediaCodec hook,
-     * evaluated ONCE per process on its first (debug-only) invocation.
-     * The production v111 ladder never runs native code, so this only
-     * matters to the harness hooks. Files live in the tracking dir:
-     *
-     * - `decode.attempt` — written right before a native decode, deleted
-     *   right after it returns. Stale marker = the previous process died
-     *   INSIDE the decoder.
-     * - `decode.crashes` — how many stale markers were consumed.
-     *
-     * One stale marker disables the native tier for this session; two
-     * disable it permanently (until the user clears the app's cache).
-     * That bounds a worst-case native crash loop to two process deaths
-     * per install while tolerating one false positive (an OOM kill of the
-     * process mid-decode looks identical to a native crash).
-     */
     internal fun evaluateNativeCrashState(): String {
         val dir = nativeCacheDir?.let { java.io.File(it, "procomic_native") }
             ?: return "ok (no tracking dir)"
@@ -1874,7 +1447,7 @@ class ProComicImageServer(
     private val nativeCrashState: String by lazy { evaluateNativeCrashState() }
 
     /** The before-decode marker file, or null when there is nowhere to
-     * track (harness / restricted storage) — tracking is best-effort. */
+     * track (harness / restricted storage). Tracking is best-effort. */
     private fun attemptMarker(): java.io.File? {
         val base = nativeCacheDir ?: return null
         return runCatching {
@@ -1901,7 +1474,7 @@ class ProComicImageServer(
 
     private val inFlightLock = Any()
 
-    // Kotlin does not surface Object.wait/notifyAll on Any — go through
+    // Kotlin does not surface Object.wait/notifyAll on Any. Go through
     // java.lang.Object explicitly for the builder/joiner handshake.
     private fun Any.monitorWait(ms: Long) = (this as java.lang.Object).wait(ms)
 
@@ -1947,7 +1520,7 @@ class ProComicImageServer(
             try {
                 Thread.sleep(INFLIGHT_GRACE_MS)
             } catch (_: InterruptedException) {
-                // daemon pool shutting down with the process — nothing to do
+                // daemon pool shutting down with the process. Nothing to do
             }
             synchronized(inFlightLock) {
                 if (inFlightBuilds[key] === slot && slot.done) inFlightBuilds.remove(key)
@@ -1987,10 +1560,6 @@ class ProComicImageServer(
                     } catch (t: IOException) {
                         Log.i(TAG, "preload $chapterId failed: ${t.message?.substringAfter("ProComic: ")}")
                     } catch (t: Throwable) {
-                        // v119: the preloader walks 25+ signed-ladder pages on
-                        // a raw pool thread — NOTHING it does may escape as an
-                        // uncaught throwable (the process-death class). The
-                        // walk continues with the next page.
                         Log.w(TAG, "preload $chapterId page died safely: ${t.javaClass.simpleName}")
                     }
                     try {
@@ -2001,8 +1570,6 @@ class ProComicImageServer(
                     }
                 }
             } catch (outer: Throwable) {
-                // v119: the loop itself (cacheKey/cachedResult/sleep) gets
-                // the same guarantee — a preloader death is never fatal.
                 Log.w(TAG, "preload $chapterId stopped safely: ${outer.javaClass.simpleName}")
             } finally {
                 synchronized(preloadLock) { preloadStarted.remove(chapterId) }
@@ -2012,11 +1579,6 @@ class ProComicImageServer(
 
     // ======================== result cache ===============================
 
-    /** Finished results keyed by the sha256 of the upstream URL (+#e<edge>
-     * for downscaled cover variants). Bounded by COUNT and by BYTES: tall
-     * page JPEGs reach ~2 MB each, so a count-only bound could hold ~48 MB
-     * of dead bytes forever (v106 budget: 32 MB) — a real memory-pressure
-     * contributor on the devices this source serves. */
     private val results = LinkedHashMap<String, Pair<String, ByteArray>>(16, 0.75f, true)
 
     /** Total bytes held in [results]; accessed only under [resultsLock]. */
@@ -2046,7 +1608,7 @@ class ProComicImageServer(
 
     // ============================ diagnostics ============================
 
-    /** Failure ring buffer feeding /.diag — the last [MAX_FAILURE_RECORDS]
+    /** Failure ring buffer feeding /.diag. The last [MAX_FAILURE_RECORDS]
      * image failures across all chapters, newest last. */
     private class FailureRecord(
         val imageUrl: String,
@@ -2059,10 +1621,6 @@ class ProComicImageServer(
 
     private val failuresLock = Any()
 
-    // v115: the last deferred-media attempt trail (the 3-page wall's
-    // diagnosis). The reader only sees logcat; this ring gives /.diag
-    // the full trail so a screenshot alone answers "mint fail or
-    // exchange reject?".
     private class DeferredRecord(
         val chapterId: Int,
         val trail: List<String>,
@@ -2090,7 +1648,7 @@ class ProComicImageServer(
     }
 
     /**
-     * `/.diag` — JSON state of the image server for remote diagnosis: the
+     * `/.diag`. JSON state of the image server for remote diagnosis: the
      * result cache size and the last failures with their full attempt
      * trails. Plain JSON on purpose: the user can paste it as-is.
      */
@@ -2115,8 +1673,6 @@ class ProComicImageServer(
         sb.append(",\"decoder\":\"bitmapfactory+server-proxy (v111, no on-device AVIF decoder)\"")
         sb.append(",\"proxyHosts\":\"").append(proxyHosts.joinToString(",").replace("\"", "'")).append('\"')
         sb.append(",\"nativeCrashState\":\"").append(nativeCrashState.replace("\"", "'")).append('\"')
-        // v115: the last deferred-media attempt trail (the 3-page wall
-        // diagnosis) — mint-fail vs exchange-reject at a glance.
         lastDeferred?.let { d ->
             sb.append(",\"lastDeferred\":{\"at\":").append(d.at)
                 .append(",\"chapterId\":").append(d.chapterId)
@@ -2195,12 +1751,6 @@ class ProComicImageServer(
         return if (line.length > MAX_DIAG_BODY) line.take(MAX_DIAG_BODY - 1) + "\u2026" else line
     }
 
-    /** Only site-owned image hosts, https only — the proxy is not a general
-     * purpose fetcher. Both apexes (the .net migration keeps .pro library
-     * links alive) plus every CDN/app subdomain. v127: the .im apex joins —
-     * the live reader mounts its rows on app.procomic.im, so a session-
-     * harvested row URL would otherwise be refused by the loopback proxy
-     * right after the session worked for it. */
     private fun isAllowedImageUrl(url: String): Boolean = runCatching {
         val httpUrl = url.toHttpUrl()
         httpUrl.isHttps && (
@@ -2263,23 +1813,15 @@ class ProComicImageServer(
         const val DIAG_PATH_PREFIX = ".diag"
         const val MAP_PAGE_PATH_PREFIX = ".map-page"
 
-        /** v133: the captured protected pages (the rendered harvest —
-         * session-decoded tiles, stitched with plain BitmapFactory draws). */
         const val CAPTURED_PATH_PREFIX = ".captured"
 
         /** Bounded registry for composed-row specs (one chapter ~= 40 rows). */
         private const val MAX_COMPOSED_SPECS = 256
 
-        /** v129: bounded registry for planned protected pages (a full
-         * chapter's maps[] — 50+ entries — must fit with room to spare). */
         private const val MAX_MAP_PAGES = 512
 
-        /** v133: the captured-row registry bound (a chapter's protected
-         * pages; each entry holds already-decoded tile bytes). */
         private const val MAX_CAPTURED_ROWS = 256
 
-        /** v133: one captured tile may not exceed this (a bounded canvas at
-         * CAPTURE_MAX_EDGE encodes to a fraction of this as JPEG). */
         private const val MAX_CAPTURED_TILE_BYTES = 6 * 1024 * 1024
 
         /** Composed canvas bounds (a reader row is ~800x1300 CSS px). */
@@ -2287,10 +1829,10 @@ class ProComicImageServer(
         const val JPEG_QUALITY = 88
 
         /**
-         * The one User-Agent the site accepts on every path (verified live:
+         * The one User-Agent the site accepts on every path. The WAF
          * its WAF answers 403 to app UAs like "Kotatsu/1.0" on both the
-         * reader page and the image CDN — including the new app.<host>
-         * files — while browser and okhttp UAs pass). Used by the
+         * reader page and the image CDN. Including the new app.<host>
+         * files. While browser and okhttp UAs pass). Used by the
          * extension's client interceptor and by this server's inner client
          * so every hop presents the same "browser".
          */
@@ -2301,24 +1843,14 @@ class ProComicImageServer(
         private const val SOCKET_TIMEOUT_MS = 30_000
         private const val MAX_HEADER_BYTES = 16_384
 
-        /** Fixed loopback port tried first (v105): proxy URLs ride in
-         * persisted host-app data, so the port must survive restarts. An
-         * obscure, IANA-unassigned port on purpose. */
         private const val PREFERRED_PORT = 44097
 
         /** The /.diag substring that identifies a sibling process of this
          * extension's image server (version-agnostic on purpose). */
         private const val SERVER_FAMILY_MARKER = "procomic-image"
 
-        /** v132: the platform AVIF decode gate — pure so the harness can
-         * pin it. Android 12 = API 31; that is the first release whose
-         * BitmapFactory decodes AVIF natively. */
         internal fun avifDecodable(sdkInt: Int): Boolean = sdkInt >= 31
 
-        /** v139: the piece codec tier's platform gate (pure, so the
-         * harness can pin it): Android 10+ ships c2.android.av1. The
-         * breaker half of the gate lives on the instance
-         * ([codecPieceTierReady]). */
         internal fun codecTierPlatformSupported(sdkInt: Int): Boolean = sdkInt >= 29
 
         private const val FAMILY_PROBE_TIMEOUT_MS = 750
@@ -2330,30 +1862,15 @@ class ProComicImageServer(
          * cannot be made. */
         private const val MAX_CONCURRENT_TRANSCODES = 2
 
-        /** Finished-result cache (bytes per entry, URL-keyed). Covers share
-         * this pool with pages since v105 (covers are ~65 KB, pages are the
-         * heavy tail) — 24 keeps a catalog page's covers plus the reader's
-         * preload window resident at once. */
         private const val MAX_CACHED_RESULTS = 24
 
-        /** v106: byte budget on top of the count — 24 entries x 2 MB tall
-         * pages could pin ~48 MB forever. 32 MB keeps the same hit-rate
-         * behavior while capping the resident cost. */
         private const val MAX_CACHED_BYTES = 32L * 1024 * 1024
 
-        /** Covers (v106) request the proxy with ?e=1280: decoded long edge
-         * capped at 1280 px (~6 MB ARGB at 16:9 worst case instead of a
-         * 90 MB full "originals" decode) and JPEG-encoded at cover quality. */
         const val COVER_PROXY_MAX_EDGE = 1280
         private const val MIN_DOWNSCALE_EDGE = 64
         private const val MAX_DOWNSCALE_EDGE = 4096
         private const val COVER_JPEG_QUALITY = 82
 
-        /** Software-decode pixel budget: ~25 MP (~100 MB ARGB_8888) is the
-         * largest bitmap this process will even attempt; when the container
-         * declares more, the v111 proxy tier downscales SERVER-SIDE (the
-         * device never sees a budget-busting bitmap) and larger "originals"
-         * fall through to the error JPEG instead of OOM-killing a phone. */
         private const val MAX_NATIVE_DECODE_PIXELS = 25_000_000L
 
         /** Stale decode-attempt markers tolerated before the DEBUG-ONLY
@@ -2361,16 +1878,13 @@ class ProComicImageServer(
          * crash loop for the hook; the production ladder never runs it). */
         private const val MAX_NATIVE_CRASHES = 2
 
-        /** v111 server-side transcode hosts, tried in order. wsrv.nl is
-         * weserv's alias domain — same service, second routing domain for
-         * a network-level block of the primary host. */
         val DEFAULT_PROXY_HOSTS = listOf("images.weserv.nl", "wsrv.nl")
 
         /** Hard ceiling for the server-side downscale box derived from the
          * pixel budget (never larger than the cover edge cap allows). */
         private const val MAX_PROXY_BOX_EDGE = 8000
 
-        /** Pause between background pre-transcoded pages (gentle pacing —
+        /** Pause between background pre-transcoded pages (gentle pacing. 
          * with one GET per page a full chapter prebuilds in seconds). */
         private const val PRELOAD_PAGE_PAUSE_MS = 250L
 

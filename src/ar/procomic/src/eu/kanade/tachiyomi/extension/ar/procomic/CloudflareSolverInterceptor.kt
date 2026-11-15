@@ -20,7 +20,7 @@ import java.util.concurrent.TimeUnit
  * This is the compatibility surface for the MHExtensions fork's
  * `keiyoushi.cloudflare.CloudflareSolverInterceptor` (the upstream
  * keiyoushi extensions-source tree no longer ships one). In ProComic it
- * is reachable ONLY when the user turns OFF "Safe chapter fetch" — the
+ * is reachable ONLY when the user turns OFF "Safe chapter fetch". The
  * default (safe) path answers challenged responses with a legible
  * IOException and never constructs this class.
  *
@@ -31,7 +31,7 @@ import java.util.concurrent.TimeUnit
  */
 class CloudflareSolverInterceptor(private val hosts: Set<String> = emptySet()) : Interceptor {
 
-    /** The app context (the WebView factory) — lazy keeps the safe path
+    /** The app context (the WebView factory). Lazy keeps the safe path
      * free of any WebView dependency. */
     private val appContext by lazy { applicationContext }
 

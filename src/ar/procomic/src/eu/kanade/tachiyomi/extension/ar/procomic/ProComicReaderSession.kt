@@ -11,67 +11,13 @@ import okio.Buffer
 import kotlin.time.Duration.Companion.milliseconds
 import kotlin.time.Duration.Companion.seconds
 
-/**
- * The reader session (the manhuarmtl-style WebView harvest) — v127.
- *
- * WHY THIS EXISTS, AND WHY v1.6.37 COULD NOT WORK
- *
- * Live recon (v124): the READER no longer lives on the catalog apex at all.
- * procomic.net's own read button is `readIsExternal:true` pointing at
- * **procomic.pro**, and every procomic.net chapter route 308s to the series
- * page — so v1.6.37's session (which loaded `$baseUrl/ar/chapter/…`, the
- * .net apex) landed on a series page, harvested nothing, tripped its own
- * 3-strikes breaker and left every reader on the WebView-free list — whose
- * chapter flights are gone too (no `images`/`appImages`/`deferredMedia` in
- * any flight on either apex, document or RSC form, live-verified). The
- * WebView-free chain cannot be patched back to life: the pages stream into
- * a real browser only.
- *
- * So the session IS the chain now — exactly the manhuarmtl architecture:
- * open the REAL reader page (procomic.pro), let the site's own reader boot,
- * and walk it like a reading user. The reader mounts one row per page
- * (`div[data-reader-image-row="N"]`); open pages are a plain `<img>`;
- * protected pages are absolutely-positioned piece `<img>`s assembled
- * visually by the site. The harvest therefore collects, per row: either
- * the single source URL, or the piece sources WITH their rectangles — and
- * the extension stitches the pieces itself (loopback composed pages), the
- * same descramble the v101-era ladder did, only with the site's own
- * freshly-signed URLs.
- *
- * The session walks the apex list (the .net route still 308s — detected by
- * the landed path, never a blind first hit), waits through a Cloudflare
- * challenge (title probe) instead of resolving empty, blocks every
- * non-site host (ads die — they wedge real renderers, observed), and
- * leaves the image bytes flowing (piece rows need their pixels; the old
- * blockImages=true would have starved every protected page).
- *
- * Safety profile (unchanged class): runWebView attaches the WebView to a
- * real window offscreen with a renderer-death handler and bounds the whole
- * session; single-flight; every failure resolves with whatever was
- * collected — the caller keeps its WebView-free list — and never throws
- * into the host. Cookies flow through the shared android CookieManager
- * (the client and the WebView already share it — clearance the page earns
- * is the client's clearance).
- */
 internal object ProComicReaderSession {
 
-    // v136: 750 → 600 ms — the draw pass re-places its target band every
-    // tick while it waits for placement + piece loads, so a tighter poll
-    // shortens the dead time between a band becoming visible and its draw
-    // (the pull budget is per-tick, so the bridge pressure is unchanged).
     private const val POLL_MS = 600L
 
     /** Quiet ticks (no growth in mounted rows) before the session resolves. */
     private const val QUIET_TICKS = 5
 
-    /** Hard tick cap — the session never outlives its polling budget.
-     * v135: raised from 150 — long chapters need the capture puller to
-     * out-live the site's own lazy loader (four pulls per tick keep the
-     * bridge bounded, but a 150+ piece row chapter needs more ticks than
-     * the old cap allowed). v136: 300 → 480 — at the tighter 600 ms poll
-     * this is the same wall-clock as the old 300×750 ms, and the draw pass
-     * (which starts only after the walk's end) needs the extra ticks to
-     * place, verify and crop every band of a tall chapter. */
     private const val MAX_TICKS = 480
 
     /** Ticks of a Cloudflare challenge before the session calls it unwinnable. */
@@ -82,59 +28,19 @@ internal object ProComicReaderSession {
      * silently) before the session reports the wall and leaves. */
     private const val LOGIN_WALL_TICKS = 18
 
-    /** v127 — WALK-AWARE SETTLE. Two bounds keep the session from
-     * resolving while the site's own deferred walk is still working:
-     *
-     * [WALK_GRACE_TICKS] — once the scroll reaches the absolute end with
-     * rows mounted, the site's reader needs a beat to NOTICE and fire its
-     * own /chapter-deferred-media walk (the batch loader the reader
-     * drives on scroll). The session never settles before this grace
-     * lapses — the v1.6.39 field report was exactly a settle that won the
-     * race against the site's walk on a short (3 public rows) reader.
-     *
-     * [WALK_ACTIVE_MS] — after every observed /chapter-deferred-media
-     * request, the site is actively minting/exchanging for the next
-     * batch; its rows follow within seconds when the mint succeeds. The
-     * session stays patient for this long after the LAST walk request
-     * (a retry loop therefore keeps the session alive — bounded by the
-     * hard tick cap), and settles only once the walk has been quiet for
-     * this long. A chapter whose walk never fires (public-only) settles
-     * on the grace alone. */
     private const val WALK_GRACE_TICKS = 10
     private const val WALK_ACTIVE_MS = 10_000L
 
     private const val DIAG_TAG = "reader-session"
 
-    /** v133: bounded captured-row registry per session (a chapter's
-     * protected pages; the same scale as MAX_DEFERRED_PAGES). v135: 128 →
-     * 224 — the field chapter's 154 piece rows over-ran the old cap, and
-     * every row past it fell back to the loopback compose (the decode-less
-     * device's error cards). 224 covers the deferred-walk scale end to
-     * end; the rows are ~250 KB JPEG tiles, so the registry stays well
-     * under the reader's own bitmap budget. */
     private const val MAX_CAPTURED_ROWS = 224
 
-    /** v133: ticks a pending capture keeps being pulled before the row
-     * gives up (the in-page capture is fast, but a signed-proxy retry
-     * ladder can lag a beat). v135: raised to 120 — four pulls happen
-     * per tick now, so this still bounds a stuck row to ~22 s of pulls
-     * while genuine laggards get their full window. */
     private const val PIX_PULL_ATTEMPTS = 120
 
-    /** v135: capture pulls per poll tick — the one-per-tick puller could
-     * not keep pace with the site's own lazy loader on long chapters
-     * (a 154-piece-row chapter needs ~115 s of pulls; the old 100 s
-     * session cap expired first). Four per tick keeps each poll's
-     * bridge traffic ~4 MB while out-running the loader 4:1. */
     private const val MAX_PIX_PULLS_PER_TICK = 4
 
-    /** v135: ticks with ZERO harvest progress (no new rows, no new
-     * captured pixels) before the session settles despite pending work —
-     * the failing path's bound (~30 s instead of the full tick cap). */
     private const val NO_PROGRESS_TICK_CAP = 40
 
-    /** v133: the capture canvas's longest edge — pieces are bounded tiles;
-     * this keeps every data url well under the bridge's comfortable size. */
     private const val CAPTURE_MAX_EDGE = 1600
 
     /** One-flight guard: a chapter open never stacks two sessions. */
@@ -178,10 +84,6 @@ internal object ProComicReaderSession {
         val rows = LinkedHashMap<Int, HarvestRow>() // row index -> row (newest wins)
         resetCaptureState()
         var challengeTicks = 0
-        // v127: the site's own deferred walk, observed on the wire. The
-        // interceptRequest below stamps every /chapter-deferred-media
-        // request; the settle logic reads the stamp so it never resolves
-        // while the site is mid-walk.
         val lastWalkAt = java.util.concurrent.atomic.AtomicLong(0L)
         var walkNoteLogged = false
 
@@ -190,9 +92,6 @@ internal object ProComicReaderSession {
         runWebView<Unit>(timeout = timeoutSeconds.seconds) {
             javaScriptEnabled = true
             domStorageEnabled = true
-            // v124: the piece pixels MUST flow — the protected rows are
-            // stitched from them. Only off-site traffic (ads, trackers)
-            // is denied, by the allow-list below.
             blockImages = false
             // Identity coherence: clearance cookies are UA-bound, and the
             // loopback proxy fetches the harvested URLs with this same UA.
@@ -202,8 +101,6 @@ internal object ProComicReaderSession {
             interceptRequest { request ->
                 val requestUrl = request.url?.toString()?.toHttpUrlOrNull()
                     ?: return@interceptRequest emptyResponse
-                // v127: the site's own batch walk rides this path — every
-                // observed call stamps the walk clock the settle logic waits on.
                 if (requestUrl.encodedPath.contains("/chapter-deferred-media")) {
                     lastWalkAt.set(System.currentTimeMillis())
                     if (!walkNoteLogged) {
@@ -236,10 +133,6 @@ internal object ProComicReaderSession {
             var quietTicks = 0
             var lastGrowthKey = ""
             var ticks = 0
-            // v135: no-progress bound — a capture pipeline making NO headway
-            // (no new rows, no new captured pixels) for NO_PROGRESS_TICK_CAP
-            // straight ticks settles even with pending work, so a stalled
-            // reader never pins the open to the full tick cap.
             var noProgressTicks = 0
             var lastProgressKey = ""
 
@@ -266,14 +159,6 @@ internal object ProComicReaderSession {
                     return@poll
                 }
 
-                // v126: the site monetized the reader — a chapter route now
-                // mounts an unlock gate (an "open the chapter" button) and
-                // may bounce to /login. Dismiss the consent banner, press
-                // the site's OWN unlock button once, and wait out a login
-                // bounce (the session shares the host cookie store — a
-                // device signed into the site passes it silently). A parked
-                // login wall after the grace window ends the session
-                // legibly; the breaker keeps the next opens fast.
                 evaluateJs(unlockScript()) { raw ->
                     val action = decodeEval(raw).orEmpty().trim('"')
                     when {
@@ -301,7 +186,7 @@ internal object ProComicReaderSession {
                     // Apex walk: a route that redirected off /chapter/ (the
                     // .net deployment 308s to the series page) moves to the
                     // next apex instead of harvesting the wrong page. A
-                    // /login bounce is NOT an apex problem — the unlock
+                    // /login bounce is NOT an apex problem. The unlock
                     // branch above owns it.
                     val href = state["href"].orEmpty()
                     val onChapter = href.contains("/chapter/") || href.contains("/login")
@@ -317,39 +202,12 @@ internal object ProComicReaderSession {
 
                     absorbRows(state, rows)
 
-                    // v133: pull finished pixel captures out of the page
-                    // store (bounded bridge payloads — a captured row is
-                    // ~1 MB of JPEG data urls). v135: pull up to FOUR rows
-                    // per tick — one-per-tick could not keep pace with the
-                    // site's own lazy loader on a long chapter (154 piece
-                    // rows needed ~115 s of pulls; the old 100 s session
-                    // cap expired first, every uncaptured row fell back
-                    // to the loopback compose, and on the decode-less
-                    // devices that was the road to the error cards). Four
-                    // per tick keeps each poll's bridge traffic ~4 MB
-                    // while out-running the loader 4:1; absent keys retry
-                    // on later ticks until the attempts cap.
                     repeat(MAX_PIX_PULLS_PER_TICK) {
                         nextPendingPixKey(rows)?.let { key ->
                             pullCapture(key) { script, callback -> evaluateJs(script) { raw -> callback(raw) } }
                         }
                     }
 
-                    // v141 — THE BAND DRAW IS RETIRED, STRUCTURALLY. The
-                    // v136 band capture drew the WebView's composited output
-                    // into an app-process bitmap (lib captureView:
-                    // view.draw(Canvas) with a software-layer retry — the
-                    // EXACT v109/v110/v137 in-process rasterization
-                    // profile). It never fired in the field (the anonymous
-                    // reader never mounted protected rows — "the draw that
-                    // never drew"), but v140's codec retirement re-armed
-                    // the session AND the user's free chapter DID mount its
-                    // rows: the field verdict was "when it tries to load
-                    // the pages it just crashs". No capture is worth a
-                    // rasterizer in this process — the draw machinery is
-                    // deleted, the session harvests URLS only, and a page
-                    // the device cannot decode answers the legible 410
-                    // card. A load error, never a dead app.
 
                     val growthKey = "${state["rows"]}:${state["loaded"]}"
                     if (growthKey != lastGrowthKey) {
@@ -358,27 +216,9 @@ internal object ProComicReaderSession {
                     } else {
                         quietTicks++
                     }
-                    // v127 — WALK-AWARE SETTLE. Quiet is not enough alone:
-                    // the walk must have REACHED THE BOTTOM (the reading
-                    // motion is what makes the site mount every row), the
-                    // site's own deferred walk must have had its grace to
-                    // fire, and — once it fires — it must have gone quiet
-                    // again (each walk request buys the session fresh
-                    // patience: its batches mount as rows seconds later).
                     val atEnd = state["atEnd"] == "1"
                     if (atEnd && rows.isNotEmpty()) endTicks++ else endTicks = 0
                     val walkQuiet = System.currentTimeMillis() - lastWalkAt.get() >= WALK_ACTIVE_MS
-                    // v135: the settle waits for the CAPTURES TOO — resolving
-                    // while piece rows still hold pending pulls or a
-                    // viewport-draw target shipped an incomplete captured
-                    // set (their rows fell back to the loopback compose; on
-                    // decode-less devices those pages turned into error
-                    // cards). Both queues are bounded (PIX_PULL_ATTEMPTS,
-                    // DRAW_TICK_CAP, MAX_TICKS) — never an unbounded wait.
-                    // v136: give-ups count as progress — a wedged row that
-                    // exhausts its band window (or a pull that exhausts its
-                    // attempts) bumps this key, so the no-progress bound
-                    // judges the PASS, never one stuck row.
                     val progressKey = "${rows.size}:${capturedRows.size}:${failedPix.size}"
                     if (progressKey != lastProgressKey) {
                         lastProgressKey = progressKey
@@ -416,46 +256,7 @@ internal object ProComicReaderSession {
         return ReaderSessionHarvest(ordered, notes, capturedRows.toMap())
     }
 
-    // ------------------------------------------------------------------
-    // v133 — the rendered harvest (captured piece pixels)
-    // ------------------------------------------------------------------
 
-    //
-    // v133 — THE RENDERED HARVEST. FIELD VERDICT on v132: "it came back to
-    // only 3 pages". The decode wall dropped every protected page on the
-    // Android 10 device, which silently un-fixed the page count. The wall
-    // itself was live-re-verified this round: the image edge serves AVIF
-    // unconditionally (no Accept negotiation — every Accept dialect, including
-    // jpeg-first, answers the same ftypavif bytes), no transcoder can fetch
-    // the referer-gated img{1-4} pieces (weserv cannot send a referer), the
-    // site's own Next.js /_next/image optimizer refuses *.procomic.im hosts
-    // (it transcodes app.procomic.net/.pro to WebP — verified — but the
-    // whitelist never covers the piece edge), and the edge sends no CORS
-    // headers, so an in-page canvas of cross-origin pieces taints.
-    //
-    // But the session's WebView has been RENDERING these pages all along —
-    // Chromium's own software AV1/AVIF decoder works on every Android
-    // version. So the pieces are no longer shipped as urls for the loopback
-    // to decode; the harvest CAPTURES THEM AS PIXELS, in the page:
-    //
-    // 1. each piece is re-fetched SAME-ORIGIN through the site's own signed
-    // proxy (POST /api/cdn-image/sign from the cleared reader session,
-    // then /api/cdn-image?url=… — the exact healing path the site's own
-    // reader runs for lapsed pieces), so the canvas never taints;
-    // 2. each same-origin piece is drawn onto a bounded canvas and encoded
-    // with toDataURL('image/jpeg') — the WebView's Chromium decodes the
-    // AVIF, not the app;
-    // 3. the data urls park in window.__mihonPix; the session pulls ONE row
-    // per tick (bounded bridge payloads), clears the slot, and hands the
-    // tiles to the loopback's new /.captured route, which stitches them
-    // with plain BitmapFactory draws — JPEG in, JPEG out, no AVIF
-    // anywhere on the Java side.
-    //
-    // A device whose WebView is too old to decode AVIF simply never reports
-    // the piece imgs as loaded — the capture never fires for it and the
-    // row falls back to the v132 behavior (unlisted, named in the diag),
-    // so the failure mode stays legible and crash-free.
-    //
 
     /** One captured layer: a JPEG data url plus its rect relative to the row. */
     @Serializable
@@ -471,15 +272,6 @@ internal object ProComicReaderSession {
     /** Rows whose in-page capture answered the 'failed' tombstone. */
     private val failedPix = HashSet<String>()
 
-    // v141 — the v135/v136 band-draw capture machinery (its state, the
-    // band planner, the store/finalize/fail helpers and the draw pass in
-    // the poll loop) is DELETED. The lib captureView they fed answers a
-    // view.draw(Canvas) — with a software-layer retry — the exact
-    // in-process rasterization profile that killed the field device in
-    // v109/v110/v137 and again in v1.6.53 once the codec retirement
-    // re-armed the session on a chapter whose rows really mount. The
-    // session harvests URLS only; pixels belong to the page's own canvas
-    // or to nobody.
 
     /** Pull attempts per pending key (a capture that never lands stops trying). */
     private val pixAttempts = HashMap<String, Int>()
@@ -526,7 +318,7 @@ internal object ProComicReaderSession {
             val decoded = decodeEval(raw)?.trim()?.trim('"')
             when {
                 decoded == null || decoded == "null" || decoded.isEmpty() -> {
-                    // still capturing in-page — a later tick tries again
+                    // still capturing in-page. A later tick tries again
                 }
                 decoded == "failed" -> failedPix.add(key)
                 decoded.startsWith("{") -> runCatching {
@@ -569,15 +361,6 @@ internal object ProComicReaderSession {
     // Harvest rows
     // ------------------------------------------------------------------
 
-    /**
-     * One reader row as the site rendered it: a single mounted source
-     * ([u]), or the site's own piece layout ([pieces] with their
-     * rectangles relative to the row box [w]×[h]).
-     *
-     * v133: [pix] names the row's in-page pixel-capture slot
-     * (window.__mihonPix[key]) when the row is a piece assembly — the
-     * session pulls the capture (JPEG data urls) on a later tick.
-     */
     @Serializable
     internal data class HarvestRow(
         val index: Int,
@@ -586,9 +369,6 @@ internal object ProComicReaderSession {
         val h: Int = 0,
         val pieces: List<Piece> = emptyList(),
         val pix: String? = null,
-        /** v135: the row's viewport-relative rect (CSS px) and its total
-         * <img> count — the viewport-draw capture's visibility + load
-         * probes. Zero when the script predates the field. */
         val vx: Int = 0,
         val vy: Int = 0,
         val total: Int = 0,
@@ -599,8 +379,6 @@ internal object ProComicReaderSession {
     @Serializable
     internal data class Piece(val u: String, val x: Int, val y: Int, val w: Int, val h: Int)
 
-    /** A reader-session outcome: ordered rows, the rows captured as
-     * rendered pixels (v133), and legible diag notes. */
     internal class ReaderSessionHarvest(
         val rows: List<HarvestRow>,
         val notes: List<String>,
@@ -611,15 +389,6 @@ internal object ProComicReaderSession {
     // In-page scripts
     // ------------------------------------------------------------------
 
-    /**
-     * v126: the site's own unlock flow. A chapter route mounts a consent
-     * banner (رفض/موافق) and an "open the chapter" button (the monetized
-     * gate the reader sits behind); pressing THE SITE'S OWN button is the
-     * lawful way in — the same tap a reading user performs. Returns one
-     * of: "login" (parked on /login), "clicked:<label>", "consent", or
-     * "none". Never navigates to the bypass/short-link host — only the
-     * on-page button.
-     */
     private fun unlockScript(): String = """
         (function () {
             if (location.pathname.indexOf('/login') !== -1) return 'login';
@@ -641,30 +410,6 @@ internal object ProComicReaderSession {
         })();
     """.trimIndent()
 
-    /**
-     * Collects the reader's mounted rows and steps the scroll one beat
-     * deeper. Per row (`div[data-reader-image-row="N"]`): a single loaded
-     * image is reported as its absolute src; a piece assembly is reported
-     * as every loaded piece's src plus its rectangle relative to the row
-     * (the extension re-assembles the image itself — same descramble the
-     * site performs, no canvas taint games).
-     *
-     * v133: piece rows ALSO capture their pixels in the page (the rendered
-     * harvest — see the class docs). When every img of a piece row has
-     * loaded, an async capture re-fetches each piece SAME-ORIGIN through
-     * the site's own signed proxy (/api/cdn-image — the reader's healing
-     * path, so the canvas never taints), draws it on a bounded canvas and
-     * parks the JPEG data urls in window.__mihonPix['r<idx>']; the session
-     * pulls the slot on a later tick. The row's payload carries the slot
-     * key as `pix` so the Kotlin side knows what to pull. A capture that
-     * cannot complete (sign refused, old WebView, tainted canvas) parks
-     * the 'failed' tombstone instead — the row then falls back to the
-     * loopback compose (Android 12+) or stays unlisted, named in the diag.
-     *
-     * v126: the scroll walks to the ABSOLUTE END of the reader (last row
-     * scrolled into view every beat) and reports atEnd so the session
-     * only settles after the site has had its chance to mount everything.
-     */
     private fun harvestScript(): String = """
         (function () {
             function abs(u) {
@@ -782,7 +527,7 @@ internal object ProComicReaderSession {
                     var s = im.currentSrc || im.src || '';
                     if (s && s.indexOf('data:') !== 0 && im.complete && im.naturalWidth > 0) loaded.push(im);
                 }
-                // v136: the row's total <img> count rides every report —
+                // The row's total <img> count rides every report.
                 // the half-loaded guard uses it. A row with more than one
                 // <img> must NEVER ship a single loaded piece as a whole
                 // page: the simple branch fires only when the row HAS one
@@ -807,7 +552,7 @@ internal object ProComicReaderSession {
                                 h: Math.round(pr.height)
                             });
                         }
-                        // v133: fire the pixel capture once, when EVERY img of
+                        // Fire the pixel capture once, when every img of
                         // the row has loaded (a partial capture would park a
                         // page with a hole in it forever).
                         var key = 'r' + idx;
@@ -841,11 +586,11 @@ internal object ProComicReaderSession {
             }
             var tvyOut = null;
             try {
-                // v136: the script honors window.__mihonTarget +
+                // The script honors window.__mihonTarget +
                 // window.__mihonSeg. With a target set (the band draw
-                // pass — latched until the walk reached the end), the
+                // pass. Latched until the walk reached the end), the
                 // requested band of that row is PLACED at the viewport
-                // top — window first, then inner scrollable ancestors —
+                // top. Window first, then inner scrollable ancestors. 
                 // and the placed top is reported (tvy). Without a target
                 // the walk continues: the last row into view, one beat
                 // deeper every tick, so the site's reader mounts its rows
