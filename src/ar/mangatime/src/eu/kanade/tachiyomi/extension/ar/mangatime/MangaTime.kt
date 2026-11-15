@@ -39,7 +39,7 @@ import java.util.concurrent.TimeUnit
 import kotlin.math.roundToInt
 
 /**
- * MangaTime (mangatime.org) — Arabic manga platform (مانجا تايم).
+ * MangaTime (mangatime.org). Arabic manga platform (مانجا تايم).
  *
  * The web app is a Vite-built SPA wrapped with Capacitor; every piece of
  * data goes through a same-origin tRPC gateway (superjson, batch=1):
@@ -50,20 +50,20 @@ import kotlin.math.roundToInt
  *   /api/trpc/content.getChapterPagesWeb   (reader pages, absolute URLs)
  *   /api/trpc/content.getGenres            (filter genres)
  *
- * As of 2026-10 the API and the /uploads images answer plain requests with
+ * The API and the /uploads images answer plain requests with
  * no cookies, no tokens and no Cloudflare. The sister domain mangadar.com is
- * the SAME platform behind a Cloudflare challenge — see MangaDar, which
+ * the SAME platform behind a Cloudflare challenge. See MangaDar, which
  * ships this exact source under that brand.
  *
  * superjson gotchas baked into buildSearchInput(): literal `null` for a
  * field the schema types as string|undefined is a 400, so absent fields are
- * marked undefined through meta.values paths — and a path listed there is
+ * marked undefined through meta.values paths. And a path listed there is
  * FORCED undefined server-side, so a field carrying a real value must be
  * removed from meta.values again. The verified recipe keeps nulls in the
  * JSON skeleton AND lists the unused paths in meta.values.
  *
  * Details follow the MangaDot description layout: star rating, a meta info
- * line, the synopsis, a Links section and the alternative names — the same
+ * line, the synopsis, a Links section and the alternative names. The same
  * block ProComic ships, driven by the same five options.
  */
 @Source
@@ -191,7 +191,7 @@ abstract class MangaTime :
      * The verified searchSeries superjson input. Unused optional fields are
      * listed in meta.values as undefined AND stay null in the JSON skeleton
      * (the exact shape the site's own client sends); a field this request
-     * actually uses gets its real value and is REMOVED from meta.values —
+     * actually uses gets its real value and is REMOVED from meta.values. 
      * a path left behind would force the value back to undefined.
      */
     private fun buildSearchInput(
@@ -463,11 +463,11 @@ abstract class MangaTime :
     }
 
     /**
-     * Optional "combine duplicate chapters" — the same option ProComic ships.
+     * Optional "combine duplicate chapters". The same option ProComic ships.
      * The platform enforces unique chapter numbers today (recon probed two
      * long series and found none), but it re-imports catalogs, so the TOC
      * can carry repeats. When enabled, one entry per non-zero chapter
-     * number survives — the newest upload wins (the list is newest-first).
+     * number survives. The newest upload wins (the list is newest-first).
      */
     private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
         mutableListOf<SChapter>().apply {
