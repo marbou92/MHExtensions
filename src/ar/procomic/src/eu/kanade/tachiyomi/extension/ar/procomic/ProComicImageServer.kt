@@ -100,6 +100,8 @@ internal class ProComicImageServer(
         private const val CACHE_MAX_ENTRIES = 24
         private const val CACHE_MAX_BYTES = 32L * 1024L * 1024L
         private const val MAP_BUDGET_PIXELS = 25_000_000.0
+        private const val MAX_DECODE_PIXELS = 8_000_000L
+        private const val MAX_SAMPLE = 64
         private const val MAX_CANVAS_W = 2600
         private const val MAX_CANVAS_H = 5200
 
@@ -886,7 +888,10 @@ internal class ProComicImageServer(
             throw StageException("decode", "ProComic: page transcode interrupted", diag, null)
         }
         try {
-            return platformDecode(maxEdge, diag, bytes)
+            // The platform decoder is an Android class. A desktop host has
+            // no android.graphics at all, so the lookup itself fails there:
+            // treat that like a missing codec and let weserv do the work.
+            return runCatching { platformDecode(maxEdge, diag, bytes) }.getOrNull()
                 ?: weservLadder(maxEdge, diag, url, bytes)
                 ?: throw IOException("ProComic: page failed to decode (server-side transcode unavailable)")
         } finally {
@@ -894,10 +899,24 @@ internal class ProComicImageServer(
         }
     }
 
-    /** Platform BitmapFactory decode → JPEG bytes, with bounds +
+    /**
+     * True when the host can decode images itself.
+     *
+     * The decoder is an Android class; a desktop host has no android.graphics
+     * at all, so the lookup itself fails there. Every caller treats that like
+     * a missing codec and lets the server-side transcode do the work.
+     */
+    private fun platformDecoderAvailable(): Boolean = runCatching {
+        BitmapFactory.Options()
+        true
+    }.getOrDefault(false)
+
+    /**
+     * Platform BitmapFactory decode to JPEG bytes, with bounds and
      * sample-size discipline (JPEG/WebP/PNG everywhere; AVIF on Android
      * 12+. The decoder that already renders the covers). Null when the
-     * platform has no codec for the bytes. */
+     * platform has no codec for the bytes.
+     */
     private fun platformDecode(maxEdge: Int, diag: Diag, bytes: ByteArray): ByteArray? {
         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
         BitmapFactory.decodeByteArray(bytes, 0, bytes.size, bounds)
@@ -906,15 +925,23 @@ internal class ProComicImageServer(
             return null
         }
         val options = BitmapFactory.Options()
+        var sample = 1
+        var max = maxOf(bounds.outWidth, bounds.outHeight)
         if (maxEdge > 0) {
-            var sample = 1
-            var max = maxOf(bounds.outWidth, bounds.outHeight)
             while (max / 2 >= maxEdge) {
                 max /= 2
                 sample *= 2
             }
-            options.inSampleSize = sample
         }
+        // A full-size decode of a 4000x6000 cover is 96 MB of ARGB_8888 and
+        // takes the host app down with it. Sample until the bitmap fits the
+        // budget, whatever the caller asked for.
+        while (sample < MAX_SAMPLE &&
+            bounds.outWidth.toLong() / sample * (bounds.outHeight.toLong() / sample) > MAX_DECODE_PIXELS
+        ) {
+            sample *= 2
+        }
+        options.inSampleSize = sample
         val bitmap = BitmapFactory.decodeByteArray(bytes, 0, bytes.size, options) ?: run {
             diag.add("bitmapfactory null (platform has no codec for this format)")
             return null
@@ -974,6 +1001,13 @@ internal class ProComicImageServer(
                             diag.add("proxy/$host returned avif")
                             return@use
                         }
+                        // The platform decoder is an Android class. Without it
+                        // the JPEG weserv already produced (sized by the w/h
+                        // it was asked for) is served as it came.
+                        if (!platformDecoderAvailable()) {
+                            diag.add("proxy/$host served as-is ${jpegCandidate.size}B (no platform decoder)")
+                            return jpegCandidate
+                        }
                         val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
                         BitmapFactory.decodeByteArray(jpegCandidate, 0, jpegCandidate.size, bounds)
                         if (bounds.outWidth <= 0 || bounds.outHeight <= 0) {
@@ -1019,9 +1053,11 @@ internal class ProComicImageServer(
     private fun budgetBoxOf(rawBytes: ByteArray?, maxEdge: Int, diag: Diag): Int {
         if (maxEdge > 0) return maxEdge
         val dims = rawBytes?.let { raw ->
-            val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
-            BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
-            if (bounds.outWidth > 0 && bounds.outHeight > 0) bounds.outWidth to bounds.outHeight else null
+            runCatching {
+                val bounds = BitmapFactory.Options().apply { inJustDecodeBounds = true }
+                BitmapFactory.decodeByteArray(raw, 0, raw.size, bounds)
+                if (bounds.outWidth > 0 && bounds.outHeight > 0) bounds.outWidth to bounds.outHeight else null
+            }.getOrNull()
         } ?: return 0
         val (w, h) = dims
         val pixels = w.toLong() * h.toLong()
