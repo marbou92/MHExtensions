@@ -24,10 +24,10 @@ import java.util.concurrent.ConcurrentHashMap
 import kotlin.math.roundToInt
 
 /**
- * Azora (azorafly.com) — Iken, Arabic (أزورا).
+ * Azora (azorafly.com). Iken, Arabic (أزورا).
  *
  * The stock Iken parse is kept as-is; on top of it this source ships the
- * family's Comix/MangaDot details block — the same options ProComic, MangaTime
+ * family's Comix/MangaDot details block. The same options ProComic, MangaTime
  * and Kawaiimanga carry:
  *
  *   - an organized description: the API's 0..10 `averageRating` rendered as
@@ -41,7 +41,7 @@ import kotlin.math.roundToInt
  * The enrichment data rides the SAME `/api/post` response the Iken base
  * already fetches for its own parse: an interceptor captures the raw body
  * (keyed by `postSlug`), and after the base returns, the description is
- * rebuilt from it — no extra network round-trips.
+ * rebuilt from it. No extra network round-trips.
  */
 @Source
 abstract class Azora : Iken() {
@@ -253,9 +253,9 @@ abstract class Azora : Iken() {
     // ============================= Chapters ==============================
 
     /**
-     * Optional "combine duplicate chapters" — the same option ProComic and
+     * Optional "combine duplicate chapters". The same option ProComic and
      * MangaTime ship. When enabled, one entry per non-zero chapter number
-     * survives — the newest upload wins (the list is newest-first).
+     * survives. The newest upload wins (the list is newest-first).
      */
     private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
         mutableListOf<SChapter>().apply {
