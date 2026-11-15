@@ -80,7 +80,7 @@ internal class GenresFilter(
 )
 
 /**
- * Tags as a proper multi-select — the old free-text input ("Medieval,
+ * Tags as a proper multi-select. The old free-text input ("Medieval,
  * -Politics") is gone: tags come from the fetched metadata, include/exclude
  * via the tri-state cycle, and unknown names simply match nothing.
  */
