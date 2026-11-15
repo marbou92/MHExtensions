@@ -106,8 +106,6 @@ abstract class MangaTek : KeiSource() {
     // ========================= Details & Chapters  =========================
 
     override suspend fun getMangaByUrl(url: HttpUrl): SManga? {
-        // v104 (upstream vc 11): ignore foreign and unsupported URLs instead of crashing on
-        // them — only /manga/<slug> (and /reader/<slug>/…) resolve to a manga here.
         if (url.host != baseUrl.toHttpUrl().host || url.pathSegments.first() !in setOf("manga", "reader")) return null
         val slug = url.pathSegments.getOrNull(1)?.takeIf { it.isNotEmpty() } ?: return null
         val manga = SManga.create().apply {
@@ -155,10 +153,6 @@ abstract class MangaTek : KeiSource() {
         val document = client.get(getChapterUrl(chapter)).asJsoup()
         val props: ChapterProps = document.extractAstroProp("imageUrls")
 
-        // v105 (upstream vc 12): the embedded list is a MIX of plain urls and objects — a
-        // pending marker means the site withholds that page from the SSR embed, and a trap is
-        // an off-screen decoy. When anything is pending the whole chapter comes from the
-        // reader's own pages API instead.
         val embedded = props.imageUrls.toReaderImages()
         val images = if (embedded.any { it.pending }) fetchReaderImages(document, props) else embedded
         val imageUrls = images.filterNot { it.isTrap }.map { it.url }
@@ -221,9 +215,6 @@ abstract class MangaTek : KeiSource() {
     @Volatile
     private var cachedSeeds: Pair<String, BundleSeeds.Seeds>? = null
 
-    // The reader's seeds rotate with each build of its bundle (v104, upstream vc 11): the
-    // /_astro/ChapterImageViewer.<hash>.js script is fetched and its obfuscated string array
-    // decoded in QuickJS (BundleSeeds). Cached per bundle URL — a new site build re-extracts.
     private suspend fun readerSeeds(document: Document): BundleSeeds.Seeds {
         val bundleUrl = document.selectFirst("astro-island[component-url*=ChapterImageViewer]")
             ?.attr("abs:component-url")

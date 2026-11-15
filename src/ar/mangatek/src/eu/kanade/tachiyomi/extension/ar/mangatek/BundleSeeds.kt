@@ -4,7 +4,7 @@ import android.util.Base64
 import app.cash.quickjs.QuickJs
 import keiyoushi.utils.parseAs
 
-// MHExtensions port note: the upstream file imports keiyoushi.utils.sha256 —
+// MHExtensions port note: the upstream file imports keiyoushi.utils.sha256. 
 // that helper does not exist in this fork's core. The module-local
 // MangaTekCrypto.kt (same package) provides ByteArray.sha256(), which is what
 // the WASM hash check below uses; the import was therefore dropped here.

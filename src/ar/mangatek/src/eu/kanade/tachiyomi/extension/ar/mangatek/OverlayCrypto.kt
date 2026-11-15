@@ -6,13 +6,6 @@ import keiyoushi.utils.readUShortBigEndian
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
 
-// The site reader's overlay unlock (proof, esid, pow, overlay key unwrap); its WASM module is
-// plain SHA-256 over these inputs and AES-GCM is done in JS.
-//
-// v104 (upstream vc 11, "read the reader's unlock seeds from its script"): the reader's seeds
-// rotate with each build of its bundle — they are no longer baked constants. The two seeds
-// (proof salt, reader seed) are extracted from the obfuscated /_astro/ChapterImageViewer bundle
-// by BundleSeeds and passed in by the source (see MangaTek.readerSeeds).
 object OverlayCrypto {
 
     private const val KEY = "ff453871399fe268588a0936b45376022d85ed0fd1292001d5102f6a30291dc1"

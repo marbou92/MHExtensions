@@ -6,13 +6,6 @@ import javax.crypto.Cipher
 import javax.crypto.spec.GCMParameterSpec
 import javax.crypto.spec.SecretKeySpec
 
-// v103: in-module port of the keiyoushi.utils Crypto.kt helpers this module
-// needs (sha256, aesGcm, aesDecrypt). The MHExtensions base core predates the
-// upstream core file that provides them, which is why CI failed with
-// "Unresolved reference 'sha256' / 'aesDecrypt' / 'aesGcm'" while the rest of
-// keiyoushi.utils (decodeHex, readUShortBigEndian, parseAs, ...) resolved fine.
-// Deliberately kept in the module package (NOT keiyoushi.utils) so it can
-// never collide with the helpers the base core already ships.
 
 /**
  * Computes the SHA-256 digest of this [ByteArray].
