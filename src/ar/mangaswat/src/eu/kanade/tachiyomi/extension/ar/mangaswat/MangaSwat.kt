@@ -28,11 +28,11 @@ import java.util.Locale
 import kotlin.math.roundToInt
 
 /**
- * MangaSwat (meshmanga.com) — custom Next.js site over the JSON v2 API,
+ * MangaSwat (meshmanga.com). Custom Next.js site over the JSON v2 API,
  * Arabic (مانجا سواط).
  *
  * Beyond the stock parse, this source ships the family's Comix/MangaDot
- * details block — the same options ProComic, MangaTime and Kawaiimanga carry:
+ * details block. The same options ProComic, MangaTime and Kawaiimanga carry:
  *
  *   - an organized description: the API's 0..5 `rating` rendered as the
  *     familiar ★★★★☆ row, a Type/Status/extra-info line, the synopsis, then
@@ -271,7 +271,7 @@ abstract class MangaSwat :
 
     private suspend fun getChapterList(manga: SManga): List<SChapter> {
         // An empty id would make the API ignore the serie filter entirely and
-        // answer with the whole site's chapter table (113k+ rows) — surface a
+        // answer with the whole site's chapter table (113k+ rows). Surface a
         // clear, actionable error instead of an endless garbage list.
         if (manga.url.isBlank()) {
             throw IOException("MangaSwat: this entry lost its series id — remove it and open it again from the source")
@@ -295,9 +295,9 @@ abstract class MangaSwat :
     }
 
     /**
-     * Optional "combine duplicate chapters" — the same option ProComic and
+     * Optional "combine duplicate chapters". The same option ProComic and
      * MangaTime ship. When enabled, one entry per non-zero chapter number
-     * survives — the newest upload wins (the list is newest-first).
+     * survives. The newest upload wins (the list is newest-first).
      */
     private fun combineDuplicateChapters(chapters: List<SChapter>): List<SChapter> = if (preferences.getBoolean(PREF_DEDUPLICATE_CHAPTERS, false)) {
         mutableListOf<SChapter>().apply {
